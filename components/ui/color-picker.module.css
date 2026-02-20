@@ -1,0 +1,55 @@
+.colorPicker :global(.react-colorful) {
+  height: 250px;
+  width: 100%;
+  position: relative;
+}
+.colorPicker :global(.react-colorful__saturation) {
+  margin: 12px 0 0;
+  border-radius: 8px;
+  border-bottom: none;
+  width: 100%;
+}
+
+.colorPicker :global(.react-colorful__saturation-pointer) {
+  width: 20px;
+  height: 20px;
+  border-radius: 4px;
+}
+.colorPicker :global(.react-colorful__pointer) {
+  border-width: 2px !important;
+  border-style: solid;
+  border-color: white;
+}
+.colorPicker
+  :global(.react-colorful__saturation)
+  :global(.react-colorful__interactive) {
+  cursor: crosshair;
+}
+
+.colorPicker :global(.react-colorful__hue) {
+  height: 16px;
+  width: 100%;
+  border-radius: 4px;
+  margin-top: 12px;
+}
+
+.colorPicker :global(.react-colorful__hue-pointer) {
+  width: 16px;
+  height: 20px;
+  border-radius: 4px;
+  cursor: e-resize;
+}
+
+.colorPicker :global(.react-colorful__alpha) {
+  height: 16px;
+  width: 100%;
+  border-radius: 4px;
+  margin-top: 12px;
+}
+
+.colorPicker :global(.react-colorful__alpha-pointer) {
+  width: 16px;
+  height: 20px;
+  border-radius: 4px;
+  cursor: e-resize;
+}

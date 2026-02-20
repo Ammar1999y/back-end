@@ -1,0 +1,78 @@
+import type { Heading } from '@platejs/toc';
+import type { SlateEditor, TElement } from 'platejs';
+import type { SlateElementProps } from 'platejs/static';
+
+import { BaseTocPlugin, isHeading } from '@platejs/toc';
+import { NodeApi } from 'platejs';
+import { SlateElement } from 'platejs/static';
+
+import { Button } from '@/components/ui/button';
+
+export function TocElementStatic(props: SlateElementProps) {
+  const { editor } = props;
+  const headingList = getHeadingList(editor);
+
+  return (
+    <SlateElement {...props} className='mb-1 p-0'>
+      <div>
+        {headingList.length > 0 &&
+          headingList.map((item) => (
+            <Button
+              className={
+                'block h-auto w-full cursor-pointer truncate rounded-none px-0.5 py-1.5 text-left font-medium text-muted-foreground underline decoration-[0.5px] underline-offset-4 hover:bg-accent hover:text-muted-foreground'
+              }
+              style={{
+                paddingInlineStart: `${Number((item.depth - 1) * 26) || 4}px`,
+              }}
+              key={item.title}
+              variant='ghost'
+            >
+              {item.title}
+            </Button>
+          ))}
+      </div>
+      {props.children}
+    </SlateElement>
+  );
+}
+
+const headingDepth: Record<string, number> = {
+  h1: 1,
+  h2: 2,
+  h3: 3,
+  h4: 4,
+  h5: 5,
+  h6: 6,
+};
+
+const getHeadingList = (editor?: SlateEditor) => {
+  if (!editor) return [];
+
+  const options = editor.getOptions(BaseTocPlugin);
+
+  if (options.queryHeading) {
+    return options.queryHeading(editor);
+  }
+
+  const headingList: Heading[] = [];
+
+  const values = editor.api.nodes<TElement>({
+    at: [],
+    match: (n) => isHeading(n),
+  });
+
+  if (!values) return [];
+
+  Array.from(values).forEach(([node, path]) => {
+    const { type } = node;
+    const title = NodeApi.string(node);
+    const depth = headingDepth[type];
+    const id = node.id as string;
+
+    if (title) {
+      headingList.push({ id, depth, path, title, type });
+    }
+  });
+
+  return headingList;
+};

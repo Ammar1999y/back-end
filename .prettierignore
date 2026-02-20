@@ -1,0 +1,10 @@
+dist
+build
+node_modules
+.next
+.env
+.env.local
+bun.lock
+package-lock.json
+.vercel
+.learn

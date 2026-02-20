@@ -1,0 +1,393 @@
+@tailwind base;
+
+a,
+button,
+input,
+textarea {
+  background: transparent;
+}
+a,
+button {
+  appearance: none;
+}
+img,
+video {
+  max-width: none;
+  height: auto;
+}
+* {
+  @apply border-border outline-ring/50;
+}
+a,
+button,
+input,
+textarea,
+*:focus-visible {
+  @apply outline-none outline-0;
+  @apply focus-visible:z-[1] focus-visible:ring-[3px] focus-visible:ring-ring/50;
+}
+@tailwind components;
+@tailwind utilities;
+
+.disabled {
+  @apply pointer-events-none select-none opacity-70 [&_*]:pointer-events-none [&_*]:select-none;
+}
+
+.formContentPadding {
+  @apply px-1 pb-10 pt-5 md:pt-6;
+}
+
+:root {
+  /* Font configuration - used in tailwind.config.ts */
+  --font-scale: 1;
+
+  /* Font sizes with scaling support */
+  --text-xs: calc(0.75rem * var(--font-scale));
+  --text-xs-line-height: 1.33;
+  --text-sm: calc(0.875rem * var(--font-scale));
+  --text-sm-line-height: 1.43;
+  --text-base: calc(1rem * var(--font-scale));
+  --text-base-line-height: 1.5;
+  --text-lg: calc(1.125rem * var(--font-scale));
+  --text-lg-line-height: 1.56;
+  --text-xl: calc(1.25rem * var(--font-scale));
+  --text-xl-line-height: 1.4;
+  --text-2xl: calc(1.5rem * var(--font-scale));
+  --text-2xl-line-height: 1.33;
+  --text-3xl: calc(1.875rem * var(--font-scale));
+  --text-3xl-line-height: 1.2;
+
+  /* Color palette */
+  --colors-palette-success-default: 155 54% 46%;
+  --colors-palette-success-dark: 167 65% 30%;
+
+  --colors-palette-warning-default: 40 100% 50%;
+  --colors-palette-warning-dark: 36 100% 36%;
+
+  --colors-palette-error-default: 11 100% 59%;
+  --colors-palette-error-dark: 2 77% 41%;
+
+  --colors-palette-info-default: 189 100% 43%;
+  --colors-palette-info-dark: 198 100% 31%;
+
+  --gray-100: 210 20% 98%;
+  --gray-200: 210 22% 96%;
+  --gray-300: 213 16% 89%;
+  --gray-400: 208 17% 80%;
+  --gray-500: 210 13% 62%;
+  --gray-600: 208 13% 45%;
+  --gray-700: 213 14% 31%;
+  --gray-800: 210 24% 15%;
+  --gray-900: 212 25% 10%;
+
+  /* Z-index */
+  --zIndex-appBar: 10;
+  --zIndex-nav: 20;
+  --zIndex-scrollbar: 30;
+
+  --font-family:
+    var(--font-main), system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI',
+    Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+
+  /* Layout */
+  --scrollbar-size: 0.6rem;
+  --container-max-width: 1200px;
+
+  --highlight: 47 100% 50%;
+}
+
+/* 🟥🟥🟥🟥 اي تغير اقوم به على الالوان، لازم يتم مزامنته معا components\theme-customizer\config\theme.ts */
+/* Shadcn UI Light Theme */
+:root {
+  --background: 0 0% 100%;
+  --foreground: 0 0% 4%;
+  --card: 0 0% 98%;
+  --card-foreground: 0 0% 4%;
+  --popover: 0 0% 100%;
+  --popover-foreground: 0 0% 4%;
+  --primary: 172 98% 40%;
+  --primary-light: 172 98% 48%;
+  --primary-dark: 172 98% 32%;
+  --primary-foreground: 0 0% 0%;
+  --secondary: 0 0% 96%;
+  --secondary-foreground: 0 0% 9%;
+  --muted: 0 0% 96%;
+  --muted-foreground: 0 0% 45%;
+  --accent: 0 0% 92%;
+  --accent-foreground: 0 0% 9%;
+  --destructive: 357 100% 45%;
+  --destructive-foreground: 223.81 -172.52% 100%;
+  --border: 0 0% 90%;
+  --input: 0 0% 94%;
+  --ring: 0 0% 63%;
+  --chart-1: 18 100% 48%;
+  --chart-2: 175 100% 29%;
+  --chart-3: 196 72% 23%;
+  --chart-4: 44 100% 50%;
+  --chart-5: 36 100% 50%;
+
+  --sidebar: 0 0% 98%;
+  --sidebar-foreground: 0 0% 4%;
+  --sidebar-primary: 11 48% 35%;
+  --sidebar-primary-foreground: 0 0% 0%;
+  --sidebar-accent: 0 0% 92%;
+  --sidebar-accent-foreground: 0 0% 9%;
+  --sidebar-border: 0 0% 90%;
+  --sidebar-ring: 0 0% 63%;
+
+  --font-mono:
+    ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono',
+    'Courier New', monospace;
+
+  --radius: 0.5rem;
+  --tracking-normal: 0.075em;
+  --spacing: 0.25rem;
+
+  --shadow-x: 0;
+  --shadow-y: 1px;
+  --shadow-blur: 3px;
+  --shadow-spread: 0px;
+  --shadow-opacity: 0.1;
+  --shadow-color: 0 0% 0%;
+  --shadow-2xs: 0 1px 3px 0px hsl(var(--shadow-color) / 0.05);
+  --shadow-xs: 0 1px 3px 0px hsl(var(--shadow-color) / 0.05);
+  --shadow-sm:
+    0 1px 3px 0px hsl(var(--shadow-color) / 0.1),
+    0 1px 2px -1px hsl(var(--shadow-color) / 0.1);
+  --shadow:
+    0 1px 3px 0px hsl(var(--shadow-color) / 0.1),
+    0 1px 2px -1px hsl(var(--shadow-color) / 0.1);
+  --shadow-md:
+    0 1px 3px 0px hsl(var(--shadow-color) / 0.1),
+    0 2px 4px -1px hsl(var(--shadow-color) / 0.1);
+  --shadow-lg:
+    0 1px 3px 0px hsl(var(--shadow-color) / 0.1),
+    0 4px 6px -1px hsl(var(--shadow-color) / 0.1);
+  --shadow-xl:
+    0 1px 3px 0px hsl(var(--shadow-color) / 0.1),
+    0 8px 10px -1px hsl(var(--shadow-color) / 0.1);
+  --shadow-2xl: 0 1px 3px 0px hsl(var(--shadow-color) / 0.25);
+
+  --placeholder: 220 9% 60%;
+}
+
+/* 🟥🟥🟥🟥 اي تغير اقوم به على الالوان، لازم يتم مزامنته معا components\theme-customizer\config\theme.ts */
+.dark,
+[data-theme='dark'] {
+  --background: 0 0% 4%;
+  --foreground: 0 0% 98%;
+  --card: 0 0% 9%;
+  --card-foreground: 0 0% 98%;
+  --popover: 11 48% 35%;
+  --popover-foreground: 0 0% 98%;
+  --primary-foreground: 0 0% 0%;
+  --secondary: 0 0% 15%;
+  --secondary-foreground: 0 0% 98%;
+  --muted: 0 0% 12%;
+  --muted-foreground: 0 0% 63%;
+  --accent: 0 0% 17%;
+  --accent-foreground: 0 0% 98%;
+  --destructive: 359 100% 70%;
+  --destructive-foreground: 223.81 0% 98.03%;
+  --border: 0 0% 100% / 0.1;
+  --input: 0 0% 19.8916%;
+  --ring: 0 0% 45%;
+  --chart-1: 225 84% 49%;
+  --chart-2: 160 100% 37%;
+  --chart-3: 36 100% 50%;
+  --chart-4: 273 100% 64%;
+  --chart-5: 345 100% 56%;
+  --sidebar: 0 0% 9%;
+  --sidebar-foreground: 0 0% 98%;
+  --sidebar-primary: 11 48% 35%;
+  --sidebar-primary-foreground: 0 0% 0%;
+  --sidebar-accent: 0 0% 18%;
+  --sidebar-accent-foreground: 0 0% 98%;
+  --sidebar-border: 0 0% 100% / 0.1;
+  --sidebar-ring: 0 0% 45%;
+}
+
+:root {
+  --layout-nav-width: 260px;
+  --layout-nav-width-mini: 88px;
+  --layout-nav-height-horizontal: 48px;
+
+  --header-base-height: calc((var(--spacing) * 27.5));
+  --header-font-offset: calc((var(--font-scale) - 1) * 16px);
+
+  /* Final calculation */
+  --layout-header-height: calc(
+    var(--header-base-height) + env(safe-area-inset-top) +
+      var(--header-font-offset)
+  );
+}
+
+@media (min-width: 768px) {
+  :root {
+    --header-base-height: calc((var(--spacing) * 20));
+  }
+}
+
+@supports (scrollbar-width: auto) and (not selector(::-webkit-scrollbar)) {
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: hsl(var(--muted-foreground) / 0.7) transparent;
+  }
+}
+@supports (selector(::-webkit-scrollbar)) {
+  ::-webkit-scrollbar {
+    width: var(--scrollbar-size);
+    height: var(--scrollbar-size);
+  }
+  ::-webkit-scrollbar-button {
+    display: none;
+  }
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  ::-webkit-scrollbar-thumb {
+    background: hsl(var(--muted-foreground) / 0.7);
+    border-radius: 10px;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background: hsl(var(--muted-foreground) / 0.9);
+  }
+}
+::selection {
+  background-color: hsl(var(--primary));
+  color: hsl(var(--primary-foreground));
+}
+
+.container {
+  margin-left: auto;
+  margin-right: auto;
+  max-width: var(--container-max-width);
+  width: 100%;
+}
+.container-padding {
+  padding-left: calc(var(--spacing) * 4);
+  padding-right: calc(var(--spacing) * 4);
+}
+
+@media (min-width: 576px) {
+  .container-padding {
+    padding-left: calc(var(--spacing) * 6);
+    padding-right: calc(var(--spacing) * 6);
+  }
+}
+@media (min-width: 768px) {
+  .container-padding {
+    padding-left: calc(var(--spacing) * 8);
+    padding-right: calc(var(--spacing) * 8);
+  }
+}
+
+/* no changes */
+html,
+body {
+  position: relative;
+  background: hsl(var(--background)) !important;
+  color: hsl(var(--foreground)) !important;
+
+  font-family: var(--font-family);
+  scroll-behavior: smooth;
+  @apply text-base;
+}
+main {
+  position: relative;
+  background: hsl(var(--background)) !important;
+  color: hsl(var(--foreground)) !important;
+  @apply text-base;
+}
+
+body {
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  overflow-x: clip;
+  animation: fadeIn 0.6s ease-in-out;
+}
+.fade-in {
+  animation: fadeIn 0.4s ease-in-out;
+}
+@keyframes fadeIn {
+  from {
+    opacity: 0.01;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+input::-webkit-outer-spin-button,
+input::-webkit-inner-spin-button {
+  -webkit-appearance: none;
+  -moz-appearance: none;
+  appearance: none;
+  margin: 0;
+}
+input[type='password']::-ms-reveal,
+input[type='password']::-ms-clear {
+  visibility: hidden;
+  pointer-events: none;
+  display: none;
+}
+input[type='number'] {
+  -moz-appearance: textfield;
+  -webkit-appearance: textfield;
+  appearance: textfield;
+}
+
+html[dir='rtl'] input[dir='ltr']::placeholder,
+html[dir='rtl'] textarea[dir='ltr']::placeholder {
+  text-align: end;
+  direction: rtl;
+}
+
+.noSelect,
+a,
+button,
+img,
+label,
+svg,
+[role='button'] {
+  -webkit-tap-highlight-color: transparent;
+  -webkit-touch-callout: none;
+  -webkit-user-select: none;
+  -khtml-user-select: none;
+  -moz-user-select: none;
+  -ms-user-select: none;
+  user-select: none;
+  -ms-touch-action: manipulation;
+  touch-action: manipulation;
+}
+
+img,
+svg {
+  pointer-events: none;
+}
+
+svg {
+  flex-shrink: 0;
+}
+img {
+  color: transparent;
+}
+
+/* html > body[data-scroll-locked] {
+  overflow-y: visible !important;
+  margin-right: 0 !important;
+  margin-left: 0 !important;
+  min-width: 100% !important;
+} */
+section h1,
+article h1,
+aside h1,
+nav h1 {
+  font-size: var(--text-2xl);
+}
+@media (max-width: 340px) {
+  body {
+    zoom: 0.9;
+  }
+}

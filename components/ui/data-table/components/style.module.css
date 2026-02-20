@@ -1,0 +1,13 @@
+[data-pinned-column='left'],
+[data-pinned-column='right'] {
+  position: sticky;
+  z-index: 10;
+}
+
+[data-pinned-column='left'] {
+  left: calc(var(--left) * 1px);
+}
+
+[data-pinned-column='right'] {
+  right: calc(var(--right) * 1px);
+}
