@@ -27,6 +27,7 @@ const ERROR_MESSAGES = {
   pagePermissionRequired: 'الصلاحيات مطلوبه',
   permissionsMaxLength: `عدد الصلاحيات يجب أن لا يتجاوز ${PERMISSIONS_ARRAY_MAX} صلاحيات`,
   permissionsRequired: 'الصلاحيات مطلوبه',
+  duplicatePageNames: 'أسماء الصفحات يجب أن لا تتكرر',
 };
 const permissionSchema = z
   .object(
@@ -43,28 +44,45 @@ export const pagePermissionSchema = z.preprocess(
   (data) => {
     if (typeof data !== 'object' || data === null) return data;
 
-    const { name, permissions } = data as {
-      name: DashboardPage;
-      permissions: Record<PermissionAction, boolean>;
-    };
-
+    const obj = data as Record<string, unknown>;
+    const name = obj.name as DashboardPage;
     const available = getAvailablePermissions(name);
+
+    const raw =
+      obj.permissions && typeof obj.permissions === 'object'
+        ? (obj.permissions as Record<string, unknown>)
+        : {};
+
     const filtered = Object.fromEntries(
-      Object.entries(permissions).filter(([key]) =>
-        available.includes(key as PermissionAction)
+      Object.entries(raw).filter(
+        ([key, value]) =>
+          available.includes(key as PermissionAction) &&
+          typeof value === 'boolean'
       )
     );
 
-    return {
-      name,
-      permissions: filtered,
-    };
+    return { name, permissions: filtered };
   },
   z.object({
     name: z.enum(Object.keys(DASHBOARD_PAGES) as DashboardPage[]),
     permissions: permissionSchema,
   })
 );
+function noDuplicatePageNames(items: { name: string }[], ctx: z.RefinementCtx) {
+  const names = items.map((p) => p.name);
+  if (new Set(names).size !== names.length) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: ERROR_MESSAGES.duplicatePageNames,
+    });
+  }
+}
+
+export const permissionsArraySchema = z
+  .array(pagePermissionSchema)
+  .superRefine((items, ctx) =>
+    noDuplicatePageNames(items as { name: string }[], ctx)
+  );
 
 export const createPermissionSchema = z.object({
   roleName: z.preprocess(
@@ -88,7 +106,10 @@ export const createPermissionSchema = z.object({
   permissions: z
     .array(pagePermissionSchema)
     .min(1, ERROR_MESSAGES.permissionsRequired)
-    .max(PERMISSIONS_ARRAY_MAX, ERROR_MESSAGES.permissionsMaxLength),
+    .max(PERMISSIONS_ARRAY_MAX, ERROR_MESSAGES.permissionsMaxLength)
+    .superRefine((items, ctx) =>
+      noDuplicatePageNames(items as { name: string }[], ctx)
+    ),
   isActive: z.boolean(),
 });
 

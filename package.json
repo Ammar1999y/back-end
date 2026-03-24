@@ -6,7 +6,7 @@
     "dev": "next dev",
     "build": "bun --bun run next build",
     "start": "bun --bun run next start",
-    "lint": "eslint . && prettier --write .",
+    "lint": "tsc --noEmit && eslint .",
     "format:fix": "prettier --write .",
     "db:generate": "drizzle-kit generate",
     "db:migrate": "drizzle-kit migrate"

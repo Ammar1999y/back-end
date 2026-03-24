@@ -28,7 +28,7 @@ const Toaster = memo(() => {
         classNames: {
           actionButton:
             '!bg-transparent !text-foreground/50 hover:!text-foreground rtl:!pl-0 ltr:!pr-0',
-          content: 'flex-1 font-main ms-4',
+          content: 'flex-1 font-main ms-4 whitespace-pre-line',
           icon: '!w-5 !h-5',
         },
       }}

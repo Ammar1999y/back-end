@@ -1,24 +1,52 @@
 import { headers } from 'next/headers';
-import { NextResponse } from 'next/server';
+import { and, count, eq, isNull } from 'drizzle-orm';
 
 import { db } from '@/db';
-import { accounts, rolePermissions, roles, users } from '@/db/schema';
+import { parseDataTableParams } from '@/db/queries/data-table';
+import { accounts, roles, users } from '@/db/schema';
 import { withTransaction } from '@/db/ws';
-import { UserClient as User } from '@/types/user';
-import { isUniqueViolation, sanitizeForLog } from '@/utils';
-import { v7 as uuidv7 } from 'uuid';
+import { isForeignKeyViolation, isUniqueViolation } from '@/utils';
+import { auditLog } from '@/lib/audit';
 import { hashPassword } from '@/lib/auth';
 import { checkUserPermission } from '@/lib/permissions/checker';
+import { CUSTOM_ROLE_VALUE } from '@/lib/permissions/constants';
 import {
-  CUSTOM_ROLE_VALUE,
-  PermissionAction,
-  SUPER_ADMIN_ROLE,
-} from '@/lib/permissions/constants';
+  createCustomRole,
+  nonSystemRoleFilter,
+  validateAssignableRole,
+  validatePermissionScope,
+  validateRolePermissionScope,
+} from '@/lib/permissions/utils';
 
+import {
+  CREDENTIAL_PROVIDER_ID,
+  HTTP_STATUS,
+  MSG_CREATE_ERROR,
+  MSG_CREATED,
+  MSG_FETCH_ERROR,
+  MSG_FETCHED,
+  MSG_INSUFFICIENT_PERMISSIONS,
+} from '@/utils/api-messages';
+import {
+  apiSuccess,
+  handleApiError,
+  parseJsonBody,
+  resolveUserUniqueViolation,
+} from '@/utils/api-response';
 import { CustomError } from '@/utils/error-class';
 import { createUserSchema } from '@/utils/validation/auth';
 
-export async function GET() {
+import { userMsg } from './messages';
+
+const USERS_ALLOWED_COLUMNS = new Set([
+  'name',
+  'email',
+  'isActive',
+  'createdAt',
+  'updatedAt',
+]);
+
+export async function GET(request: Request) {
   try {
     await checkUserPermission({
       headers: await headers(),
@@ -26,171 +54,180 @@ export async function GET() {
       action: 'view',
     });
 
-    const dashboardUsers = await db.query.users.findMany({
-      where: (users, { isNotNull }) => isNotNull(users.roleId),
-      columns: {
-        id: true,
-        name: true,
-        email: true,
-        isActive: true,
-        roleId: true,
-        createdAt: true,
-        updatedAt: true,
-      },
-      with: {
-        role: {
-          columns: {
-            id: true,
-            roleName: true,
-            scope: true,
+    const { where, orderBy, limit, offset, page, perPage, buildPageCount } =
+      parseDataTableParams(users, {
+        url: request.url,
+        allowedColumns: USERS_ALLOWED_COLUMNS,
+        searchableColumns: ['name', 'email'],
+        defaultSort: { id: 'createdAt', desc: true },
+      });
+
+    const baseFilter = and(
+      isNull(users.deletedAt),
+      nonSystemRoleFilter(),
+      where
+    );
+
+    //  No transaction needed for read-only queries
+    const [dashboardUsers, [{ total }]] = await Promise.all([
+      db
+        .select({
+          id: users.id,
+          name: users.name,
+          email: users.email,
+          isActive: users.isActive,
+          roleId: users.roleId,
+          createdAt: users.createdAt,
+          updatedAt: users.updatedAt,
+          role: {
+            id: roles.id,
+            roleName: roles.roleName,
+            scope: roles.scope,
           },
-        },
+        })
+        .from(users)
+        .innerJoin(roles, eq(users.roleId, roles.id))
+        .where(baseFilter)
+        .orderBy(...orderBy)
+        .limit(limit)
+        .offset(offset),
+      db
+        .select({ total: count() })
+        .from(users)
+        .innerJoin(roles, eq(users.roleId, roles.id))
+        .where(baseFilter),
+    ]);
+
+    return apiSuccess({
+      message: MSG_FETCHED,
+      data: dashboardUsers.map(({ role, ...u }) => ({
+        ...u,
+        roleId:
+          role?.scope === CUSTOM_ROLE_VALUE ? CUSTOM_ROLE_VALUE : u.roleId,
+        role: role ? { id: role.id, roleName: role.roleName } : null,
+      })),
+      meta: {
+        page,
+        perPage,
+        total,
+        pageCount: buildPageCount(total),
       },
-      orderBy: (users, { desc }) => [desc(users.createdAt)],
     });
-
-    // Filter out super admin users (filtered in JS since we can't filter on relations in where)
-    const filteredUsers = dashboardUsers.filter(
-      (u) => u.role?.roleName !== SUPER_ADMIN_ROLE
-    );
-
-    return NextResponse.json({ data: filteredUsers }, { status: 200 });
   } catch (error) {
-    if (error instanceof CustomError) {
-      return NextResponse.json(
-        { error: error.message },
-        { status: error.status }
-      );
-    }
-
-    console.error(sanitizeForLog(error));
-    return NextResponse.json(
-      { error: 'حدث خطأ أثناء جلب بيانات المستخدمين' },
-      { status: 500 }
-    );
+    return handleApiError(error, MSG_FETCH_ERROR);
   }
 }
 
 export async function POST(request: Request) {
-  let poolOpened = false;
   try {
-    await checkUserPermission({
-      headers: await headers(),
-      resource: 'users',
-      action: 'create',
-    });
+    const { session, permissions: actorPermissions } =
+      await checkUserPermission({
+        headers: await headers(),
+        resource: 'users',
+        action: 'create',
+      });
 
-    const body = await request.json();
+    const body = await parseJsonBody(request);
 
     const validatedDataParsed = createUserSchema.safeParse(body);
     if (!validatedDataParsed.success)
-      throw new CustomError(validatedDataParsed.error.issues[0].message, 422);
+      throw new CustomError(
+        validatedDataParsed.error.issues[0].message,
+        HTTP_STATUS.UNPROCESSABLE
+      );
 
     const validatedData = validatedDataParsed.data;
+    const isCustomRole = validatedData.roleId === CUSTOM_ROLE_VALUE;
+
+    // Verify actor has permission to manage custom roles (no extra query)
+    if (
+      isCustomRole &&
+      actorPermissions?.['permissions']?.['create'] !== true
+    )
+      throw new CustomError(
+        MSG_INSUFFICIENT_PERMISSIONS,
+        HTTP_STATUS.FORBIDDEN
+      );
+
+    // Validate custom role permissions synchronously (no DB needed)
+    if (actorPermissions && isCustomRole && validatedData.permissions?.length)
+      validatePermissionScope(actorPermissions, validatedData.permissions);
 
     const hashedPassword = await hashPassword(validatedData.password);
 
-    const { db: tdb, pool } = WSDB();
-    poolOpened = true;
-    let createdUser: Partial<User> = {};
+    const newId = await withTransaction(async (tx) => {
+      if (!isCustomRole) {
+        await validateAssignableRole(validatedData.roleId, tx);
+      }
 
-    try {
-      await tdb.transaction(async (tx) => {
-        // Verify the role inside the transaction
-        if (validatedData.roleId !== CUSTOM_ROLE_VALUE) {
-          const targetRole = await tx.query.roles.findFirst({
-            where: (roles, { eq }) => eq(roles.id, validatedData.roleId),
-            columns: { roleName: true },
-          });
-          if (targetRole?.roleName === SUPER_ADMIN_ROLE)
-            throw new CustomError(
-              `لا يمكن إنشاء مستخدم بدور ${SUPER_ADMIN_ROLE}`,
-              400
-            );
-        }
-        let assignedRoleId: string;
+      //  Scope check inside transaction — prevents TOCTOU race
+      if (actorPermissions && !isCustomRole) {
+        await validateRolePermissionScope(
+          actorPermissions,
+          validatedData.roleId,
+          tx
+        );
+      }
 
-        if (
-          validatedData.roleId === CUSTOM_ROLE_VALUE &&
-          validatedData?.permissions?.length
-        ) {
-          // Create a custom-scoped role for this user
-          const [customRole] = await tx
-            .insert(roles)
-            .values({
-              roleName: `custom-${uuidv7()}`,
-              scope: 'custom',
-              isActive: true,
-            })
-            .returning({ id: roles.id });
+      const assignedRoleId =
+        isCustomRole && validatedData.permissions?.length
+          ? await createCustomRole(tx, validatedData.permissions)
+          : validatedData.roleId;
 
-          assignedRoleId = customRole.id;
+      const [newUser] = await tx
+        .insert(users)
+        .values({
+          name: validatedData.name,
+          email: validatedData.email,
+          roleId: assignedRoleId,
+          isActive: validatedData.isActive,
+        })
+        .returning({ id: users.id });
 
-          const customPermsData = validatedData.permissions.map((p) => ({
-            roleId: assignedRoleId,
-            pageName: p.name,
-            permissions: p.permissions as Record<PermissionAction, boolean>,
-          }));
+      const userId = newUser.id;
 
-          await tx.insert(rolePermissions).values(customPermsData);
-        } else {
-          assignedRoleId = validatedData.roleId;
-        }
-
-        const [newUser] = await tx
-          .insert(users)
-          .values({
-            name: validatedData.name,
-            email: validatedData.email,
-            roleId: assignedRoleId,
-            isActive: validatedData.isActive,
-          })
-          .returning({ id: users.id });
-
-        const userId = newUser.id;
-        if (!userId) throw new CustomError('فشل في إنشاء المستخدم', 500);
-
-        await tx.insert(accounts).values({
-          accountId: userId,
-          providerId: 'credential',
-          userId: userId,
-          password: hashedPassword,
-        });
-
-        createdUser = {
-          id: userId,
-        };
+      await tx.insert(accounts).values({
+        accountId: userId,
+        providerId: CREDENTIAL_PROVIDER_ID,
+        userId: userId,
+        password: hashedPassword,
       });
 
-      return NextResponse.json(
-        {
-          data: createdUser,
-          success: true,
-          message: 'تم إنشاء المستخدم بنجاح',
+      await auditLog(tx, {
+        userId: session!.user.id,
+        userEmail: session!.user.email,
+        action: 'INSERT',
+        tableName: 'users',
+        recordId: userId,
+        newData: {
+          name: validatedData.name,
+          email: validatedData.email,
+          roleId: assignedRoleId,
+          isActive: validatedData.isActive,
         },
-        { status: 201 }
-      );
-    } finally {
-      if (poolOpened) await pool.end();
-    }
+        request,
+      });
+
+      return userId;
+    });
+
+    return apiSuccess({
+      message: MSG_CREATED,
+      data: { id: newId },
+      status: HTTP_STATUS.CREATED,
+    });
   } catch (error) {
-    if (isUniqueViolation(error))
-      return NextResponse.json(
-        { error: 'البريد الإلكتروني أو رقم الهاتف مستخدم بالفعل' },
-        { status: 409 }
-      );
-
-    if (error instanceof CustomError) {
-      return NextResponse.json(
-        { error: error.message },
-        { status: error.status }
+    if (isUniqueViolation(error)) {
+      return handleApiError(
+        new CustomError(resolveUserUniqueViolation(error), HTTP_STATUS.CONFLICT)
       );
     }
-
-    console.error(sanitizeForLog(error));
-    return NextResponse.json(
-      { error: 'حدث خطأ أثناء إنشاء المستخدم' },
-      { status: 500 }
-    );
+    //  Concurrent role deletion — surface as friendly 400
+    if (isForeignKeyViolation(error)) {
+      return handleApiError(
+        new CustomError(userMsg.roleNotFound, HTTP_STATUS.BAD_REQUEST)
+      );
+    }
+    return handleApiError(error, MSG_CREATE_ERROR);
   }
 }

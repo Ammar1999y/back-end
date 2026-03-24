@@ -1,24 +1,47 @@
 import { headers } from 'next/headers';
-import { NextResponse } from 'next/server';
-import { and, count, desc, eq, ne } from 'drizzle-orm';
+import { and, count, eq, isNull, sql } from 'drizzle-orm';
 
 import { db } from '@/db';
+import { parseDataTableParams } from '@/db/queries/data-table';
 import { rolePermissions, roles, users } from '@/db/schema';
-import { WSDB } from '@/db/ws';
-import { PermissionClient as Permission } from '@/types/permission';
-import { isUniqueViolation, sanitizeForLog } from '@/utils';
+import { withTransaction } from '@/db/ws';
+import { isUniqueViolation } from '@/utils';
+import { auditLog } from '@/lib/audit';
 import { checkUserPermission } from '@/lib/permissions/checker';
 import {
+  CUSTOM_ROLE_VALUE,
   PermissionAction,
-  SUPER_ADMIN_ROLE,
+  ROLE_SCOPE,
 } from '@/lib/permissions/constants';
+import { validatePermissionScope } from '@/lib/permissions/utils';
 
+import {
+  HTTP_STATUS,
+  MSG_CREATE_ERROR,
+  MSG_CREATED,
+  MSG_FETCH_ERROR,
+  MSG_FETCHED,
+} from '@/utils/api-messages';
+import {
+  apiSuccess,
+  handleApiError,
+  parseJsonBody,
+  resolvePermissionUniqueViolation,
+} from '@/utils/api-response';
 import { CustomError } from '@/utils/error-class';
 import { createPermissionSchema } from '@/utils/validation/permissions';
 
-export const dynamic = 'force-dynamic';
+import { permissionMsg } from './messages';
 
-export async function GET() {
+const PERMISSIONS_ALLOWED_COLUMNS = new Set([
+  'roleName',
+  'description',
+  'isActive',
+  'createdAt',
+  'updatedAt',
+]);
+
+export async function GET(request: Request) {
   try {
     await checkUserPermission({
       headers: await headers(),
@@ -26,124 +49,153 @@ export async function GET() {
       action: 'view',
     });
 
-    const rolesWithCounts = await db
-      .select({
-        id: roles.id,
-        roleName: roles.roleName,
-        description: roles.description,
-        isActive: roles.isActive,
-        createdAt: roles.createdAt,
-        updatedAt: roles.updatedAt,
-        usersCount: count(users.id),
-      })
-      .from(roles)
-      .leftJoin(users, eq(users.roleId, roles.id))
-      .where(
-        and(eq(roles.scope, 'standard'), ne(roles.roleName, SUPER_ADMIN_ROLE))
-      )
-      .groupBy(roles.id)
-      .orderBy(desc(roles.createdAt));
+    const { where, orderBy, limit, offset, page, perPage, buildPageCount } =
+      parseDataTableParams(roles, {
+        url: request.url,
+        allowedColumns: PERMISSIONS_ALLOWED_COLUMNS,
+        searchableColumns: ['roleName', 'description'],
+        defaultSort: { id: 'createdAt', desc: true },
+      });
 
-    return NextResponse.json({ data: rolesWithCounts }, { status: 200 });
-  } catch (error) {
-    if (error instanceof CustomError) {
-      return NextResponse.json(
-        { error: error.message },
-        { status: error.status }
-      );
-    }
-    console.error(sanitizeForLog(error));
-    return NextResponse.json(
-      { error: 'فشل في جلب الصلاحيات' },
-      { status: 500 }
+    const baseFilter = and(
+      eq(roles.scope, ROLE_SCOPE.STANDARD),
+      where
     );
+
+    // Pre-aggregated user counts — single scan instead of N correlated subqueries
+    const userCounts = db
+      .select({
+        roleId: users.roleId,
+        cnt: count().as('cnt'),
+      })
+      .from(users)
+      .where(isNull(users.deletedAt))
+      .groupBy(users.roleId)
+      .as('uc');
+
+    const [rolesWithCounts, [{ total }]] = await Promise.all([
+      db
+        .select({
+          id: roles.id,
+          roleName: roles.roleName,
+          description: roles.description,
+          isActive: roles.isActive,
+          createdAt: roles.createdAt,
+          updatedAt: roles.updatedAt,
+          usersCount: sql<number>`COALESCE(${userCounts.cnt}, 0)`.mapWith(
+            Number
+          ),
+        })
+        .from(roles)
+        .leftJoin(userCounts, eq(roles.id, userCounts.roleId))
+        .where(baseFilter)
+        .orderBy(...orderBy)
+        .limit(limit)
+        .offset(offset),
+      db.select({ total: count() }).from(roles).where(baseFilter),
+    ]);
+
+    return apiSuccess({
+      message: MSG_FETCHED,
+      data: rolesWithCounts,
+      meta: {
+        page,
+        perPage,
+        total,
+        pageCount: buildPageCount(total),
+      },
+    });
+  } catch (error) {
+    return handleApiError(error, MSG_FETCH_ERROR);
   }
 }
 
 export async function POST(request: Request) {
-  let poolOpened = false;
   try {
-    await checkUserPermission({
-      headers: await headers(),
-      resource: 'permissions',
-      action: 'create',
-    });
+    const { session, permissions: actorPermissions } =
+      await checkUserPermission({
+        headers: await headers(),
+        resource: 'permissions',
+        action: 'create',
+      });
 
-    const body = await request.json();
+    const body = await parseJsonBody(request);
 
     const validatedDataParsed = createPermissionSchema.safeParse(body);
     if (!validatedDataParsed.success)
-      throw new CustomError(validatedDataParsed.error.issues[0].message, 422);
+      throw new CustomError(
+        validatedDataParsed.error.issues[0].message,
+        HTTP_STATUS.UNPROCESSABLE
+      );
 
     const validatedData = validatedDataParsed.data;
 
-    if (validatedData.roleName === SUPER_ADMIN_ROLE)
-      throw new CustomError(`لا يمكن إنشاء دور باسم ${SUPER_ADMIN_ROLE}`, 400);
+    if (validatedData.roleName.startsWith(CUSTOM_ROLE_VALUE))
+      throw new CustomError(
+        permissionMsg.customPrefixForbidden(CUSTOM_ROLE_VALUE),
+        HTTP_STATUS.BAD_REQUEST
+      );
 
-    const { db: tdb, pool } = WSDB();
-    poolOpened = true;
-    let createdRole: Partial<Permission> = {};
+    // Actor cannot grant permissions they don't hold
+    if (actorPermissions && validatedData.permissions?.length) {
+      validatePermissionScope(actorPermissions, validatedData.permissions);
+    }
 
-    try {
-      await tdb.transaction(async (tx) => {
-        const [newRole] = await tx
-          .insert(roles)
-          .values({
-            roleName: validatedData.roleName,
-            description: validatedData.description,
-            isActive: validatedData.isActive,
-          })
-          .returning({ id: roles.id });
-
-        if (validatedData.permissions && validatedData.permissions.length > 0) {
-          const permissionsData = validatedData.permissions.map((p) => ({
-            roleId: newRole.id,
-            pageName: p.name,
-            permissions: p.permissions as Record<PermissionAction, boolean>,
-          }));
-          await tx.insert(rolePermissions).values(permissionsData);
-        }
-
-        createdRole = {
-          id: newRole.id,
+    const newId = await withTransaction(async (tx) => {
+      const [newRole] = await tx
+        .insert(roles)
+        .values({
           roleName: validatedData.roleName,
           description: validatedData.description,
           isActive: validatedData.isActive,
-          usersCount: 0,
-          createdAt: new Date().toISOString(),
-          updatedAt: new Date().toISOString(),
-          permissions: validatedData.permissions || [],
-        };
+        })
+        .returning({ id: roles.id });
+
+      if (validatedData.permissions && validatedData.permissions.length > 0) {
+        const permissionsData = validatedData.permissions.map((p) => ({
+          roleId: newRole.id,
+          pageName: p.name,
+          permissions: p.permissions as Record<PermissionAction, boolean>,
+        }));
+        await tx.insert(rolePermissions).values(permissionsData);
+      }
+
+      await auditLog(tx, {
+        userId: session!.user.id,
+        userEmail: session!.user.email,
+        action: 'INSERT',
+        tableName: 'roles',
+        recordId: newRole.id,
+        newData: {
+          roleName: validatedData.roleName,
+          description: validatedData.description,
+          isActive: validatedData.isActive,
+          permissions: validatedData.permissions,
+        },
+        request,
       });
 
-      return NextResponse.json(
-        {
-          data: createdRole,
-          success: true,
-          message: 'تم إنشاء الصلاحية بنجاح',
-        },
-        { status: 201 }
-      );
-    } finally {
-      if (poolOpened) await pool.end();
-    }
-  } catch (error) {
-    if (isUniqueViolation(error))
-      return NextResponse.json(
-        { error: 'اسم الصلاحية موجود بالفعل، قم بتغيره' },
-        { status: 409 }
-      );
-    if (error instanceof CustomError) {
-      return NextResponse.json(
-        { error: error.message },
-        { status: error.status }
-      );
-    }
+      return newRole.id;
+    });
 
-    console.error(sanitizeForLog(error));
-    return NextResponse.json(
-      { error: 'حدث خطأ أثناء إنشاء الصلاحية' },
-      { status: 500 }
-    );
+    return apiSuccess({
+      message: MSG_CREATED,
+      data: { id: newId },
+      status: HTTP_STATUS.CREATED,
+    });
+  } catch (error) {
+    if (isUniqueViolation(error)) {
+      return handleApiError(
+        new CustomError(
+          resolvePermissionUniqueViolation(error, {
+            nameExists: permissionMsg.nameExists,
+            duplicatePagePermission: permissionMsg.duplicatePagePermission,
+            fallback: MSG_CREATE_ERROR,
+          }),
+          HTTP_STATUS.CONFLICT
+        )
+      );
+    }
+    return handleApiError(error, MSG_CREATE_ERROR);
   }
 }

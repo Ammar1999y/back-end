@@ -1,13 +1,26 @@
 /**
- * SuperAdmin role that cannot be edited or deleted
+ * When true: users MUST have an active role to login (dashboard-only apps).
+ * When false: users CAN login without a role (public website + dashboard).
+ *
+ * Toggling this requires a new DB migration (`bun drizzle-kit generate`)
+ * because it controls the `chk_active_user_has_role` CHECK constraint
+ * and the `roleId` foreign key ON DELETE behavior in the users table.
  */
-export const SUPER_ADMIN_ROLE = 'superAdmin' as const;
+export const REQUIRE_ROLE_FOR_LOGIN = true as boolean;
 
 /**
  * Value used in the form when a user selects custom permissions.
  * Not an actual role ID - triggers creation of a role with scope='custom'.
  */
 export const CUSTOM_ROLE_VALUE = 'custom' as const;
+
+export const ROLE_SCOPE = {
+  SYSTEM: 'system',
+  STANDARD: 'standard',
+  CUSTOM: CUSTOM_ROLE_VALUE,
+} as const;
+
+export type RoleScope = (typeof ROLE_SCOPE)[keyof typeof ROLE_SCOPE];
 
 export const DASHBOARD_PAGES = {
   home: 'الرئيسية',
@@ -38,6 +51,7 @@ export type PermissionObject = Record<
 export interface SessionMetadata {
   roleId?: string | null;
   roleName?: string | null;
+  roleScope?: string | null;
   permissions?: Partial<PermissionObject>;
 }
 
@@ -59,7 +73,7 @@ export const DEFAULT_PAGE_PERMISSIONS: Array<{
   },
   {
     name: 'permissions',
-    availablePermissions: ['view', 'edit', 'create'],
+    availablePermissions: ['view', 'edit', 'delete', 'create'],
   },
 ];
 

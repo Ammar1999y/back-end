@@ -37,7 +37,7 @@ const DeleteAction = memo(
       setLoading(true);
 
       try {
-        await mutate({
+        const result = await mutate({
           href: `/api/dash/sections/${section.id}`,
           method: 'DELETE',
           onSuccess: () => {
@@ -60,7 +60,7 @@ const DeleteAction = memo(
           },
         });
 
-        toast.success('تم حذف القسم بنجاح');
+        toast.success(result.message || 'تم حذف القسم بنجاح');
         onSuccess?.();
         setOpen(false);
       } catch (error) {

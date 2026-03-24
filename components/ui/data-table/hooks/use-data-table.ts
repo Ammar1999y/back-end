@@ -65,8 +65,7 @@ interface UseDataTableProps<TData>
 export function useDataTable<TData>(props: UseDataTableProps<TData>) {
   const {
     columns,
-    // TODO
-    // pageCount = -1,
+    pageCount,
     storageKey,
     data,
     tableContainerRef,
@@ -122,7 +121,7 @@ export function useDataTable<TData>(props: UseDataTableProps<TData>) {
     data,
     ...tableProps,
     columns,
-    // pageCount,
+    pageCount,
     state: {
       pagination,
       sorting,

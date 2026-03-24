@@ -17,6 +17,7 @@ import {
   CUSTOM_ROLE_VALUE,
   PERMISSION_ACTIONS,
   PermissionAction,
+  ROLE_SCOPE,
 } from '@/lib/permissions/constants';
 import { cn } from '@/lib/utils';
 
@@ -27,7 +28,10 @@ import { useErrors } from '@/utils/store/errors';
 import { updatePermissionSchema } from '@/utils/validation/permissions';
 
 import ErrorMessage from '@/components/error-message';
-import { flattenErrors } from '@/components/form/form-error-handeling';
+import {
+  flattenErrors,
+  showFormErrors,
+} from '@/components/form/form-error-handeling';
 import { Header } from '@/components/form/header';
 import LoadingPage from '@/components/loading-page';
 import PermissionsForm from '@/components/permissions/permissions-form';
@@ -127,7 +131,7 @@ const EditPermission = () => {
           onSuccess: (serverData) => {
             const updatedPermission: Permission = {
               ...validatedData,
-              scope: 'standard',
+              scope: ROLE_SCOPE.STANDARD,
               permissions:
                 validatedData.permissions || permissionData?.permissions || [],
               updatedAt: serverData.updatedAt || new Date().toISOString(),
@@ -186,7 +190,9 @@ const EditPermission = () => {
                   };
                   updatedRoles = [
                     newRole,
-                    ...updatedRoles.filter((r) => r.value !== CUSTOM_ROLE_VALUE),
+                    ...updatedRoles.filter(
+                      (r) => r.value !== CUSTOM_ROLE_VALUE
+                    ),
                     { value: CUSTOM_ROLE_VALUE, label: 'مخصص' } as RoleOption,
                   ];
                 } else {
@@ -225,7 +231,9 @@ const EditPermission = () => {
   );
 
   const onError = useCallback((errors: FieldErrors<UpdatePermissionInput>) => {
-    useErrors.getState().setErrors(flattenErrors(errors));
+    const erros = flattenErrors(errors);
+    showFormErrors(erros);
+    useErrors.getState().setErrors(erros);
   }, []);
 
   useEffect(() => {

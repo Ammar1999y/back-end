@@ -22,7 +22,7 @@ import { useErrors } from '@/utils/store/errors';
 import { updateProjectSchema } from '@/utils/validation/projects';
 
 import ErrorMessage from '@/components/error-message';
-import { flattenErrors } from '@/components/form/form-error-handeling';
+import { flattenErrors, showFormErrors } from '@/components/form/form-error-handeling';
 import { Header } from '@/components/form/header';
 import LoadingPage from '@/components/loading-page';
 import { ProjectForm } from '@/components/projects/form';
@@ -141,9 +141,7 @@ const EditProject = () => {
 
   const onError = useCallback((errors: FieldErrors<UpdateProjectInput>) => {
     const erros = flattenErrors(errors);
-    toast.error(
-      (Object.values(erros)[0] as string) || 'تحقق من صحه جميع الخانات'
-    );
+    showFormErrors(erros);
     useErrors.getState().setErrors(erros);
   }, []);
 

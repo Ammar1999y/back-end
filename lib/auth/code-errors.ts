@@ -1,4 +1,9 @@
-export const BASE_ERROR_CODES = {
+import { MSG_INVALID_CREDENTIALS } from '@/utils/api-messages';
+
+export const MSG_ACCOUNT_LOCKED = (secondsLeft: number) =>
+  `تم حظر الحساب مؤقتًا. حاول مرة أخرى بعد ${secondsLeft} ثانية.`;
+
+export const BASE_ERROR_CODES: Record<string, string> = {
   USER_NOT_FOUND: 'المستخدم غير موجود',
   FAILED_TO_CREATE_USER:
     'حدث خطأ ما في عملية إنشاء المستخدم، حاول مجددا، او اعد تحميل الصفحة',
@@ -10,7 +15,7 @@ export const BASE_ERROR_CODES = {
     'حدث خطأ ما في عملية الحصول على بيانات الجلسة، حاول مجددا، او اعد تحميل الصفحة',
   INVALID_PASSWORD: 'كلمة المرور غير صحيحة',
   INVALID_EMAIL: 'البريد الالكتروني غير صحيح',
-  INVALID_EMAIL_OR_PASSWORD: 'بيانات الدخول غير صحيحة',
+  INVALID_EMAIL_OR_PASSWORD: MSG_INVALID_CREDENTIALS,
   INVALID_TOKEN: 'حاول مجددا، او اعد تحميل الصفحة',
   FAILED_TO_GET_USER_INFO:
     'حدث خطأ ما في عملية الحصول على بيانات المستخدم، حاول مجددا، او اعد تحميل الصفحة',
@@ -36,5 +41,5 @@ export const BASE_ERROR_CODES = {
   USER_ALREADY_EXISTS_USE_ANOTHER_EMAIL:
     'المستخدم موجود بالفعل، استخدم بريد الكتروني اخر لإنشاء الحساب',
 
-  ux_user_phone_number: 'رقم الهاتف موجود من قبل، استخدم رقم هاتف اخر',
+  ux_users_phone_number: 'رقم الهاتف موجود من قبل، استخدم رقم هاتف اخر',
 };

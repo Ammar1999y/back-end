@@ -35,7 +35,7 @@ const DeleteAction = memo(({ user }: { user: User }) => {
     setLoading(true);
 
     try {
-      await mutate({
+      const result = await mutate({
         href: `/api/dash/users/${user.id}`,
         method: 'DELETE',
         onSuccess: () => {
@@ -58,7 +58,7 @@ const DeleteAction = memo(({ user }: { user: User }) => {
         },
       });
 
-      toast.success('تم حذف المستخدم بنجاح');
+      toast.success(result.message || 'تم حذف المستخدم بنجاح');
       setOpen(false);
     } catch (error) {
       toast.error(

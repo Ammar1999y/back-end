@@ -1,5 +1,6 @@
 const primaryColor = '#02caaf'; // 🟥 when change it, you should search for all the simmiler color
 const APP_NAME = 'البيت التقني';
 const MAX_ID = 999_999_999;
+const ENTITY_ID_AS_UUID = false;
 
-export { primaryColor, APP_NAME, MAX_ID };
+export { primaryColor, APP_NAME, MAX_ID, ENTITY_ID_AS_UUID };

@@ -1,3 +1,5 @@
+import type { PgTransactionConfig } from 'drizzle-orm/pg-core';
+
 import { drizzle } from 'drizzle-orm/neon-serverless';
 
 import { Pool } from '@neondatabase/serverless';
@@ -19,10 +21,11 @@ export type WsTx = Parameters<
 // return db.transaction(fn);
 export async function withTransaction<T>(
   fn: (tx: WsTx) => Promise<T>,
+  config?: PgTransactionConfig,
 ): Promise<T> {
   const { db, pool } = WSDB();
   try {
-    return await db.transaction(fn);
+    return await db.transaction(fn, config);
   } finally {
     try {
       await pool.end();

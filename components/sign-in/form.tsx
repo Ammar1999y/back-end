@@ -16,7 +16,7 @@ import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import Label from '@/components/ui/label';
 import { ErrorMessage } from '@/components/form/error-message';
-import { flattenErrors } from '@/components/form/form-error-handeling';
+import { flattenErrors, showFormErrors } from '@/components/form/form-error-handeling';
 import PasswordInput from '@/components/sign-in/password-input';
 
 interface FormProps {
@@ -64,7 +64,9 @@ const Form = ({ onSuccess }: FormProps) => {
   );
 
   const onError = useCallback((errors: FieldErrors<LoginFormData>) => {
-    useErrors.getState().setErrors(flattenErrors(errors));
+    const erros = flattenErrors(errors);
+    showFormErrors(erros);
+    useErrors.getState().setErrors(erros);
   }, []);
 
   useEffect(() => {

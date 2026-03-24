@@ -4,7 +4,7 @@ import type { TableState } from '@tanstack/react-table';
 import dynamic from 'next/dynamic';
 import { useMemo, useRef } from 'react';
 
-import { useQueryData } from '@/utils/query';
+import { useServerDataTable } from '@/utils/query';
 
 import { DataTableContent } from '@/components/ui/data-table';
 import Header from '@/components/ui/data-table/client-side-table/header';
@@ -32,7 +32,8 @@ const queryParams = {
 };
 
 const UsersPage = () => {
-  const { data, isLoading, error, refetch } = useQueryData<User[]>(queryParams);
+  const { data, meta, isLoading, error, refetch } =
+    useServerDataTable<User>(queryParams);
   const tableContainerRef = useRef<HTMLDivElement>(null);
   const initialState:
     | (Omit<Partial<TableState>, 'sorting'> & {
@@ -50,7 +51,7 @@ const UsersPage = () => {
   const { table } = useDataTable({
     data: data || [],
     columns,
-    pageCount: 1,
+    pageCount: meta.pageCount,
     storageKey: STORAGE_KEY,
     tableContainerRef,
     initialState,

@@ -4,7 +4,7 @@ import type {
 } from '@/utils/validation/permissions';
 
 import { EntityID } from '@/types';
-import { CUSTOM_ROLE_VALUE } from '@/lib/permissions/constants';
+import { CUSTOM_ROLE_VALUE, ROLE_SCOPE } from '@/lib/permissions/constants';
 
 import { CustomError } from '@/utils/error-class';
 import { registerLocalStorageHandler } from '@/utils/mutation';
@@ -16,7 +16,7 @@ registerLocalStorageHandler(/\/api\/dash\/permissions/, {
   create: async (data: CreatePermissionOutput) => {
     const newPermission = usePermissionsStore
       .getState()
-      .addPermission({ ...data, scope: 'standard' });
+      .addPermission({ ...data, scope: ROLE_SCOPE.STANDARD });
     return {
       data: {
         id: newPermission.id,

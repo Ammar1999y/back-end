@@ -1,16 +1,20 @@
-import type {
-  DashboardPage,
-  PermissionAction,
-  SessionMetadata,
-} from './constants';
+import type { DashboardPage, PermissionAction } from './constants';
 
+import { and, eq, isNull } from 'drizzle-orm';
+
+import { db } from '@/db';
+import { rolePermissions, roles, users } from '@/db/schema';
 import { validID } from '@/utils';
 import { auth } from '@/lib/auth';
 
+import {
+  HTTP_STATUS,
+  MSG_INSUFFICIENT_PERMISSIONS,
+  MSG_LOGIN_REQUIRED,
+} from '@/utils/api-messages';
 import { CustomError } from '@/utils/error-class';
 
-import { SUPER_ADMIN_ROLE } from './constants';
-import { getUserPermissions } from './utils';
+import { getUserPermissions, sanitizePermissions } from './utils';
 
 export async function checkUserPermission(params: {
   headers: Headers;
@@ -29,36 +33,97 @@ export async function checkUserPermission(params: {
 
   const session = await auth.api.getSession({ headers });
   const userId = validID(session?.user.id);
-  if (!userId) throw new CustomError('قم بتسجيل الدخول اولا', 401);
+  if (!userId)
+    throw new CustomError(MSG_LOGIN_REQUIRED, HTTP_STATUS.UNAUTHORIZED);
 
-  const roleId = session?.user.roleId;
-  const roleName = (session?.session?.metadata as SessionMetadata)?.roleName;
+  // Write operations always verify from DB; reads use cache
+  const shouldForceDB = forceDB || action !== 'view';
 
-  if (!roleId) throw new CustomError('ليس لديك صلاحيه', 403);
+  if (shouldForceDB) {
+    // Single query: fetch user + role + permissions in one round-trip
+    const rows = await db
+      .select({
+        roleId: users.roleId,
+        roleName: roles.roleName,
+        roleScope: roles.scope,
+        roleIsActive: roles.isActive,
+        pageName: rolePermissions.pageName,
+        pagePermissions: rolePermissions.permissions,
+      })
+      .from(users)
+      .leftJoin(roles, eq(users.roleId, roles.id))
+      .leftJoin(rolePermissions, eq(roles.id, rolePermissions.roleId))
+      .where(
+        and(
+          eq(users.id, userId),
+          isNull(users.deletedAt),
+          eq(users.isActive, true)
+        )
+      );
 
-  // SuperAdmin has full access
-  if (roleName === SUPER_ADMIN_ROLE) {
+    if (!rows.length)
+      throw new CustomError(MSG_LOGIN_REQUIRED, HTTP_STATUS.UNAUTHORIZED);
+
+    const roleId = rows[0].roleId;
+    if (!roleId)
+      throw new CustomError(
+        MSG_INSUFFICIENT_PERMISSIONS,
+        HTTP_STATUS.FORBIDDEN
+      );
+
+    if (rows[0].roleIsActive === false)
+      throw new CustomError(
+        MSG_INSUFFICIENT_PERMISSIONS,
+        HTTP_STATUS.FORBIDDEN
+      );
+
+    const rolePerms = rows
+      .filter((r) => r.pageName != null)
+      .map((r) => ({
+        pageName: r.pageName!,
+        permissions: r.pagePermissions,
+      }));
+
+    const permissions = sanitizePermissions(rolePerms);
+
+    const allowed = permissions?.[resource]?.[action] === true;
+    if (!allowed && throwError)
+      throw new CustomError(
+        MSG_INSUFFICIENT_PERMISSIONS,
+        HTTP_STATUS.FORBIDDEN
+      );
+
     return {
-      allowed: true,
-      source: forceDB ? 'database' : 'cache',
+      allowed,
+      source: 'database' as const,
       session,
+      roleId,
+      permissions,
     };
   }
 
+  // Cache path (view operations)
+  const roleId = session?.user.roleId ?? null;
+
+  if (!roleId)
+    throw new CustomError(MSG_INSUFFICIENT_PERMISSIONS, HTTP_STATUS.FORBIDDEN);
+
   const permissions = await getUserPermissions({
-    session: session.session,
+    session: session?.session ?? null,
     roleId,
-    forceDB,
+    forceDB: false,
   });
 
   const allowed = permissions?.[resource]?.[action] === true;
-
-  if (!allowed && throwError) throw new CustomError('ليس لديك صلاحيه', 403);
+  if (!allowed && throwError)
+    throw new CustomError(MSG_INSUFFICIENT_PERMISSIONS, HTTP_STATUS.FORBIDDEN);
 
   return {
-    allowed: allowed,
-    source: forceDB ? 'database' : 'cache',
+    allowed,
+    source: 'cache' as const,
     session,
+    roleId,
+    permissions,
   };
 }
 
@@ -74,19 +139,60 @@ export async function checkMultiplePermissions(params: {
   permissions: Record<string, boolean>;
   session: Awaited<ReturnType<typeof auth.api.getSession>>;
 }> {
-  const { headers, checks, forceDB } = params;
+  const { headers, checks, forceDB = false } = params;
 
   const session = await auth.api.getSession({ headers });
   const userId = validID(session?.user.id);
-  if (!userId) throw new CustomError('قم بتسجيل الدخول اولا', 401);
+  if (!userId)
+    throw new CustomError(MSG_LOGIN_REQUIRED, HTTP_STATUS.UNAUTHORIZED);
 
-  const roleId = session?.user.roleId;
-  if (!roleId) throw new CustomError('ليس لديك صلاحيه', 403);
+  const hasWriteAction = checks.some((c) => c.action !== 'view');
+  const shouldForceDB = forceDB || hasWriteAction;
+
+  let roleId = session?.user.roleId ?? null;
+
+  if (shouldForceDB) {
+    const [userData] = await db
+      .select({
+        roleId: users.roleId,
+        roleName: roles.roleName,
+        roleScope: roles.scope,
+        roleIsActive: roles.isActive,
+      })
+      .from(users)
+      .leftJoin(roles, eq(users.roleId, roles.id))
+      .where(
+        and(
+          eq(users.id, userId),
+          isNull(users.deletedAt),
+          eq(users.isActive, true)
+        )
+      );
+
+    if (!userData)
+      throw new CustomError(MSG_LOGIN_REQUIRED, HTTP_STATUS.UNAUTHORIZED);
+    roleId = userData.roleId;
+
+    if (!roleId)
+      throw new CustomError(
+        MSG_INSUFFICIENT_PERMISSIONS,
+        HTTP_STATUS.FORBIDDEN
+      );
+
+    if (!userData.roleIsActive)
+      throw new CustomError(
+        MSG_INSUFFICIENT_PERMISSIONS,
+        HTTP_STATUS.FORBIDDEN
+      );
+  }
+
+  if (!roleId)
+    throw new CustomError(MSG_INSUFFICIENT_PERMISSIONS, HTTP_STATUS.FORBIDDEN);
 
   const allPermissions = await getUserPermissions({
-    session: session.session,
     roleId,
-    forceDB,
+    session: shouldForceDB ? null : (session?.session ?? null),
+    forceDB: shouldForceDB,
   });
 
   const permissions = checks.reduce(

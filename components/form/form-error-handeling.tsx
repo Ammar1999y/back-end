@@ -1,3 +1,15 @@
+import { toast } from 'sonner';
+
+export function showFormErrors(errors: Record<string, unknown>) {
+  const messages = Object.values(errors)
+    .filter((v): v is string => typeof v === 'string' && v.trim() !== '')
+    .slice(0, 3);
+
+  toast.error(
+    messages.length ? messages.join('\n') : 'تحقق من صحه جميع الخانات'
+  );
+}
+
 export function flattenErrors(data: any, path = '', result = {}) {
   if (!data) return result;
   if (Array.isArray(data)) {

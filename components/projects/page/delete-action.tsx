@@ -37,7 +37,7 @@ const DeleteAction = memo(
       setLoading(true);
 
       try {
-        await mutate({
+        const result = await mutate({
           href: `/api/dash/projects/${project.id}`,
           method: 'DELETE',
           onSuccess: () => {
@@ -60,7 +60,7 @@ const DeleteAction = memo(
           },
         });
 
-        toast.success('تم حذف المشروع بنجاح');
+        toast.success(result.message || 'تم حذف المشروع بنجاح');
         onSuccess?.();
         setOpen(false);
       } catch (error) {

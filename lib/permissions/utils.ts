@@ -4,20 +4,116 @@ import type {
   PermissionObject,
   SessionMetadata,
 } from './constants';
+import type { WsTx } from '@/db/ws';
 
-import { eq, sql } from 'drizzle-orm';
+import { and, eq, isNull, ne, sql } from 'drizzle-orm';
 
 import { db } from '@/db';
-import type { WsTx } from '@/db/ws';
-import { sessions, users } from '@/db/schema';
-
-type DbOrTx = typeof db | WsTx;
+import { rolePermissions, roles, users } from '@/db/schema';
+import { v7 as uuidv7 } from 'uuid';
 
 import {
+  HTTP_STATUS,
+  MSG_CANNOT_GRANT_UNOWNED_PERMISSIONS,
+  MSG_NOT_FOUND,
+} from '@/utils/api-messages';
+import { CustomError } from '@/utils/error-class';
+
+import {
+  CUSTOM_ROLE_VALUE,
   DASHBOARD_PAGES,
   DEFAULT_PAGE_PERMISSIONS,
   PERMISSION_ACTIONS,
+  ROLE_SCOPE,
 } from './constants';
+
+type DbOrTx = typeof db | WsTx;
+type RolePolicyTarget =
+  | { roleName?: string | null; scope?: string | null }
+  | null
+  | undefined;
+
+/**
+ * Reusable predicate for roles that are editable/visible in dashboard handlers.
+ * Excludes system-scope roles (created by the developer, not editable via dashboard).
+ */
+export function nonSystemRoleFilter() {
+  return ne(roles.scope, ROLE_SCOPE.SYSTEM);
+}
+
+/**
+ * Runtime guard for fetched role objects.
+ */
+export function isProtectedSystemRole(role: RolePolicyTarget): boolean {
+  return role?.scope === ROLE_SCOPE.SYSTEM;
+}
+
+/**
+ * Reusable filter: only standard-scope roles.
+ * Use in all queries that should exclude system/custom roles.
+ */
+export function standardRoleFilter(roleId: string) {
+  return and(eq(roles.id, roleId), eq(roles.scope, ROLE_SCOPE.STANDARD));
+}
+
+/**
+ * Create a custom role with permissions inside a transaction.
+ * If existingRoleId is provided, reuses it (clears old permissions first).
+ * Otherwise creates a new role with scope='custom'.
+ */
+export async function createCustomRole(
+  tx: WsTx,
+  permissions: Array<{
+    name: DashboardPage;
+    permissions: Record<string, boolean>;
+  }>,
+  existingRoleId?: string | null
+): Promise<string> {
+  let roleId: string;
+
+  if (existingRoleId) {
+    roleId = existingRoleId;
+    await tx.delete(rolePermissions).where(eq(rolePermissions.roleId, roleId));
+  } else {
+    const [customRole] = await tx
+      .insert(roles)
+      .values({
+        roleName: `custom-${uuidv7()}`,
+        scope: CUSTOM_ROLE_VALUE,
+        isActive: true,
+      })
+      .returning({ id: roles.id });
+    roleId = customRole.id;
+  }
+
+  const permsData = permissions.map((p) => ({
+    roleId,
+    pageName: p.name,
+    permissions: p.permissions as Record<PermissionAction, boolean>,
+  }));
+  await tx.insert(rolePermissions).values(permsData);
+
+  return roleId;
+}
+
+/**
+ * Validate that a role ID refers to an assignable role:
+ * - Exists in the database
+ * - Is active
+ * - Has 'standard' scope (not system/custom)
+ */
+export async function validateAssignableRole(
+  roleId: string,
+  tx: WsTx
+): Promise<void> {
+  // FOR SHARE prevents role deactivation/deletion between validation and assignment
+  const [role] = await tx
+    .select({ id: roles.id })
+    .from(roles)
+    .where(and(standardRoleFilter(roleId), eq(roles.isActive, true)))
+    .for('share');
+  if (!role) throw new CustomError(MSG_NOT_FOUND, HTTP_STATUS.NOT_FOUND);
+}
 
 /**
  * Type guard to check if a string is a valid DashboardPage key
@@ -43,9 +139,8 @@ export function sanitizePermissions(
     if (!isValidDashboardPage(perm.pageName)) continue;
 
     const availableActions =
-      DEFAULT_PAGE_PERMISSIONS.find(
-        (p) => p.name === perm.pageName
-      )?.availablePermissions || [];
+      DEFAULT_PAGE_PERMISSIONS.find((p) => p.name === perm.pageName)
+        ?.availablePermissions || [];
 
     const rawPerms = (perm.permissions || {}) as Record<string, boolean>;
     const pagePerms = {} as Record<PermissionAction, boolean>;
@@ -60,6 +155,26 @@ export function sanitizePermissions(
   }
 
   return sanitized;
+}
+
+/**
+ * Normalize permissions to include ALL dashboard pages with ALL actions.
+ * Missing pages/actions default to false — ensures consistent comparison.
+ */
+export function normalizeFullPermissions(
+  rolePerms: Array<{ pageName: string; permissions: unknown }>
+): PermissionObject {
+  const sanitized = sanitizePermissions(rolePerms);
+  const full = {} as PermissionObject;
+
+  for (const page of DEFAULT_PAGE_PERMISSIONS) {
+    const pagePerms = {} as Record<PermissionAction, boolean>;
+    for (const action of ALL_ACTIONS)
+      pagePerms[action] = sanitized[page.name]?.[action] === true;
+    full[page.name] = pagePerms;
+  }
+
+  return full;
 }
 
 /**
@@ -81,7 +196,7 @@ export async function getUserPermissions({
   session,
   forceDB = false,
 }: {
-  roleId: string | null;
+  roleId: EntityID | null;
   session: { metadata?: SessionMetadata | unknown } | null;
   forceDB?: boolean;
 }): Promise<Partial<PermissionObject>> {
@@ -94,12 +209,14 @@ export async function getUserPermissions({
 
   if (!roleId) return {};
 
-  // Fetch role with its permissions
   const roleData = await db.query.roles.findFirst({
     where: (rolesTable, { eq, and }) =>
       and(eq(rolesTable.id, roleId), eq(rolesTable.isActive, true)),
+    columns: {},
     with: {
-      rolePermissions: true,
+      rolePermissions: {
+        columns: { pageName: true, permissions: true },
+      },
     },
   });
 
@@ -109,36 +226,114 @@ export async function getUserPermissions({
 }
 
 /**
+ * Validate that the acting user holds all permissions they are trying to grant.
+ * Compares each `true` permission in `targetPermissions` against the acting user's own permissions.
+ * Throws if any granted permission is not held by the acting user.
+ */
+export function validatePermissionScope(
+  actorPermissions: Partial<PermissionObject>,
+  targetPermissions: Array<{
+    name: DashboardPage;
+    permissions: Record<string, boolean>;
+  }>
+): void {
+  for (const target of targetPermissions) {
+    const actorPagePerms = actorPermissions[target.name];
+
+    for (const [action, granted] of Object.entries(target.permissions)) {
+      if (
+        granted === true &&
+        actorPagePerms?.[action as PermissionAction] !== true
+      )
+        throw new CustomError(MSG_CANNOT_GRANT_UNOWNED_PERMISSIONS, HTTP_STATUS.FORBIDDEN);
+    }
+  }
+}
+
+/**
+ * Validate that the acting user holds all permissions of a standard role.
+ * Fetches the role's permissions from DB and compares against the actor's permissions.
+ * Acquires FOR SHARE lock on rolePermissions rows to prevent concurrent modification.
+ */
+export async function validateRolePermissionScope(
+  actorPermissions: Partial<PermissionObject>,
+  roleId: string,
+  executor: DbOrTx
+): Promise<void> {
+  const perms = await executor
+    .select({
+      pageName: rolePermissions.pageName,
+      permissions: rolePermissions.permissions,
+    })
+    .from(rolePermissions)
+    .where(eq(rolePermissions.roleId, roleId))
+    .for('share');
+
+  if (!perms.length) return;
+
+  const targetPerms = perms.map((p) => ({
+    name: p.pageName as DashboardPage,
+    permissions: (p.permissions || {}) as Record<string, boolean>,
+  }));
+
+  validatePermissionScope(actorPermissions, targetPerms);
+}
+
+/**
  * Refresh session metadata for all users with a specific role.
  * Updates permissions in-place without invalidating sessions (users stay logged in).
+ * When `precomputed` is provided, skips the DB read for role data.
  */
 export async function refreshRoleSessions(
   roleId: string,
-  tx?: WsTx
+  tx: WsTx,
+  precomputed?: {
+    roleName: string;
+    roleScope: string;
+    permissions: Partial<PermissionObject>;
+  }
 ): Promise<void> {
-  const executor: DbOrTx = tx ?? db;
+  let roleName: string;
+  let roleScope: string;
+  let permissions: Partial<PermissionObject>;
 
-  const roleData = await executor.query.roles.findFirst({
-    where: (rolesTable, { eq }) => eq(rolesTable.id, roleId),
-    columns: { roleName: true },
-    with: { rolePermissions: true },
-  });
+  if (precomputed) {
+    roleName = precomputed.roleName;
+    roleScope = precomputed.roleScope;
+    permissions = precomputed.permissions;
+  } else {
+    const roleData = await tx.query.roles.findFirst({
+      where: (rolesTable, { eq }) => eq(rolesTable.id, roleId),
+      columns: { roleName: true, scope: true },
+      with: {
+        rolePermissions: {
+          columns: { pageName: true, permissions: true },
+        },
+      },
+    });
 
-  if (!roleData) return;
+    if (!roleData) return;
 
-  const permissions = sanitizePermissions(roleData.rolePermissions);
+    roleName = roleData.roleName;
+    roleScope = roleData.scope;
+    permissions = sanitizePermissions(roleData.rolePermissions);
+  }
 
   const metadataPatch = JSON.stringify({
-    roleName: roleData.roleName,
+    roleName,
+    roleScope,
     permissions,
+    roleId,
   });
 
-  await executor.execute(sql`
+  await tx.execute(sql`
     UPDATE sessions
-    SET metadata = COALESCE(metadata, '{}'::jsonb) || ${metadataPatch}::jsonb
+    SET metadata = COALESCE(metadata, '{}'::jsonb) || ${metadataPatch}::jsonb,
+        updated_at = NOW()
     WHERE user_id IN (
-      SELECT id FROM users WHERE role_id = ${roleId}
+      SELECT id FROM users WHERE role_id = ${roleId} AND deleted_at IS NULL AND is_active = true
     )
+    AND expires_at > NOW()
   `);
 }
 
@@ -146,14 +341,23 @@ export async function refreshRoleSessions(
  * Refresh session metadata for a specific user.
  * Fetches the user's current role and updates permissions in-place.
  */
-export async function refreshUserSessions(userId: string): Promise<void> {
-  const userData = await db.query.users.findFirst({
-    where: eq(users.id, userId),
+export async function refreshUserSessions(
+  userId: string,
+  tx?: WsTx
+): Promise<void> {
+  const executor: DbOrTx = tx ?? db;
+
+  const userData = await executor.query.users.findFirst({
+    where: and(eq(users.id, userId), isNull(users.deletedAt)),
     columns: { roleId: true },
     with: {
       role: {
-        columns: { roleName: true },
-        with: { rolePermissions: true },
+        columns: { roleName: true, scope: true },
+        with: {
+          rolePermissions: {
+            columns: { pageName: true, permissions: true },
+          },
+        },
       },
     },
   });
@@ -165,13 +369,15 @@ export async function refreshUserSessions(userId: string): Promise<void> {
   const metadataPatch = JSON.stringify({
     roleId: userData.roleId,
     roleName: userData.role.roleName,
+    roleScope: userData.role.scope,
     permissions,
   });
 
-  await db
-    .update(sessions)
-    .set({
-      metadata: sql`COALESCE(metadata, '{}'::jsonb) || ${metadataPatch}::jsonb`,
-    })
-    .where(eq(sessions.userId, userId));
+  await executor.execute(sql`
+    UPDATE sessions
+    SET metadata = COALESCE(metadata, '{}'::jsonb) || ${metadataPatch}::jsonb,
+        updated_at = NOW()
+    WHERE user_id = ${userId}
+    AND expires_at > NOW()
+  `);
 }

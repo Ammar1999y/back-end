@@ -20,7 +20,7 @@ import { useQueryData } from '@/utils/query';
 import { useErrors } from '@/utils/store/errors';
 import { settingsSchema } from '@/utils/validation/settings';
 
-import { flattenErrors } from '@/components/form/form-error-handeling';
+import { flattenErrors, showFormErrors } from '@/components/form/form-error-handeling';
 import { Header } from '@/components/form/header';
 import { MainTabs } from '@/components/form/tabs/main-tabs';
 import { useTabsStore } from '@/components/form/tabs/store';
@@ -161,9 +161,7 @@ const SettingsPage = () => {
 
   const onError = useCallback((errors: FieldErrors<SettingsInput>) => {
     const flatErrors = flattenErrors(errors);
-    toast.error(
-      (Object.values(flatErrors)[0] as string) || 'تحقق من صحة جميع الخانات'
-    );
+    showFormErrors(flatErrors);
     useErrors.getState().setErrors(flatErrors);
   }, []);
 

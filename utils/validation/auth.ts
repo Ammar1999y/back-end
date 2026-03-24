@@ -2,13 +2,14 @@ import * as z from 'zod';
 import { CUSTOM_ROLE_VALUE } from '@/lib/permissions/constants';
 
 import { NAME_MAX } from './constants';
-import { pagePermissionSchema } from './permissions';
+import { permissionsArraySchema } from './permissions';
 import {
   emailSchema,
   idSchema,
   passwordSchema,
   sanitizeStrictSingleLine,
 } from './rules';
+import { EntityID } from '@/types';
 
 export const loginSchema = z.object({
   email: emailSchema,
@@ -17,7 +18,7 @@ export const loginSchema = z.object({
 
 export type LoginFormData = z.input<typeof loginSchema>;
 
-export const createUserSchema = z.object({
+const userRoleSchema = z.object({
   email: emailSchema,
   password: passwordSchema,
   name: z.preprocess(
@@ -29,11 +30,51 @@ export const createUserSchema = z.object({
   ),
   isActive: z.boolean().default(true),
   roleId: z.union([z.literal(CUSTOM_ROLE_VALUE), idSchema]),
-  permissions: z.array(pagePermissionSchema).optional(),
+  permissions: permissionsArraySchema.optional(),
 });
 
-export const updateUserSchema = createUserSchema
+function validateCustomRolePermissions(
+  data: { roleId: EntityID | typeof CUSTOM_ROLE_VALUE; permissions?: unknown[] },
+  ctx: z.RefinementCtx
+) {
+  if (data.roleId === CUSTOM_ROLE_VALUE && !data.permissions?.length) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: 'يجب تحديد صلاحيات للدور المخصص',
+      path: ['permissions'],
+    });
+  }
+
+  if (data.roleId !== CUSTOM_ROLE_VALUE && data.permissions?.length) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: 'الصلاحيات مسموح بها فقط عند اختيار دور مخصص',
+      path: ['permissions'],
+    });
+  }
+}
+
+export const createUserSchema = userRoleSchema.superRefine(
+  validateCustomRolePermissions
+);
+
+export const updateUserSchema = userRoleSchema
   .omit({ password: true })
+  .extend({
+    id: idSchema,
+    isActive: z.boolean(),
+    password: z
+      .preprocess(
+        (e) => (typeof e === 'string' && e.trim().length ? e : null),
+        passwordSchema.optional().nullish()
+      )
+      .optional()
+      .nullish(),
+  })
+  .superRefine(validateCustomRolePermissions);
+
+export const selfUpdateUserSchema = userRoleSchema
+  .pick({ name: true, email: true })
   .extend({
     id: idSchema,
     password: z

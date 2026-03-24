@@ -1,16 +1,17 @@
 import type { NextRequest } from 'next/server';
 
-import { NextResponse } from 'next/server';
-
 import {
   isAllowedImageType,
   uploadImagesToR2,
   validateMagicBytes,
 } from '@/lib/r2/upload-helper';
 
+import { HTTP_STATUS } from '@/utils/api-messages';
+import { apiSuccess, handleApiError } from '@/utils/api-response';
 import { CustomError } from '@/utils/error-class';
 import { sanitizeFilename } from '@/utils/sanitize-filename';
 import { MAX_IMAGE_SIZE } from '@/utils/validation/constants';
+import { uploadMsg } from './messages';
 
 const MAX_FILE_SIZE = MAX_IMAGE_SIZE * 1024 * 1024;
 const MAX_FILES_PER_REQUEST = 1;
@@ -19,92 +20,65 @@ export async function POST(request: NextRequest) {
   try {
     // TODO: Add authentication check when auth is implemented, and rate limiting
 
-    const formData = await request.formData();
+    const formData = await request.formData().catch(() => {
+      throw new CustomError(uploadMsg.noFiles, HTTP_STATUS.BAD_REQUEST);
+    });
     const entries = formData.getAll('files');
 
     if (entries.length === 0) {
-      return NextResponse.json(
-        { error: 'لم يتم إرسال ملفات' },
-        { status: 400 }
-      );
+      throw new CustomError(uploadMsg.noFiles, HTTP_STATUS.BAD_REQUEST);
     }
 
-    // Validate file count limit
     if (entries.length > MAX_FILES_PER_REQUEST) {
-      return NextResponse.json(
-        {
-          error: `الحد الأقصى ${MAX_FILES_PER_REQUEST} ملفات في الطلب الواحد`,
-        },
-        { status: 400 }
+      throw new CustomError(
+        uploadMsg.maxFiles(MAX_FILES_PER_REQUEST),
+        HTTP_STATUS.BAD_REQUEST
       );
     }
 
-    // Validate all files
-    const files: File[] = [];
+    const files: { file: File; buffer: Buffer }[] = [];
     for (const entry of entries) {
       if (!(entry instanceof File)) continue;
 
       const safeName = sanitizeFilename(entry.name);
 
-      // Validate file size
       if (entry.size > MAX_FILE_SIZE) {
-        return NextResponse.json(
-          {
-            error: `حجم الملف ${safeName} كبير جداً. الحد الأقصى: ${MAX_IMAGE_SIZE}MB`,
-          },
-          { status: 400 }
+        throw new CustomError(
+          uploadMsg.fileTooLarge(safeName, MAX_IMAGE_SIZE),
+          HTTP_STATUS.BAD_REQUEST
         );
       }
 
-      // Validate MIME type
       if (!isAllowedImageType(entry.type)) {
-        return NextResponse.json(
-          {
-            error: `نوع الملف ${safeName} غير مسموح. الأنواع المسموحة: PNG, WebP, SVG`,
-          },
-          { status: 400 }
+        throw new CustomError(
+          uploadMsg.invalidType(safeName),
+          HTTP_STATUS.BAD_REQUEST
         );
       }
 
-      // Validate magic bytes (actual file content)
       const buffer = Buffer.from(await entry.arrayBuffer());
       const magicValidation = validateMagicBytes(buffer, entry.type);
       if (!magicValidation.valid) {
-        return NextResponse.json(
-          {
-            error: `محتوى الملف ${safeName} لا يتطابق مع نوعه المعلن`,
-          },
-          { status: 400 }
+        throw new CustomError(
+          uploadMsg.contentMismatch(safeName),
+          HTTP_STATUS.BAD_REQUEST
         );
       }
 
-      files.push(entry);
+      files.push({ file: entry, buffer });
     }
 
     if (files.length === 0) {
-      return NextResponse.json(
-        { error: 'لم يتم إرسال ملفات صالحة' },
-        { status: 400 }
-      );
+      throw new CustomError(uploadMsg.noValidFiles, HTTP_STATUS.BAD_REQUEST);
     }
 
-    // Upload images to R2
-    const r2Keys = await uploadImagesToR2({ files });
+    const r2Keys = await uploadImagesToR2({
+      files: files.map((f) => f.file),
+      preBuffers: files.map((f) => f.buffer),
+    });
 
-    return NextResponse.json({ r2Keys });
+    return apiSuccess({ message: uploadMsg.uploaded, data: r2Keys });
   } catch (error) {
-    console.error('[Upload Image Error]', error);
-
-    if (error instanceof CustomError) {
-      return NextResponse.json(
-        { error: error.message },
-        { status: error.status || 500 }
-      );
-    }
-
-    return NextResponse.json(
-      { error: 'حدث خطأ أثناء رفع الملفات' },
-      { status: 500 }
-    );
+    return handleApiError(error, uploadMsg.uploadFailed);
   }
 }

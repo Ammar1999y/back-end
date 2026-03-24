@@ -21,8 +21,13 @@ import { isEmpty } from '@/db/queries';
 
 import { safeDate } from '@/utils/time';
 
+function safeNumber(value: unknown): number | null {
+  const num = Number(value);
+  return Number.isFinite(num) ? num : null;
+}
+
 /** Escape SQL LIKE/ILIKE wildcards to prevent wildcard injection */
-function escapeLike(value: string): string {
+export function escapeLike(value: string): string {
   return value.replace(/[%_\\]/g, '\\$&');
 }
 
@@ -71,6 +76,11 @@ export function filterColumns<T extends Table>({
           end.setHours(23, 59, 59, 999);
           return and(gte(column, date), lte(column, end));
         }
+        if (column.dataType === 'number' || column.dataType === 'bigint') {
+          const num = safeNumber(filter.value);
+          if (num === null) return undefined;
+          return eq(column, num);
+        }
         return eq(column, filter.value);
 
       case 'ne':
@@ -85,23 +95,42 @@ export function filterColumns<T extends Table>({
           end.setHours(23, 59, 59, 999);
           return or(lt(column, date), gt(column, end));
         }
+        if (column.dataType === 'number' || column.dataType === 'bigint') {
+          const num = safeNumber(filter.value);
+          if (num === null) return undefined;
+          return ne(column, num);
+        }
         return ne(column, filter.value);
 
       case 'inArray':
         if (Array.isArray(filter.value)) {
+          if (column.dataType === 'number' || column.dataType === 'bigint') {
+            const nums = filter.value
+              .map(safeNumber)
+              .filter((n): n is number => n !== null);
+            return nums.length > 0 ? inArray(column, nums) : undefined;
+          }
           return inArray(column, filter.value);
         }
         return undefined;
 
       case 'notInArray':
         if (Array.isArray(filter.value)) {
+          if (column.dataType === 'number' || column.dataType === 'bigint') {
+            const nums = filter.value
+              .map(safeNumber)
+              .filter((n): n is number => n !== null);
+            return nums.length > 0 ? notInArray(column, nums) : undefined;
+          }
           return notInArray(column, filter.value);
         }
         return undefined;
 
       case 'lt': {
-        if (filter.variant === 'number' || filter.variant === 'range')
-          return lt(column, filter.value);
+        if (filter.variant === 'number' || filter.variant === 'range') {
+          const num = safeNumber(filter.value);
+          return num !== null ? lt(column, num) : undefined;
+        }
         if (filter.variant === 'date' && typeof filter.value === 'string') {
           const date = safeDate(Number(filter.value));
           if (!date) return undefined;
@@ -112,8 +141,10 @@ export function filterColumns<T extends Table>({
       }
 
       case 'lte': {
-        if (filter.variant === 'number' || filter.variant === 'range')
-          return lte(column, filter.value);
+        if (filter.variant === 'number' || filter.variant === 'range') {
+          const num = safeNumber(filter.value);
+          return num !== null ? lte(column, num) : undefined;
+        }
         if (filter.variant === 'date' && typeof filter.value === 'string') {
           const date = safeDate(Number(filter.value));
           if (!date) return undefined;
@@ -124,8 +155,10 @@ export function filterColumns<T extends Table>({
       }
 
       case 'gt': {
-        if (filter.variant === 'number' || filter.variant === 'range')
-          return gt(column, filter.value);
+        if (filter.variant === 'number' || filter.variant === 'range') {
+          const num = safeNumber(filter.value);
+          return num !== null ? gt(column, num) : undefined;
+        }
         if (filter.variant === 'date' && typeof filter.value === 'string') {
           const date = safeDate(Number(filter.value));
           if (!date) return undefined;
@@ -136,8 +169,10 @@ export function filterColumns<T extends Table>({
       }
 
       case 'gte': {
-        if (filter.variant === 'number' || filter.variant === 'range')
-          return gte(column, filter.value);
+        if (filter.variant === 'number' || filter.variant === 'range') {
+          const num = safeNumber(filter.value);
+          return num !== null ? gte(column, num) : undefined;
+        }
         if (filter.variant === 'date' && typeof filter.value === 'string') {
           const date = safeDate(Number(filter.value));
           if (!date) return undefined;

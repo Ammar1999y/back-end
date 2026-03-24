@@ -46,16 +46,9 @@ export const mutate = async <TData = unknown, TVariables = unknown>({
   useFormData = false,
 }: MutationOptions<TData, TVariables>): Promise<{
   data?: TData;
-  error?: CustomError;
   message?: string;
 }> => {
   try {
-    // TODO: remove it
-    await new Promise((res) =>
-      setTimeout(() => {
-        res('');
-      }, 800)
-    );
     // Check if endpoint has a local storage handler
     for (const [pattern, handler] of localStorageHandlers) {
       if (pattern.test(href)) {
@@ -99,9 +92,9 @@ export const mutate = async <TData = unknown, TVariables = unknown>({
 
     const result = await response.json();
 
-    if (!response.ok || result.error) {
+    if (!response.ok || !result.success) {
       const error = new CustomError(
-        result.error || 'لايوجد اتصال بالانترنت، اعد المحاولة',
+        result.message || 'لايوجد اتصال بالانترنت، اعد المحاولة',
         response.status
       );
       throw error;

@@ -1,6 +1,13 @@
+// Unique indexes follow 'ux_<table>_<column>' convention (e.g. ux_users_email).
+// Violation resolvers match against the full index name — keep names unique across tables.
+//
+// ⚠️ IMPORTANT: When adding new columns that will be searchable via ILIKE in the
+// data-table UI, you MUST also add a corresponding trigram (GIN) index in:
+//   db/migrations/001_add_trgm_indexes.sql
+// Without a trgm index, ILIKE '%text%' queries will cause full table scans.
+
 import { relations, sql } from 'drizzle-orm';
 import {
-  bigint,
   boolean,
   check,
   index,
@@ -10,15 +17,16 @@ import {
   pgTable,
   timestamp,
   uniqueIndex,
-  uuid,
   varchar,
 } from 'drizzle-orm/pg-core';
 
-import { v7 as generateId } from 'uuid';
 import {
+  CUSTOM_ROLE_VALUE,
   DASHBOARD_PAGES,
   DashboardPage,
   PermissionAction,
+  REQUIRE_ROLE_FOR_LOGIN,
+  ROLE_SCOPE,
   SessionMetadata,
 } from '@/lib/permissions/constants';
 
@@ -69,7 +77,11 @@ export const pageNameValues = Object.keys(DASHBOARD_PAGES) as unknown as [
  * - 'standard': Normal roles created via dashboard - fully editable and visible in permissions page
  * - 'custom': User-specific roles - only visible/editable when editing that specific user
  */
-export const roleScopeValues = ['system', 'standard', 'custom'] as const;
+export const roleScopeValues = [
+  ROLE_SCOPE.SYSTEM,
+  ROLE_SCOPE.STANDARD,
+  ROLE_SCOPE.CUSTOM,
+] as const;
 export const bucketType = pgEnum('bucket_type', bucketTypeEnum);
 export const auditLogActionEnum = ['INSERT', 'UPDATE', 'DELETE'] as const;
 export const auditLogAction = pgEnum('audit_log_action', auditLogActionEnum);
@@ -94,17 +106,12 @@ export type AuditAction = 'INSERT' | 'UPDATE' | 'DELETE';
 export const users = pgTable(
   'users',
   {
-    id: uuid('id').primaryKey().$defaultFn(generateId),
+    id: integer('id').primaryKey().generatedAlwaysAsIdentity(),
     name: varchar('name', { length: NAME_MAX }).notNull(),
     email: varchar('email', { length: EMAIL_MAX }).notNull(),
     isActive: boolean('is_active').default(true).notNull(),
-    /**
-     * When a role is deleted, roleId becomes null.
-     * Users with null roleId are regular users without dashboard access.
-     * They can only access the public-facing parts of the application.
-     */
-    roleId: uuid('role_id').references(() => roles.id, {
-      onDelete: 'set null',
+    roleId: integer('role_id').references(() => roles.id, {
+      onDelete: REQUIRE_ROLE_FOR_LOGIN ? 'restrict' : 'set null',
     }),
     // TODO: Remove failedLoginAttempts & lockedUntil, and convert it to Redis or any KV store
     failedLoginAttempts: integer('failed_login_attempts').notNull().default(0),
@@ -113,15 +120,40 @@ export const users = pgTable(
       precision: 2,
       mode: 'string',
     }),
+    deletedAt: timestamp('deleted_at', {
+      withTimezone: true,
+      precision: 2,
+      mode: 'string',
+    }),
     ...timestamps,
   },
   (t) => [
-    uniqueIndex('ux_users_email').on(t.email),
-    index('idx_users_role_id').on(t.roleId),
-    check('chk_user_email_format', sql`email ~* '^[^@]+@[^@]+\\.[^@]+$'`),
-    index('idx_users_active')
-      .on(t.id)
-      .where(sql`is_active = true`),
+    uniqueIndex('ux_users_email')
+      .on(t.email)
+      .where(sql`deleted_at IS NULL`),
+    index('idx_users_role_active')
+      .on(t.roleId)
+      .where(sql`deleted_at IS NULL`),
+    index('idx_users_created_at')
+      .on(t.createdAt)
+      .where(sql`deleted_at IS NULL`),
+    check('chk_email_lowercase', sql`email = LOWER(email)`),
+    check(
+      'chk_failed_login_attempts_non_negative',
+      sql`failed_login_attempts >= 0`
+    ),
+    check(
+      'chk_deleted_user_inactive',
+      sql`deleted_at IS NULL OR is_active = false`
+    ),
+    ...(REQUIRE_ROLE_FOR_LOGIN
+      ? [
+          check(
+            'chk_active_user_has_role',
+            sql`deleted_at IS NOT NULL OR role_id IS NOT NULL`
+          ),
+        ]
+      : []),
   ]
 );
 
@@ -132,7 +164,7 @@ export const users = pgTable(
 export const sessions = pgTable(
   'sessions',
   {
-    id: uuid('id').primaryKey().$defaultFn(generateId),
+    id: integer('id').primaryKey().generatedAlwaysAsIdentity(),
     expiresAt: timestamp('expires_at', {
       withTimezone: true,
       precision: 2,
@@ -141,7 +173,7 @@ export const sessions = pgTable(
     token: varchar('token', { length: 500 }).notNull(),
     ipAddress: varchar('ip_address', { length: 45 }),
     userAgent: varchar('user_agent', { length: 2000 }),
-    userId: uuid('user_id')
+    userId: integer('user_id')
       .notNull()
       .references(() => users.id, { onDelete: 'cascade' }),
     // Session metadata for caching permissions
@@ -150,6 +182,7 @@ export const sessions = pgTable(
   },
   (t) => [
     index('idx_sessions_user_id').on(t.userId),
+    index('idx_sessions_expires_at').on(t.expiresAt),
     uniqueIndex('ux_sessions_token').on(t.token),
   ]
 );
@@ -160,10 +193,10 @@ export const sessions = pgTable(
 export const accounts = pgTable(
   'accounts',
   {
-    id: uuid('id').primaryKey().$defaultFn(generateId),
+    id: integer('id').primaryKey().generatedAlwaysAsIdentity(),
     accountId: varchar('account_id', { length: 255 }).notNull(),
     providerId: varchar('provider_id', { length: 100 }).notNull(),
-    userId: uuid('user_id')
+    userId: integer('user_id')
       .notNull()
       .references(() => users.id, { onDelete: 'cascade' }),
     password: varchar('password', { length: 255 }),
@@ -176,6 +209,11 @@ export const accounts = pgTable(
       'chk_password_hash_length',
       sql`password IS NULL OR char_length(password) >= 50`
     ),
+    // Credential-provider records must have a password hash
+    check(
+      'chk_credential_password',
+      sql`provider_id <> 'credential' OR password IS NOT NULL`
+    ),
   ]
 );
 
@@ -184,10 +222,10 @@ export const accounts = pgTable(
 // ================================
 
 const userTracking = {
-  createdBy: uuid('created_by').references(() => users.id, {
+  createdBy: integer('created_by').references(() => users.id, {
     onDelete: 'set null',
   }),
-  updatedBy: uuid('updated_by').references(() => users.id, {
+  updatedBy: integer('updated_by').references(() => users.id, {
     onDelete: 'set null',
   }),
 };
@@ -205,19 +243,19 @@ const auditFields = {
 export const files = pgTable(
   'files',
   {
-    id: uuid('id').primaryKey().$defaultFn(generateId),
+    id: integer('id').primaryKey().generatedAlwaysAsIdentity(),
     r2Key: varchar('r2_key', { length: URL_MAX }).notNull(),
     bucketType: bucketType('bucket_type').notNull(),
     contextTable: fileContextTable('context_table'),
-    contextId: uuid('context_id'),
+    contextId: integer('context_id'),
     mimeType: varchar('mime_type', { length: 100 }).notNull(),
-    sizeBytes: bigint('size_bytes', { mode: 'number' }).notNull().default(0),
+    sizeBytes: integer('size_bytes').notNull().default(0),
     width: integer('width'),
     height: integer('height'),
     blurhash: varchar('blurhash', { length: 100 }),
     sortOrder: integer('sort_order').notNull().default(0),
     isTemporary: boolean('is_temporary').notNull().default(true),
-    uploadedBy: uuid('uploaded_by').references(() => users.id, {
+    uploadedBy: integer('uploaded_by').references(() => users.id, {
       onDelete: 'set null',
     }),
     ...timestamps,
@@ -246,20 +284,19 @@ export const files = pgTable(
 export const auditLogs = pgTable(
   'audit_logs',
   {
-    id: uuid('id').primaryKey().$defaultFn(generateId),
-    userId: uuid('user_id').references(() => users.id, {
+    id: integer('id').primaryKey().generatedAlwaysAsIdentity(),
+    userId: integer('user_id').references(() => users.id, {
       onDelete: 'set null',
     }),
     userEmail: varchar('user_email', { length: EMAIL_MAX }).notNull(),
     tableName: varchar('table_name', { length: 50 }).notNull(),
-    recordId: varchar('record_id', { length: 100 }).notNull(),
+    recordId: integer('record_id').notNull(),
     action: auditLogAction('action').notNull(),
     oldData: jsonb('old_data'),
     newData: jsonb('new_data'),
     changedFields: jsonb('changed_fields'),
     ipAddress: varchar('ip_address', { length: 45 }),
     userAgent: varchar('user_agent', { length: 2000 }),
-    requestId: varchar('request_id', { length: 36 }),
     apiPath: varchar('api_path', { length: 255 }),
     createdAt: timestamp('created_at', {
       withTimezone: true,
@@ -276,20 +313,38 @@ export const auditLogs = pgTable(
 // Roles Table (defined first for FK reference)
 // في حال اردت ان يتم تحديث جميع المستخدمين في حال تغير اي شي في الدور، يتم اضافه عامود الاصدار، وفي كل طلب يتم التحقق من الاصدار
 // ================================
-export const roles = pgTable('roles', {
-  id: uuid('id').primaryKey().$defaultFn(generateId),
-  roleName: varchar('role_name', { length: ROLE_NAME_MAX }).notNull().unique(),
-  description: varchar('description', { length: ROLE_DESCRIPTION_MAX }),
-  isActive: boolean('is_active').default(true).notNull(),
-  scope: roleScope('scope').notNull().default('standard'),
-  ...timestamps,
-});
+export const roles = pgTable(
+  'roles',
+  {
+    id: integer('id').primaryKey().generatedAlwaysAsIdentity(),
+    roleName: varchar('role_name', { length: ROLE_NAME_MAX })
+      .notNull()
+      .unique('ux_roles_role_name'),
+    description: varchar('description', { length: ROLE_DESCRIPTION_MAX }),
+    isActive: boolean('is_active').default(true).notNull(),
+    scope: roleScope('scope').notNull().default(ROLE_SCOPE.STANDARD),
+    ...timestamps,
+  },
+  (t) => [
+    index('idx_roles_scope_active_created').on(
+      t.scope,
+      t.isActive,
+      t.createdAt
+    ),
+    check(
+      'chk_custom_prefix_scope',
+      sql.raw(
+        `(role_name LIKE '${CUSTOM_ROLE_VALUE}-%' AND scope = '${CUSTOM_ROLE_VALUE}') OR (role_name NOT LIKE '${CUSTOM_ROLE_VALUE}-%' AND scope <> '${CUSTOM_ROLE_VALUE}')`
+      )
+    ),
+  ]
+);
 
 export const rolePermissions = pgTable(
   'role_permissions',
   {
-    id: uuid('id').primaryKey().$defaultFn(generateId),
-    roleId: uuid('role_id')
+    id: integer('id').primaryKey().generatedAlwaysAsIdentity(),
+    roleId: integer('role_id')
       .notNull()
       .references(() => roles.id, { onDelete: 'cascade' }),
     pageName: pageName('page_name').notNull(),

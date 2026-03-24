@@ -9,9 +9,8 @@ import { zodResolver } from '@hookform/resolvers/zod';
 import { useQueryClient } from '@tanstack/react-query';
 import { FormProvider, useForm } from 'react-hook-form';
 import { toast } from 'sonner';
+import { CUSTOM_ROLE_VALUE, ROLE_SCOPE } from '@/lib/permissions/constants';
 import { cn } from '@/lib/utils';
-
-import { CUSTOM_ROLE_VALUE } from '@/lib/permissions/constants';
 
 import { CustomError } from '@/utils/error-class';
 import { mutate } from '@/utils/mutation';
@@ -21,7 +20,10 @@ import {
   createPermissionSchema,
 } from '@/utils/validation/permissions';
 
-import { flattenErrors } from '@/components/form/form-error-handeling';
+import {
+  flattenErrors,
+  showFormErrors,
+} from '@/components/form/form-error-handeling';
 import { Header } from '@/components/form/header';
 import PermissionsForm from '@/components/permissions/permissions-form';
 import { PERMISSIONS_QUERY_KEYS } from '@/components/permissions/query-keys';
@@ -64,7 +66,7 @@ const NewPermission = () => {
           onSuccess: (serverData) => {
             const newPermission: Permission = {
               ...validatedData,
-              scope: 'standard', // For local cache type only - API sets this on the server
+              scope: ROLE_SCOPE.STANDARD, // For local cache type only - API sets this on the server
               id: serverData.id,
               createdAt: serverData.createdAt || new Date().toISOString(),
               usersCount: 0,
@@ -126,7 +128,9 @@ const NewPermission = () => {
   );
 
   const onError = useCallback((errors: FieldErrors<CreatePermissionInput>) => {
-    useErrors.getState().setErrors(flattenErrors(errors));
+    const erros = flattenErrors(errors);
+    showFormErrors(erros);
+    useErrors.getState().setErrors(erros);
   }, []);
 
   useEffect(() => {

@@ -5,7 +5,7 @@ import type { TableState } from '@tanstack/react-table';
 import dynamic from 'next/dynamic';
 import { useMemo, useRef } from 'react';
 
-import { useQueryData } from '@/utils/query';
+import { useServerDataTable } from '@/utils/query';
 
 import { DataTableContent } from '@/components/ui/data-table';
 import Header from '@/components/ui/data-table/client-side-table/header';
@@ -35,8 +35,8 @@ const queryParams = {
 };
 
 const PermissionsPage = () => {
-  const { data, isLoading, error, refetch } =
-    useQueryData<Permission[]>(queryParams);
+  const { data, meta, isLoading, error, refetch } =
+    useServerDataTable<Permission>(queryParams);
 
   const tableContainerRef = useRef<HTMLDivElement>(null);
   const initialState:
@@ -57,7 +57,7 @@ const PermissionsPage = () => {
   const { table } = useDataTable({
     data: data || [],
     columns,
-    pageCount: 1,
+    pageCount: meta.pageCount,
     storageKey: STORAGE_KEY,
     tableContainerRef,
     initialState,

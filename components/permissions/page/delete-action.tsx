@@ -39,7 +39,7 @@ const DeleteAction = memo(({ permission }: { permission: Permission }) => {
     setLoading(true);
 
     try {
-      await mutate({
+      const result = await mutate({
         href: `/api/dash/permissions/${id}`,
         method: 'DELETE',
         onSuccess: () => {
@@ -74,7 +74,7 @@ const DeleteAction = memo(({ permission }: { permission: Permission }) => {
         },
       });
 
-      toast.success('تم حذف الصلاحية بنجاح');
+      toast.success(result.message || 'تم حذف الصلاحية بنجاح');
       setOpen(false);
     } catch (error) {
       toast.error(

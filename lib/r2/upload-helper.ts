@@ -8,14 +8,17 @@ import { encode } from 'blurhash';
 import sharp from 'sharp';
 
 import { CustomError } from '@/utils/error-class';
+import { HTTP_STATUS } from '@/utils/api-messages';
 import { generateShortId, sanitizeFilename } from '@/utils/sanitize-filename';
 import { sanitizeSvgServer, svgOptimizerServer } from '@/utils/svg/server';
+import { uploadMsg } from '@/app/api/upload/image/messages';
 import {
   MAX_IMAGE_PIXELS,
   SERVER_MAX_IMAGE_SIZE,
 } from '@/utils/validation/constants';
 
 import {
+  deleteFromR2,
   getCacheControlHeader,
   getContentDisposition,
   uploadToR2,
@@ -117,18 +120,19 @@ type ProcessedImage = {
 // Process a single image (validate, optimize, sanitize, generate blurhash)
 async function processImage(
   file: File,
-  targetSize: number
+  targetSize: number,
+  preBuffer?: Buffer
 ): Promise<ProcessedImage> {
   // Validate MIME type
   if (!isAllowedImageType(file.type)) {
     throw new CustomError(
-      `نوع الملف غير مسموح: ${file.type}. الأنواع المسموحة: PNG, WebP, SVG`,
-      400
+      uploadMsg.invalidMimeType(file.type),
+      HTTP_STATUS.BAD_REQUEST
     );
   }
 
-  const arrayBuffer = await file.arrayBuffer();
-  let buffer: Buffer = Buffer.from(arrayBuffer);
+  const arrayBuffer = preBuffer ?? Buffer.from(await file.arrayBuffer());
+  let buffer: Buffer = Buffer.isBuffer(arrayBuffer) ? arrayBuffer : Buffer.from(arrayBuffer);
   let finalMimeType = file.type;
   let finalSize = file.size;
   let width: number | undefined;
@@ -142,10 +146,8 @@ async function processImage(
     const sanitizeResult = sanitizeSvgServer(svgContent);
 
     if (!sanitizeResult.isValid) {
-      throw new CustomError(
-        `فشل تنظيف SVG: ${sanitizeResult.errors.join(', ')}`,
-        400
-      );
+      console.error('SVG sanitization failed:', sanitizeForLog(sanitizeResult.errors));
+      throw new CustomError(uploadMsg.invalidSvg, HTTP_STATUS.BAD_REQUEST);
     }
 
     const optimizedSvg = svgOptimizerServer({
@@ -195,20 +197,27 @@ async function processImage(
 
 export async function uploadImagesToR2(params: {
   files: File[];
+  preBuffers?: Buffer[];
   targetSize?: number;
   bucketType?: BucketType;
 }): Promise<string[]> {
   const {
     files: imageFiles,
+    preBuffers,
     bucketType = 'public',
     targetSize = SERVER_MAX_IMAGE_SIZE * 1024 * 1024,
   } = params;
 
+  let uploadedKeys: string[] = [];
+
   try {
     // Process all images (optimize, generate blurhash, etc.)
     const processedImages = await Promise.all(
-      imageFiles.map((file) => processImage(file, targetSize))
+      imageFiles.map((file, i) => processImage(file, targetSize, preBuffers?.[i]))
     );
+
+    // Pre-populate keys so cleanup always has the full list on partial failure
+    uploadedKeys = processedImages.map((img) => img.r2Key);
 
     // Upload all to R2 in parallel
     await Promise.all(
@@ -249,17 +258,29 @@ export async function uploadImagesToR2(params: {
       isTemporary: true,
     }));
 
-    // Insert all records in a single batch
-    await db.insert(files).values(dbRecords);
-
-    // Return array of r2Keys
-    return processedImages.map((img) => img.r2Key);
-  } catch (error) {
-    if (error instanceof CustomError) {
-      throw error;
+    try {
+      await db.insert(files).values(dbRecords);
+    } catch (dbError) {
+      // Best-effort cleanup: delete uploaded R2 objects to avoid orphans
+      await Promise.allSettled(
+        uploadedKeys.map((key) => deleteFromR2({ key, bucketType }))
+      );
+      uploadedKeys = []; // Prevent double cleanup
+      throw dbError;
     }
 
+    return processedImages.map((img) => img.r2Key);
+  } catch (error) {
+    // Best-effort cleanup on any failure (upload or processing)
+    if (uploadedKeys.length > 0) {
+      await Promise.allSettled(
+        uploadedKeys.map((key) => deleteFromR2({ key, bucketType }))
+      );
+    }
+
+    if (error instanceof CustomError) throw error;
+
     console.error(sanitizeForLog(error));
-    throw new CustomError('فشل رفع الملفات', 500);
+    throw new CustomError(uploadMsg.uploadFailed, HTTP_STATUS.INTERNAL_ERROR);
   }
 }

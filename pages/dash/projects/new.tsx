@@ -19,7 +19,7 @@ import {
   createProjectSchema,
 } from '@/utils/validation/projects';
 
-import { flattenErrors } from '@/components/form/form-error-handeling';
+import { flattenErrors, showFormErrors } from '@/components/form/form-error-handeling';
 import { Header } from '@/components/form/header';
 import { ProjectForm } from '@/components/projects/form';
 import { PROJECTS_QUERY_KEYS } from '@/components/projects/query-keys';
@@ -96,9 +96,7 @@ const NewProject = () => {
 
   const onError = useCallback((errors: FieldErrors<CreateProjectInput>) => {
     const erros = flattenErrors(errors);
-    toast.error(
-      (Object.values(erros)[0] as string) || 'تحقق من صحه جميع الخانات'
-    );
+    showFormErrors(erros);
     useErrors.getState().setErrors(erros);
   }, []);
 

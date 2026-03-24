@@ -7,10 +7,22 @@ import { APIError, createAuthMiddleware } from 'better-auth/api';
 import { hashPassword, verifyPassword } from 'better-auth/crypto';
 import { captcha, haveIBeenPwned } from 'better-auth/plugins';
 
+import {
+  HTTP_STATUS,
+  MSG_INVALID_CREDENTIALS,
+  MSG_INVALID_INPUT,
+  MSG_PAGE_NOT_FOUND,
+} from '@/utils/api-messages';
 import { loginSchema } from '@/utils/validation/auth';
 
 import { BASE_ERROR_CODES } from './auth/code-errors';
-import { getUserPermissions } from './permissions/utils';
+import {
+  checkLoginLock,
+  recordFailedLogin,
+  resetLoginAttempts,
+} from './auth/login-guard';
+import { REQUIRE_ROLE_FOR_LOGIN } from './permissions/constants';
+import { sanitizePermissions } from './permissions/utils';
 
 const ALLOWED_PATHS = new Set([
   '/get-session',
@@ -36,50 +48,102 @@ export const auth = betterAuth({
   hooks: {
     before: createAuthMiddleware(async (ctx) => {
       if (!ALLOWED_PATHS.has(ctx.path))
-        throw new APIError(404, {
-          message: 'الصفحة غير موجودة',
+        throw new APIError(HTTP_STATUS.NOT_FOUND, {
+          message: MSG_PAGE_NOT_FOUND,
           code: CUSTOM_CODE,
         });
-      let body;
       if (ctx.path === '/sign-in/email') {
-        const { email, password } = ctx.body;
-        const safeUserData = loginSchema.safeParse({
+        const { email, password } =
+          ctx.body && typeof ctx.body === 'object'
+            ? (ctx.body as Record<string, unknown>)
+            : {};
+
+        const { success, data } = loginSchema.safeParse({
           email,
           password,
         });
 
-        if (!safeUserData.success) {
-          throw new APIError(422, {
-            message: 'قم بالتحقق من البيانات المدخله',
+        if (!success) {
+          throw new APIError(HTTP_STATUS.UNPROCESSABLE, {
+            message: MSG_INVALID_INPUT,
+            code: CUSTOM_CODE,
           });
         }
-        body = {
-          email: safeUserData.data.email,
-          password: safeUserData.data.password,
-        };
-      }
-      if (body)
+
+        const user = await db.query.users.findFirst({
+          where: (u, { eq, and, isNull }) =>
+            and(eq(u.email, data.email), isNull(u.deletedAt)),
+          columns: { isActive: true },
+          with: {
+            role: {
+              columns: { isActive: true },
+            },
+          },
+        });
+
+        if (user && (!user.isActive || (user.role && !user.role.isActive)))
+          throw new APIError(HTTP_STATUS.UNAUTHORIZED, {
+            message: MSG_INVALID_CREDENTIALS,
+            code: CUSTOM_CODE,
+          });
+
+        // Check account lock (race-condition safe with FOR UPDATE)
+        // Returns same error as invalid credentials to prevent user enumeration
+        const lockStatus = await checkLoginLock(data.email);
+        if (lockStatus?.locked) {
+          throw new APIError(HTTP_STATUS.UNAUTHORIZED, {
+            message: MSG_INVALID_CREDENTIALS,
+            code: CUSTOM_CODE,
+          });
+        }
+
         return {
           context: {
             ...ctx,
-            body,
+            body: {
+              email: data.email,
+              password: data.password,
+            },
           },
         };
+      }
     }),
     after: createAuthMiddleware(async (ctx) => {
       const errorCode = (ctx.context?.returned as any)?.body?.code;
+
+      if (ctx.path === '/sign-in/email') {
+        const email: string | undefined = ctx.body?.email;
+
+        if (email && ctx.context?.newSession) {
+          // Successful login — reset attempts (no-op if already 0)
+          try {
+            await resetLoginAttempts(email);
+          } catch (e) {
+            console.error(sanitizeForLog(e));
+          }
+          return;
+        }
+
+        // Failed login — record attempt (may trigger lock)
+        if (email && errorCode && errorCode !== CUSTOM_CODE) {
+          await recordFailedLogin(email);
+        }
+      }
 
       if (
         errorCode &&
         errorCode !== CUSTOM_CODE &&
         BASE_ERROR_CODES[errorCode]
       ) {
-        throw new APIError((ctx.context?.returned as any)?.statusCode || 400, {
-          message: BASE_ERROR_CODES[errorCode],
-          code: CUSTOM_CODE,
-        });
+        throw new APIError(
+          (ctx.context?.returned as any)?.statusCode || HTTP_STATUS.BAD_REQUEST,
+          {
+            message: BASE_ERROR_CODES[errorCode],
+            code: CUSTOM_CODE,
+          }
+        );
       } else if (errorCode && errorCode !== CUSTOM_CODE)
-        console.error(ctx.context?.returned);
+        console.error(sanitizeForLog(ctx.context?.returned));
     }),
   },
 
@@ -110,7 +174,7 @@ export const auth = betterAuth({
     freshAge: 60 * 60 * 10, // 10 hours
     cookieCache: {
       enabled: true,
-      maxAge: 600,
+      maxAge: 300,
     },
     additionalFields: {
       metadata: {
@@ -122,57 +186,82 @@ export const auth = betterAuth({
     },
     modelName: 'sessions',
   },
-  // TODO: open it when set the cach
   databaseHooks: {
     session: {
       create: {
+        // Fail-closed: any error here must block session creation
         before: async (session) => {
-          try {
-            const userId = validID(session.userId);
-            if (!userId) return;
+          const userId = validID(session.userId);
+          if (!userId)
+            throw new APIError(HTTP_STATUS.UNAUTHORIZED, {
+              message: MSG_INVALID_CREDENTIALS,
+              code: CUSTOM_CODE,
+            });
 
-            // Fetch user with role relation
-            const userData = await db.query.users.findFirst({
-              where: (users, { eq }) => eq(users.id, userId),
-              columns: {
-                roleId: true,
-              },
-              with: {
-                role: {
-                  columns: {
-                    id: true,
-                    roleName: true,
+          const userData = await db.query.users.findFirst({
+            where: (users, { eq, and, isNull }) =>
+              and(eq(users.id, userId), isNull(users.deletedAt)),
+            columns: {
+              isActive: true,
+              roleId: true,
+            },
+            with: {
+              role: {
+                columns: {
+                  id: true,
+                  roleName: true,
+                  scope: true,
+                  isActive: true,
+                },
+                with: {
+                  rolePermissions: {
+                    columns: { pageName: true, permissions: true },
                   },
                 },
               },
+            },
+          });
+
+          // Block inactive users or users with inactive roles from getting sessions
+          if (
+            !userData ||
+            !userData.isActive ||
+            (userData.role && !userData.role.isActive)
+          ) {
+            throw new APIError(HTTP_STATUS.UNAUTHORIZED, {
+              message: MSG_INVALID_CREDENTIALS,
+              code: CUSTOM_CODE,
             });
+          }
 
-            if (!userData || !userData.roleId || !userData.role) {
-              return {
-                data: {
-                  ...session,
-                  metadata: {},
-                },
-              };
+          if (!userData.roleId || !userData.role) {
+            if (REQUIRE_ROLE_FOR_LOGIN) {
+              throw new APIError(HTTP_STATUS.UNAUTHORIZED, {
+                message: MSG_INVALID_CREDENTIALS,
+                code: CUSTOM_CODE,
+              });
             }
-
             return {
               data: {
                 ...session,
-                metadata: {
-                  roleId: userData.roleId,
-                  roleName: userData.role.roleName,
-                  permissions: await getUserPermissions({
-                    roleId: userData.roleId,
-                    session: null,
-                    forceDB: true,
-                  }),
-                },
+                metadata: {},
               },
             };
-          } catch (error) {
-            console.error(sanitizeForLog(error));
           }
+
+          return {
+            data: {
+              ...session,
+              metadata: {
+                roleId: userData.roleId,
+                roleName: userData.role.roleName,
+                roleScope: userData.role.scope,
+                permissions: sanitizePermissions(
+                  userData.role.rolePermissions
+                ),
+              },
+            },
+          };
         },
       },
     },
@@ -183,7 +272,7 @@ export const auth = betterAuth({
     enabled: true,
     window: 60,
     max: 10,
-    storage: 'memory', // TODO: Use Redis/Upstash in production for multi-instance
+    storage: 'memory', // TODO: in multiple server/less function instances Use Redis
     customRules: {
       '/sign-in/email': { window: 60, max: 5 },
       '/sign-up/email': { window: 60, max: 3 },

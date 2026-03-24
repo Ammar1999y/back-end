@@ -181,18 +181,17 @@ export function useUploadFile({
 
           if (signal.aborted) return;
 
-          if (!response.ok) {
-            const error = await response.json();
-            throw new Error(error.error || 'Upload failed');
-          }
+          const result = await response.json();
 
-          const data = await response.json();
+          if (!response.ok || !result.success) {
+            throw new Error(result.message || 'Upload failed');
+          }
 
           // Merge local dimensions if available and not returned by server
           const finalData = {
-            ...data,
-            width: data.width || width,
-            height: data.height || height,
+            ...result.data,
+            width: result.data?.width || width,
+            height: result.data?.height || height,
           };
 
           setProgress(100);

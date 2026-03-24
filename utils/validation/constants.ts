@@ -1,3 +1,5 @@
+import { DASHBOARD_PAGES } from '@/lib/permissions/constants';
+
 export const TITLE_MAX = 255;
 export const DESCRIPTION_MAX = 5000;
 export const SHORT_TEXT_MAX = 500;
@@ -12,7 +14,7 @@ export const DIST_MAX = 100;
 
 // Auth
 export const PASSWORD_MIN = 8;
-export const PASSWORD_MAX = 32;
+export const PASSWORD_MAX = 128;
 export const EMAIL_MAX = 150;
 export const USER_ROLE_MAX = 50;
 
@@ -20,7 +22,7 @@ export const USER_ROLE_MAX = 50;
 export const ROLE_NAME_MIN = 1;
 export const ROLE_NAME_MAX = 100;
 export const ROLE_DESCRIPTION_MAX = 150;
-export const PERMISSIONS_ARRAY_MAX = 50;
+export const PERMISSIONS_ARRAY_MAX = Object.keys(DASHBOARD_PAGES).length;
 
 // Common schemas
 export const ORDER_MAX = 1000;

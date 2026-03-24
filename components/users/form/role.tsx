@@ -9,11 +9,13 @@ import {
 } from 'react';
 
 import { EntityID } from '@/types';
+import { validID } from '@/utils';
 import {
   CheckIcon as _CheckIcon,
   ChevronDownIcon as _ChevronDownIcon,
 } from 'lucide-react';
 import { useController } from 'react-hook-form';
+import { CUSTOM_ROLE_VALUE } from '@/lib/permissions/constants';
 import { cn } from '@/lib/utils';
 
 import { useQueryData } from '@/utils/query';
@@ -57,16 +59,16 @@ const RoleInput = memo(() => {
   });
 
   const [open, setOpen] = useState(false);
-  const [selectedValue, setSelectedValue] = useState<string | null>(
-    field.value || null
-  );
+  const [selectedValue, setSelectedValue] = useState<
+    EntityID | typeof CUSTOM_ROLE_VALUE | null
+  >(field.value || null);
 
   useEffect(() => {
     setSelectedValue(field.value || null);
   }, [field.value]);
 
   const handleSelect = useCallback(
-    (roleValue: string) => {
+    (roleValue: EntityID | typeof CUSTOM_ROLE_VALUE) => {
       const newValue = roleValue === selectedValue ? null : roleValue;
       setSelectedValue(newValue);
       field.onChange(newValue);
@@ -111,7 +113,7 @@ const RoleInput = memo(() => {
 RoleInput.displayName = 'RoleInput';
 
 interface RoleLabelProps {
-  selectedValue: string | null;
+  selectedValue: EntityID | typeof CUSTOM_ROLE_VALUE | null;
 }
 
 const RoleLabel = memo(({ selectedValue }: RoleLabelProps) => {
@@ -137,8 +139,8 @@ const RoleLabel = memo(({ selectedValue }: RoleLabelProps) => {
 RoleLabel.displayName = 'RoleLabel';
 
 interface ContentProps {
-  selectedValue: string | null;
-  onSelect: (value: string) => void;
+  selectedValue: EntityID | typeof CUSTOM_ROLE_VALUE | null;
+  onSelect: (value: EntityID | typeof CUSTOM_ROLE_VALUE) => void;
   isOpen: boolean;
 }
 
@@ -206,12 +208,16 @@ Content.displayName = 'RoleComboboxContent';
 interface RoleItemProps {
   role: RoleOption;
   isSelected: boolean;
-  onSelect: (value: string) => void;
+  onSelect: (value: EntityID | typeof CUSTOM_ROLE_VALUE) => void;
 }
 
 const RoleItem = memo(({ role, isSelected, onSelect }: RoleItemProps) => {
   const handleSelect = useCallback(() => {
-    onSelect(role.value);
+    onSelect(
+      role.value === CUSTOM_ROLE_VALUE
+        ? CUSTOM_ROLE_VALUE
+        : validID(role.value)
+    );
   }, [role.value, onSelect]);
 
   const checkIconClassName = useMemo(

@@ -23,7 +23,7 @@ import { useErrors } from '@/utils/store/errors';
 import { updateUserSchema } from '@/utils/validation/auth';
 
 import ErrorMessage from '@/components/error-message';
-import { flattenErrors } from '@/components/form/form-error-handeling';
+import { flattenErrors, showFormErrors } from '@/components/form/form-error-handeling';
 import { Header } from '@/components/form/header';
 import LoadingPage from '@/components/loading-page';
 import UserForm from '@/components/users/form/index';
@@ -171,7 +171,9 @@ const EditUser = () => {
   );
 
   const onError = useCallback((errors: FieldErrors<UpdateUserInput>) => {
-    useErrors.getState().setErrors(flattenErrors(errors));
+    const erros = flattenErrors(errors);
+    showFormErrors(erros);
+    useErrors.getState().setErrors(erros);
   }, []);
 
   useEffect(() => {
