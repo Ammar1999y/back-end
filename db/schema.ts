@@ -17,9 +17,11 @@ import {
   pgTable,
   timestamp,
   uniqueIndex,
+  uuid,
   varchar,
 } from 'drizzle-orm/pg-core';
 
+import { v7 as generateId } from 'uuid';
 import {
   CUSTOM_ROLE_VALUE,
   DASHBOARD_PAGES,
@@ -106,11 +108,11 @@ export type AuditAction = 'INSERT' | 'UPDATE' | 'DELETE';
 export const users = pgTable(
   'users',
   {
-    id: integer('id').primaryKey().generatedAlwaysAsIdentity(),
+    id: uuid('id').primaryKey().$defaultFn(generateId),
     name: varchar('name', { length: NAME_MAX }).notNull(),
     email: varchar('email', { length: EMAIL_MAX }).notNull(),
     isActive: boolean('is_active').default(true).notNull(),
-    roleId: integer('role_id').references(() => roles.id, {
+    roleId: uuid('role_id').references(() => roles.id, {
       onDelete: REQUIRE_ROLE_FOR_LOGIN ? 'restrict' : 'set null',
     }),
     // TODO: Remove failedLoginAttempts & lockedUntil, and convert it to Redis or any KV store
@@ -164,7 +166,7 @@ export const users = pgTable(
 export const sessions = pgTable(
   'sessions',
   {
-    id: integer('id').primaryKey().generatedAlwaysAsIdentity(),
+    id: uuid('id').primaryKey().$defaultFn(generateId),
     expiresAt: timestamp('expires_at', {
       withTimezone: true,
       precision: 2,
@@ -173,7 +175,7 @@ export const sessions = pgTable(
     token: varchar('token', { length: 500 }).notNull(),
     ipAddress: varchar('ip_address', { length: 45 }),
     userAgent: varchar('user_agent', { length: 2000 }),
-    userId: integer('user_id')
+    userId: uuid('user_id')
       .notNull()
       .references(() => users.id, { onDelete: 'cascade' }),
     // Session metadata for caching permissions
@@ -193,10 +195,10 @@ export const sessions = pgTable(
 export const accounts = pgTable(
   'accounts',
   {
-    id: integer('id').primaryKey().generatedAlwaysAsIdentity(),
+    id: uuid('id').primaryKey().$defaultFn(generateId),
     accountId: varchar('account_id', { length: 255 }).notNull(),
     providerId: varchar('provider_id', { length: 100 }).notNull(),
-    userId: integer('user_id')
+    userId: uuid('user_id')
       .notNull()
       .references(() => users.id, { onDelete: 'cascade' }),
     password: varchar('password', { length: 255 }),
@@ -222,10 +224,10 @@ export const accounts = pgTable(
 // ================================
 
 const userTracking = {
-  createdBy: integer('created_by').references(() => users.id, {
+  createdBy: uuid('created_by').references(() => users.id, {
     onDelete: 'set null',
   }),
-  updatedBy: integer('updated_by').references(() => users.id, {
+  updatedBy: uuid('updated_by').references(() => users.id, {
     onDelete: 'set null',
   }),
 };
@@ -243,11 +245,11 @@ const auditFields = {
 export const files = pgTable(
   'files',
   {
-    id: integer('id').primaryKey().generatedAlwaysAsIdentity(),
+    id: uuid('id').primaryKey().$defaultFn(generateId),
     r2Key: varchar('r2_key', { length: URL_MAX }).notNull(),
     bucketType: bucketType('bucket_type').notNull(),
     contextTable: fileContextTable('context_table'),
-    contextId: integer('context_id'),
+    contextId: uuid('context_id'),
     mimeType: varchar('mime_type', { length: 100 }).notNull(),
     sizeBytes: integer('size_bytes').notNull().default(0),
     width: integer('width'),
@@ -255,7 +257,7 @@ export const files = pgTable(
     blurhash: varchar('blurhash', { length: 100 }),
     sortOrder: integer('sort_order').notNull().default(0),
     isTemporary: boolean('is_temporary').notNull().default(true),
-    uploadedBy: integer('uploaded_by').references(() => users.id, {
+    uploadedBy: uuid('uploaded_by').references(() => users.id, {
       onDelete: 'set null',
     }),
     ...timestamps,
@@ -284,13 +286,13 @@ export const files = pgTable(
 export const auditLogs = pgTable(
   'audit_logs',
   {
-    id: integer('id').primaryKey().generatedAlwaysAsIdentity(),
-    userId: integer('user_id').references(() => users.id, {
+    id: uuid('id').primaryKey().$defaultFn(generateId),
+    userId: uuid('user_id').references(() => users.id, {
       onDelete: 'set null',
     }),
     userEmail: varchar('user_email', { length: EMAIL_MAX }).notNull(),
     tableName: varchar('table_name', { length: 50 }).notNull(),
-    recordId: integer('record_id').notNull(),
+    recordId: varchar('record_id', { length: 100 }).notNull(),
     action: auditLogAction('action').notNull(),
     oldData: jsonb('old_data'),
     newData: jsonb('new_data'),
@@ -316,7 +318,7 @@ export const auditLogs = pgTable(
 export const roles = pgTable(
   'roles',
   {
-    id: integer('id').primaryKey().generatedAlwaysAsIdentity(),
+    id: uuid('id').primaryKey().$defaultFn(generateId),
     roleName: varchar('role_name', { length: ROLE_NAME_MAX })
       .notNull()
       .unique('ux_roles_role_name'),
@@ -343,8 +345,8 @@ export const roles = pgTable(
 export const rolePermissions = pgTable(
   'role_permissions',
   {
-    id: integer('id').primaryKey().generatedAlwaysAsIdentity(),
-    roleId: integer('role_id')
+    id: uuid('id').primaryKey().$defaultFn(generateId),
+    roleId: uuid('role_id')
       .notNull()
       .references(() => roles.id, { onDelete: 'cascade' }),
     pageName: pageName('page_name').notNull(),

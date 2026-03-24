@@ -1,4 +1,3 @@
-import { MAX_ID } from '@/constants';
 import { EntityID } from '@/types';
 import * as z from 'zod';
 
@@ -47,9 +46,9 @@ export function getIDSchema(
   const { optional = false } = props;
 
   // when EntityID is number
-  const schema = z.int(idRequired).min(1, idRequired).max(MAX_ID, idRequired);
+  // const schema = z.int(idRequired).min(1, idRequired).max(MAX_ID, idRequired);
   // when EntityID is UUID
-  // const schema = z.string(idRequired).min(1, idRequired);
+  const schema = z.string(idRequired).min(1, idRequired);
 
   return z.preprocess(
     (v: EntityID) => validID(v) || (optional ? null : 0),
@@ -60,7 +59,7 @@ export function getIDSchema(
 
 export const idSchema = getIDSchema({ optional: false }) as z.ZodPipe<
   z.ZodTransform<EntityID, EntityID>,
-  z.ZodInt /* when EntityID is UUID, use ZodString, and when EntityID is number, use ZodInt */
+  z.ZodString /* when EntityID is UUID, use ZodString, and when EntityID is number, use ZodInt */
 >;
 
 export const richTextSchema = z.any();

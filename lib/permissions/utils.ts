@@ -26,6 +26,7 @@ import {
   PERMISSION_ACTIONS,
   ROLE_SCOPE,
 } from './constants';
+import { EntityID } from '@/types';
 
 type DbOrTx = typeof db | WsTx;
 type RolePolicyTarget =
@@ -52,7 +53,7 @@ export function isProtectedSystemRole(role: RolePolicyTarget): boolean {
  * Reusable filter: only standard-scope roles.
  * Use in all queries that should exclude system/custom roles.
  */
-export function standardRoleFilter(roleId: string) {
+export function standardRoleFilter(roleId: EntityID) {
   return and(eq(roles.id, roleId), eq(roles.scope, ROLE_SCOPE.STANDARD));
 }
 
@@ -67,9 +68,9 @@ export async function createCustomRole(
     name: DashboardPage;
     permissions: Record<string, boolean>;
   }>,
-  existingRoleId?: string | null
-): Promise<string> {
-  let roleId: string;
+  existingRoleId?: EntityID | null
+): Promise<EntityID> {
+  let roleId: EntityID;
 
   if (existingRoleId) {
     roleId = existingRoleId;
@@ -103,7 +104,7 @@ export async function createCustomRole(
  * - Has 'standard' scope (not system/custom)
  */
 export async function validateAssignableRole(
-  roleId: string,
+  roleId: EntityID,
   tx: WsTx
 ): Promise<void> {
   // FOR SHARE prevents role deactivation/deletion between validation and assignment
@@ -257,7 +258,7 @@ export function validatePermissionScope(
  */
 export async function validateRolePermissionScope(
   actorPermissions: Partial<PermissionObject>,
-  roleId: string,
+  roleId: EntityID,
   executor: DbOrTx
 ): Promise<void> {
   const perms = await executor
@@ -285,7 +286,7 @@ export async function validateRolePermissionScope(
  * When `precomputed` is provided, skips the DB read for role data.
  */
 export async function refreshRoleSessions(
-  roleId: string,
+  roleId: EntityID,
   tx: WsTx,
   precomputed?: {
     roleName: string;
@@ -342,7 +343,7 @@ export async function refreshRoleSessions(
  * Fetches the user's current role and updates permissions in-place.
  */
 export async function refreshUserSessions(
-  userId: string,
+  userId: EntityID,
   tx?: WsTx
 ): Promise<void> {
   const executor: DbOrTx = tx ?? db;

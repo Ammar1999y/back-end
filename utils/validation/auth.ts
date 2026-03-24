@@ -1,5 +1,5 @@
 import * as z from 'zod';
-import { CUSTOM_ROLE_VALUE } from '@/lib/permissions/constants';
+import { ROLE_SCOPE } from '@/lib/permissions/constants';
 
 import { NAME_MAX } from './constants';
 import { permissionsArraySchema } from './permissions';
@@ -9,7 +9,6 @@ import {
   passwordSchema,
   sanitizeStrictSingleLine,
 } from './rules';
-import { EntityID } from '@/types';
 
 export const loginSchema = z.object({
   email: emailSchema,
@@ -18,9 +17,11 @@ export const loginSchema = z.object({
 
 export type LoginFormData = z.input<typeof loginSchema>;
 
-const userRoleSchema = z.object({
+export const ROLE_TYPE_VALUES = [ROLE_SCOPE.STANDARD, ROLE_SCOPE.CUSTOM] as const;
+export type RoleType = (typeof ROLE_TYPE_VALUES)[number];
+
+const baseUserFields = {
   email: emailSchema,
-  password: passwordSchema,
   name: z.preprocess(
     sanitizeStrictSingleLine,
     z
@@ -29,62 +30,53 @@ const userRoleSchema = z.object({
       .max(NAME_MAX, `الاسم يجب أن لا يتجاوز ${NAME_MAX} حرفاً`)
   ),
   isActive: z.boolean().default(true),
-  roleId: z.union([z.literal(CUSTOM_ROLE_VALUE), idSchema]),
-  permissions: permissionsArraySchema.optional(),
+};
+
+const standardRoleSchema = z.object({
+  roleType: z.literal(ROLE_SCOPE.STANDARD),
+  roleId: idSchema,
 });
 
-function validateCustomRolePermissions(
-  data: { roleId: EntityID | typeof CUSTOM_ROLE_VALUE; permissions?: unknown[] },
-  ctx: z.RefinementCtx
-) {
-  if (data.roleId === CUSTOM_ROLE_VALUE && !data.permissions?.length) {
-    ctx.addIssue({
-      code: z.ZodIssueCode.custom,
-      message: 'يجب تحديد صلاحيات للدور المخصص',
-      path: ['permissions'],
-    });
-  }
+const customRoleSchema = z.object({
+  roleType: z.literal(ROLE_SCOPE.CUSTOM),
+  permissions: permissionsArraySchema.min(1, 'يجب تحديد صلاحيات للدور المخصص'),
+});
 
-  if (data.roleId !== CUSTOM_ROLE_VALUE && data.permissions?.length) {
-    ctx.addIssue({
-      code: z.ZodIssueCode.custom,
-      message: 'الصلاحيات مسموح بها فقط عند اختيار دور مخصص',
-      path: ['permissions'],
-    });
-  }
-}
+const roleAssignment = z.discriminatedUnion('roleType', [
+  standardRoleSchema,
+  customRoleSchema,
+]);
 
-export const createUserSchema = userRoleSchema.superRefine(
-  validateCustomRolePermissions
-);
+export const createUserSchema = z
+  .object({
+    ...baseUserFields,
+    password: passwordSchema,
+  })
+  .and(roleAssignment);
 
-export const updateUserSchema = userRoleSchema
-  .omit({ password: true })
-  .extend({
+const optionalPassword = z
+  .preprocess(
+    (e) => (typeof e === 'string' && e.trim().length ? e : null),
+    passwordSchema.optional().nullish()
+  )
+  .optional()
+  .nullish();
+
+export const updateUserSchema = z
+  .object({
+    ...baseUserFields,
     id: idSchema,
     isActive: z.boolean(),
-    password: z
-      .preprocess(
-        (e) => (typeof e === 'string' && e.trim().length ? e : null),
-        passwordSchema.optional().nullish()
-      )
-      .optional()
-      .nullish(),
+    password: optionalPassword,
   })
-  .superRefine(validateCustomRolePermissions);
+  .and(roleAssignment);
 
-export const selfUpdateUserSchema = userRoleSchema
-  .pick({ name: true, email: true })
-  .extend({
-    id: idSchema,
-    password: z
-      .preprocess(
-        (e) => (typeof e === 'string' && e.trim().length ? e : null),
-        passwordSchema.optional().nullish()
-      )
-      .optional()
-      .nullish(),
-  });
+export const selfUpdateUserSchema = z.object({
+  id: idSchema,
+  name: baseUserFields.name,
+  email: baseUserFields.email,
+  password: optionalPassword,
+});
 
 // Type inference
 export type CreateUserInput = z.input<typeof createUserSchema>;

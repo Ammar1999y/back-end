@@ -1,2 +1,2 @@
 // UUID v7 format
-export type EntityID = number;
+export type EntityID = string;

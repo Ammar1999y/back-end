@@ -1,6 +1,14 @@
 /* eslint-disable unicorn/prefer-math-trunc */
 import { MAX_ID } from '@/constants';
-// import { v7 as uuidv7 } from 'uuid';
+import { EntityID } from '@/types';
+// export const validID = positiveInt;
+// export const extractIdFromUrl = (url: string): number | null => {
+//   const idMatch = url.match(/\/(\d+)$/);
+//   const id = idMatch ? Number(idMatch[1]) : null;
+//   return id;
+// };
+
+import { v7 as uuidv7 } from 'uuid';
 
 export function normalizeArabicDigits(input: any): any {
   if (typeof input !== 'string') return input;
@@ -65,35 +73,28 @@ export const formatDate = (date: string) =>
     year: 'numeric',
   });
 
-export const validID = positiveInt;
-export const extractIdFromUrl = (url: string): number | null => {
-  const idMatch = url.match(/\/(\d+)$/);
-  const id = idMatch ? Number(idMatch[1]) : null;
-  return id;
-};
-
 // UUID v7 validation regex
 // Format: xxxxxxxx-xxxx-7xxx-xxxx-xxxxxxxxxxxx
-// const UUID_V7_REGEX =
-//   /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const UUID_V7_REGEX =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 /**
  * Validates if the given value is a valid UUID v7
  * @param val - Value to validate
  * @returns The valid UUID v7 string, or empty string if invalid
  */
-// export const validID = (val: any): string => {
-//   if (typeof val !== 'string') return '';
-//   const trimmed = val.trim();
-//   return UUID_V7_REGEX.test(trimmed) ? trimmed : '';
-// };
+export const validID = (val: any): string => {
+  if (typeof val !== 'string') return '';
+  const trimmed = val.trim();
+  return UUID_V7_REGEX.test(trimmed) ? trimmed : '';
+};
 
 /**
  * Generates a UUID v7 (time-ordered UUID)
  * @returns A new UUID v7 string
  */
-export const generateUUIDv7 = (): number => {
-  return 1;
+export const generateUUIDv7 = (): EntityID => {
+  return uuidv7();
 };
 
 /**
@@ -102,8 +103,8 @@ export const generateUUIDv7 = (): number => {
  * @param url - The URL to extract ID from
  * @returns The extracted ID string, or null if not found
  */
-// export const extractIdFromUrl = (url: string): string | null => {
-//   // Match UUID v7 (36 chars with hyphens) or numeric ID at the end
-//   const match = url.match(/\/([0-9a-f-]{36}|\d+)$/i);
-//   return match ? match[1] : null;
-// };
+export const extractIdFromUrl = (url: string): string | null => {
+  // Match UUID v7 (36 chars with hyphens) or numeric ID at the end
+  const match = url.match(/\/([0-9a-f-]{36}|\d+)$/i);
+  return match ? match[1] : null;
+};

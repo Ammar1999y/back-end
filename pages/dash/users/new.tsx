@@ -35,7 +35,7 @@ const NewUser = () => {
       email: '',
       password: '',
       isActive: true,
-      roleId: '',
+      roleId: undefined,
       permissions: undefined,
     },
   });

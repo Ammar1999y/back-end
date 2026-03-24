@@ -6,8 +6,9 @@ import { and, eq, isNull, ne, sql } from 'drizzle-orm';
 import { db } from '@/db';
 import { accounts, rolePermissions, roles, sessions, users } from '@/db/schema';
 import { withTransaction } from '@/db/ws';
+import { EntityID } from '@/types';
 import { isForeignKeyViolation, isUniqueViolation, validID } from '@/utils';
-import { EMAIL_MAX } from '@/utils/validation/constants';
+import { auditLog } from '@/lib/audit';
 import { hashPassword } from '@/lib/auth';
 import { checkUserPermission } from '@/lib/permissions/checker';
 import { CUSTOM_ROLE_VALUE } from '@/lib/permissions/constants';
@@ -21,8 +22,6 @@ import {
   validatePermissionScope,
   validateRolePermissionScope,
 } from '@/lib/permissions/utils';
-
-import { auditLog } from '@/lib/audit';
 
 import {
   CREDENTIAL_PROVIDER_ID,
@@ -48,10 +47,10 @@ import {
   selfUpdateUserSchema,
   updateUserSchema,
 } from '@/utils/validation/auth';
+import { EMAIL_MAX } from '@/utils/validation/constants';
 import { idRequired } from '@/utils/validation/rules';
 
 import { userMsg } from '../messages';
-import { EntityID } from '@/types';
 
 export async function GET(
   _request: Request,
@@ -194,6 +193,8 @@ async function handleSelfEdit(
 
     if (!updated) throw new CustomError(MSG_NOT_FOUND, HTTP_STATUS.NOT_FOUND);
 
+    const currentSessionId = validID(session.session.id);
+
     if (hashedPassword) {
       const [pwUpdated] = await tx
         .update(accounts)
@@ -212,8 +213,6 @@ async function handleSelfEdit(
           HTTP_STATUS.BAD_REQUEST
         );
 
-      // Invalidate all other sessions (keep current)
-      const currentSessionId = session.session.id;
       if (currentSessionId)
         await tx
           .delete(sessions)
@@ -226,7 +225,7 @@ async function handleSelfEdit(
     }
 
     await auditLog(tx, {
-      userId: session.user.id,
+      userId: currentSessionId,
       userEmail: session.user.email,
       action: 'UPDATE',
       tableName: 'users',
@@ -250,7 +249,7 @@ async function handleAdminEdit(
   actorPermissions: Awaited<
     ReturnType<typeof checkUserPermission>
   >['permissions'],
-  targetId: string,
+  targetId: EntityID,
   body: Record<string, unknown>,
   request: Request
 ) {
@@ -302,7 +301,7 @@ async function handleAdminEdit(
 
     // Validate standard role is active and assignable (fail fast)
     if (!isCustomRole) {
-      await validateAssignableRole(validatedData.roleId, tx);
+      await validateAssignableRole(validatedData.roleId as EntityID, tx);
     }
 
     // Always validate actor scope against the target user's current role
@@ -319,7 +318,7 @@ async function handleAdminEdit(
       } else if (!isCustomRole && validatedData.roleId !== lockedUser.roleId) {
         await validateRolePermissionScope(
           actorPermissions,
-          validatedData.roleId,
+          validatedData.roleId as EntityID,
           tx
         );
       }
@@ -335,7 +334,7 @@ async function handleAdminEdit(
         );
     }
 
-    let assignedRoleId: string;
+    let assignedRoleId: EntityID;
     let customPermsChanged = false;
 
     if (isCustomRole && validatedData.permissions?.length) {
@@ -373,7 +372,7 @@ async function handleAdminEdit(
         isCurrentlyCustom ? lockedUser.roleId : null
       );
     } else {
-      assignedRoleId = validatedData.roleId;
+      assignedRoleId = validatedData.roleId as EntityID;
     }
 
     // Update user FIRST, then delete orphaned custom role
@@ -425,7 +424,7 @@ async function handleAdminEdit(
     }
 
     await auditLog(tx, {
-      userId: session.user.id,
+      userId: validID(session.user.id),
       userEmail: session.user.email,
       action: 'UPDATE',
       tableName: 'users',
@@ -474,9 +473,10 @@ export async function PUT(
     const body = await parseJsonBody(request);
 
     const targetId = validID(id);
+    const userId = validID(session?.user.id);
     if (!targetId) throw new CustomError(idRequired, HTTP_STATUS.UNPROCESSABLE);
 
-    if (session?.user.id === targetId) {
+    if (userId === targetId && !!session?.user.id) {
       await handleSelfEdit(session, targetId, body, request);
       return apiSuccess({ message: MSG_UPDATED });
     }
@@ -488,13 +488,7 @@ export async function PUT(
         HTTP_STATUS.FORBIDDEN
       );
 
-    await handleAdminEdit(
-      session!,
-      actorPermissions,
-      targetId,
-      body,
-      request
-    );
+    await handleAdminEdit(session!, actorPermissions, targetId, body, request);
     return apiSuccess({ message: MSG_UPDATED });
   } catch (error) {
     if (isUniqueViolation(error)) {
@@ -525,9 +519,10 @@ export async function DELETE(
 
     const { id: _id } = await params;
     const userId = validID(_id);
+    const sessionUserId = validID(session?.user.id);
     if (!userId) throw new CustomError(idRequired, HTTP_STATUS.UNPROCESSABLE);
 
-    if (session?.user.id === userId)
+    if (sessionUserId === userId)
       throw new CustomError(userMsg.cannotDeleteSelf, HTTP_STATUS.BAD_REQUEST);
 
     await withTransaction(async (tx) => {
@@ -545,12 +540,7 @@ export async function DELETE(
       const [userRole] = await tx
         .select({ roleName: roles.roleName, scope: roles.scope })
         .from(roles)
-        .where(
-          and(
-            eq(roles.id, lockedUser.roleId),
-            nonSystemRoleFilter()
-          )
-        );
+        .where(and(eq(roles.id, lockedUser.roleId), nonSystemRoleFilter()));
 
       if (!userRole)
         throw new CustomError(MSG_NOT_FOUND, HTTP_STATUS.NOT_FOUND);
@@ -587,7 +577,7 @@ export async function DELETE(
       }
 
       await auditLog(tx, {
-        userId: session!.user.id,
+        userId: sessionUserId,
         userEmail: session!.user.email,
         action: 'DELETE',
         tableName: 'users',
