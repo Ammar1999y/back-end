@@ -13,12 +13,7 @@ import { zodResolver } from '@hookform/resolvers/zod';
 import { useQueryClient } from '@tanstack/react-query';
 import { FormProvider, useForm, useWatch } from 'react-hook-form';
 import { toast } from 'sonner';
-import {
-  CUSTOM_ROLE_VALUE,
-  PERMISSION_ACTIONS,
-  PermissionAction,
-  ROLE_SCOPE,
-} from '@/lib/permissions/constants';
+import { CUSTOM_ROLE_VALUE, ROLE_SCOPE } from '@/lib/permissions/constants';
 import { cn } from '@/lib/utils';
 
 import { CustomError } from '@/utils/error-class';
@@ -87,14 +82,9 @@ const EditPermission = () => {
       reset(permissionData);
       initialDataRef.current = permissionData;
 
-      const ACTIONS_ARRAY = Object.keys(
-        PERMISSION_ACTIONS
-      ) as PermissionAction[];
-      usePermissionsTableStore.setState({
-        checkboxStates: permissionData.permissions.map((page) =>
-          ACTIONS_ARRAY.map((action) => Boolean(page.permissions[action]))
-        ),
-      });
+      usePermissionsTableStore
+        .getState()
+        .initializeStates(permissionData.permissions);
     }
   }, [permissionData, reset]);
 

@@ -66,6 +66,11 @@ export function isForeignKeyViolation(e: unknown): boolean {
   return anyErr?.code === '23503' || anyErr?.cause?.code === '23503';
 }
 
+export function getConstraintName(e: unknown): string {
+  const anyErr = e as any;
+  return anyErr?.constraint ?? anyErr?.cause?.constraint ?? '';
+}
+
 export const formatDate = (date: string) =>
   new Date(date).toLocaleDateString('ar-EG', {
     day: 'numeric',

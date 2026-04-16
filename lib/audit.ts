@@ -10,6 +10,7 @@ const MAX_IP_LENGTH = 45;
 const IP_PATTERN = /^[\da-fA-F.:]+$/;
 
 /**
+ * TODO: Set the right header to get the ip address
  * Extracts the client IP from trusted proxy headers.
  * Priority: cf-connecting-ip (Cloudflare) → x-vercel-forwarded-for (Vercel) → x-forwarded-for (generic)
  * Validates the IP to prevent header injection in audit logs.
@@ -21,8 +22,7 @@ function getClientIp(headers: Headers): string | null {
     headers.get('x-forwarded-for')?.split(',')[0]?.trim() ??
     null;
 
-  if (!raw || raw.length > MAX_IP_LENGTH || !IP_PATTERN.test(raw))
-    return null;
+  if (!raw || raw.length > MAX_IP_LENGTH || !IP_PATTERN.test(raw)) return null;
   return raw;
 }
 
@@ -104,6 +104,6 @@ export async function auditLog(tx: WsTx, params: AuditLogParams) {
     changedFields,
     ipAddress,
     userAgent: request.headers.get('user-agent')?.slice(0, 2000) ?? null,
-    apiPath: url.pathname,
+    apiPath: url.pathname.slice(0, 255),
   });
 }

@@ -1,25 +1,26 @@
 import { useRouter } from 'next/router';
-import { memo, useCallback /* useEffect  */ } from 'react';
+import { memo, useCallback, useEffect } from 'react';
+
+import { validID } from '@/utils';
+import { useSession } from '@/lib/auth/use-session';
 
 import { validateRedirectPath } from '@/utils/validate-redirect-path';
-
-// import { validID } from '@/utils';
-// import { useSession } from '@/lib/auth/use-session';
 
 import Form from './form';
 
 const SignInPage = () => {
   const { replace } = useRouter();
-  // const { isPending, data } = useSession();
+  const { isPending, data } = useSession();
   const onSuccess = useCallback(() => {
     replace(validateRedirectPath(localStorage.getItem('redirect-path') ?? ''));
     localStorage.removeItem('redirect-path');
   }, [replace]);
-  // useEffect(() => {
-  //   if (!isPending && validID(data?.user.id) && data?.session.id) replace('/dash');
-  // }, [isPending, data, replace]);
+  useEffect(() => {
+    if (!isPending && validID(data?.user.id) && data?.session.id)
+      replace('/dash');
+  }, [isPending, data, replace]);
 
-  // if (isPending || data?.user) return null;
+  if (isPending || data?.user) return null;
   return (
     <div className='flex min-h-screen w-full items-center justify-center fade-in'>
       <div className='z-20 w-full max-w-lg rounded-3xl bg-card px-6 pb-10 pt-6 text-card-foreground shadow-lg'>

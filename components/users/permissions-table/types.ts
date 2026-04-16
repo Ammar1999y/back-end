@@ -1,16 +1,12 @@
-/* eslint-disable unicorn/prefer-export-from */
-import type {
-  DashboardPage,
+import type { PagePermission } from '@/types/permission';
+
+
+// Re-export from single source of truth (types/permission.ts)
+export type {
   PermissionAction,
+  DashboardPage,
 } from '@/lib/permissions/constants';
-
-// Re-export types from single source of truth
-export type { PermissionAction, DashboardPage };
-
-export interface PagePermission {
-  name: DashboardPage;
-  permissions: Partial<Record<PermissionAction, boolean>>;
-}
+export type { PagePermission } from '@/types/permission';
 
 export interface PermissionsTableProps {
   onPermissionsChange?: (permissions: PagePermission[]) => void;

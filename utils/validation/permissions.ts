@@ -28,6 +28,8 @@ const ERROR_MESSAGES = {
   permissionsMaxLength: `عدد الصلاحيات يجب أن لا يتجاوز ${PERMISSIONS_ARRAY_MAX} صلاحيات`,
   permissionsRequired: 'الصلاحيات مطلوبه',
   duplicatePageNames: 'أسماء الصفحات يجب أن لا تتكرر',
+  viewRequiredForWrite:
+    'يجب تفعيل صلاحية العرض عند تفعيل أي صلاحية كتابة (إنشاء، تعديل، حذف)',
 };
 const permissionSchema = z
   .object(
@@ -63,10 +65,25 @@ export const pagePermissionSchema = z.preprocess(
 
     return { name, permissions: filtered };
   },
-  z.object({
-    name: z.enum(Object.keys(DASHBOARD_PAGES) as DashboardPage[]),
-    permissions: permissionSchema,
-  })
+  z
+    .object({
+      name: z.enum(Object.keys(DASHBOARD_PAGES) as DashboardPage[]),
+      permissions: permissionSchema,
+    })
+    .superRefine(({ permissions }, ctx) => {
+      const hasWrite =
+        permissions.create === true ||
+        permissions.edit === true ||
+        permissions.delete === true;
+
+      if (hasWrite && permissions.view !== true) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['permissions', 'view'],
+          message: ERROR_MESSAGES.viewRequiredForWrite,
+        });
+      }
+    })
 );
 function noDuplicatePageNames(items: { name: string }[], ctx: z.RefinementCtx) {
   const names = items.map((p) => p.name);

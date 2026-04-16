@@ -1,91 +1,146 @@
-import { and, eq, gt, isNull, sql } from 'drizzle-orm';
+import type { WsTx } from '@/db/ws';
 
-import { users } from '@/db/schema';
+import { and, eq, isNull, sql } from 'drizzle-orm';
+
+import { accounts, users } from '@/db/schema';
 import { withTransaction } from '@/db/ws';
+import { verifyPassword } from 'better-auth/crypto';
+
+import { CREDENTIAL_PROVIDER_ID } from '@/utils/api-messages';
 
 const MAX_FAILED_ATTEMPTS = 5;
-const LOCK_DURATION_MS = 5 * 60 * 1000; // 5 minutes
+const LOCK_DURATION_SECONDS = 5 * 60; // 5 minutes
+
+export interface VerifyAttemptOptions {
+  password: string;
+  /** Find user by email (login flow) */
+  email?: string;
+  /** Find user by ID (authenticated endpoints — skips email lookup) */
+  userId?: string;
+  /** Skip the fake-hash timing guard (for authenticated endpoints where user is known) */
+  skipTimingGuard?: boolean;
+  /** Reuse an existing transaction instead of creating a new one */
+  tx?: WsTx;
+}
 
 /**
- * Checks if a user account is locked due to too many failed login attempts.
- * If the lock has expired, atomically resets it within the same transaction.
- * Uses FOR UPDATE to serialize concurrent login checks on the same row.
+ * Atomic login verification: locks the user row, checks lock status,
+ * verifies the password, and updates attempt counters — all in a single
+ * transaction. Eliminates the TOCTOU race between check and increment.
+ *
+ * Returns true on successful verification, throws on any failure.
  */
-export async function checkLoginLock(
-  email: string
-): Promise<{ locked: boolean; secondsLeft: number } | null> {
-  return withTransaction(async (tx) => {
+export async function verifyLoginAttempt(
+  options: VerifyAttemptOptions
+): Promise<true> {
+  const {
+    password,
+    email,
+    userId,
+    skipTimingGuard = false,
+    tx: externalTx,
+  } = options;
+
+  const executor = async (tx: WsTx): Promise<true> => {
+    const whereClause = userId
+      ? and(eq(users.id, userId), isNull(users.deletedAt))
+      : and(eq(users.email, email!), isNull(users.deletedAt));
+
     const [user] = await tx
       .select({
+        id: users.id,
+        isActive: users.isActive,
         failedLoginAttempts: users.failedLoginAttempts,
         lockedUntil: users.lockedUntil,
       })
       .from(users)
-      .where(and(eq(users.email, email), isNull(users.deletedAt)))
+      .where(whereClause)
       .for('update')
       .limit(1);
 
-    if (!user) return null;
+    // User not found — don't reveal whether account exists
+    if (!user) return reject(password, skipTimingGuard);
 
+    if (!user.isActive) return reject(password, skipTimingGuard);
+
+    // Account locked and lock not yet expired
     if (user.lockedUntil) {
       const lockTime = new Date(user.lockedUntil).getTime();
-      const now = Date.now();
+      if (lockTime > Date.now()) return reject(password, skipTimingGuard);
 
-      if (lockTime > now) {
-        return {
-          locked: true,
-          secondsLeft: Math.ceil((lockTime - now) / 1000),
-        };
-      }
-
-      // Lock expired — reset inside the same locked transaction
+      // Lock expired — reset within the same transaction before proceeding
       await tx
         .update(users)
         .set({ failedLoginAttempts: 0, lockedUntil: null })
-        .where(and(eq(users.email, email), isNull(users.deletedAt)));
+        .where(eq(users.id, user.id));
     }
 
-    return { locked: false, secondsLeft: 0 };
-  });
+    const [account] = await tx
+      .select({ password: accounts.password })
+      .from(accounts)
+      .where(
+        and(
+          eq(accounts.userId, user.id),
+          eq(accounts.providerId, CREDENTIAL_PROVIDER_ID)
+        )
+      );
+
+    const ok = await verifyPassword({
+      hash: account?.password ?? '',
+      password,
+    });
+
+    if (!ok) {
+      // Increment counter + lock if threshold reached — single atomic UPDATE
+      await tx
+        .update(users)
+        .set({
+          failedLoginAttempts: sql`${users.failedLoginAttempts} + 1`,
+          lockedUntil: sql`
+            CASE
+              WHEN ${users.failedLoginAttempts} + 1 >= ${MAX_FAILED_ATTEMPTS}
+              THEN NOW() + make_interval(secs => ${LOCK_DURATION_SECONDS})
+              ELSE ${users.lockedUntil}
+            END`,
+        })
+        .where(eq(users.id, user.id));
+
+      throw new LoginRejected();
+    }
+
+    // Successful — reset attempts (no-op if already 0)
+    if (user.failedLoginAttempts > 0) {
+      await tx
+        .update(users)
+        .set({ failedLoginAttempts: 0, lockedUntil: null })
+        .where(eq(users.id, user.id));
+    }
+
+    return true;
+  };
+
+  if (externalTx) return executor(externalTx);
+  return withTransaction<true>(executor);
 }
 
-/**
- * Records a failed login attempt atomically in a single SQL statement.
- * If the threshold is reached, locks the account in the same UPDATE.
- */
-export async function recordFailedLogin(email: string): Promise<void> {
-  const lockDurationSeconds = LOCK_DURATION_MS / 1000;
-  const { db } = await import('@/db');
+// Pre-computed hash of a dummy password — guarantees the full scrypt computation
+// runs even when the user doesn't exist, equalizing response timing.
+// Generated via: hashPassword('__timing_guard_dummy__')
+const DUMMY_HASH =
+  '87d098331f88fd6812baa9e6d1d7bf2d:8fbe29d3b3bfb0e282b0687f5f6e097920bcd715261674570ba60881289bb47c585ca68c7095d2768c42c900406c464a302e167076a09cac2e1320c662be229d';
 
-  await db.execute(sql`
-    UPDATE users
-    SET
-      failed_login_attempts = failed_login_attempts + 1,
-      locked_until = CASE
-        WHEN failed_login_attempts + 1 >= ${MAX_FAILED_ATTEMPTS}
-          THEN NOW() + make_interval(secs => ${lockDurationSeconds})
-        ELSE locked_until
-      END
-    WHERE email = ${email} AND deleted_at IS NULL
-  `);
+async function reject(
+  password: string,
+  skipTimingGuard: boolean
+): Promise<never> {
+  if (!skipTimingGuard) {
+    await verifyPassword({ hash: DUMMY_HASH, password });
+  }
+  throw new LoginRejected();
 }
 
-/**
- * Resets failed login attempts and lock on successful login.
- * Only issues an UPDATE if the user actually has failed attempts,
- * avoiding unnecessary writes on every successful login.
- */
-export async function resetLoginAttempts(email: string): Promise<void> {
-  const { db } = await import('@/db');
-
-  await db
-    .update(users)
-    .set({ failedLoginAttempts: 0, lockedUntil: null })
-    .where(
-      and(
-        eq(users.email, email),
-        isNull(users.deletedAt),
-        gt(users.failedLoginAttempts, 0)
-      )
-    );
+export class LoginRejected extends Error {
+  constructor() {
+    super('login_rejected');
+  }
 }

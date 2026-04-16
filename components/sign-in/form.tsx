@@ -1,11 +1,13 @@
 import type { LoginFormData } from '@/utils/validation/auth';
 import type { FieldErrors } from 'react-hook-form';
 
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 
 import { zodResolver } from '@hookform/resolvers/zod';
 import { FormProvider, useForm } from 'react-hook-form';
 import { toast } from 'sonner';
+import { authClient } from '@/lib/auth/client';
+import { fastestFetchWithin } from '@/lib/race-fetch';
 import { cn } from '@/lib/utils';
 
 import { CustomError } from '@/utils/error-class';
@@ -16,8 +18,13 @@ import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import Label from '@/components/ui/label';
 import { ErrorMessage } from '@/components/form/error-message';
-import { flattenErrors, showFormErrors } from '@/components/form/form-error-handeling';
+import {
+  flattenErrors,
+  showFormErrors,
+} from '@/components/form/form-error-handeling';
 import PasswordInput from '@/components/sign-in/password-input';
+
+import TurnstileWidget from './turnstile';
 
 interface FormProps {
   onSuccess: () => void;
@@ -25,7 +32,8 @@ interface FormProps {
 
 const Form = ({ onSuccess }: FormProps) => {
   const [loading, setLoading] = useState(false);
-
+  const [resetTurnstile, setResetTurnstile] = useState(false);
+  const userIp = useRef<string | null>(null);
   const methods = useForm<LoginFormData>({
     resolver: zodResolver(loginSchema),
     disabled: loading,
@@ -35,32 +43,53 @@ const Form = ({ onSuccess }: FormProps) => {
     },
   });
 
-  const { handleSubmit, register } = methods;
+  const { handleSubmit, register, setValue } = methods;
 
   const onSubmit = useCallback(
     async (data: LoginFormData) => {
       setLoading(true);
       useErrors.getState().setErrors({});
-
+      if (!userIp.current) {
+        const res = await fastestFetchWithin(
+          ['https://api.ipify.org?format=json', 'https://ipinfo.io/json'],
+          3000
+        );
+        userIp.current = res ? (await res.json())?.ip : null;
+      }
       try {
-        console.log('Login data:', data);
-
-        // Simulate API call
-        await new Promise((resolve) => setTimeout(resolve, 1000));
-
+        const { data: resData, error } = await authClient.signIn.email({
+          email: data.email,
+          password: data.password,
+          fetchOptions: {
+            headers: {
+              'x-captcha-response': data.captcha + 'hgvcxcv',
+              ...(userIp.current && {
+                'x-captcha-user-remote-ip': userIp.current,
+              }),
+            },
+          },
+        });
+        if (error) throw error;
+        if (!resData?.user?.id) throw new CustomError('حدث خطاء، اعد المحاوله');
         toast.success('تم تسجيل الدخول بنجاح');
         onSuccess();
-      } catch (error) {
+      } catch (error: any) {
+        setValue('captcha', '');
+        setResetTurnstile(true);
         toast.error(
           error instanceof CustomError
             ? error.message
-            : 'حدث خطاء، اعد المحاوله'
+            : error?.message?.toLowerCase?.()?.includes('captcha')
+              ? 'حدث خطاء اثناء التحقق من انك انسان، اعد المحاولة'
+              : 'حدث خطاء، اعد المحاوله',
+          {
+            duration: 8000,
+          }
         );
-      } finally {
-        setLoading(false);
       }
+      setLoading(false);
     },
-    [onSuccess]
+    [onSuccess, setValue]
   );
 
   const onError = useCallback((errors: FieldErrors<LoginFormData>) => {
@@ -110,6 +139,7 @@ const Form = ({ onSuccess }: FormProps) => {
           <PasswordInput />
           <ErrorMessage path={register('password').name} />
         </div>
+        <TurnstileWidget reset={resetTurnstile} setReset={setResetTurnstile} />
 
         <Button
           type='submit'

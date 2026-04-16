@@ -1,8 +1,16 @@
+import type {
+  DashboardPage,
+  PermissionAction,
+} from '@/lib/permissions/constants';
+
 import { RoleScopes } from '@/db/schema';
 
-import { PagePermission } from '@/components/users/permissions-table';
-
 import { EntityID } from '.';
+
+export interface PagePermission {
+  name: DashboardPage;
+  permissions: Partial<Record<PermissionAction, boolean>>;
+}
 
 export interface PermissionClient {
   id: EntityID;

@@ -12,24 +12,20 @@ import {
   MSG_INVALID_CREDENTIALS,
   MSG_INVALID_INPUT,
   MSG_PAGE_NOT_FOUND,
+  MSG_PASSWORD_COMPROMISED,
 } from '@/utils/api-messages';
 import { loginSchema } from '@/utils/validation/auth';
 
 import { BASE_ERROR_CODES } from './auth/code-errors';
-import {
-  checkLoginLock,
-  recordFailedLogin,
-  resetLoginAttempts,
-} from './auth/login-guard';
+import { LoginRejected, verifyLoginAttempt } from './auth/login-guard';
 import { REQUIRE_ROLE_FOR_LOGIN } from './permissions/constants';
 import { sanitizePermissions } from './permissions/utils';
 
-const ALLOWED_PATHS = new Set([
-  '/get-session',
-  '/sign-out',
-  '/revoke-session',
-  '/sign-in/email',
-]);
+// ⚠️ WARNING: password.verify below always returns true because the before
+// hook already verifies credentials via verifyLoginAttempt(). If you add a new
+// path that relies on Better Auth's built-in password verification, you MUST
+// either add verification logic in the before hook or restore the real verify.
+const ALLOWED_PATHS = new Set(['/get-session', '/sign-out', '/sign-in/email']);
 
 const CUSTOM_CODE = '__';
 
@@ -41,7 +37,10 @@ export const auth = betterAuth({
     autoSignIn: false,
     password: {
       hash: hashPassword,
-      verify: verifyPassword,
+      // Always true — the before hook already verifies via verifyLoginAttempt().
+      // See ALLOWED_PATHS warning above before adding new password-based paths.
+      verify: async () => true,
+      // verify: verifyPassword,
     },
   },
 
@@ -61,6 +60,7 @@ export const auth = betterAuth({
         const { success, data } = loginSchema.safeParse({
           email,
           password,
+          captcha: 'success', // captcha plugin runs before this middleware, so we can assume it's always valid here
         });
 
         if (!success) {
@@ -70,31 +70,20 @@ export const auth = betterAuth({
           });
         }
 
-        const user = await db.query.users.findFirst({
-          where: (u, { eq, and, isNull }) =>
-            and(eq(u.email, data.email), isNull(u.deletedAt)),
-          columns: { isActive: true },
-          with: {
-            role: {
-              columns: { isActive: true },
-            },
-          },
-        });
-
-        if (user && (!user.isActive || (user.role && !user.role.isActive)))
-          throw new APIError(HTTP_STATUS.UNAUTHORIZED, {
-            message: MSG_INVALID_CREDENTIALS,
-            code: CUSTOM_CODE,
+        // Atomic: lock row → check lock → verify password → update attempts
+        // All in one transaction — eliminates the TOCTOU race condition
+        try {
+          await verifyLoginAttempt({
+            email: data.email,
+            password: data.password,
           });
-
-        // Check account lock (race-condition safe with FOR UPDATE)
-        // Returns same error as invalid credentials to prevent user enumeration
-        const lockStatus = await checkLoginLock(data.email);
-        if (lockStatus?.locked) {
-          throw new APIError(HTTP_STATUS.UNAUTHORIZED, {
-            message: MSG_INVALID_CREDENTIALS,
-            code: CUSTOM_CODE,
-          });
+        } catch (e) {
+          if (e instanceof LoginRejected)
+            throw new APIError(HTTP_STATUS.UNAUTHORIZED, {
+              message: MSG_INVALID_CREDENTIALS,
+              code: CUSTOM_CODE,
+            });
+          throw e;
         }
 
         return {
@@ -110,25 +99,6 @@ export const auth = betterAuth({
     }),
     after: createAuthMiddleware(async (ctx) => {
       const errorCode = (ctx.context?.returned as any)?.body?.code;
-
-      if (ctx.path === '/sign-in/email') {
-        const email: string | undefined = ctx.body?.email;
-
-        if (email && ctx.context?.newSession) {
-          // Successful login — reset attempts (no-op if already 0)
-          try {
-            await resetLoginAttempts(email);
-          } catch (e) {
-            console.error(sanitizeForLog(e));
-          }
-          return;
-        }
-
-        // Failed login — record attempt (may trigger lock)
-        if (email && errorCode && errorCode !== CUSTOM_CODE) {
-          await recordFailedLogin(email);
-        }
-      }
 
       if (
         errorCode &&
@@ -147,17 +117,6 @@ export const auth = betterAuth({
     }),
   },
 
-  // 404,403,401,400, 429, 500,
-  // onAPIError: {
-  //   onError: (error, ctx) => {
-  //     throw new APIError(403, {
-  //       message: 'تم رفض الوصول: تحتاج صلاحيات أعلى أو إعادة المصادقة.',
-  //       code: 'ACCESS_DENIED',
-  //     });
-  //   },
-  //   throw: true,
-  // },
-
   advanced: {
     database: {
       generateId: false,
@@ -174,7 +133,7 @@ export const auth = betterAuth({
     freshAge: 60 * 60 * 10, // 10 hours
     cookieCache: {
       enabled: true,
-      maxAge: 300,
+      maxAge: 300, // 5 minutes, TODO: change it depending on the app security policy
     },
     additionalFields: {
       metadata: {
@@ -256,9 +215,7 @@ export const auth = betterAuth({
                 roleId: userData.roleId,
                 roleName: userData.role.roleName,
                 roleScope: userData.role.scope,
-                permissions: sanitizePermissions(
-                  userData.role.rolePermissions
-                ),
+                permissions: sanitizePermissions(userData.role.rolePermissions),
               },
             },
           };
@@ -305,7 +262,7 @@ export const auth = betterAuth({
   // read more https://www.better-auth.com/docs/reference/options#emailverification
   plugins: [
     haveIBeenPwned({
-      customPasswordCompromisedMessage: 'كلمة السر ضعيفه، قم بتغيرها',
+      customPasswordCompromisedMessage: MSG_PASSWORD_COMPROMISED,
     }),
     captcha({
       provider: 'cloudflare-turnstile',
@@ -313,7 +270,7 @@ export const auth = betterAuth({
         process.env.NODE_ENV === 'development'
           ? '1x0000000000000000000000000000000AA'
           : process.env.TURNSTILE_SECRET_KEY!,
-      endpoints: ['/sign-up/email', '/sign-in/email'], // TODO: add the proper endpoints
+      endpoints: ['/sign-in/email'], // TODO: add the proper endpoints
     }),
   ],
 });

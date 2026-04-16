@@ -1,4 +1,3 @@
-/* eslint-disable react-hooks/exhaustive-deps */
 /* eslint-disable unicorn/no-for-loop */
 import * as React from 'react';
 
@@ -57,6 +56,7 @@ function composeRefs<T>(...refs: PossibleRef<T>[]): React.RefCallback<T> {
  * Accepts callback refs and RefObject(s)
  */
 function useComposedRefs<T>(...refs: PossibleRef<T>[]): React.RefCallback<T> {
+  // eslint-disable-next-line react-hooks/use-memo
   return React.useCallback(composeRefs(...refs), refs);
 }
 

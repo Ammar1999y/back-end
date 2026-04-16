@@ -7,7 +7,8 @@ export const MSG_PHONE_EXISTS = 'رقم الهاتف مستخدم بالفعل';
 
 export const MSG_LOGIN_REQUIRED = 'قم بتسجيل الدخول اولا';
 export const MSG_INSUFFICIENT_PERMISSIONS = 'ليس لديك صلاحيه';
-export const MSG_CANNOT_GRANT_UNOWNED_PERMISSIONS = 'لا يمكنك منح صلاحيات لا تملكها';
+export const MSG_CANNOT_GRANT_UNOWNED_PERMISSIONS =
+  'لا يمكنك منح صلاحيات لا تملكها';
 
 export const MSG_PAGE_NOT_FOUND = 'الصفحة غير موجودة';
 export const MSG_NOT_FOUND = 'البيانات غير موجودة';
@@ -23,6 +24,9 @@ export const MSG_FETCH_ERROR = 'حدث خطأ في جلب البيانات';
 export const MSG_CREATE_ERROR = 'حدث خطأ في الإنشاء';
 export const MSG_UPDATE_ERROR = 'حدث خطأ في التحديث';
 export const MSG_DELETE_ERROR = 'حدث خطأ في الحذف';
+
+export const MSG_PASSWORD_COMPROMISED =
+  'هذه الكلمة مستخدمة بكثرة أو مُسرّبة سابقًا، لذلك لا تُعد آمنة. يرجى اختيار كلمة مرور مختلفة.';
 
 export const CREDENTIAL_PROVIDER_ID = 'credential' as const;
 

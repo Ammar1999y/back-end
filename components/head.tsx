@@ -103,7 +103,7 @@ const StaticHead = memo(() => {
       <meta name='revisit-after' content='7 days' />
       <meta name='format-detection' content='telephone=no' />
 
-      {/* TODO https://medium.com/appscope/changing-the-ios-status-bar-of-your-progressive-web-app-9fc8fbe8e6ab */}
+      {/* https://medium.com/appscope/changing-the-ios-status-bar-of-your-progressive-web-app-9fc8fbe8e6ab */}
       <meta name='apple-mobile-web-app-status-bar-style' content='default' />
       <meta name='theme-color' content={metadata.themeColor} />
 

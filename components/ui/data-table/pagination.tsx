@@ -1,4 +1,3 @@
-/* eslint-disable react-hooks/exhaustive-deps */
 import { memo, useCallback, useEffect, useMemo } from 'react';
 
 import { type Table } from '@tanstack/react-table';
@@ -50,7 +49,7 @@ const DataTablePagination = memo(
     const totalPages = useMemo(() => {
       const pc = table.getPageCount();
       return Number.isFinite(pc) && pc > 0 ? pc : 1;
-    }, [table.getPageCount(), reRender]);
+    }, [table, reRender]);
 
     const pageNumbers = useMemo(
       () => getPageNumbers(currentPage, totalPages),

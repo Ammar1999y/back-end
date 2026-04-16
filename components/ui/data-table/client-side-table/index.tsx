@@ -1,4 +1,3 @@
-/* eslint-disable react-hooks/exhaustive-deps */
 import type { ColumnDef, TableState } from '@tanstack/react-table';
 
 import dynamic from 'next/dynamic';
@@ -48,7 +47,7 @@ const ClientSideTable = memo(
         href,
         enabled: !!enabledQuery,
       }),
-      [enabledQuery]
+      [queryKey, href, enabledQuery]
     );
 
     const { data, isLoading, error, refetch } =
@@ -68,7 +67,7 @@ const ClientSideTable = memo(
         columnVisibility: {},
         columnOrder: columns.map((col) => col.id!),
       }),
-      []
+      [initialSorting, columns]
     );
     const { table } = useDataTable({
       data: data || [],

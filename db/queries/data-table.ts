@@ -8,10 +8,7 @@ import {
   filterColumns,
   getColumn,
 } from '@/lib/data-table/filter-columns';
-import {
-  MAX_PER_PAGE,
-  parseSearchParams,
-} from '@/lib/data-table/parsers';
+import { MAX_PER_PAGE, parseSearchParams } from '@/lib/data-table/parsers';
 
 const MAX_SEARCH_LENGTH = 200;
 

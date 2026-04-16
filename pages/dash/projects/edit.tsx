@@ -22,7 +22,10 @@ import { useErrors } from '@/utils/store/errors';
 import { updateProjectSchema } from '@/utils/validation/projects';
 
 import ErrorMessage from '@/components/error-message';
-import { flattenErrors, showFormErrors } from '@/components/form/form-error-handeling';
+import {
+  flattenErrors,
+  showFormErrors,
+} from '@/components/form/form-error-handeling';
 import { Header } from '@/components/form/header';
 import LoadingPage from '@/components/loading-page';
 import { ProjectForm } from '@/components/projects/form';

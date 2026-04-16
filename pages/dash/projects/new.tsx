@@ -19,7 +19,10 @@ import {
   createProjectSchema,
 } from '@/utils/validation/projects';
 
-import { flattenErrors, showFormErrors } from '@/components/form/form-error-handeling';
+import {
+  flattenErrors,
+  showFormErrors,
+} from '@/components/form/form-error-handeling';
 import { Header } from '@/components/form/header';
 import { ProjectForm } from '@/components/projects/form';
 import { PROJECTS_QUERY_KEYS } from '@/components/projects/query-keys';

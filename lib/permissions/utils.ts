@@ -10,6 +10,7 @@ import { and, eq, isNull, ne, sql } from 'drizzle-orm';
 
 import { db } from '@/db';
 import { rolePermissions, roles, users } from '@/db/schema';
+import { EntityID } from '@/types';
 import { v7 as uuidv7 } from 'uuid';
 
 import {
@@ -26,7 +27,6 @@ import {
   PERMISSION_ACTIONS,
   ROLE_SCOPE,
 } from './constants';
-import { EntityID } from '@/types';
 
 type DbOrTx = typeof db | WsTx;
 type RolePolicyTarget =
@@ -74,6 +74,12 @@ export async function createCustomRole(
 
   if (existingRoleId) {
     roleId = existingRoleId;
+    // Lock the role row to prevent concurrent reads from seeing empty permissions
+    await tx
+      .select({ id: roles.id })
+      .from(roles)
+      .where(eq(roles.id, roleId))
+      .for('update');
     await tx.delete(rolePermissions).where(eq(rolePermissions.roleId, roleId));
   } else {
     const [customRole] = await tx
@@ -246,7 +252,10 @@ export function validatePermissionScope(
         granted === true &&
         actorPagePerms?.[action as PermissionAction] !== true
       )
-        throw new CustomError(MSG_CANNOT_GRANT_UNOWNED_PERMISSIONS, HTTP_STATUS.FORBIDDEN);
+        throw new CustomError(
+          MSG_CANNOT_GRANT_UNOWNED_PERMISSIONS,
+          HTTP_STATUS.FORBIDDEN
+        );
     }
   }
 }

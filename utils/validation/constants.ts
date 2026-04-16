@@ -17,6 +17,15 @@ export const PASSWORD_MIN = 8;
 export const PASSWORD_MAX = 128;
 export const EMAIL_MAX = 150;
 export const USER_ROLE_MAX = 50;
+export const PHONE_NUMBER_MAX = 15;
+
+// OTP / Verification
+export const OTP_CODE_LENGTH = 6;
+export const OTP_IDENTIFIER_MAX = 160;
+export const OTP_MAX_ATTEMPTS = 5;
+export const OTP_MAX_VERIFY_ATTEMPTS = 5;
+export const OTP_EXPIRY_MINUTES = 10;
+export const OTP_BLOCK_DURATION_HOURS = 24;
 
 // Roles & Permissions
 export const ROLE_NAME_MIN = 1;

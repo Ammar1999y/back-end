@@ -85,7 +85,9 @@ export async function optimizeImage(
   let resultSize: number;
   let resultMetadata: sharp.OutputInfo;
 
-  const firstAttempt = await sharp(input, { limitInputPixels: MAX_IMAGE_PIXELS })
+  const firstAttempt = await sharp(input, {
+    limitInputPixels: MAX_IMAGE_PIXELS,
+  })
     .resize({
       width: currentWidth,
       withoutEnlargement: true, // Don't upscale small images

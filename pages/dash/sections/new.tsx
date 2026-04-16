@@ -19,7 +19,10 @@ import {
   createSectionSchema,
 } from '@/utils/validation/sections';
 
-import { flattenErrors, showFormErrors } from '@/components/form/form-error-handeling';
+import {
+  flattenErrors,
+  showFormErrors,
+} from '@/components/form/form-error-handeling';
 import { Header } from '@/components/form/header';
 import { MainTabs } from '@/components/form/tabs/main-tabs';
 import { useTabsStore } from '@/components/form/tabs/store';

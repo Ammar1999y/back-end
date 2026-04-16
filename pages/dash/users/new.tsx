@@ -16,7 +16,10 @@ import { mutate } from '@/utils/mutation';
 import { useErrors } from '@/utils/store/errors';
 import { CreateUserOutput, createUserSchema } from '@/utils/validation/auth';
 
-import { flattenErrors, showFormErrors } from '@/components/form/form-error-handeling';
+import {
+  flattenErrors,
+  showFormErrors,
+} from '@/components/form/form-error-handeling';
 import { Header } from '@/components/form/header';
 import UserForm from '@/components/users/form/index';
 import RolesTable from '@/components/users/form/roles-table';

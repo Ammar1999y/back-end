@@ -1,8 +1,0 @@
-
-
-كيف بنسوي اذا قررنا نقوم بتحويل EntityID الى رقم
-وجعل ids يتم انشائها تلقائيا بالترقيم
-هل هذا الشي ممكن وبسيط تغيره
-
-
-add the corect pg_trgm GIN indexes for the apis

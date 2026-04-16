@@ -13,7 +13,11 @@ import { zodResolver } from '@hookform/resolvers/zod';
 import { useQueryClient } from '@tanstack/react-query';
 import { FormProvider, useForm, useWatch } from 'react-hook-form';
 import { toast } from 'sonner';
-import { CUSTOM_ROLE_VALUE } from '@/lib/permissions/constants';
+import {
+  CUSTOM_ROLE_VALUE,
+  PERMISSION_ACTIONS,
+  PermissionAction,
+} from '@/lib/permissions/constants';
 import { cn } from '@/lib/utils';
 
 import { CustomError } from '@/utils/error-class';
@@ -23,11 +27,15 @@ import { useErrors } from '@/utils/store/errors';
 import { updateUserSchema } from '@/utils/validation/auth';
 
 import ErrorMessage from '@/components/error-message';
-import { flattenErrors, showFormErrors } from '@/components/form/form-error-handeling';
+import {
+  flattenErrors,
+  showFormErrors,
+} from '@/components/form/form-error-handeling';
 import { Header } from '@/components/form/header';
 import LoadingPage from '@/components/loading-page';
 import UserForm from '@/components/users/form/index';
 import RolesTable from '@/components/users/form/roles-table';
+import { usePermissionsTableStore } from '@/components/users/permissions-table/store';
 import { USERS_QUERY_KEYS } from '@/components/users/query-keys';
 
 const EditUser = () => {
@@ -76,6 +84,27 @@ const EditUser = () => {
         roleId: userData.roleId || '',
       });
       initialDataRef.current = userData;
+
+      // Initialize permissions table store for custom role users
+      if (
+        userData.roleId === CUSTOM_ROLE_VALUE &&
+        userData.permissions?.length
+      ) {
+        const ACTIONS_ARRAY = Object.keys(
+          PERMISSION_ACTIONS
+        ) as PermissionAction[];
+        usePermissionsTableStore.getState().initializeStates(
+          userData.permissions.map((p) => ({
+            name: p.name,
+            permissions: Object.fromEntries(
+              ACTIONS_ARRAY.map((action) => [
+                action,
+                Boolean(p.permissions[action]),
+              ])
+            ),
+          }))
+        );
+      }
     }
   }, [userData, reset]);
 

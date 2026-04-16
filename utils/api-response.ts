@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server';
 
-import { isUniqueViolation, sanitizeForLog } from '@/utils';
+import { getConstraintName, isUniqueViolation, sanitizeForLog } from '@/utils';
 
 import {
   HTTP_STATUS,
@@ -84,14 +84,6 @@ export function handleApiError(
     message: fallbackMessage ?? MSG_INTERNAL_ERROR,
     status: HTTP_STATUS.INTERNAL_ERROR,
   });
-}
-
-/**
- * Extracts the constraint name from a DB error (direct or wrapped via error.cause).
- */
-function getConstraintName(error: unknown): string {
-  const e = error as any;
-  return e?.constraint ?? e?.cause?.constraint ?? '';
 }
 
 /**

@@ -1,3 +1,4 @@
+import { EntityID } from '@/types';
 import * as z from 'zod';
 import { CUSTOM_ROLE_VALUE } from '@/lib/permissions/constants';
 
@@ -9,11 +10,14 @@ import {
   passwordSchema,
   sanitizeStrictSingleLine,
 } from './rules';
-import { EntityID } from '@/types';
 
 export const loginSchema = z.object({
   email: emailSchema,
   password: passwordSchema,
+  captcha: z
+    .string()
+    .min(1, 'الرجاء التحقق من أنك لست روبوت')
+    .max(1000, 'الرجاء التحقق من أنك لست روبوت'),
 });
 
 export type LoginFormData = z.input<typeof loginSchema>;
@@ -34,7 +38,10 @@ const userRoleSchema = z.object({
 });
 
 function validateCustomRolePermissions(
-  data: { roleId: EntityID | typeof CUSTOM_ROLE_VALUE; permissions?: unknown[] },
+  data: {
+    roleId: EntityID | typeof CUSTOM_ROLE_VALUE;
+    permissions?: unknown[];
+  },
   ctx: z.RefinementCtx
 ) {
   if (data.roleId === CUSTOM_ROLE_VALUE && !data.permissions?.length) {
@@ -73,18 +80,21 @@ export const updateUserSchema = userRoleSchema
   })
   .superRefine(validateCustomRolePermissions);
 
-export const selfUpdateUserSchema = userRoleSchema
-  .pick({ name: true, email: true })
-  .extend({
-    id: idSchema,
-    password: z
-      .preprocess(
-        (e) => (typeof e === 'string' && e.trim().length ? e : null),
-        passwordSchema.optional().nullish()
-      )
-      .optional()
-      .nullish(),
-  });
+export const selfUpdateUserSchema = userRoleSchema.pick({ name: true }).extend({
+  id: idSchema,
+});
+
+// Self-service: change own password
+export const changePasswordSchema = z.object({
+  currentPassword: passwordSchema,
+  newPassword: passwordSchema,
+});
+
+// Self-service: change own email
+export const changeEmailSchema = z.object({
+  currentPassword: passwordSchema,
+  newEmail: emailSchema,
+});
 
 // Type inference
 export type CreateUserInput = z.input<typeof createUserSchema>;

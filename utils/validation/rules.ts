@@ -1,10 +1,15 @@
 import { EntityID } from '@/types';
 import * as z from 'zod';
 
-import { positiveInt, validID } from '..';
+import { normalizeArabicDigits, positiveInt, validID } from '..';
 import { sanitizeSvg } from '../images/svg-optimizer';
 import { safeDate } from '../time';
-import { EMAIL_MAX, PASSWORD_MAX, PASSWORD_MIN } from './constants';
+import {
+  EMAIL_MAX,
+  PASSWORD_MAX,
+  PASSWORD_MIN,
+  PHONE_NUMBER_MAX,
+} from './constants';
 
 export const NAME_MAX = 150;
 export const DIST_MAX = 100;
@@ -167,3 +172,37 @@ export const SVGIconSchema = z
     message: 'أيقونة SVG غير صحيحة أو تحتوي على محتوى غير آمن',
   })
   .transform((val) => sanitizeSvg(val).cleanedSvg);
+
+// Saudi phone: strips non-digits, accepts 966XXXXXXXXX / 05XXXXXXXX / 5XXXXXXXX
+const phoneCleanupRegex = /[^\d]/g;
+const saudiPhoneEmptyError = 'رقم الهاتف مطلوب';
+const saudiPhoneFormatError = 'يرجى إدخال رقم هاتف سعودي صحيح';
+
+export const phoneSchema = z.preprocess(
+  (v) => {
+    if (typeof v === 'number') v = String(v);
+    if (typeof v !== 'string') return v;
+    return normalizeArabicDigits(v).replace(phoneCleanupRegex, '');
+  },
+  z
+    .string(saudiPhoneEmptyError)
+    .min(1, saudiPhoneEmptyError)
+    .max(PHONE_NUMBER_MAX, saudiPhoneFormatError)
+    .refine(
+      (val) => {
+        // 966XXXXXXXXX (12 digits), 05XXXXXXXX (10 digits), or 5XXXXXXXX (9 digits)
+        if (val.startsWith('966')) return /^9665\d{8}$/.test(val);
+        if (val.startsWith('05')) return /^05\d{8}$/.test(val);
+        if (val.startsWith('5')) return /^5\d{8}$/.test(val);
+        return false;
+      },
+      { message: saudiPhoneFormatError }
+    )
+    .transform((val) => {
+      // Normalize to 9665XXXXXXXX
+      if (val.startsWith('966')) return val;
+      if (val.startsWith('05')) return '966' + val.slice(1);
+      if (val.startsWith('5')) return '966' + val;
+      return val;
+    })
+);

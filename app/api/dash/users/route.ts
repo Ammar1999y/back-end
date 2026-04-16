@@ -5,7 +5,11 @@ import { db } from '@/db';
 import { parseDataTableParams } from '@/db/queries/data-table';
 import { accounts, roles, users } from '@/db/schema';
 import { withTransaction } from '@/db/ws';
-import { isForeignKeyViolation, isUniqueViolation } from '@/utils';
+import {
+  getConstraintName,
+  isForeignKeyViolation,
+  isUniqueViolation,
+} from '@/utils';
 import { auditLog } from '@/lib/audit';
 import { hashPassword } from '@/lib/auth';
 import { checkUserPermission } from '@/lib/permissions/checker';
@@ -140,10 +144,7 @@ export async function POST(request: Request) {
     const isCustomRole = validatedData.roleId === CUSTOM_ROLE_VALUE;
 
     // Verify actor has permission to manage custom roles (no extra query)
-    if (
-      isCustomRole &&
-      actorPermissions?.['permissions']?.['create'] !== true
-    )
+    if (isCustomRole && actorPermissions?.['permissions']?.['create'] !== true)
       throw new CustomError(
         MSG_INSUFFICIENT_PERMISSIONS,
         HTTP_STATUS.FORBIDDEN
@@ -224,9 +225,12 @@ export async function POST(request: Request) {
     }
     //  Concurrent role deletion — surface as friendly 400
     if (isForeignKeyViolation(error)) {
-      return handleApiError(
-        new CustomError(userMsg.roleNotFound, HTTP_STATUS.BAD_REQUEST)
-      );
+      const constraint = getConstraintName(error);
+      if (constraint.includes('role_id')) {
+        return handleApiError(
+          new CustomError(userMsg.roleNotFound, HTTP_STATUS.BAD_REQUEST)
+        );
+      }
     }
     return handleApiError(error, MSG_CREATE_ERROR);
   }

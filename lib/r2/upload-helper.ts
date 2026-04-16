@@ -1,17 +1,17 @@
 import type { BucketType } from './client';
 import type { NewFile } from '@/db/schema';
 
+import { uploadMsg } from '@/app/api/upload/image/messages';
 import { db } from '@/db';
 import { files } from '@/db/schema';
 import { sanitizeForLog } from '@/utils';
 import { encode } from 'blurhash';
 import sharp from 'sharp';
 
-import { CustomError } from '@/utils/error-class';
 import { HTTP_STATUS } from '@/utils/api-messages';
+import { CustomError } from '@/utils/error-class';
 import { generateShortId, sanitizeFilename } from '@/utils/sanitize-filename';
 import { sanitizeSvgServer, svgOptimizerServer } from '@/utils/svg/server';
-import { uploadMsg } from '@/app/api/upload/image/messages';
 import {
   MAX_IMAGE_PIXELS,
   SERVER_MAX_IMAGE_SIZE,
@@ -132,7 +132,9 @@ async function processImage(
   }
 
   const arrayBuffer = preBuffer ?? Buffer.from(await file.arrayBuffer());
-  let buffer: Buffer = Buffer.isBuffer(arrayBuffer) ? arrayBuffer : Buffer.from(arrayBuffer);
+  let buffer: Buffer = Buffer.isBuffer(arrayBuffer)
+    ? arrayBuffer
+    : Buffer.from(arrayBuffer);
   let finalMimeType = file.type;
   let finalSize = file.size;
   let width: number | undefined;
@@ -146,7 +148,10 @@ async function processImage(
     const sanitizeResult = sanitizeSvgServer(svgContent);
 
     if (!sanitizeResult.isValid) {
-      console.error('SVG sanitization failed:', sanitizeForLog(sanitizeResult.errors));
+      console.error(
+        'SVG sanitization failed:',
+        sanitizeForLog(sanitizeResult.errors)
+      );
       throw new CustomError(uploadMsg.invalidSvg, HTTP_STATUS.BAD_REQUEST);
     }
 
@@ -213,7 +218,9 @@ export async function uploadImagesToR2(params: {
   try {
     // Process all images (optimize, generate blurhash, etc.)
     const processedImages = await Promise.all(
-      imageFiles.map((file, i) => processImage(file, targetSize, preBuffers?.[i]))
+      imageFiles.map((file, i) =>
+        processImage(file, targetSize, preBuffers?.[i])
+      )
     );
 
     // Pre-populate keys so cleanup always has the full list on partial failure

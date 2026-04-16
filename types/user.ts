@@ -1,8 +1,7 @@
 import { RoleScopes } from '@/db/schema';
 
-import { PagePermission } from '@/components/users/permissions-table';
-
 import { EntityID } from '.';
+import { PagePermission } from './permission';
 
 export interface UserRole {
   id: EntityID;

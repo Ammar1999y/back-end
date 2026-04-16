@@ -134,6 +134,7 @@ const BlockCommentContent = ({
     selected ||
     (isCommenting && !!draftCommentNode && commentingCurrent);
 
+  // eslint-disable-next-line react-hooks/preserve-manual-memoization
   const anchorElement = React.useMemo(() => {
     let activeNode: NodeEntry | undefined;
 
@@ -160,7 +161,6 @@ const BlockCommentContent = ({
     if (!activeNode) return null;
 
     return editor.api.toDOMNode(activeNode[0])!;
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [
     open,
     activeSuggestion,

@@ -21,7 +21,7 @@ export type WsTx = Parameters<
 // return db.transaction(fn);
 export async function withTransaction<T>(
   fn: (tx: WsTx) => Promise<T>,
-  config?: PgTransactionConfig,
+  config?: PgTransactionConfig
 ): Promise<T> {
   const { db, pool } = WSDB();
   try {

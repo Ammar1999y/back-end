@@ -11,17 +11,9 @@ expected from a professional conducting a production security and code review.
 
 I want you to review and analyze the provided API endpoint(s) and any related
 database schema. The only API endpoints you need to read are under the folder
-`app/api/dash/` and the file for auth config `lib/auth.ts` and the database
-schema `db/schema.ts` `db/migrations/001_add_trgm_indexes.sql`
-
-Do NOT generate the entire report in a single response. Instead, process and
-generate each H2 section individually (one section at a time). For each section:
-
-1. Generate or modify that section only.
-2. Apply the changes directly to the file.
-3. Confirm completion before moving to the next section. This is required to
-   avoid output overflow and partial generation failures.
-
+@app/api/dash/ and the file for auth config @lib/auth.ts  
+and the database schema @db/schema.ts  
+@db/migrations/001_add_trgm_indexes.sql  
 Please perform a thorough evaluation and provide a structured report that
 includes:
 
@@ -101,7 +93,7 @@ const result = await db
   .where(and(eq(users.id, userId), gte(users.balance, 100)))
   .returning();
 
-if (result.length === 0) throw new Error("Insufficient balance");
+if (result.length === 0) throw new Error('Insufficient balance');
 ```
 
 - **Missing transactions** — Are multiple related DB operations wrapped in a
@@ -269,15 +261,27 @@ The document should:
   user's balance", "two concurrent requests could both pass the balance check")
 - Suggest **how to fix it** with a concrete code example where possible
 - Prioritize issues by severity: 🔴 Critical / 🟠 High / 🟡 Medium / 🟢 Low
+- Tag each issue with a **scale indicator** to show when it becomes relevant:
+  - 🧪 **Early Stage** — Not a real concern yet with few users; a simpler
+    solution exists now, but flag the future risk so it's not forgotten
+  - 📈 **At Scale** — Only becomes a real problem under high traffic or with
+    many users (e.g., N+1 queries, missing indexes, race conditions under load)
+  - ⚠️ **Always** — Critical regardless of traffic or user count (e.g., auth
+    bypasses, SQL injection, data exposure)
 
-Write the report as if advising a competent developer who understands backend
-concepts but is not a security or concurrency specialist.
+  For **Early Stage** issues: briefly mention the simpler approach that works
+  now, then explain what breaks when traffic or users grow. For **At Scale**
+  issues: give a rough sense of when it starts to hurt (e.g., "noticeable above
+  ~10k rows", "problematic with concurrent requests"). Write the report as if
+  advising a competent developer who understands backend concepts but is not a
+  security or concurrency specialist.
 
 ---
 
 Provide your response as a **clear technical report** with explanations and
-concrete recommendations. Update the file `reports/gemini.md` for the report.
+concrete recommendations. Update the file @reports/claude-opus.md for the
+report.
 
 ---
 
-Issues you should ignore: `reports/should-ignore.txt`
+Issues you should ignore: @reports/should-ignore.md

@@ -35,10 +35,15 @@ import {
 import {
   EMAIL_MAX,
   NAME_MAX,
+  OTP_IDENTIFIER_MAX,
+  OTP_MAX_ATTEMPTS,
+  OTP_MAX_VERIFY_ATTEMPTS,
+  PHONE_NUMBER_MAX,
   ROLE_DESCRIPTION_MAX,
   ROLE_NAME_MAX,
   URL_MAX,
 } from '@/utils/validation/constants';
+import { OTP_CHANNELS } from '@/utils/validation/otp';
 
 export type PermissionActions = Record<PermissionAction, boolean>;
 
@@ -111,6 +116,11 @@ export const users = pgTable(
     id: uuid('id').primaryKey().$defaultFn(generateId),
     name: varchar('name', { length: NAME_MAX }).notNull(),
     email: varchar('email', { length: EMAIL_MAX }).notNull(),
+    phoneNumber: varchar('phone_number', { length: PHONE_NUMBER_MAX }),
+    emailVerified: boolean('email_verified').default(false).notNull(),
+    phoneNumberVerified: boolean('phone_number_verified')
+      .default(false)
+      .notNull(),
     isActive: boolean('is_active').default(true).notNull(),
     roleId: uuid('role_id').references(() => roles.id, {
       onDelete: REQUIRE_ROLE_FOR_LOGIN ? 'restrict' : 'set null',
@@ -133,6 +143,9 @@ export const users = pgTable(
     uniqueIndex('ux_users_email')
       .on(t.email)
       .where(sql`deleted_at IS NULL`),
+    uniqueIndex('ux_users_phone_number')
+      .on(t.phoneNumber)
+      .where(sql`deleted_at IS NULL AND phone_number IS NOT NULL`),
     index('idx_users_role_active')
       .on(t.roleId)
       .where(sql`deleted_at IS NULL`),
@@ -147,6 +160,10 @@ export const users = pgTable(
     check(
       'chk_deleted_user_inactive',
       sql`deleted_at IS NULL OR is_active = false`
+    ),
+    check(
+      'chk_phone_number_format',
+      sql`phone_number IS NULL OR phone_number ~ '^966[0-9]{9}$'`
     ),
     ...(REQUIRE_ROLE_FOR_LOGIN
       ? [
@@ -183,8 +200,7 @@ export const sessions = pgTable(
     ...timestamps,
   },
   (t) => [
-    index('idx_sessions_user_id').on(t.userId),
-    index('idx_sessions_expires_at').on(t.expiresAt),
+    index('idx_sessions_user_expires').on(t.userId, t.expiresAt),
     uniqueIndex('ux_sessions_token').on(t.token),
   ]
 );
@@ -207,6 +223,7 @@ export const accounts = pgTable(
   (t) => [
     uniqueIndex('ux_accounts_provider_user').on(t.providerId, t.userId),
     uniqueIndex('ux_accounts_provider_account').on(t.providerId, t.accountId),
+    index('idx_accounts_user_id').on(t.userId),
     check(
       'chk_password_hash_length',
       sql`password IS NULL OR char_length(password) >= 50`
@@ -366,8 +383,115 @@ export const rolePermissions = pgTable(
 );
 
 // ================================
+// Verification Sessions (OTP rate-limiting & attempts tracking)
+// ================================
+export const verificationSessions = pgTable(
+  'verification_sessions',
+  {
+    id: uuid('id').primaryKey().$defaultFn(generateId),
+    userId: uuid('user_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'cascade' }),
+    channel: varchar('channel', { length: 10 }).notNull(),
+    identifier: varchar('identifier', { length: OTP_IDENTIFIER_MAX }).notNull(),
+    attemptNumber: integer('attempt_number').notNull().default(0),
+    verifyAttemptNumber: integer('verify_attempt_number').notNull().default(0),
+    lastSentAt: timestamp('last_sent_at', {
+      withTimezone: true,
+      precision: 2,
+      mode: 'string',
+    }),
+    nextAllowedAt: timestamp('next_allowed_at', {
+      withTimezone: true,
+      precision: 2,
+      mode: 'string',
+    }),
+    isBlocked: boolean('is_blocked').notNull().default(false),
+    blockedUntil: timestamp('blocked_until', {
+      withTimezone: true,
+      precision: 2,
+      mode: 'string',
+    }),
+    ...timestamps,
+  },
+  (t) => [
+    uniqueIndex('ux_verification_sessions_user_channel').on(
+      t.userId,
+      t.channel
+    ),
+    check('chk_attempt_number_non_negative', sql`attempt_number >= 0`),
+    check('chk_attempt_number_max', sql`attempt_number <= ${OTP_MAX_ATTEMPTS}`),
+    check(
+      'chk_verify_attempt_number_non_negative',
+      sql`verify_attempt_number >= 0`
+    ),
+    check(
+      'chk_verify_attempt_number_max',
+      sql`verify_attempt_number <= ${OTP_MAX_VERIFY_ATTEMPTS}`
+    ),
+    check(
+      'chk_blocked_has_until',
+      sql`is_blocked = false OR blocked_until IS NOT NULL`
+    ),
+    check(
+      'chk_unblocked_no_until',
+      sql`is_blocked = true OR blocked_until IS NULL`
+    ),
+    check(
+      'chk_verification_channel',
+      sql.raw(`channel IN (${OTP_CHANNELS.map((c) => `'${c}'`).join(', ')})`)
+    ),
+  ]
+);
+
+// ================================
+// Verification Codes (OTP codes linked to sessions)
+// ================================
+export const verificationCodes = pgTable(
+  'verification_codes',
+  {
+    id: uuid('id').primaryKey().$defaultFn(generateId),
+    sessionId: uuid('session_id')
+      .notNull()
+      .references(() => verificationSessions.id, { onDelete: 'cascade' }),
+    // Stored as argon2 hash, not plaintext
+    code: varchar('code', { length: 255 }).notNull(),
+    expiresAt: timestamp('expires_at', {
+      withTimezone: true,
+      precision: 2,
+      mode: 'string',
+    }).notNull(),
+    createdAt: timestamp('created_at', {
+      withTimezone: true,
+      precision: 2,
+      mode: 'string',
+    })
+      .defaultNow()
+      .notNull(),
+  },
+  (t) => [uniqueIndex('ux_verification_codes_session').on(t.sessionId)]
+);
+
+// ================================
 // Relations
 // ================================
+
+export const verificationSessionsRelations = relations(
+  verificationSessions,
+  ({ many }) => ({
+    codes: many(verificationCodes),
+  })
+);
+
+export const verificationCodesRelations = relations(
+  verificationCodes,
+  ({ one }) => ({
+    session: one(verificationSessions, {
+      fields: [verificationCodes.sessionId],
+      references: [verificationSessions.id],
+    }),
+  })
+);
 
 export const usersRelations = relations(users, ({ one }) => ({
   role: one(roles, {
@@ -423,6 +547,10 @@ export type AuditLog = typeof auditLogs.$inferSelect;
 export type NewAuditLog = typeof auditLogs.$inferInsert;
 export type RolePermission = typeof rolePermissions.$inferSelect;
 export type NewRolePermission = typeof rolePermissions.$inferInsert;
+export type VerificationSession = typeof verificationSessions.$inferSelect;
+export type NewVerificationSession = typeof verificationSessions.$inferInsert;
+export type VerificationCode = typeof verificationCodes.$inferSelect;
+export type NewVerificationCode = typeof verificationCodes.$inferInsert;
 
 // User with role included (for queries with relations)
 export type UserWithRole = User & { role: Role | null };

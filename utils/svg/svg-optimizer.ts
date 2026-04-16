@@ -1,3 +1,5 @@
+import type { SanitizeResult } from './config';
+
 import DOMPurify from 'isomorphic-dompurify';
 
 import { SERVER_MAX_IMAGE_SIZE } from '@/utils/validation/constants';
@@ -9,7 +11,6 @@ import {
   isDangerousValue,
   safeDecodeURI,
   SVG_MAX_ELEMENTS,
-  type SanitizeResult,
 } from './config';
 
 export { SVG_MAX_ELEMENTS, type SanitizeResult } from './config';

@@ -254,7 +254,6 @@ export const ColorPickerContent = memo(
     useEffect(() => {
       updateColorValues(value || defaultColor);
       setHexInputValue((value || defaultColor).toUpperCase());
-      // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [value]);
 
     // Get current hex value for display

@@ -24,7 +24,10 @@ import { updateCategorySchema } from '@/utils/validation/categories';
 import { CategoryForm } from '@/components/categories/form';
 import { CATEGORIES_QUERY_KEYS } from '@/components/categories/query-keys';
 import ErrorMessage from '@/components/error-message';
-import { flattenErrors, showFormErrors } from '@/components/form/form-error-handeling';
+import {
+  flattenErrors,
+  showFormErrors,
+} from '@/components/form/form-error-handeling';
 import { Header } from '@/components/form/header';
 import LoadingPage from '@/components/loading-page';
 

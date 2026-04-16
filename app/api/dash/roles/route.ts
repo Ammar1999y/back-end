@@ -6,7 +6,7 @@ import { roles } from '@/db/schema';
 import { checkUserPermission } from '@/lib/permissions/checker';
 import { ROLE_SCOPE } from '@/lib/permissions/constants';
 
-import { MSG_FETCHED, MSG_FETCH_ERROR } from '@/utils/api-messages';
+import { MSG_FETCH_ERROR, MSG_FETCHED } from '@/utils/api-messages';
 import { apiSuccess, handleApiError } from '@/utils/api-response';
 
 export async function GET() {
@@ -23,7 +23,9 @@ export async function GET() {
         roleName: roles.roleName,
       })
       .from(roles)
-      .where(and(eq(roles.isActive, true), eq(roles.scope, ROLE_SCOPE.STANDARD)))
+      .where(
+        and(eq(roles.isActive, true), eq(roles.scope, ROLE_SCOPE.STANDARD))
+      )
       .orderBy(asc(roles.createdAt), asc(roles.id))
       .limit(1000);
 

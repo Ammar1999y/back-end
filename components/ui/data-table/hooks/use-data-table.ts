@@ -1,5 +1,3 @@
-/* eslint-disable react-hooks/exhaustive-deps */
-// TODO: need updates
 import type { ExtendedColumnSort } from '@/types/data-table';
 import type {
   PaginationState,
@@ -117,6 +115,7 @@ export function useDataTable<TData>(props: UseDataTableProps<TData>) {
     [page, perPage]
   );
 
+  // eslint-disable-next-line react-hooks/incompatible-library
   const table = useReactTable<TData>({
     data,
     ...tableProps,

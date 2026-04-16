@@ -1,4 +1,7 @@
-import type { PermissionAction } from '@/lib/permissions/constants';
+import type {
+  DashboardPage,
+  PermissionAction,
+} from '@/lib/permissions/constants';
 
 import { headers } from 'next/headers';
 import { and, eq, inArray, isNull, sql } from 'drizzle-orm';
@@ -9,10 +12,7 @@ import { withTransaction } from '@/db/ws';
 import { isUniqueViolation, validID } from '@/utils';
 import { auditLog } from '@/lib/audit';
 import { checkUserPermission } from '@/lib/permissions/checker';
-import {
-  CUSTOM_ROLE_VALUE,
-  ROLE_SCOPE,
-} from '@/lib/permissions/constants';
+import { CUSTOM_ROLE_VALUE, ROLE_SCOPE } from '@/lib/permissions/constants';
 import {
   normalizeFullPermissions,
   refreshRoleSessions,
@@ -77,10 +77,7 @@ export async function GET(
 
     const roleData = await db.query.roles.findFirst({
       where: (roles, { eq, and }) =>
-        and(
-          eq(roles.id, roleId),
-          eq(roles.scope, ROLE_SCOPE.STANDARD)
-        ),
+        and(eq(roles.id, roleId), eq(roles.scope, ROLE_SCOPE.STANDARD)),
       with: {
         rolePermissions: {
           columns: {
@@ -149,9 +146,9 @@ export async function PUT(
       );
     const validatedData = validatedDataParsed.data;
 
-    if (validatedData.roleName.startsWith(CUSTOM_ROLE_VALUE))
+    if (validatedData.roleName.startsWith(`${CUSTOM_ROLE_VALUE}-`))
       throw new CustomError(
-        permissionMsg.customPrefixForbidden(CUSTOM_ROLE_VALUE),
+        permissionMsg.customPrefixForbidden(`${CUSTOM_ROLE_VALUE}-`),
         HTTP_STATUS.BAD_REQUEST
       );
 
@@ -274,7 +271,7 @@ export async function PUT(
           roleName: validatedData.roleName,
           description: validatedData.description,
           isActive: validatedData.isActive,
-          permissionsChanged,
+          ...(permissionsChanged && { permissions: validatedData.permissions }),
         },
         request,
       });
@@ -346,16 +343,34 @@ export async function DELETE(
 
     await withTransaction(async (tx) => {
       const [existingRole] = await tx
-        .select({ id: roles.id })
+        .select({
+          id: roles.id,
+          roleName: roles.roleName,
+          description: roles.description,
+        })
         .from(roles)
         .where(standardRoleFilter(roleId))
         .for('update');
       if (!existingRole)
         throw new CustomError(MSG_NOT_FOUND, HTTP_STATUS.NOT_FOUND);
 
+      // Single fetch with FOR SHARE — reused for both scope validation and audit log
+      const existingPermissions = await tx
+        .select({
+          pageName: rolePermissions.pageName,
+          permissions: rolePermissions.permissions,
+        })
+        .from(rolePermissions)
+        .where(eq(rolePermissions.roleId, roleId))
+        .for('share');
+
       // Enforce scope — actor must hold all permissions the role contains
       if (actorPermissions) {
-        await validateRolePermissionScope(actorPermissions, roleId, tx);
+        const targetPerms = existingPermissions.map((p) => ({
+          name: p.pageName as DashboardPage,
+          permissions: (p.permissions || {}) as Record<string, boolean>,
+        }));
+        validatePermissionScope(actorPermissions, targetPerms);
       }
 
       // Atomic delete — eliminates race between EXISTS check and DELETE
@@ -380,6 +395,11 @@ export async function DELETE(
         action: 'DELETE',
         tableName: 'roles',
         recordId: roleId,
+        oldData: {
+          roleName: existingRole.roleName,
+          description: existingRole.description,
+          permissions: existingPermissions,
+        },
         request,
       });
     });

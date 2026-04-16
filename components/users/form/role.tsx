@@ -170,7 +170,6 @@ const Content = memo(({ selectedValue, onSelect, isOpen }: ContentProps) => {
         await refetch();
       }
     })();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isOpen, refetch]);
 
   return (
@@ -214,9 +213,7 @@ interface RoleItemProps {
 const RoleItem = memo(({ role, isSelected, onSelect }: RoleItemProps) => {
   const handleSelect = useCallback(() => {
     onSelect(
-      role.value === CUSTOM_ROLE_VALUE
-        ? CUSTOM_ROLE_VALUE
-        : validID(role.value)
+      role.value === CUSTOM_ROLE_VALUE ? CUSTOM_ROLE_VALUE : validID(role.value)
     );
   }, [role.value, onSelect]);
 

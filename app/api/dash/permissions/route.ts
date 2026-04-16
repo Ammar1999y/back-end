@@ -1,9 +1,9 @@
 import { headers } from 'next/headers';
-import { and, count, eq, isNull, sql } from 'drizzle-orm';
+import { and, count, eq, sql } from 'drizzle-orm';
 
 import { db } from '@/db';
 import { parseDataTableParams } from '@/db/queries/data-table';
-import { rolePermissions, roles, users } from '@/db/schema';
+import { rolePermissions, roles } from '@/db/schema';
 import { withTransaction } from '@/db/ws';
 import { isUniqueViolation } from '@/utils';
 import { auditLog } from '@/lib/audit';
@@ -57,21 +57,7 @@ export async function GET(request: Request) {
         defaultSort: { id: 'createdAt', desc: true },
       });
 
-    const baseFilter = and(
-      eq(roles.scope, ROLE_SCOPE.STANDARD),
-      where
-    );
-
-    // Pre-aggregated user counts — single scan instead of N correlated subqueries
-    const userCounts = db
-      .select({
-        roleId: users.roleId,
-        cnt: count().as('cnt'),
-      })
-      .from(users)
-      .where(isNull(users.deletedAt))
-      .groupBy(users.roleId)
-      .as('uc');
+    const baseFilter = and(eq(roles.scope, ROLE_SCOPE.STANDARD), where);
 
     const [rolesWithCounts, [{ total }]] = await Promise.all([
       db
@@ -82,12 +68,12 @@ export async function GET(request: Request) {
           isActive: roles.isActive,
           createdAt: roles.createdAt,
           updatedAt: roles.updatedAt,
-          usersCount: sql<number>`COALESCE(${userCounts.cnt}, 0)`.mapWith(
-            Number
-          ),
+          usersCount: sql<number>`(
+            SELECT COUNT(*) FROM users
+            WHERE role_id = ${roles.id} AND deleted_at IS NULL
+          )`.mapWith(Number),
         })
         .from(roles)
-        .leftJoin(userCounts, eq(roles.id, userCounts.roleId))
         .where(baseFilter)
         .orderBy(...orderBy)
         .limit(limit)
@@ -130,9 +116,9 @@ export async function POST(request: Request) {
 
     const validatedData = validatedDataParsed.data;
 
-    if (validatedData.roleName.startsWith(CUSTOM_ROLE_VALUE))
+    if (validatedData.roleName.startsWith(`${CUSTOM_ROLE_VALUE}-`))
       throw new CustomError(
-        permissionMsg.customPrefixForbidden(CUSTOM_ROLE_VALUE),
+        permissionMsg.customPrefixForbidden(`${CUSTOM_ROLE_VALUE}-`),
         HTTP_STATUS.BAD_REQUEST
       );
 

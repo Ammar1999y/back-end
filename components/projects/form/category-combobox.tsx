@@ -179,7 +179,6 @@ const Content = memo(({ selectedValue, onSelect, isOpen }: ContentProps) => {
         await refetch();
       }
     })();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isOpen, refetch]);
 
   return (

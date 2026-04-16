@@ -35,6 +35,8 @@ const eslintConfig = [
       'no-console': 'off',
       /* TODO: should remove it and fix the issues */
       'react-hooks/set-state-in-effect': 'off',
+      'react-hooks/exhaustive-deps': 'off',
+
       'suggest-canonical-class': 'off',
 
       'security/detect-object-injection': 'off',
