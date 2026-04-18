@@ -1,0 +1,145 @@
+/**
+ * Elysia adapter — DISABLED.
+ *
+ * Rename this file to `elysia.ts` and activate it when migrating from Next.js
+ * to Elysia. See `doc/framework-migration.md` for the full migration guide.
+ *
+ * This file is kept as `.disabled` so it is ignored by the TypeScript compiler
+ * and the Next.js build while Next is the active framework.
+ *
+ * Required packages when activating:
+ *   bun add elysia @elysiajs/cors
+ *
+ * Required imports in your Elysia entry file (e.g. `server.ts`):
+ *   import { Elysia } from 'elysia';
+ *   import { cors } from '@elysiajs/cors';
+ *   import { auth } from '@/lib/auth';
+ *   import { betterAuthPlugin, toElysiaRoute } from '@/lib/http/adapters/elysia';
+ */
+
+/*
+
+import { Elysia } from 'elysia';
+
+import { auth } from '@/lib/auth';
+import { getClientIp } from '@/lib/audit';
+import { handleApiError } from '@/utils/api-response';
+
+import type { Handler, HandlerInput, HandlerOutput } from '../contract';
+
+// -------------------------------------------------------------------------
+// 1. Route adapter — converts a framework-agnostic Handler into an Elysia
+//    route handler. Handlers remain 100% portable; only this wrapper changes.
+// -------------------------------------------------------------------------
+
+type ElysiaContext = {
+  request: Request;
+  params: Record<string, string>;
+  query: Record<string, string>;
+  body: unknown;
+  headers: Record<string, string | undefined>;
+  set: { status?: number; headers: Record<string, string> };
+};
+
+export function toElysiaRoute(handler: Handler) {
+  return async (ctx: ElysiaContext) => {
+    try {
+      const input = buildContext(ctx);
+      const output = await handler(input);
+      return writeResponse(output, ctx);
+    } catch (error) {
+      return writeResponse(handleApiError(error), ctx);
+    }
+  };
+}
+
+function buildContext(ctx: ElysiaContext): HandlerInput {
+  const headers = new Headers();
+  for (const [key, value] of Object.entries(ctx.headers)) {
+    if (typeof value === 'string') headers.set(key, value);
+  }
+
+  const url = new URL(ctx.request.url);
+  const query = url.searchParams;
+
+  return {
+    body: ctx.body ?? null,
+    query,
+    params: ctx.params ?? {},
+    headers,
+    url: ctx.request.url,
+    method: ctx.request.method,
+    ip: getClientIp(headers) ?? '',
+    userAgent: headers.get('user-agent'),
+    apiPath: url.pathname,
+    rawRequest: ctx.request,
+  };
+}
+
+function writeResponse(output: HandlerOutput, ctx: ElysiaContext) {
+  ctx.set.status = output.status;
+  if (output.headers) {
+    for (const [key, value] of Object.entries(output.headers)) {
+      ctx.set.headers[key] = value;
+    }
+  }
+  return output.body;
+}
+
+// -------------------------------------------------------------------------
+// 2. Better Auth integration — mount the auth handler and expose a `auth: true`
+//    macro that resolves `{ user, session }` into the route context.
+//
+//    Docs: https://better-auth.com/docs/integrations/elysia
+//          https://elysiajs.com/integrations/better-auth.md
+// -------------------------------------------------------------------------
+
+export const betterAuthPlugin = new Elysia({ name: 'better-auth' })
+  .mount(auth.handler)
+  .macro({
+    auth: {
+      async resolve({ status, request: { headers } }) {
+        const session = await auth.api.getSession({ headers });
+        if (!session) return status(401);
+        return {
+          user: session.user,
+          session: session.session,
+        };
+      },
+    },
+  });
+
+// -------------------------------------------------------------------------
+// 3. Example wiring — paste into `server.ts`:
+//
+//    import { Elysia } from 'elysia';
+//    import { cors } from '@elysiajs/cors';
+//    import { betterAuthPlugin, toElysiaRoute } from '@/lib/http/adapters/elysia';
+//    import * as usersHandlers from '@/app/api/dash/users/handler';
+//    import * as usersIdHandlers from '@/app/api/dash/users/[id]/handler';
+//    import * as otpSendHandlers from '@/app/api/auth/otp/send/handler';
+//
+//    new Elysia()
+//      .use(cors({ origin: process.env.PUBLIC_URL, credentials: true }))
+//      .use(betterAuthPlugin)
+//      .get('/api/dash/users', toElysiaRoute(usersHandlers.GET))
+//      .post('/api/dash/users', toElysiaRoute(usersHandlers.POST))
+//      .get('/api/dash/users/:id', toElysiaRoute(usersIdHandlers.GET))
+//      .put('/api/dash/users/:id', toElysiaRoute(usersIdHandlers.PUT))
+//      .delete('/api/dash/users/:id', toElysiaRoute(usersIdHandlers.DELETE))
+//      .post('/api/auth/otp/send', toElysiaRoute(otpSendHandlers.POST))
+//      // ...repeat for every handler.ts under app/api
+//      .listen(3000);
+//
+// -------------------------------------------------------------------------
+// 4. Security headers & CSP — NOT portable from next.config.js.
+//    In Elysia, add an onRequest hook that writes headers to `set.headers`,
+//    or install an equivalent plugin. Mirror the values in next.config.js.
+// -------------------------------------------------------------------------
+// 5. Cookies — our Handler contract does not yet model outgoing cookies.
+//    Better Auth manages its own auth cookies via its handler. If the app
+//    later needs to set cookies from a handler, extend HandlerOutput with a
+//    `cookies` field and update all three adapters to honour it.
+// -------------------------------------------------------------------------
+
+*/

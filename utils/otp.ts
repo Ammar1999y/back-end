@@ -18,6 +18,7 @@ import {
   OTP_MAX_ATTEMPTS,
   OTP_MAX_VERIFY_ATTEMPTS,
 } from '@/utils/validation/constants';
+import { EntityID } from '@/types';
 
 // ── Email Transport (lazy-initialized to avoid crash when env vars are missing) ──
 let _transporter: nodemailer.Transporter | null = null;
@@ -167,7 +168,7 @@ async function sendOtp(
 
 interface ProcessOtpSendOptions {
   /** User ID to bind the verification session to */
-  userId: string;
+  userId: EntityID;
   /** Unique key for the verification session (e.g. email, phone) */
   identifier: string;
   channel: OtpChannel;
@@ -346,7 +347,7 @@ export async function processOtpSend({
 
 interface ProcessOtpVerifyOptions {
   /** User ID that owns the verification session */
-  userId: string;
+  userId: EntityID;
   /** Channel used when sending */
   channel: OtpChannel;
   code: string;

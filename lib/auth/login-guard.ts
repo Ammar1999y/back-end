@@ -7,6 +7,7 @@ import { withTransaction } from '@/db/ws';
 import { verifyPassword } from 'better-auth/crypto';
 
 import { CREDENTIAL_PROVIDER_ID } from '@/utils/api-messages';
+import { EntityID } from '@/types';
 
 const MAX_FAILED_ATTEMPTS = 5;
 const LOCK_DURATION_SECONDS = 5 * 60; // 5 minutes
@@ -16,7 +17,7 @@ export interface VerifyAttemptOptions {
   /** Find user by email (login flow) */
   email?: string;
   /** Find user by ID (authenticated endpoints — skips email lookup) */
-  userId?: string;
+  userId?: EntityID;
   /** Skip the fake-hash timing guard (for authenticated endpoints where user is known) */
   skipTimingGuard?: boolean;
   /** Reuse an existing transaction instead of creating a new one */

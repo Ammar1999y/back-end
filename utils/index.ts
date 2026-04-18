@@ -1,12 +1,7 @@
 /* eslint-disable unicorn/prefer-math-trunc */
 import { MAX_ID } from '@/constants';
 import { EntityID } from '@/types';
-// export const validID = positiveInt;
-// export const extractIdFromUrl = (url: string): number | null => {
-//   const idMatch = url.match(/\/(\d+)$/);
-//   const id = idMatch ? Number(idMatch[1]) : null;
-//   return id;
-// };
+
 
 import { v7 as uuidv7 } from 'uuid';
 
@@ -113,3 +108,10 @@ export const extractIdFromUrl = (url: string): string | null => {
   const match = url.match(/\/([0-9a-f-]{36}|\d+)$/i);
   return match ? match[1] : null;
 };
+
+// export const validID = positiveInt;
+// export const extractIdFromUrl = (url: string): number | null => {
+//   const idMatch = url.match(/\/(\d+)$/);
+//   const id = idMatch ? Number(idMatch[1]) : null;
+//   return id;
+// };

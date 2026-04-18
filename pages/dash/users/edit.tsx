@@ -81,7 +81,7 @@ const EditUser = () => {
     if (userData) {
       reset({
         ...userData,
-        roleId: userData.roleId || '',
+        roleId: userData.roleId || undefined,
       });
       initialDataRef.current = userData;
 

@@ -1,7 +1,10 @@
 {
   "permissions": {
     "allow": [
-      "Bash(ls:*)"
+      "Bash(ls:*)",
+      "WebFetch(domain:elysiajs.com)",
+      "WebFetch(domain:better-auth.com)",
+      "Bash(bun tsc *)"
     ]
   }
 }

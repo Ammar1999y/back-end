@@ -1,0 +1,119 @@
+/**
+ * Hono adapter — DISABLED.
+ *
+ * Rename to `hono.ts` when migrating to Hono. See `doc/framework-migration.md`.
+ *
+ * Required packages when activating:
+ *   bun add hono hono/cors hono/secure-headers
+ *
+ * Note: Better Auth does NOT ship a first-class Hono integration — call
+ * `auth.handler(c.req.raw)` from a catch-all route to serve its endpoints.
+ */
+
+/*
+
+import type { Context } from 'hono';
+
+import { auth } from '@/lib/auth';
+import { getClientIp } from '@/lib/audit';
+import { handleApiError } from '@/utils/api-response';
+
+import type { Handler, HandlerInput, HandlerOutput } from '../contract';
+
+// -------------------------------------------------------------------------
+// 1. Route adapter
+// -------------------------------------------------------------------------
+
+export function toHonoRoute(handler: Handler) {
+  return async (c: Context) => {
+    try {
+      const input = await buildContext(c);
+      const output = await handler(input);
+      return writeResponse(output, c);
+    } catch (error) {
+      return writeResponse(handleApiError(error), c);
+    }
+  };
+}
+
+async function buildContext(c: Context): Promise<HandlerInput> {
+  const request = c.req.raw;
+  const url = new URL(request.url);
+  const body = await safeReadJson(request);
+
+  return {
+    body,
+    query: url.searchParams,
+    params: c.req.param() as Record<string, string>,
+    headers: request.headers,
+    url: request.url,
+    method: request.method,
+    ip: getClientIp(request.headers) ?? '',
+    userAgent: request.headers.get('user-agent'),
+    apiPath: url.pathname,
+    rawRequest: request,
+  };
+}
+
+async function safeReadJson(request: Request): Promise<unknown> {
+  const method = request.method.toUpperCase();
+  if (method === 'GET' || method === 'HEAD') return null;
+  const contentType = request.headers.get('content-type') ?? '';
+  if (!contentType.includes('application/json')) return null;
+  try {
+    const text = await request.text();
+    return text ? JSON.parse(text) : null;
+  } catch {
+    return null;
+  }
+}
+
+function writeResponse(output: HandlerOutput, c: Context) {
+  if (output.headers) {
+    for (const [key, value] of Object.entries(output.headers)) {
+      c.header(key, value);
+    }
+  }
+  return c.json(output.body, output.status as 200);
+}
+
+// -------------------------------------------------------------------------
+// 2. Better Auth mount — catch-all on /api/auth/*:
+//
+//    app.on(['GET', 'POST'], '/api/auth/*', (c) => auth.handler(c.req.raw));
+//
+// -------------------------------------------------------------------------
+// 3. Example wiring — paste into `server.ts`:
+//
+//    import { Hono } from 'hono';
+//    import { cors } from 'hono/cors';
+//    import { secureHeaders } from 'hono/secure-headers';
+//    import { toHonoRoute } from '@/lib/http/adapters/hono';
+//    import { auth } from '@/lib/auth';
+//    import * as usersHandlers from '@/app/api/dash/users/handler';
+//    import * as otpSendHandlers from '@/app/api/auth/otp/send/handler';
+//
+//    const app = new Hono()
+//      .use(cors({ origin: process.env.PUBLIC_URL!, credentials: true }))
+//      .use(secureHeaders());
+//
+//    // Better Auth (Next's built-in next-js handler is replaced by this)
+//    app.on(['GET', 'POST'], '/api/auth/*', (c) => auth.handler(c.req.raw));
+//
+//    app.get('/api/dash/users', toHonoRoute(usersHandlers.GET));
+//    app.post('/api/dash/users', toHonoRoute(usersHandlers.POST));
+//    app.post('/api/auth/otp/send', toHonoRoute(otpSendHandlers.POST));
+//    // ...repeat for every handler.ts under app/api
+//
+//    export default app;
+//
+// -------------------------------------------------------------------------
+// 4. Security headers & CSP — mirror next.config.js values in a Hono
+//    middleware (secureHeaders() covers most, but CSP / HSTS need to be
+//    set explicitly).
+// -------------------------------------------------------------------------
+// 5. Cookies — same note as Elysia: extend HandlerOutput when a handler
+//    needs to set cookies directly.
+// -------------------------------------------------------------------------
+
+*/

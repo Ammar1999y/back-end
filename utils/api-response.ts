@@ -1,5 +1,3 @@
-import { NextResponse } from 'next/server';
-
 import { getConstraintName, isUniqueViolation, sanitizeForLog } from '@/utils';
 
 import {
@@ -11,16 +9,7 @@ import {
 } from '@/utils/api-messages';
 import { CustomError } from '@/utils/error-class';
 
-/** Parses request JSON body, throwing 400 instead of 500 on malformed JSON */
-export async function parseJsonBody(
-  request: Request
-): Promise<Record<string, unknown>> {
-  try {
-    return await request.json();
-  } catch {
-    throw new CustomError(MSG_INVALID_INPUT, HTTP_STATUS.BAD_REQUEST);
-  }
-}
+import type { HandlerOutput } from '@/lib/http/contract';
 
 export interface PaginationMeta {
   page: number;
@@ -34,11 +23,38 @@ interface ApiSuccessOptions<T = unknown> {
   data?: T;
   meta?: PaginationMeta;
   status?: number;
+  headers?: Record<string, string>;
 }
 
 interface ApiErrorOptions {
   message: string;
   status?: number;
+  headers?: Record<string, string>;
+}
+
+/**
+ * Parses a JSON body from a web `Request`, throwing a 400 CustomError on
+ * malformed JSON. Kept for handlers that still accept raw Request, but
+ * the standard flow is for the adapter to pre-parse into `ctx.body`.
+ */
+export async function parseJsonBody(
+  request: Request
+): Promise<Record<string, unknown>> {
+  try {
+    return await request.json();
+  } catch {
+    throw new CustomError(MSG_INVALID_INPUT, HTTP_STATUS.BAD_REQUEST);
+  }
+}
+
+/**
+ * Narrow `ctx.body` to a plain object. Throws 400 if the body is missing
+ * or not a JSON object — matches prior `parseJsonBody` behaviour.
+ */
+export function requireJsonBody(body: unknown): Record<string, unknown> {
+  if (!body || typeof body !== 'object' || Array.isArray(body))
+    throw new CustomError(MSG_INVALID_INPUT, HTTP_STATUS.BAD_REQUEST);
+  return body as Record<string, unknown>;
 }
 
 export function apiSuccess<T = unknown>({
@@ -46,28 +62,41 @@ export function apiSuccess<T = unknown>({
   data = null as T,
   meta,
   status = HTTP_STATUS.OK,
-}: ApiSuccessOptions<T>) {
-  const body: Record<string, unknown> = { success: true, message, data };
-  if (meta) body.meta = meta;
-  return NextResponse.json(body, { status });
+  headers,
+}: ApiSuccessOptions<T>): HandlerOutput<T> {
+  return {
+    status,
+    body: {
+      success: true,
+      message,
+      data,
+      ...(meta && { meta }),
+    },
+    ...(headers && { headers }),
+  };
 }
 
 export function apiError({
   message,
   status = HTTP_STATUS.BAD_REQUEST,
-}: ApiErrorOptions) {
-  return NextResponse.json({ success: false, message, data: null }, { status });
+  headers,
+}: ApiErrorOptions): HandlerOutput<null> {
+  return {
+    status,
+    body: { success: false, message, data: null },
+    ...(headers && { headers }),
+  };
 }
 
 /**
- * Handles the common catch-block pattern across all API endpoints.
- * Checks for unique violations, CustomError, and falls back to 500.
+ * Common catch-block converter. Maps known error types to a HandlerOutput
+ * so the adapter can emit a framework-specific response.
  */
 export function handleApiError(
   error: unknown,
   fallbackMessage?: string,
   uniqueViolationMessage?: string
-): NextResponse {
+): HandlerOutput<null> {
   if (uniqueViolationMessage && isUniqueViolation(error)) {
     return apiError({
       message: uniqueViolationMessage,
@@ -76,7 +105,14 @@ export function handleApiError(
   }
 
   if (error instanceof CustomError) {
-    return apiError({ message: error.message, status: error.status });
+    const extraHeaders = (error as CustomError & {
+      responseHeaders?: Record<string, string>;
+    }).responseHeaders;
+    return apiError({
+      message: error.message,
+      status: error.status,
+      ...(extraHeaders && { headers: extraHeaders }),
+    });
   }
 
   console.error(sanitizeForLog(error));
@@ -86,10 +122,7 @@ export function handleApiError(
   });
 }
 
-/**
- * Resolves unique violation message for user endpoints.
- * Matches against full index names defined in db/schema.ts (e.g. 'ux_users_email').
- */
+/** Resolves unique-violation message for user endpoints. */
 export function resolveUserUniqueViolation(error: unknown): string {
   const constraintName = getConstraintName(error);
   if (constraintName.includes('ux_users_email')) return MSG_EMAIL_EXISTS;
@@ -97,10 +130,7 @@ export function resolveUserUniqueViolation(error: unknown): string {
   return MSG_INTERNAL_ERROR;
 }
 
-/**
- * Resolves unique violation message for permission/role endpoints.
- * Maps constraint names to specific user-facing messages.
- */
+/** Resolves unique-violation message for permission/role endpoints. */
 export function resolvePermissionUniqueViolation(
   error: unknown,
   messages: {

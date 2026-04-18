@@ -4,18 +4,21 @@ import type { WsTx } from '@/db/ws';
 import { auditLogs } from '@/db/schema';
 import { EntityID } from '@/types';
 
+import type { HandlerInput } from '@/lib/http/contract';
+
 // Max valid IP length: IPv6 mapped IPv4 = 45 chars
 const MAX_IP_LENGTH = 45;
 // Block injection: only allow hex digits, dots, colons (valid IP chars)
 const IP_PATTERN = /^[\da-fA-F.:]+$/;
+const USER_AGENT_MAX = 2000;
+const API_PATH_MAX = 255;
 
 /**
- * TODO: Set the right header to get the ip address
  * Extracts the client IP from trusted proxy headers.
  * Priority: cf-connecting-ip (Cloudflare) → x-vercel-forwarded-for (Vercel) → x-forwarded-for (generic)
  * Validates the IP to prevent header injection in audit logs.
  */
-function getClientIp(headers: Headers): string | null {
+export function getClientIp(headers: Headers): string | null {
   const raw =
     headers.get('cf-connecting-ip') ??
     headers.get('x-vercel-forwarded-for')?.split(',')[0]?.trim() ??
@@ -24,6 +27,19 @@ function getClientIp(headers: Headers): string | null {
 
   if (!raw || raw.length > MAX_IP_LENGTH || !IP_PATTERN.test(raw)) return null;
   return raw;
+}
+
+/** Extract request-scoped metadata used by audit logs from a HandlerInput. */
+export function getAuditMeta(ctx: HandlerInput): {
+  ip: string | null;
+  userAgent: string | null;
+  apiPath: string;
+} {
+  return {
+    ip: ctx.ip || null,
+    userAgent: ctx.userAgent?.slice(0, USER_AGENT_MAX) ?? null,
+    apiPath: ctx.apiPath.slice(0, API_PATH_MAX),
+  };
 }
 
 // Fields that must never appear in audit log data
@@ -68,7 +84,8 @@ interface AuditLogParams {
   recordId: EntityID;
   oldData?: Record<string, unknown> | null;
   newData?: Record<string, unknown> | null;
-  request: Request;
+  /** Request metadata (from `getAuditMeta(ctx)`). */
+  meta: { ip: string | null; userAgent: string | null; apiPath: string };
 }
 
 /**
@@ -76,7 +93,7 @@ interface AuditLogParams {
  * Must be called inside the same transaction as the mutation to guarantee atomicity.
  */
 export async function auditLog(tx: WsTx, params: AuditLogParams) {
-  const { userId, userEmail, action, tableName, recordId, request } = params;
+  const { userId, userEmail, action, tableName, recordId, meta } = params;
 
   const oldData = params.oldData ? stripSensitive(params.oldData) : null;
   const newData = params.newData ? stripSensitive(params.newData) : null;
@@ -89,10 +106,6 @@ export async function auditLog(tx: WsTx, params: AuditLogParams) {
         )
       : null;
 
-  const url = new URL(request.url);
-
-  const ipAddress = getClientIp(request.headers);
-
   await tx.insert(auditLogs).values({
     userId,
     userEmail,
@@ -102,8 +115,8 @@ export async function auditLog(tx: WsTx, params: AuditLogParams) {
     oldData,
     newData,
     changedFields,
-    ipAddress,
-    userAgent: request.headers.get('user-agent')?.slice(0, 2000) ?? null,
-    apiPath: url.pathname.slice(0, 255),
+    ipAddress: meta.ip,
+    userAgent: meta.userAgent,
+    apiPath: meta.apiPath,
   });
 }

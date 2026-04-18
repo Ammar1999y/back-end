@@ -104,36 +104,30 @@
 
 42. **Unauthenticated Upload** — `app/api/upload/image/route.ts` — No auth or
     rate limiting on upload endpoint
-43. **In-Memory Rate Limiter** — `lib/auth.ts` — Per-process counters bypassed
-    in multi-instance deployments
-44. **No Rate Limiting on Admin API** — All `app/api/dash/*` routes
-45. **Pool-Per-Transaction** — `db/ws.ts` — Creates and destroys a DB connection
+43. **Pool-Per-Transaction** — `db/ws.ts` — Creates and destroys a DB connection
     pool on every write call
-46. **Swallowed Pool Cleanup Errors** — `db/ws.ts`
-47. **No Request Size Limit** — All POST/PUT handlers
-48. **No Session, Audit Log, Deleted Users, Temp Files Cleanup** — No cron jobs
+44. **Swallowed Pool Cleanup Errors** — `db/ws.ts`
+45. **No Request Size Limit** — All POST/PUT handlers
+46. **No Session, Audit Log, Deleted Users, Temp Files Cleanup** — No cron jobs
     for stale data
-49. **No CSRF Protection** — All POST/PUT/DELETE endpoints
-50. **Email Provider Allowlist Restrictive** — `utils/validation/rules.ts` —
+47. **No CSRF Protection** — All POST/PUT/DELETE endpoints
+48. **Email Provider Allowlist Restrictive** — `utils/validation/rules.ts` —
     Blocks corporate/custom domain emails
-51. **No Optimistic Locking on Updates** — All PUT endpoints — Last write wins
+49. **No Optimistic Locking on Updates** — All PUT endpoints — Last write wins
     with no conflict detection
-52. **Bulk Session Operations Inside Transaction Hold Role Lock** —
+50. **Bulk Session Operations Inside Transaction Hold Role Lock** —
     `app/api/dash/permissions/[id]/route.ts` — Blocks concurrent requests at
     scale
-53. **Login Lock Counters on Users Table** — `db/schema.ts` — `FOR UPDATE`
+51. **Login Lock Counters on Users Table** — `db/schema.ts` — `FOR UPDATE`
     contention; should move to Redis
-54. **Session Revocation Gaps After Deactivation** — `lib/auth.ts`,
+52. **Session Revocation Gaps After Deactivation** — `lib/auth.ts`,
     `lib/permissions/checker.ts` — Cookie cache stale window + concurrent login
     race
-55. **GIN Indexes Built Without `CONCURRENTLY`** —
+53. **GIN Indexes Built Without `CONCURRENTLY`** —
     `db/migrations/001_add_trgm_indexes.sql` — Blocking on live tables
-56. **OTP Send Has Only Identifier-Level Throttling** — `utils/otp.ts:196–266` —
-    No IP/device-level rate limiting; attacker can rotate identifiers to spam
-    OTP sends
-57. **Email Change Without Ownership Verification** —
+54. **Email Change Without Ownership Verification** —
     `app/api/dash/users/me/change-email/route.ts` — New email is not verified
     via OTP before updating; `emailVerified` stays `true` after change
-58. **External OTP Delivery Inside DB Transaction** — `utils/otp.ts:306` —
+55. **External OTP Delivery Inside DB Transaction** — `utils/otp.ts:306` —
     `sendOtp()` runs inside `withTransaction`, holding a DB connection and row
     lock during the full external HTTP call; needs benchmarking before splitting

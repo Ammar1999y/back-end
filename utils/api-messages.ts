@@ -25,6 +25,9 @@ export const MSG_CREATE_ERROR = 'حدث خطأ في الإنشاء';
 export const MSG_UPDATE_ERROR = 'حدث خطأ في التحديث';
 export const MSG_DELETE_ERROR = 'حدث خطأ في الحذف';
 
+export const MSG_TOO_MANY_REQUESTS =
+  'طلبات كثيرة جدًا، حاول مرة أخرى لاحقًا';
+
 export const MSG_PASSWORD_COMPROMISED =
   'هذه الكلمة مستخدمة بكثرة أو مُسرّبة سابقًا، لذلك لا تُعد آمنة. يرجى اختيار كلمة مرور مختلفة.';
 

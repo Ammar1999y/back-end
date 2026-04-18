@@ -20,6 +20,7 @@ import { BASE_ERROR_CODES } from './auth/code-errors';
 import { LoginRejected, verifyLoginAttempt } from './auth/login-guard';
 import { REQUIRE_ROLE_FOR_LOGIN } from './permissions/constants';
 import { sanitizePermissions } from './permissions/utils';
+import { authRateLimitStorage } from './rate-limit/auth-storage';
 
 // ⚠️ WARNING: password.verify below always returns true because the before
 // hook already verifies credentials via verifyLoginAttempt(). If you add a new
@@ -225,11 +226,13 @@ export const auth = betterAuth({
   },
 
   // https://www.better-auth.com/docs/concepts/rate-limit
+  // Storage is Upstash Redis (see lib/rate-limit/) so the counter is shared
+  // across serverless instances on Vercel.
   rateLimit: {
     enabled: true,
     window: 60,
     max: 10,
-    storage: 'memory', // TODO: in multiple server/less function instances Use Redis
+    customStorage: authRateLimitStorage,
     customRules: {
       '/sign-in/email': { window: 60, max: 5 },
       '/sign-up/email': { window: 60, max: 3 },

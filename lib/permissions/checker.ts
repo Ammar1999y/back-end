@@ -15,6 +15,7 @@ import {
 import { CustomError } from '@/utils/error-class';
 
 import { getUserPermissions, sanitizePermissions } from './utils';
+import { EntityID } from '@/types';
 
 export async function checkUserPermission(params: {
   headers: Headers;
@@ -103,7 +104,7 @@ export async function checkUserPermission(params: {
   }
 
   // Cache path (view operations)
-  const roleId = session?.user.roleId ?? null;
+  const roleId = validID(session?.user.roleId) ?? null;
 
   if (!roleId)
     throw new CustomError(MSG_INSUFFICIENT_PERMISSIONS, HTTP_STATUS.FORBIDDEN);
@@ -149,7 +150,7 @@ export async function checkMultiplePermissions(params: {
   const hasWriteAction = checks.some((c) => c.action !== 'view');
   const shouldForceDB = forceDB || hasWriteAction;
 
-  let roleId = session?.user.roleId ?? null;
+  let roleId: EntityID | null = validID(session?.user.roleId) ?? null;
 
   if (shouldForceDB) {
     const [userData] = await db

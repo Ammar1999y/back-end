@@ -38,6 +38,7 @@ import {
 } from '@/components/ui/popover';
 
 import { ROLES_QUERY_KEYS } from '../query-keys';
+import { UserClient } from '@/types/user';
 
 // Memoized icons
 const CheckIcon = memo(_CheckIcon);
@@ -48,7 +49,7 @@ ChevronDownIcon.displayName = 'ChevronDownIcon';
 
 export interface RoleOption {
   id: EntityID;
-  value: string;
+  value: UserClient['roleId'];
   label: string;
 }
 
