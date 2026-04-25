@@ -1,4 +1,4 @@
-import { getConstraintName, isUniqueViolation, sanitizeForLog } from '@/utils';
+import { getConstraintName, sanitizeForLog } from '@/utils';
 
 import {
   HTTP_STATUS,
@@ -9,7 +9,7 @@ import {
 } from '@/utils/api-messages';
 import { CustomError } from '@/utils/error-class';
 
-import type { HandlerOutput } from '@/lib/http/contract';
+import type { HandlerCookie, HandlerOutput } from '@/lib/http/contract';
 
 export interface PaginationMeta {
   page: number;
@@ -24,6 +24,7 @@ interface ApiSuccessOptions<T = unknown> {
   meta?: PaginationMeta;
   status?: number;
   headers?: Record<string, string>;
+  cookies?: HandlerCookie[];
 }
 
 interface ApiErrorOptions {
@@ -32,24 +33,10 @@ interface ApiErrorOptions {
   headers?: Record<string, string>;
 }
 
-/**
- * Parses a JSON body from a web `Request`, throwing a 400 CustomError on
- * malformed JSON. Kept for handlers that still accept raw Request, but
- * the standard flow is for the adapter to pre-parse into `ctx.body`.
- */
-export async function parseJsonBody(
-  request: Request
-): Promise<Record<string, unknown>> {
-  try {
-    return await request.json();
-  } catch {
-    throw new CustomError(MSG_INVALID_INPUT, HTTP_STATUS.BAD_REQUEST);
-  }
-}
 
 /**
  * Narrow `ctx.body` to a plain object. Throws 400 if the body is missing
- * or not a JSON object — matches prior `parseJsonBody` behaviour.
+ * or not a JSON object
  */
 export function requireJsonBody(body: unknown): Record<string, unknown> {
   if (!body || typeof body !== 'object' || Array.isArray(body))
@@ -63,6 +50,7 @@ export function apiSuccess<T = unknown>({
   meta,
   status = HTTP_STATUS.OK,
   headers,
+  cookies,
 }: ApiSuccessOptions<T>): HandlerOutput<T> {
   return {
     status,
@@ -73,6 +61,7 @@ export function apiSuccess<T = unknown>({
       ...(meta && { meta }),
     },
     ...(headers && { headers }),
+    ...(cookies && { cookies }),
   };
 }
 
@@ -89,29 +78,42 @@ export function apiError({
 }
 
 /**
+ * Read `responseHeaders` off an unknown error shape (CustomError or any
+ * object carrying the field) without pulling in the class at the call site.
+ */
+export function getErrorHeaders(
+  error: unknown
+): Record<string, string> | undefined {
+  if (error && typeof error === 'object' && 'responseHeaders' in error) {
+    return (error as { responseHeaders?: Record<string, string> })
+      .responseHeaders;
+  }
+  return undefined;
+}
+
+/**
  * Common catch-block converter. Maps known error types to a HandlerOutput
  * so the adapter can emit a framework-specific response.
+ *
+ * Pass `extraHeaders` when a catch block rewrites an error into a new
+ * `CustomError` and still needs outbound headers (Retry-After, rate-limit,
+ * idempotency, ...) that were attached to the original error.
  */
 export function handleApiError(
   error: unknown,
   fallbackMessage?: string,
-  uniqueViolationMessage?: string
+  extraHeaders?: Record<string, string>
 ): HandlerOutput<null> {
-  if (uniqueViolationMessage && isUniqueViolation(error)) {
-    return apiError({
-      message: uniqueViolationMessage,
-      status: HTTP_STATUS.CONFLICT,
-    });
-  }
-
   if (error instanceof CustomError) {
-    const extraHeaders = (error as CustomError & {
-      responseHeaders?: Record<string, string>;
-    }).responseHeaders;
+    const errorHeaders = error.responseHeaders;
+    const headers =
+      errorHeaders || extraHeaders
+        ? { ...extraHeaders, ...errorHeaders }
+        : undefined;
     return apiError({
       message: error.message,
       status: error.status,
-      ...(extraHeaders && { headers: extraHeaders }),
+      ...(headers && { headers }),
     });
   }
 
@@ -119,6 +121,7 @@ export function handleApiError(
   return apiError({
     message: fallbackMessage ?? MSG_INTERNAL_ERROR,
     status: HTTP_STATUS.INTERNAL_ERROR,
+    ...(extraHeaders && { headers: extraHeaders }),
   });
 }
 
@@ -127,6 +130,7 @@ export function resolveUserUniqueViolation(error: unknown): string {
   const constraintName = getConstraintName(error);
   if (constraintName.includes('ux_users_email')) return MSG_EMAIL_EXISTS;
   if (constraintName.includes('ux_users_phone_number')) return MSG_PHONE_EXISTS;
+  console.error('Unknown unique violation:', sanitizeForLog({ constraintName, error }));
   return MSG_INTERNAL_ERROR;
 }
 

@@ -28,6 +28,9 @@ export const MSG_DELETE_ERROR = 'حدث خطأ في الحذف';
 export const MSG_TOO_MANY_REQUESTS =
   'طلبات كثيرة جدًا، حاول مرة أخرى لاحقًا';
 
+export const MSG_SERVICE_UNAVAILABLE =
+  'الخدمة غير متاحة مؤقتًا، حاول مرة أخرى بعد قليل';
+
 export const MSG_PASSWORD_COMPROMISED =
   'هذه الكلمة مستخدمة بكثرة أو مُسرّبة سابقًا، لذلك لا تُعد آمنة. يرجى اختيار كلمة مرور مختلفة.';
 
@@ -44,4 +47,5 @@ export const HTTP_STATUS = {
   UNPROCESSABLE: 422,
   TOO_MANY_REQUESTS: 429,
   INTERNAL_ERROR: 500,
+  SERVICE_UNAVAILABLE: 503,
 } as const;

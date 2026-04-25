@@ -9,7 +9,6 @@ const SITEVERIFY_URL =
   'https://challenges.cloudflare.com/turnstile/v0/siteverify';
 
 const CAPTCHA_HEADER = 'x-captcha-response';
-const CAPTCHA_REMOTE_IP_HEADER = 'x-captcha-user-remote-ip';
 
 const MAX_TOKEN_LENGTH = 2048;
 
@@ -43,18 +42,20 @@ export async function verifyTurnstileToken(
     const data = (await response.json()) as { success?: boolean };
     return data.success === true;
   } catch (error) {
-    console.error('[captcha] verify failed:', sanitizeForLog(error));
+    console.error(sanitizeForLog(error));
     return false;
   }
 }
 
-/** Reads token from `x-captcha-response` and optional remote IP from `x-captcha-user-remote-ip`. */
+/**
+ * Reads token from `x-captcha-response`. The remote IP is sourced only from
+ * trusted proxy headers via `getClientIp` — we never accept a client-supplied
+ * IP override, which would let an attacker forge the IP sent to Turnstile.
+ */
 export async function verifyTurnstileRequest(
   headers: Headers
 ): Promise<boolean> {
   const token = headers.get(CAPTCHA_HEADER);
   if (!token) return false;
-  const remoteIp =
-    headers.get(CAPTCHA_REMOTE_IP_HEADER) ?? getClientIp(headers);
-  return verifyTurnstileToken(token, remoteIp);
+  return verifyTurnstileToken(token, getClientIp(headers));
 }

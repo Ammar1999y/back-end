@@ -38,6 +38,8 @@ export const DELETE: Handler = async (ctx) => {
   try {
     const {
       session,
+      userId: currentUserId,
+      sessionId: currentSessionId,
       allowed,
       permissions: actorPermissions,
     } = await requirePermission(ctx, {
@@ -48,14 +50,14 @@ export const DELETE: Handler = async (ctx) => {
 
     await enforceRateLimit({
       scope: 'users.id.sessions.delete',
-      identifier: userIdentifier(session!.user.id),
+      identifier: userIdentifier(currentUserId),
       limit: 15,
+      failClosed: true,
     });
 
     const targetId = validID(ctx.params.id);
     if (!targetId) throw new CustomError(idRequired, HTTP_STATUS.UNPROCESSABLE);
 
-    const currentUserId = validID(session?.user.id);
     const isSelf = currentUserId === targetId;
 
     if (!isSelf && !allowed)
@@ -64,7 +66,7 @@ export const DELETE: Handler = async (ctx) => {
         HTTP_STATUS.FORBIDDEN
       );
 
-    if (isSelf && !session?.user.roleId)
+    if (isSelf && !session.user.roleId)
       throw new CustomError(
         MSG_INSUFFICIENT_PERMISSIONS,
         HTTP_STATUS.FORBIDDEN
@@ -78,7 +80,6 @@ export const DELETE: Handler = async (ctx) => {
         HTTP_STATUS.UNPROCESSABLE
       );
 
-    const currentSessionId = validID(session?.session.id);
     const idsToDelete = parsed.data.sessionIds.filter(
       (id) => id !== currentSessionId
     );
@@ -120,7 +121,7 @@ export const DELETE: Handler = async (ctx) => {
       if (deleted.length > 0) {
         await auditLog(tx, {
           userId: currentUserId,
-          userEmail: session!.user.email,
+          userEmail: session.user.email,
           action: 'DELETE',
           tableName: 'sessions',
           recordId: targetId,

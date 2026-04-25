@@ -97,7 +97,9 @@ export async function checkUserPermission(params: {
     return {
       allowed,
       source: 'database' as const,
-      session,
+      session: session!,
+      userId,
+      sessionId: validID(session!.session.id),
       roleId,
       permissions,
     };
@@ -122,7 +124,9 @@ export async function checkUserPermission(params: {
   return {
     allowed,
     source: 'cache' as const,
-    session,
+    session: session!,
+    userId,
+    sessionId: validID(session!.session.id)!,
     roleId,
     permissions,
   };
@@ -138,7 +142,9 @@ export async function checkMultiplePermissions(params: {
   forceDB?: boolean;
 }): Promise<{
   permissions: Record<string, boolean>;
-  session: Awaited<ReturnType<typeof auth.api.getSession>>;
+  session: NonNullable<Awaited<ReturnType<typeof auth.api.getSession>>>;
+  userId: EntityID;
+  sessionId: EntityID;
 }> {
   const { headers, checks, forceDB = false } = params;
 
@@ -205,5 +211,10 @@ export async function checkMultiplePermissions(params: {
     {} as Record<string, boolean>
   );
 
-  return { permissions, session };
+  return {
+    permissions,
+    session: session!,
+    userId,
+    sessionId: validID(session!.session.id),
+  };
 }

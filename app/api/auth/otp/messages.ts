@@ -1,6 +1,9 @@
-// All non-success responses must take at least this long to prevent
-// timing-based user enumeration.
-export const MINIMUM_RESPONSE_MS = 350;
+// All OTP responses must take at least this long to prevent timing-based
+// user enumeration. The floor needs to sit above the p99.9 of the real
+// path (DB lookup + argon2 + SMS/email delivery). Tune after measuring
+// real p99 delivery in production.
+// TODO: Measure the real `processOtpSend` latency distribution and tune this value if needed.
+export const MINIMUM_RESPONSE_MS = 1500;
 
 export async function ensureMinDelay(elapsed: number): Promise<void> {
   if (elapsed < MINIMUM_RESPONSE_MS)
@@ -20,4 +23,5 @@ export const otpMsg = {
   verifyError: 'حدث خطأ أثناء التحقق من الرمز',
   invalidOrExpired: 'رمز التحقق غير صحيح أو منتهي الصلاحية',
   captchaFailed: 'حدث خطاء اثناء التحقق من انك انسان، اعد المحاولة',
+  invalidInput: 'صيغة المدخلات غير صحيحة',
 } as const;

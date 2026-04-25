@@ -6,7 +6,7 @@ import { emailSchema, phoneSchema, sanitizeStrictSingleLine } from './rules';
 // ── Channel Configuration ──
 // All supported channels — any change here requires a DB migration
 // (update the CHECK constraint chk_verification_channel on verification_sessions)
-export const OTP_CHANNELS = ['email', 'sms', 'phone'] as const;
+export const OTP_CHANNELS = ['email', 'sms', 'whatsapp'] as const;
 export type OtpChannel = (typeof OTP_CHANNELS)[number];
 
 // Currently enabled channels — change this to enable SMS/WhatsApp later.
@@ -41,7 +41,7 @@ const codeSchema = z.preprocess(
 
 // ── Send OTP Schemas ──
 const sendOtpPhoneSchema = z.object({
-  channel: z.literal('phone'),
+  channel: z.literal('whatsapp'),
   phoneNumber: phoneSchema,
 });
 
@@ -77,7 +77,7 @@ export type SendOtpInput = z.infer<typeof sendOtpSchema>;
 
 // ── Verify OTP Schemas ──
 const verifyOtpPhoneSchema = z.object({
-  channel: z.literal('phone'),
+  channel: z.literal('whatsapp'),
   phoneNumber: phoneSchema,
   code: codeSchema,
 });

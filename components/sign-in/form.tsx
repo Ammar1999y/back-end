@@ -1,13 +1,12 @@
 import type { LoginFormData } from '@/utils/validation/auth';
 import type { FieldErrors } from 'react-hook-form';
 
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 
 import { zodResolver } from '@hookform/resolvers/zod';
 import { FormProvider, useForm } from 'react-hook-form';
 import { toast } from 'sonner';
 import { authClient } from '@/lib/auth/client';
-import { fastestFetchWithin } from '@/lib/race-fetch';
 import { cn } from '@/lib/utils';
 
 import { CustomError } from '@/utils/error-class';
@@ -25,6 +24,7 @@ import {
 import PasswordInput from '@/components/sign-in/password-input';
 
 import TurnstileWidget from './turnstile';
+import { otpMsg } from '@/app/api/auth/otp/messages';
 
 interface FormProps {
   onSuccess: () => void;
@@ -33,7 +33,6 @@ interface FormProps {
 const Form = ({ onSuccess }: FormProps) => {
   const [loading, setLoading] = useState(false);
   const [resetTurnstile, setResetTurnstile] = useState(false);
-  const userIp = useRef<string | null>(null);
   const methods = useForm<LoginFormData>({
     resolver: zodResolver(loginSchema),
     disabled: loading,
@@ -49,23 +48,13 @@ const Form = ({ onSuccess }: FormProps) => {
     async (data: LoginFormData) => {
       setLoading(true);
       useErrors.getState().setErrors({});
-      if (!userIp.current) {
-        const res = await fastestFetchWithin(
-          ['https://api.ipify.org?format=json', 'https://ipinfo.io/json'],
-          3000
-        );
-        userIp.current = res ? (await res.json())?.ip : null;
-      }
       try {
         const { data: resData, error } = await authClient.signIn.email({
           email: data.email,
           password: data.password,
           fetchOptions: {
             headers: {
-              'x-captcha-response': data.captcha + 'hgvcxcv',
-              ...(userIp.current && {
-                'x-captcha-user-remote-ip': userIp.current,
-              }),
+              'x-captcha-response': data.captcha,
             },
           },
         });
@@ -80,7 +69,7 @@ const Form = ({ onSuccess }: FormProps) => {
           error instanceof CustomError
             ? error.message
             : error?.message?.toLowerCase?.()?.includes('captcha')
-              ? 'حدث خطاء اثناء التحقق من انك انسان، اعد المحاولة'
+              ? otpMsg.captchaFailed
               : 'حدث خطاء، اعد المحاوله',
           {
             duration: 8000,

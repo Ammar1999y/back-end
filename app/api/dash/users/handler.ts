@@ -1,3 +1,5 @@
+import type { Handler } from '@/lib/http/contract';
+
 import { and, count, eq, isNull } from 'drizzle-orm';
 
 import { db } from '@/db';
@@ -12,8 +14,8 @@ import {
 } from '@/utils';
 import { auditLog, getAuditMeta } from '@/lib/audit';
 import { hashPassword } from '@/lib/auth';
+import { checkPasswordCompromise } from '@/lib/auth/check-password';
 import { requirePermission } from '@/lib/http/session';
-import { enforceRateLimit, userIdentifier } from '@/lib/rate-limit';
 import { CUSTOM_ROLE_VALUE } from '@/lib/permissions/constants';
 import {
   createCustomRole,
@@ -22,8 +24,7 @@ import {
   validatePermissionScope,
   validateRolePermissionScope,
 } from '@/lib/permissions/utils';
-
-import type { Handler } from '@/lib/http/contract';
+import { enforceRateLimit, userIdentifier } from '@/lib/rate-limit';
 
 import {
   CREDENTIAL_PROVIDER_ID,
@@ -36,6 +37,7 @@ import {
 } from '@/utils/api-messages';
 import {
   apiSuccess,
+  getErrorHeaders,
   handleApiError,
   requireJsonBody,
   resolveUserUniqueViolation,
@@ -55,14 +57,14 @@ const USERS_ALLOWED_COLUMNS = new Set([
 
 export const GET: Handler = async (ctx) => {
   try {
-    const { session } = await requirePermission(ctx, {
+    const { userId } = await requirePermission(ctx, {
       resource: 'users',
       action: 'view',
     });
 
     await enforceRateLimit({
       scope: 'users.get',
-      identifier: userIdentifier(session!.user.id),
+      identifier: userIdentifier(userId),
       limit: 60,
     });
 
@@ -131,15 +133,17 @@ export const GET: Handler = async (ctx) => {
 
 export const POST: Handler = async (ctx) => {
   try {
-    const { session, permissions: actorPermissions } = await requirePermission(
-      ctx,
-      { resource: 'users', action: 'create' }
-    );
+    const {
+      session,
+      userId: actorUserId,
+      permissions: actorPermissions,
+    } = await requirePermission(ctx, { resource: 'users', action: 'create' });
 
     await enforceRateLimit({
       scope: 'users.post',
-      identifier: userIdentifier(session!.user.id),
+      identifier: userIdentifier(actorUserId),
       limit: 20,
+      failClosed: true,
     });
 
     const body = requireJsonBody(ctx.body);
@@ -163,21 +167,21 @@ export const POST: Handler = async (ctx) => {
     if (actorPermissions && isCustomRole && validatedData.permissions?.length)
       validatePermissionScope(actorPermissions, validatedData.permissions);
 
+    // Run HIBP check before argon2 so we don't pay hashing cost on rejected passwords.
+    await checkPasswordCompromise(validatedData.password);
+
     const hashedPassword = await hashPassword(validatedData.password);
     const auditMeta = getAuditMeta(ctx);
 
     const newId = await withTransaction(async (tx) => {
-      if (!isCustomRole) {
+      if (!isCustomRole)
         await validateAssignableRole(validID(validatedData.roleId), tx);
-      }
-
-      if (actorPermissions && !isCustomRole) {
+      if (actorPermissions && !isCustomRole)
         await validateRolePermissionScope(
           actorPermissions,
           validID(validatedData.roleId),
           tx
         );
-      }
 
       const assignedRoleId =
         isCustomRole && validatedData.permissions?.length
@@ -204,8 +208,8 @@ export const POST: Handler = async (ctx) => {
       });
 
       await auditLog(tx, {
-        userId: validID(session!.user.id),
-        userEmail: session!.user.email,
+        userId: actorUserId,
+        userEmail: session.user.email,
         action: 'INSERT',
         tableName: 'users',
         recordId: userId,
@@ -229,14 +233,21 @@ export const POST: Handler = async (ctx) => {
   } catch (error) {
     if (isUniqueViolation(error)) {
       return handleApiError(
-        new CustomError(resolveUserUniqueViolation(error), HTTP_STATUS.CONFLICT)
+        new CustomError(
+          resolveUserUniqueViolation(error),
+          HTTP_STATUS.CONFLICT
+        ),
+        undefined,
+        getErrorHeaders(error)
       );
     }
     if (isForeignKeyViolation(error)) {
       const constraint = getConstraintName(error);
       if (constraint.includes('role_id')) {
         return handleApiError(
-          new CustomError(userMsg.roleNotFound, HTTP_STATUS.BAD_REQUEST)
+          new CustomError(userMsg.roleNotFound, HTTP_STATUS.BAD_REQUEST),
+          undefined,
+          getErrorHeaders(error)
         );
       }
     }

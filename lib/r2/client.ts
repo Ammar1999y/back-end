@@ -197,7 +197,7 @@ export async function getPresignedUrl(params: {
   );
 
   if (validExpiry !== expiresIn) {
-    console.warn(
+    console.error(
       `[R2] Expiry time ${expiresIn}s is out of range. Using ${validExpiry}s instead. ` +
         `Valid range: ${MIN_PRESIGNED_URL_EXPIRY}-${MAX_PRESIGNED_URL_EXPIRY} seconds`
     );

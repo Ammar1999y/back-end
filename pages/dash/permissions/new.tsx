@@ -98,14 +98,13 @@ const NewPermission = () => {
               if (existingRoles) {
                 const newRole: RoleOption = {
                   id: newPermission.id,
-                  value: newPermission.id,
-                  label: newPermission.roleName,
+                  roleName: newPermission.roleName,
                 };
 
                 queryClient.setQueryData(ROLES_QUERY_KEYS.list, [
                   newRole,
-                  ...existingRoles.filter((r) => r.value !== CUSTOM_ROLE_VALUE),
-                  { value: CUSTOM_ROLE_VALUE, label: 'مخصص' },
+                  ...existingRoles.filter((r) => r.id !== CUSTOM_ROLE_VALUE),
+                  { id: CUSTOM_ROLE_VALUE, roleName: 'مخصص' },
                 ]);
               }
             }

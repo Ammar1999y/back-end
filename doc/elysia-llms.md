@@ -1,4 +1,4 @@
-# Elysia - Ergonomic Framework for Humans
+# Elysia
 
 ## Table of Contents
 
@@ -7,14 +7,15 @@
 - [Key Concept - ElysiaJS](https://elysiajs.com/key-concept.md)
 - [Quick Start - ElysiaJS](https://elysiajs.com/quick-start.md)
 - [Cheat Sheet - ElysiaJS](https://elysiajs.com/integrations/cheat-sheet.md)
+- [Key Concept - ElysiaJS](https://elysiajs.com/key-concept.md)
 
 ### Essential
 
 - [Route - ElysiaJS](https://elysiajs.com/essential/route.md)
 - [Handler - ElysiaJS](https://elysiajs.com/essential/handler.md)
-- [Validation - ElysiaJS](https://elysiajs.com/essential/validation.md)
 - [Plugin - ElysiaJS](https://elysiajs.com/essential/plugin.md)
 - [Lifecycle - ElysiaJS](https://elysiajs.com/essential/life-cycle.md)
+- [Validation - ElysiaJS](https://elysiajs.com/essential/validation.md)
 - [Best Practice - ElysiaJS](https://elysiajs.com/essential/best-practice.md)
 
 ### Patterns

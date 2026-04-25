@@ -1,15 +1,16 @@
 const { PUBLIC_URL } = require('./lib/env');
 
+// TODO: clear the unuse
 const isDev = process.env.NODE_ENV !== 'production';
 const CSP = `
   base-uri 'self';
   default-src 'self';
-  script-src 'self' 'sha256-nne+twLvxGzokkKtrC/+Z9Mdq4l8OjukUCknsajUZSs='${isDev ? " 'unsafe-eval' 'unsafe-inline'" : ''};
+  script-src 'self' 'sha256-nne+twLvxGzokkKtrC/+Z9Mdq4l8OjukUCknsajUZSs=' https://challenges.cloudflare.com/turnstile/${isDev ? " 'unsafe-eval' 'unsafe-inline'" : ''};
   style-src 'self' 'unsafe-inline';
   font-src 'self';
   connect-src 'self';
-  frame-src 'self';
-  img-src 'self' https://thispersondoesnotexist.com/ data: blob:;
+  frame-src 'self' https://challenges.cloudflare.com/;
+  img-src 'self' data: blob:;
   media-src 'self';
   object-src 'none';
   form-action 'none';
@@ -63,6 +64,12 @@ const headers = isDev
             key: 'Access-Control-Allow-Origin',
             value: PUBLIC_URL /* الغيه واستخدمة فقط مع APIs و الخطوط والصور */,
           },
+          // إذا صارت الواجهة على origin مختلف (أو تحولنا لإطار آخر يتحكم بـ CORS يدوياً)،
+          // يجب السماح للمتصفح بقراءة رؤوس rate limit لتظهر في الـ UI.
+          // {
+          //   key: 'Access-Control-Expose-Headers',
+          //   value: 'Retry-After, X-RateLimit-Limit, X-RateLimit-Remaining',
+          // },
           {
             key: 'X-XSS-Protection',
             value: '0', // لتعطيل الفلتر القديم الذي به مشاكل

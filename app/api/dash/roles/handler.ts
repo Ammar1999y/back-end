@@ -13,14 +13,14 @@ import { apiSuccess, handleApiError } from '@/utils/api-response';
 
 export const GET: Handler = async (ctx) => {
   try {
-    const { session } = await requirePermission(ctx, {
+    const { userId } = await requirePermission(ctx, {
       resource: 'permissions',
       action: 'view',
     });
 
     await enforceRateLimit({
       scope: 'roles.get',
-      identifier: userIdentifier(session!.user.id),
+      identifier: userIdentifier(userId),
       limit: 30,
     });
 
@@ -36,13 +36,7 @@ export const GET: Handler = async (ctx) => {
       .orderBy(asc(roles.createdAt), asc(roles.id))
       .limit(1000);
 
-    const allRoles = activeRoles.map((role) => ({
-      id: role.id,
-      value: role.roleName,
-      label: role.roleName,
-    }));
-
-    return apiSuccess({ message: MSG_FETCHED, data: allRoles });
+    return apiSuccess({ message: MSG_FETCHED, data: activeRoles });
   } catch (error) {
     return handleApiError(error, MSG_FETCH_ERROR);
   }

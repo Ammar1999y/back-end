@@ -3,7 +3,7 @@ import type {
   PermissionAction,
 } from '@/lib/permissions/constants';
 
-import { and, eq, inArray, isNull, sql } from 'drizzle-orm';
+import { and, eq, inArray, isNotNull, isNull, sql } from 'drizzle-orm';
 
 import { db } from '@/db';
 import { rolePermissions, roles, sessions, users } from '@/db/schema';
@@ -12,9 +12,13 @@ import { isUniqueViolation, validID } from '@/utils';
 import { auditLog, getAuditMeta } from '@/lib/audit';
 import { requirePermission } from '@/lib/http/session';
 import { enforceRateLimit, userIdentifier } from '@/lib/rate-limit';
-import { CUSTOM_ROLE_VALUE, ROLE_SCOPE } from '@/lib/permissions/constants';
 import {
-  normalizeFullPermissions,
+  CUSTOM_ROLE_VALUE,
+  REQUIRE_ROLE_FOR_LOGIN,
+  ROLE_SCOPE,
+} from '@/lib/permissions/constants';
+import {
+  permissionsEqual,
   refreshRoleSessions,
   sanitizePermissions,
   standardRoleFilter,
@@ -37,6 +41,7 @@ import {
 } from '@/utils/api-messages';
 import {
   apiSuccess,
+  getErrorHeaders,
   handleApiError,
   requireJsonBody,
   resolvePermissionUniqueViolation,
@@ -47,31 +52,16 @@ import { idRequired } from '@/utils/validation/rules';
 
 import { permissionMsg } from '../messages';
 
-function comparablePermissionsJSON(
-  rows: Array<{ pageName: string; permissions: Record<string, boolean> }>
-) {
-  const normalized = normalizeFullPermissions(rows);
-
-  return JSON.stringify(
-    Object.entries(normalized)
-      .sort(([a], [b]) => a.localeCompare(b))
-      .map(([pageName, permissions]) => [
-        pageName,
-        Object.entries(permissions).sort(([a], [b]) => a.localeCompare(b)),
-      ])
-  );
-}
-
 export const GET: Handler = async (ctx) => {
   try {
-    const { session } = await requirePermission(ctx, {
+    const { userId } = await requirePermission(ctx, {
       resource: 'permissions',
       action: 'view',
     });
 
     await enforceRateLimit({
       scope: 'permissions.id.get',
-      identifier: userIdentifier(session!.user.id),
+      identifier: userIdentifier(userId),
       limit: 60,
     });
 
@@ -115,6 +105,7 @@ export const PUT: Handler = async (ctx) => {
   try {
     const {
       session,
+      userId: actorUserId,
       permissions: actorPermissions,
       roleId: actorRoleId,
     } = await requirePermission(ctx, {
@@ -124,8 +115,9 @@ export const PUT: Handler = async (ctx) => {
 
     await enforceRateLimit({
       scope: 'permissions.id.put',
-      identifier: userIdentifier(session!.user.id),
+      identifier: userIdentifier(actorUserId),
       limit: 20,
+      failClosed: true,
     });
 
     const body = requireJsonBody(ctx.body);
@@ -226,19 +218,16 @@ export const PUT: Handler = async (ctx) => {
           .from(rolePermissions)
           .where(eq(rolePermissions.roleId, roleId));
 
-        permissionsChanged =
-          comparablePermissionsJSON(
-            existingPermissions.map((p) => ({
-              pageName: p.pageName,
-              permissions: p.permissions as Record<string, boolean>,
-            }))
-          ) !==
-          comparablePermissionsJSON(
-            permissionsData.map((p) => ({
-              pageName: p.pageName,
-              permissions: p.permissions,
-            }))
-          );
+        permissionsChanged = !permissionsEqual(
+          existingPermissions.map((p) => ({
+            pageName: p.pageName,
+            permissions: p.permissions as Record<string, boolean>,
+          })),
+          permissionsData.map((p) => ({
+            pageName: p.pageName,
+            permissions: p.permissions,
+          }))
+        );
 
         if (permissionsChanged) {
           oldPermissionsForAudit = existingPermissions.map((p) => ({
@@ -255,8 +244,8 @@ export const PUT: Handler = async (ctx) => {
       }
 
       await auditLog(tx, {
-        userId: validID(session!.user.id),
-        userEmail: session!.user.email,
+        userId: actorUserId,
+        userEmail: session.user.email,
         action: 'UPDATE',
         tableName: 'roles',
         recordId: roleId,
@@ -318,7 +307,9 @@ export const PUT: Handler = async (ctx) => {
             fallback: MSG_UPDATE_ERROR,
           }),
           HTTP_STATUS.CONFLICT
-        )
+        ),
+        undefined,
+        getErrorHeaders(error)
       );
     }
     return handleApiError(error, MSG_UPDATE_ERROR);
@@ -327,15 +318,20 @@ export const PUT: Handler = async (ctx) => {
 
 export const DELETE: Handler = async (ctx) => {
   try {
-    const { session, permissions: actorPermissions } = await requirePermission(
-      ctx,
-      { resource: 'permissions', action: 'delete' }
-    );
+    const {
+      session,
+      userId: actorUserId,
+      permissions: actorPermissions,
+    } = await requirePermission(ctx, {
+      resource: 'permissions',
+      action: 'delete',
+    });
 
     await enforceRateLimit({
       scope: 'permissions.id.delete',
-      identifier: userIdentifier(session!.user.id),
+      identifier: userIdentifier(actorUserId),
       limit: 10,
+      failClosed: true,
     });
 
     const roleId = validID(ctx.params.id);
@@ -373,6 +369,17 @@ export const DELETE: Handler = async (ctx) => {
         validatePermissionScope(actorPermissions, targetPerms);
       }
 
+      // When REQUIRE_ROLE_FOR_LOGIN is on, the FK is RESTRICT — soft-deleted
+      // users still pinning role_id would block the role DELETE with an FK
+      // violation. Null them out first so the DELETE proceeds. With the flag
+      // off the FK is `set null` and Postgres handles this on its own.
+      if (REQUIRE_ROLE_FOR_LOGIN) {
+        await tx
+          .update(users)
+          .set({ roleId: null })
+          .where(and(eq(users.roleId, roleId), isNotNull(users.deletedAt)));
+      }
+
       // SYNC: scope condition mirrors standardRoleFilter() in lib/permissions/utils.ts
       const deleted = await tx.execute(sql`
         DELETE FROM roles r
@@ -389,8 +396,8 @@ export const DELETE: Handler = async (ctx) => {
         throw new CustomError(permissionMsg.hasUsers, HTTP_STATUS.BAD_REQUEST);
 
       await auditLog(tx, {
-        userId: validID(session!.user.id),
-        userEmail: session!.user.email,
+        userId: actorUserId,
+        userEmail: session.user.email,
         action: 'DELETE',
         tableName: 'roles',
         recordId: roleId,

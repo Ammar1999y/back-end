@@ -22,6 +22,7 @@ import {
 } from 'drizzle-orm/pg-core';
 
 import { v7 as generateId } from 'uuid';
+import { USER_AGENT_MAX } from '@/lib/audit';
 import {
   CUSTOM_ROLE_VALUE,
   DASHBOARD_PAGES,
@@ -37,6 +38,7 @@ import {
   NAME_MAX,
   OTP_IDENTIFIER_MAX,
   OTP_MAX_ATTEMPTS,
+  OTP_MAX_DAILY_VERIFY_ATTEMPTS,
   OTP_MAX_VERIFY_ATTEMPTS,
   PHONE_NUMBER_MAX,
   ROLE_DESCRIPTION_MAX,
@@ -94,6 +96,7 @@ export const auditLogActionEnum = ['INSERT', 'UPDATE', 'DELETE'] as const;
 export const auditLogAction = pgEnum('audit_log_action', auditLogActionEnum);
 export const pageName = pgEnum('page_name', pageNameValues);
 export const roleScope = pgEnum('role_scope', roleScopeValues);
+export const otpChannel = pgEnum('otp_channel', OTP_CHANNELS);
 export const fileContextTablesEnum = [''] as const;
 
 export const fileContextTable = pgEnum(
@@ -124,6 +127,9 @@ export const users = pgTable(
     isActive: boolean('is_active').default(true).notNull(),
     roleId: uuid('role_id').references(() => roles.id, {
       onDelete: REQUIRE_ROLE_FOR_LOGIN ? 'restrict' : 'set null',
+    }),
+    createdBy: uuid('created_by').references(() => users.id, {
+      onDelete: 'set null',
     }),
     // TODO: Remove failedLoginAttempts & lockedUntil, and convert it to Redis or any KV store
     failedLoginAttempts: integer('failed_login_attempts').notNull().default(0),
@@ -163,7 +169,7 @@ export const users = pgTable(
     ),
     check(
       'chk_phone_number_format',
-      sql`phone_number IS NULL OR phone_number ~ '^966[0-9]{9}$'`
+      sql`phone_number IS NULL OR phone_number ~ '^9665[0-9]{8}$'`
     ),
     ...(REQUIRE_ROLE_FOR_LOGIN
       ? [
@@ -191,7 +197,7 @@ export const sessions = pgTable(
     }).notNull(),
     token: varchar('token', { length: 500 }).notNull(),
     ipAddress: varchar('ip_address', { length: 45 }),
-    userAgent: varchar('user_agent', { length: 2000 }),
+    userAgent: varchar('user_agent', { length: USER_AGENT_MAX }),
     userId: uuid('user_id')
       .notNull()
       .references(() => users.id, { onDelete: 'cascade' }),
@@ -315,7 +321,7 @@ export const auditLogs = pgTable(
     newData: jsonb('new_data'),
     changedFields: jsonb('changed_fields'),
     ipAddress: varchar('ip_address', { length: 45 }),
-    userAgent: varchar('user_agent', { length: 2000 }),
+    userAgent: varchar('user_agent', { length: USER_AGENT_MAX }),
     apiPath: varchar('api_path', { length: 255 }),
     createdAt: timestamp('created_at', {
       withTimezone: true,
@@ -392,10 +398,20 @@ export const verificationSessions = pgTable(
     userId: uuid('user_id')
       .notNull()
       .references(() => users.id, { onDelete: 'cascade' }),
-    channel: varchar('channel', { length: 10 }).notNull(),
+    channel: otpChannel('channel').notNull(),
     identifier: varchar('identifier', { length: OTP_IDENTIFIER_MAX }).notNull(),
     attemptNumber: integer('attempt_number').notNull().default(0),
     verifyAttemptNumber: integer('verify_attempt_number').notNull().default(0),
+    // Rolling 24h counter of failed verifies. Unlike verifyAttemptNumber,
+    // this is NOT reset on resend — it closes the send-cycle-reset bypass.
+    verifyAttemptDaily: integer('verify_attempt_daily').notNull().default(0),
+    verifyAttemptWindowStart: timestamp('verify_attempt_window_start', {
+      withTimezone: true,
+      precision: 2,
+      mode: 'string',
+    })
+      .notNull()
+      .defaultNow(),
     lastSentAt: timestamp('last_sent_at', {
       withTimezone: true,
       precision: 2,
@@ -420,14 +436,25 @@ export const verificationSessions = pgTable(
       t.channel
     ),
     check('chk_attempt_number_non_negative', sql`attempt_number >= 0`),
-    check('chk_attempt_number_max', sql`attempt_number <= ${OTP_MAX_ATTEMPTS}`),
+    check(
+      'chk_attempt_number_max',
+      sql.raw(`attempt_number <= ${OTP_MAX_ATTEMPTS}`)
+    ),
+    check(
+      'chk_verify_attempt_number_max',
+      sql.raw(`verify_attempt_number <= ${OTP_MAX_VERIFY_ATTEMPTS}`)
+    ),
+    check(
+      'chk_verify_attempt_daily_max',
+      sql.raw(`verify_attempt_daily <= ${OTP_MAX_DAILY_VERIFY_ATTEMPTS}`)
+    ),
     check(
       'chk_verify_attempt_number_non_negative',
       sql`verify_attempt_number >= 0`
     ),
     check(
-      'chk_verify_attempt_number_max',
-      sql`verify_attempt_number <= ${OTP_MAX_VERIFY_ATTEMPTS}`
+      'chk_verify_attempt_daily_non_negative',
+      sql`verify_attempt_daily >= 0`
     ),
     check(
       'chk_blocked_has_until',
@@ -436,10 +463,6 @@ export const verificationSessions = pgTable(
     check(
       'chk_unblocked_no_until',
       sql`is_blocked = true OR blocked_until IS NULL`
-    ),
-    check(
-      'chk_verification_channel',
-      sql.raw(`channel IN (${OTP_CHANNELS.map((c) => `'${c}'`).join(', ')})`)
     ),
   ]
 );

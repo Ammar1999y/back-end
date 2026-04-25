@@ -185,6 +185,31 @@ export function normalizeFullPermissions(
 }
 
 /**
+ * Compare two sets of role permissions for semantic equality. Normalises
+ * into the full dashboard-page matrix first so ordering, missing pages, and
+ * missing actions can't produce false negatives.
+ */
+export function permissionsEqual(
+  a: Array<{ pageName: string; permissions: unknown }>,
+  b: Array<{ pageName: string; permissions: unknown }>
+): boolean {
+  const toKey = (
+    rows: Array<{ pageName: string; permissions: unknown }>
+  ) => {
+    const normalized = normalizeFullPermissions(rows);
+    return JSON.stringify(
+      Object.entries(normalized)
+        .sort(([x], [y]) => x.localeCompare(y))
+        .map(([pageName, permissions]) => [
+          pageName,
+          Object.entries(permissions).sort(([x], [y]) => x.localeCompare(y)),
+        ])
+    );
+  };
+  return toKey(a) === toKey(b);
+}
+
+/**
  * Sanitize cached permissions from session metadata.
  * Converts the PermissionObject format to the array format expected by sanitizePermissions.
  */

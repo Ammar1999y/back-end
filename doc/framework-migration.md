@@ -48,6 +48,15 @@ interface HandlerOutput<T = unknown> {
   status: number;
   body: { success: boolean; message: string; data: T; meta?: PaginationMeta };
   headers?: Record<string, string>;
+  cookies?: Array<{
+    name: string;
+    value: string;
+    options?: {
+      path?: string; domain?: string; maxAge?: number;
+      httpOnly?: boolean; secure?: boolean;
+      sameSite?: 'strict' | 'lax' | 'none'; expires?: Date;
+    };
+  }>;
 }
 ```
 
@@ -174,7 +183,81 @@ Adding `body: sendOtpSchema` lets Elysia pre-validate, populate OpenAPI, and
 enable Eden Treaty typing. The handler still safe-parses internally, so
 removing the handler-level check is optional.
 
+Validation covers `body`, `query`, `params`, `headers`, and `cookie`. Path and
+query values are auto-coerced to the declared type (`t.Numeric()` turns a
+query string into a number). In production, validation error responses omit
+schema detail by default to avoid leaking the shape — enable explicit detail
+only in staging/local.
+
 Docs: <https://elysiajs.com/essential/validation.md>
+
+### 7. Framework-specific advantages to leverage
+
+Elysia ships a number of features that either replace current ad-hoc code or
+add capabilities Next.js does not provide. Adopt them deliberately after the
+mechanical migration is green:
+
+- **Macros for session / permission resolution.** Today every `/api/dash/*`
+  handler calls `requirePermission(...)` imperatively. Elysia's `.macro({
+  auth: { resolve({ headers }) { ... } } })` injects `{ user, session }` into
+  the route context and returns `status(401)` on miss. Combined with
+  `.guard({ auth: true })` on a dashboard sub-app, this removes the session
+  check from every handler body while keeping it portable — the handler
+  contract already accepts headers, so migration back to Next is a matter of
+  re-adding the imperative call.
+  Docs: <https://elysiajs.com/patterns/macro.md>
+
+- **Plugin encapsulation.** Elysia isolates lifecycle hooks per instance
+  unless `{ as: 'scoped' | 'global' }` is declared, and de-duplicates plugins
+  via the `name` field. The existing `betterAuthPlugin` uses `name:
+  'better-auth'` for this reason — any new plugin (rate-limit, audit,
+  security-headers) should follow the same pattern to avoid double-running
+  on sub-apps.
+  Docs: <https://elysiajs.com/essential/plugin.md>
+
+- **Auto-generated OpenAPI via `@elysiajs/openapi`.** Register the plugin,
+  attach Zod/Valibot schemas to routes via `body`/`query`/`params`, and
+  Scalar UI is served at `/openapi` for free. Solves §10.2 in `reports/final.md`
+  without a separate toolchain. Works with Better Auth's `openAPI()` plugin
+  to expose auth endpoints under a "Better Auth" tag.
+  Docs: <https://elysiajs.com/patterns/openapi.md>
+
+- **Eden Treaty end-to-end typing.** Export the `Elysia` app type, pass it to
+  the frontend via `treaty<typeof app>(...)`, and the dashboard client gets
+  autocompletion + response narrowing with zero codegen. Replaces hand-typed
+  `fetch` wrappers in the Next dashboard.
+  Docs: <https://elysiajs.com/eden/overview.md>
+
+- **Reactive cookies with signing.** `t.Cookie({ ... })` validates incoming
+  cookies; `cookie.name.value = ...` sets outgoing. `secret: [new, old]`
+  supports rotation. Layer this over the `HandlerOutput.cookies` channel
+  when a handler needs signed cookies.
+  Docs: <https://elysiajs.com/patterns/cookie.md>
+
+- **Trace / OpenTelemetry.** Built-in `trace({ onRequest, onHandle, ... })`
+  reports elapsed time per lifecycle stage with no runtime overhead in
+  static mode — useful for diagnosing the `At Scale` items in the final
+  report (3.1 user-list join, 2.2 in-transaction session refresh).
+  Docs: <https://elysiajs.com/patterns/trace.md>
+
+- **Server Timing plugin.** `@elysiajs/server-timing` emits `Server-Timing`
+  headers per request, giving the frontend a per-stage breakdown without
+  setting up a full observability stack.
+  Docs: <https://elysiajs.com/plugins/server-timing.md>
+
+- **Bun binary build for production.** `bun build --compile
+  --minify-whitespace --minify-syntax` emits a single binary with 2–3× less
+  memory vs. `bun run`. Skip `--minify` if OpenTelemetry stays enabled
+  (function names are needed). Pair with cluster mode (SO_REUSEPORT on
+  Linux) to use every core — Elysia is single-threaded per instance.
+  Docs: <https://elysiajs.com/patterns/deploy.md>
+
+- **Method-chaining type inference.** Every `.use() / .get() / .post()`
+  returns a new, wider type. If `server.ts` breaks the chain (assigns
+  `app.get(...)` back to `app` imperatively), Eden Treaty loses types.
+  Keep route registration as one continuous chain, or use `app.as('scoped')`
+  when composing sub-apps.
+  Docs: <https://elysiajs.com/key-concept.md>
 
 ---
 
@@ -237,16 +320,105 @@ app.use(secureHeaders({
 }));
 ```
 
+`secureHeaders()` ships 13 defaults out of the box: removes `X-Powered-By`,
+sets `Strict-Transport-Security` (max-age 15552000), `X-Content-Type-Options:
+nosniff`, `X-DNS-Prefetch-Control: off`, `X-Download-Options: noopen`,
+`X-Frame-Options: SAMEORIGIN`, `X-Permitted-Cross-Domain-Policies: none`,
+`X-XSS-Protection: 0`, `Cross-Origin-Resource-Policy: same-origin`,
+`Cross-Origin-Opener-Policy: same-origin`, `Origin-Agent-Cluster: ?1`,
+`Referrer-Policy: no-referrer`. CSP, `Permissions-Policy`, and
+`Cross-Origin-Embedder-Policy` must be set explicitly. Override the HSTS
+`max-age` to `63072000` to match the value listed in the security baseline.
+Docs: <https://hono.dev/docs/middleware/builtin/secure-headers>
+
+### 5. Framework-specific advantages to leverage
+
+- **RPC / `hc` client with shared types (the "Hono stack").** Export
+  `export type AppType = typeof app` from the server, then
+  `hc<AppType>('/api')` in the dashboard gives typed calls (`client.dash.users
+  .$get()`) with zero codegen. End-to-end typing for the Next frontend even
+  after the API moves off Next.
+  Docs: <https://hono.dev/docs/concepts/stacks>, <https://hono.dev/docs/guides/best-practices>
+
+- **Modular routing via `app.route()` and `basePath()`.** Split the flat
+  registration shown above into feature-scoped sub-apps:
+
+  ```ts
+  const dashUsers = new Hono()
+    .get('/', toHonoRoute(usersHandlers.GET))
+    .post('/', toHonoRoute(usersHandlers.POST))
+    .get('/:id', toHonoRoute(usersIdHandlers.GET));
+
+  const api = new Hono().basePath('/api')
+    .route('/dash/users', dashUsers)
+    .route('/auth/otp', otp);
+  ```
+
+  Keeps middleware scoped to the right prefix (`app.use('/api/dash/*',
+  requireAuthMiddleware)`) and makes RPC types compose cleanly.
+  Docs: <https://hono.dev/docs/api/hono>
+
+- **`factory.createHandlers()` for reusable middleware chains.** Alternative
+  to `toHonoRoute` when a route needs middleware before the handler (e.g.
+  rate-limit → captcha → handler). Type inference is preserved.
+  Docs: <https://hono.dev/docs/guides/best-practices>
+
+- **`bodyLimit` middleware.** Not currently enforced in Next — there is no
+  global body-size cap today. After migration, apply `bodyLimit({ maxSize:
+  100_000 })` to JSON routes and a larger limit to `/api/upload/image`. On
+  Bun, also bump `Bun.serve({ maxRequestBodySize })` — Bun rejects >128 MiB
+  before Hono sees the request.
+  Docs: <https://hono.dev/docs/middleware/builtin/body-limit>
+
+- **`contextStorage()` (AsyncLocalStorage).** Lets `lib/audit.ts`,
+  `lib/rate-limit/*`, and other utilities read the request context without
+  threading it through every function signature. Requires `nodejs_compat` /
+  `nodejs_als` on Cloudflare Workers; works natively on Node and Bun.
+  Docs: <https://hono.dev/docs/middleware/builtin/context-storage>
+
+- **`timing` middleware.** Emits `Server-Timing` headers with per-stage
+  measurements. `startTime(c, 'db')` / `endTime(c, 'db')` or `wrapTime(c,
+  'db', db.query(...))`. Pair with `setMetric` for custom markers.
+  Docs: <https://hono.dev/docs/middleware/builtin/timing>
+
+- **Router selection for the deployment target.** `SmartRouter` (default)
+  auto-picks RegExpRouter vs TrieRouter. For serverless/edge where the
+  module reinitializes per request, `LinearRouter` skips the compile step.
+  `PatternRouter` shrinks the bundle below 15 KB. Pass via
+  `new Hono({ router: new LinearRouter() })`. The `/api/auth/*` wildcard
+  forces SmartRouter to fall back to TrieRouter — unavoidable but harmless
+  because that route runs once per auth request.
+  Docs: <https://hono.dev/docs/concepts/routers>
+
+- **`HTTPException` and `app.onError`.** The adapter already funnels thrown
+  `CustomError`s through `handleApiError`, so `onError` at the Hono level is
+  only needed for errors that escape the adapter (framework internals,
+  middleware before the adapter runs). Register a final net:
+
+  ```ts
+  app.onError((err, c) => writeResponse(handleApiError(err), c));
+  ```
+
+  Note: `HTTPException.getResponse()` is not aware of `Context`, so if any
+  middleware throws one, copy CORS/expose headers onto the resulting
+  response explicitly.
+  Docs: <https://hono.dev/docs/api/exception>
+
+- **Additional built-in middleware worth enabling.** `timeout()` to cap
+  long-running handlers, `etag()` for GET caching, `ipRestriction()` for
+  admin-only endpoints, `cache()` for safe idempotent GETs, `logger()` with
+  `pretty-json` during local dev.
+  Docs: <https://hono.dev/docs/middleware/builtin/timeout>
+
+- **Signed cookies via `setSignedCookie`.** HMAC SHA-256, async due to
+  WebCrypto. Matches Elysia's signed-cookie feature. Swap the adapter's
+  `setCookie` call for `setSignedCookie` when a handler emits a cookie that
+  must be tamper-resistant.
+  Docs: <https://hono.dev/docs/helpers/cookie>
+
 ---
 
 ## Outstanding portability notes
-
-- **Cookies (handler-set):** the current `HandlerOutput` contract does not
-  include an outgoing-cookie field. Better Auth cookies are managed inside
-  its own handler so this does not affect existing endpoints. If a handler
-  later needs to set a cookie directly (e.g. a feature flag cookie), extend
-  `HandlerOutput` with a `cookies: Array<{ name, value, options }>` field
-  and update all three adapters. Noted for future work.
 
 - **CORS:** currently enforced by `Access-Control-Allow-Origin` in
   `next.config.js`. When switching frameworks, use `@elysiajs/cors` or
@@ -268,6 +440,75 @@ app.use(secureHeaders({
   carrying `responseHeaders` (Retry-After, X-RateLimit-*). Every adapter
   catches the error via `handleApiError` and copies those headers onto the
   response, so behaviour is identical across frameworks.
+
+- **`ctx.rawRequest` body is single-use:** the Next adapter runs
+  `safeReadJson(request)` during `buildContext` for JSON content types, which
+  consumes the body stream. Any handler that later calls
+  `ctx.rawRequest.json()` / `.text()` / `.formData()` on a JSON request gets
+  an empty stream. Today only `upload/image` uses `rawRequest`, and multipart
+  content-type skips `safeReadJson`, so the issue is latent. Fix: clone the
+  request before reading (`safeReadJson(request.clone())`) or restrict
+  `rawRequest` usage to `.headers` / `.url` only.
+
+- **Elysia body-parser divergence:** the disabled Elysia adapter reads
+  `ctx.body` directly from Elysia's built-in parser. Elysia rejects malformed
+  JSON before the handler runs, while the Next adapter's `safeReadJson`
+  returns `null` and lets `requireJsonBody` translate that to a 400. When
+  activating the Elysia adapter, build `ctx.body` via the same `safeReadJson`
+  helper used by Next so both frameworks deliver the same 400 on malformed
+  JSON.
+
+- **No request body-size limit on any adapter.** `safeReadJson` reads the
+  entire request into memory with no cap; `app/api/upload/image` has its own
+  MIME/magic-byte check but no byte ceiling. Next's App Router applies no
+  implicit JSON size limit in route handlers, so this is latent today. Under
+  Bun/Elysia the default `maxRequestBodySize` is 128 MiB; under Hono there
+  is no limit unless `bodyLimit({ maxSize })` is applied. When activating
+  either adapter, apply a coarse cap per route class: `~100 KB` for JSON
+  handlers, a larger explicit limit for `upload/image`. Elysia: configure
+  `parse` with a max, or reject in `onParse`. Hono: `app.use('/api/dash/*',
+  bodyLimit({ maxSize: 100_000 }))`. Without this, a ~100 MB POST is
+  accepted into memory before a handler rejects it.
+
+- **Hono's `strict: true` default breaks trailing-slash URLs.** Hono by
+  default treats `/api/dash/users` and `/api/dash/users/` as two different
+  routes (the latter 404s). Next's App Router tolerates either. If any
+  existing client — curl scripts, mobile SDKs, upstream proxies that append
+  a slash — sends the trailing form, migration to Hono silently breaks
+  them. Activate the adapter with `new Hono({ strict: false })`, or
+  explicitly mount a trailing-slash redirect middleware. Elysia treats both
+  as the same route by default, so this only affects Hono.
+
+- **Pre-adapter errors bypass `handleApiError`.** The adapter wraps the
+  handler in `try/catch`, but errors raised *before* the handler runs —
+  framework router 404, malformed-JSON rejection by Elysia's built-in
+  parser, `bodyLimit` overflow on Hono, middleware exceptions — never reach
+  `handleApiError` and are returned in the framework's native error shape
+  (`{ error: string }` on Elysia, plain-text on Hono). Clients then see two
+  different JSON contracts from the same endpoint depending on which layer
+  fails. Install framework-level funnels:
+
+  ```ts
+  // Elysia
+  app.onError(({ error }) => handleApiError(error).body);
+
+  // Hono
+  app.onError((err, c) => writeResponse(handleApiError(err), c));
+  app.notFound((c) => writeResponse(
+    handleApiError(new CustomError(MSG_PAGE_NOT_FOUND, 404)), c,
+  ));
+  ```
+
+  Without this, `reports/final.md` §6.1 (centralized error wrapper) is
+  re-introduced at the framework boundary after migration.
+
+- **`baseURL: process.env.NEXT_PUBLIC_URL` is Next-specific.** `lib/auth.ts`
+  reads `NEXT_PUBLIC_URL` for Better Auth's `baseURL`. The `NEXT_PUBLIC_*`
+  prefix convention only has meaning to Next's bundler; Bun/Node read plain
+  env vars. The value still works, but the name becomes misleading once
+  Next is no longer the host framework. Rename to `PUBLIC_URL` (with a
+  fallback to `NEXT_PUBLIC_URL` during migration) and update the CORS
+  origin reference that uses the same variable.
 
 - **Audit logs:** `auditLog` now accepts `meta: { ip, userAgent, apiPath }`
   (built by `getAuditMeta(ctx)`) instead of a raw `Request`. The adapter

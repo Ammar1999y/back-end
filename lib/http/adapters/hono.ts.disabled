@@ -13,6 +13,7 @@
 /*
 
 import type { Context } from 'hono';
+import { setCookie } from 'hono/cookie';
 
 import { auth } from '@/lib/auth';
 import { getClientIp } from '@/lib/audit';
@@ -74,6 +75,11 @@ function writeResponse(output: HandlerOutput, c: Context) {
       c.header(key, value);
     }
   }
+  if (output.cookies) {
+    for (const cookie of output.cookies) {
+      setCookie(c, cookie.name, cookie.value, cookie.options);
+    }
+  }
   return c.json(output.body, output.status as 200);
 }
 
@@ -112,8 +118,9 @@ function writeResponse(output: HandlerOutput, c: Context) {
 //    middleware (secureHeaders() covers most, but CSP / HSTS need to be
 //    set explicitly).
 // -------------------------------------------------------------------------
-// 5. Cookies — same note as Elysia: extend HandlerOutput when a handler
-//    needs to set cookies directly.
+// 5. Cookies — `HandlerOutput.cookies` is forwarded to Hono's `setCookie`
+//    helper above. For signed cookies, swap to `setSignedCookie` (HMAC
+//    SHA-256, async) at the call site that produces the HandlerOutput.
 // -------------------------------------------------------------------------
 
 */

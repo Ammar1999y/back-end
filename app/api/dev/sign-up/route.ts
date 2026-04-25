@@ -1,3 +1,4 @@
+// TODO: remove this endpoint in production
 import { toNextHandler } from '@/lib/http/adapters/next';
 
 import * as handlers from './handler';

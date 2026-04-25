@@ -16,6 +16,7 @@ import {
 } from '@/utils/api-messages';
 import { loginSchema } from '@/utils/validation/auth';
 
+import { getClientIp, USER_AGENT_MAX } from './audit';
 import { BASE_ERROR_CODES } from './auth/code-errors';
 import { LoginRejected, verifyLoginAttempt } from './auth/login-guard';
 import { REQUIRE_ROLE_FOR_LOGIN } from './permissions/constants';
@@ -71,12 +72,26 @@ export const auth = betterAuth({
           });
         }
 
+        // Build audit metadata so login success / lockout transitions are
+        // recorded inside verifyLoginAttempt's transaction.
+        const reqHeaders =
+          (ctx as { headers?: Headers }).headers ??
+          (ctx as { request?: Request }).request?.headers ??
+          new Headers();
+        const auditMeta = {
+          ip: getClientIp(reqHeaders),
+          userAgent:
+            reqHeaders.get('user-agent')?.slice(0, USER_AGENT_MAX) ?? null,
+          apiPath: ctx.path.slice(0, 255),
+        };
+
         // Atomic: lock row → check lock → verify password → update attempts
         // All in one transaction — eliminates the TOCTOU race condition
         try {
           await verifyLoginAttempt({
             email: data.email,
             password: data.password,
+            auditMeta,
           });
         } catch (e) {
           if (e instanceof LoginRejected)
@@ -235,7 +250,6 @@ export const auth = betterAuth({
     customStorage: authRateLimitStorage,
     customRules: {
       '/sign-in/email': { window: 60, max: 5 },
-      '/sign-up/email': { window: 60, max: 3 },
     },
   },
 

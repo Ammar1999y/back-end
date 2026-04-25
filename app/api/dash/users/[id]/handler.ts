@@ -24,13 +24,12 @@ import { hashPassword } from '@/lib/auth';
 import { checkPasswordCompromise } from '@/lib/auth/check-password';
 import { requirePermission } from '@/lib/http/session';
 import { enforceRateLimit, userIdentifier } from '@/lib/rate-limit';
-import { CUSTOM_ROLE_VALUE } from '@/lib/permissions/constants';
-import { checkUserPermission } from '@/lib/permissions/checker';
+import { CUSTOM_ROLE_VALUE, ROLE_SCOPE } from '@/lib/permissions/constants';
+import type { checkUserPermission } from '@/lib/permissions/checker';
 import {
   createCustomRole,
   isProtectedSystemRole,
-  nonSystemRoleFilter,
-  normalizeFullPermissions,
+  permissionsEqual,
   refreshUserSessions,
   validateAssignableRole,
   validatePermissionScope,
@@ -53,6 +52,7 @@ import {
 } from '@/utils/api-messages';
 import {
   apiSuccess,
+  getErrorHeaders,
   handleApiError,
   requireJsonBody,
   resolveUserUniqueViolation,
@@ -73,6 +73,8 @@ export const GET: Handler = async (ctx) => {
   try {
     const {
       session,
+      userId,
+      sessionId,
       allowed,
       permissions: actorViewPermissions,
     } = await requirePermission(ctx, {
@@ -83,15 +85,14 @@ export const GET: Handler = async (ctx) => {
 
     await enforceRateLimit({
       scope: 'users.id.get',
-      identifier: userIdentifier(session!.user.id),
+      identifier: userIdentifier(userId),
       limit: 60,
     });
 
     const targetId = validID(ctx.params.id);
     if (!targetId) throw new CustomError(idRequired, HTTP_STATUS.UNPROCESSABLE);
 
-    const currentUserId = validID(session?.user.id);
-    const isSelf = currentUserId === targetId;
+    const isSelf = userId === targetId;
 
     if (!isSelf && !allowed)
       throw new CustomError(
@@ -99,13 +100,16 @@ export const GET: Handler = async (ctx) => {
         HTTP_STATUS.FORBIDDEN
       );
 
-    if (isSelf && !session?.user.roleId)
+    if (isSelf && !session.user.roleId)
       throw new CustomError(
         MSG_INSUFFICIENT_PERMISSIONS,
         HTTP_STATUS.FORBIDDEN
       );
 
-    const userData = await db.query.users.findFirst({
+    const canViewSessions =
+      isSelf || actorViewPermissions?.users?.edit === true;
+
+    const userDataPromise = db.query.users.findFirst({
       where: (users, { eq, and, isNull }) =>
         and(eq(users.id, targetId), isNull(users.deletedAt)),
       columns: {
@@ -136,9 +140,34 @@ export const GET: Handler = async (ctx) => {
       },
     });
 
+    const sessionsPromise = canViewSessions
+      ? db
+          .select({
+            id: sessions.id,
+            ipAddress: sessions.ipAddress,
+            userAgent: sessions.userAgent,
+            createdAt: sessions.createdAt,
+          })
+          .from(sessions)
+          .where(
+            and(
+              eq(sessions.userId, targetId),
+              gt(sessions.expiresAt, sql`now()`)
+            )
+          )
+          .orderBy(desc(sessions.createdAt))
+          .limit(50)
+      : Promise.resolve(null);
+
+    const [userData, sessionRows] = await Promise.all([
+      userDataPromise,
+      sessionsPromise,
+    ]);
+
     if (!userData) throw new CustomError(MSG_NOT_FOUND, HTTP_STATUS.NOT_FOUND);
 
-    if (isProtectedSystemRole(userData.role))
+    // System-scoped owner can read their own profile; hide from others.
+    if (!isSelf && isProtectedSystemRole(userData.role))
       throw new CustomError(MSG_NOT_FOUND, HTTP_STATUS.NOT_FOUND);
 
     if (!userData.roleId)
@@ -150,40 +179,12 @@ export const GET: Handler = async (ctx) => {
         permissions: p.permissions,
       })) || [];
 
-    const canViewSessions =
-      isSelf || actorViewPermissions?.users?.edit === true;
-
-    let userSessions:
-      | {
-          id: EntityID;
-          ipAddress: string | null;
-          userAgent: string | null;
-          createdAt: string;
-          isCurrent: boolean;
-        }[]
-      | undefined;
-
-    if (canViewSessions) {
-      const rows = await db
-        .select({
-          id: sessions.id,
-          ipAddress: sessions.ipAddress,
-          userAgent: sessions.userAgent,
-          createdAt: sessions.createdAt,
-        })
-        .from(sessions)
-        .where(
-          and(eq(sessions.userId, targetId), gt(sessions.expiresAt, sql`now()`))
-        )
-        .orderBy(desc(sessions.createdAt))
-        .limit(50);
-
-      const currentSessionId = validID(session?.session.id);
-      userSessions = rows.map((s) => ({
-        ...s,
-        isCurrent: s.id === currentSessionId,
-      }));
-    }
+    const userSessions = sessionRows
+      ? sessionRows.map((s) => ({
+          ...s,
+          isCurrent: s.id === sessionId,
+        }))
+      : undefined;
 
     return apiSuccess({
       message: MSG_FETCHED,
@@ -214,14 +215,12 @@ export const GET: Handler = async (ctx) => {
 };
 
 async function handleSelfEdit(
-  session: NonNullable<
-    Awaited<ReturnType<typeof checkUserPermission>>['session']
-  >,
+  actor: { userId: EntityID; userEmail: string; hasRole: boolean },
   targetId: EntityID,
   body: Record<string, unknown>,
   auditMeta: AuditMeta
 ) {
-  if (!session.user.roleId)
+  if (!actor.hasRole)
     throw new CustomError(MSG_INSUFFICIENT_PERMISSIONS, HTTP_STATUS.FORBIDDEN);
 
   const parsed = selfUpdateUserSchema.safeParse({ ...body, id: targetId });
@@ -232,39 +231,34 @@ async function handleSelfEdit(
     );
 
   await withTransaction(async (tx) => {
-    const [activeUser] = await tx
-      .select({ id: users.id, name: users.name })
-      .from(users)
-      .where(
-        and(
-          eq(users.id, targetId),
-          isNull(users.deletedAt),
-          eq(users.isActive, true)
-        )
+    // Single-round-trip self-edit: capture the old name via a CTE so the
+    // UPDATE ... RETURNING has both the new value (for audit parity) and
+    // the pre-update value. FOR UPDATE is unnecessary — a user can't race
+    // themselves meaningfully, and the WHERE filter blocks updates against
+    // a concurrently deactivated/soft-deleted row.
+    const updated = await tx.execute<{ old_name: string }>(sql`
+      WITH prev AS (
+        SELECT id, name FROM users WHERE id = ${targetId}
       )
-      .for('update');
+      UPDATE users u
+      SET name = ${parsed.data.name}, updated_at = now()
+      FROM prev
+      WHERE u.id = prev.id
+        AND u.deleted_at IS NULL
+        AND u.is_active = true
+      RETURNING prev.name AS old_name
+    `);
 
-    if (!activeUser)
-      throw new CustomError(
-        MSG_INSUFFICIENT_PERMISSIONS,
-        HTTP_STATUS.FORBIDDEN
-      );
-
-    const [updated] = await tx
-      .update(users)
-      .set({ name: parsed.data.name })
-      .where(and(eq(users.id, targetId), isNull(users.deletedAt)))
-      .returning({ id: users.id });
-
-    if (!updated) throw new CustomError(MSG_NOT_FOUND, HTTP_STATUS.NOT_FOUND);
+    const row = updated.rows[0];
+    if (!row) throw new CustomError(MSG_NOT_FOUND, HTTP_STATUS.NOT_FOUND);
 
     await auditLog(tx, {
-      userId: validID(session.user.id),
-      userEmail: session.user.email,
+      userId: actor.userId,
+      userEmail: actor.userEmail,
       action: 'UPDATE',
       tableName: 'users',
       recordId: targetId,
-      oldData: { name: activeUser.name },
+      oldData: { name: row.old_name },
       newData: { name: parsed.data.name },
       meta: auditMeta,
     });
@@ -272,9 +266,7 @@ async function handleSelfEdit(
 }
 
 async function handleAdminEdit(
-  session: NonNullable<
-    Awaited<ReturnType<typeof checkUserPermission>>['session']
-  >,
+  actor: { userId: EntityID; userEmail: string },
   actorPermissions: Awaited<
     ReturnType<typeof checkUserPermission>
   >['permissions'],
@@ -374,28 +366,34 @@ async function handleAdminEdit(
           .from(rolePermissions)
           .where(eq(rolePermissions.roleId, lockedUser.roleId));
 
-        const oldNorm = normalizeFullPermissions(
+        customPermsChanged = !permissionsEqual(
           oldPerms.map((p) => ({
             pageName: p.pageName,
             permissions: p.permissions,
-          }))
-        );
-        const newNorm = normalizeFullPermissions(
+          })),
           validatedData.permissions.map((p) => ({
             pageName: p.name,
             permissions: p.permissions,
           }))
         );
 
-        customPermsChanged =
-          JSON.stringify(oldNorm) !== JSON.stringify(newNorm);
+        // Skip rewriting role_permissions rows when nothing changed — avoids
+        // a useless DELETE/INSERT cycle that resets created_at and briefly
+        // leaves the role with zero permission rows.
+        assignedRoleId = customPermsChanged
+          ? await createCustomRole(
+              tx,
+              validatedData.permissions,
+              lockedUser.roleId
+            )
+          : lockedUser.roleId;
+      } else {
+        assignedRoleId = await createCustomRole(
+          tx,
+          validatedData.permissions,
+          null
+        );
       }
-
-      assignedRoleId = await createCustomRole(
-        tx,
-        validatedData.permissions,
-        isCurrentlyCustom ? lockedUser.roleId : null
-      );
     } else {
       assignedRoleId = validatedData.roleId as EntityID;
     }
@@ -408,7 +406,6 @@ async function handleAdminEdit(
         email: validatedData.email,
         isActive: validatedData.isActive,
         roleId: assignedRoleId,
-        ...(emailChanged && { emailVerified: false }),
       })
       .where(and(eq(users.id, userId), isNull(users.deletedAt)))
       .returning({ id: users.id });
@@ -428,8 +425,8 @@ async function handleAdminEdit(
       await tx.delete(roles).where(eq(roles.id, lockedUser.roleId));
 
       await auditLog(tx, {
-        userId: validID(session.user.id),
-        userEmail: session.user.email,
+        userId: actor.userId,
+        userEmail: actor.userEmail,
         action: 'DELETE',
         tableName: 'roles',
         recordId: lockedUser.roleId,
@@ -439,8 +436,12 @@ async function handleAdminEdit(
     }
 
     const roleChanged = lockedUser.roleId !== assignedRoleId;
+    // Email mutation is an identity change — invalidate other sessions so the
+    // victim can't keep using stale identity in cached cookies.
     const shouldDeleteAllSessions =
-      !!password || (lockedUser.isActive && validatedData.isActive === false);
+      !!password ||
+      emailChanged ||
+      (lockedUser.isActive && validatedData.isActive === false);
     const shouldRefreshSessions =
       !shouldDeleteAllSessions && (roleChanged || customPermsChanged);
 
@@ -466,8 +467,8 @@ async function handleAdminEdit(
     }
 
     await auditLog(tx, {
-      userId: validID(session.user.id),
-      userEmail: session.user.email,
+      userId: actor.userId,
+      userEmail: actor.userEmail,
       action: 'UPDATE',
       tableName: 'users',
       recordId: userId,
@@ -505,6 +506,7 @@ export const PUT: Handler = async (ctx) => {
   try {
     const {
       session,
+      userId,
       allowed,
       permissions: actorPermissions,
     } = await requirePermission(ctx, {
@@ -515,19 +517,25 @@ export const PUT: Handler = async (ctx) => {
 
     await enforceRateLimit({
       scope: 'users.id.put',
-      identifier: userIdentifier(session!.user.id),
-      limit: 20,
+      identifier: userIdentifier(userId),
+      limit: 10,
+      failClosed: true,
     });
 
     const body = requireJsonBody(ctx.body);
     const auditMeta = getAuditMeta(ctx);
 
     const targetId = validID(ctx.params.id);
-    const userId = validID(session?.user.id);
     if (!targetId) throw new CustomError(idRequired, HTTP_STATUS.UNPROCESSABLE);
 
-    if (userId === targetId && !!session?.user.id) {
-      await handleSelfEdit(session, targetId, body, auditMeta);
+    const actor = {
+      userId,
+      userEmail: session.user.email,
+      hasRole: !!session.user.roleId,
+    };
+
+    if (userId === targetId) {
+      await handleSelfEdit(actor, targetId, body, auditMeta);
       return apiSuccess({ message: MSG_UPDATED });
     }
 
@@ -537,19 +545,26 @@ export const PUT: Handler = async (ctx) => {
         HTTP_STATUS.FORBIDDEN
       );
 
-    await handleAdminEdit(session!, actorPermissions, targetId, body, auditMeta);
+    await handleAdminEdit(actor, actorPermissions, targetId, body, auditMeta);
     return apiSuccess({ message: MSG_UPDATED });
   } catch (error) {
     if (isUniqueViolation(error)) {
       return handleApiError(
-        new CustomError(resolveUserUniqueViolation(error), HTTP_STATUS.CONFLICT)
+        new CustomError(
+          resolveUserUniqueViolation(error),
+          HTTP_STATUS.CONFLICT
+        ),
+        undefined,
+        getErrorHeaders(error)
       );
     }
     if (isForeignKeyViolation(error)) {
       const constraint = getConstraintName(error);
       if (constraint.includes('role_id')) {
         return handleApiError(
-          new CustomError(userMsg.roleNotFound, HTTP_STATUS.BAD_REQUEST)
+          new CustomError(userMsg.roleNotFound, HTTP_STATUS.BAD_REQUEST),
+          undefined,
+          getErrorHeaders(error)
         );
       }
     }
@@ -559,53 +574,61 @@ export const PUT: Handler = async (ctx) => {
 
 export const DELETE: Handler = async (ctx) => {
   try {
-    const { session, permissions: actorPermissions } = await requirePermission(
-      ctx,
-      { resource: 'users', action: 'delete' }
-    );
+    const {
+      session,
+      userId: actorUserId,
+      permissions: actorPermissions,
+    } = await requirePermission(ctx, { resource: 'users', action: 'delete' });
 
     await enforceRateLimit({
       scope: 'users.id.delete',
-      identifier: userIdentifier(session!.user.id),
+      identifier: userIdentifier(actorUserId),
       limit: 10,
+      failClosed: true,
     });
 
     const userId = validID(ctx.params.id);
-    const sessionUserId = validID(session?.user.id);
     if (!userId) throw new CustomError(idRequired, HTTP_STATUS.UNPROCESSABLE);
 
-    if (sessionUserId === userId)
+    if (actorUserId === userId)
       throw new CustomError(userMsg.cannotDeleteSelf, HTTP_STATUS.BAD_REQUEST);
 
     const auditMeta = getAuditMeta(ctx);
 
     await withTransaction(async (tx) => {
-      const [lockedUser] = await tx
-        .select({ id: users.id, roleId: users.roleId, email: users.email })
-        .from(users)
-        .where(and(eq(users.id, userId), isNull(users.deletedAt)))
-        .for('update');
+      // Lock user + role together so another tx can't flip the role's
+      // scope/name between selects.
+      // TODO: test it if the FOR UPDATE OF u FOR SHARE OF r is not working as expected
+      const locked = await tx.execute<{
+        email: string;
+        phone_number: string | null;
+        role_id: EntityID;
+        role_name: string;
+        role_scope: string;
+      }>(sql`
+        SELECT u.email, u.phone_number, u.role_id, r.role_name, r.scope AS role_scope
+        FROM users u
+        INNER JOIN roles r ON r.id = u.role_id
+        WHERE u.id = ${userId}
+          AND u.deleted_at IS NULL
+          AND r.scope <> ${ROLE_SCOPE.SYSTEM}
+        FOR UPDATE OF u
+        FOR SHARE OF r
+      `);
 
-      if (!lockedUser?.roleId)
-        throw new CustomError(MSG_NOT_FOUND, HTTP_STATUS.NOT_FOUND);
-
-      const [userRole] = await tx
-        .select({ roleName: roles.roleName, scope: roles.scope })
-        .from(roles)
-        .where(and(eq(roles.id, lockedUser.roleId), nonSystemRoleFilter()));
-
-      if (!userRole)
+      const lockedUser = locked.rows[0];
+      if (!lockedUser?.role_id)
         throw new CustomError(MSG_NOT_FOUND, HTTP_STATUS.NOT_FOUND);
 
       if (actorPermissions) {
         await validateRolePermissionScope(
           actorPermissions,
-          lockedUser.roleId,
+          lockedUser.role_id,
           tx
         );
       }
 
-      const DELETED_SUFFIX_LEN = 46;
+      const DELETED_SUFFIX_LEN = 41;
       await tx
         .update(users)
         .set({
@@ -625,21 +648,22 @@ export const DELETE: Handler = async (ctx) => {
       await tx
         .delete(verificationSessions)
         .where(eq(verificationSessions.userId, userId));
-      if (userRole.scope === CUSTOM_ROLE_VALUE) {
-        await tx.delete(roles).where(eq(roles.id, lockedUser.roleId));
+      if (lockedUser.role_scope === CUSTOM_ROLE_VALUE) {
+        await tx.delete(roles).where(eq(roles.id, lockedUser.role_id));
       }
 
       await auditLog(tx, {
-        userId: sessionUserId,
-        userEmail: session!.user.email,
+        userId: actorUserId,
+        userEmail: session.user.email,
         action: 'DELETE',
         tableName: 'users',
         recordId: userId,
         oldData: {
           email: lockedUser.email,
-          roleId: lockedUser.roleId,
-          roleName: userRole.roleName,
-          roleScope: userRole.scope,
+          phoneNumber: lockedUser.phone_number,
+          roleId: lockedUser.role_id,
+          roleName: lockedUser.role_name,
+          roleScope: lockedUser.role_scope,
         },
         meta: auditMeta,
       });

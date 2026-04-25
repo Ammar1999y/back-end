@@ -11,6 +11,9 @@ import {
 import { MAX_PER_PAGE, parseSearchParams } from '@/lib/data-table/parsers';
 
 const MAX_SEARCH_LENGTH = 200;
+// pg_trgm's GIN index is only chosen when the input has ≥ 3 distinct trigrams;
+// shorter inputs would fall back to a full table scan, so treat them as empty.
+const MIN_SEARCH_LENGTH = 3;
 
 interface DataTableQueryParams {
   url: string;
@@ -66,7 +69,7 @@ export function parseDataTableParams<T extends Table>(
   // --- Quick search (mutually exclusive with filters on the client) ---
   const rawSearch = searchParams.get('search')?.trim() ?? '';
   const search =
-    rawSearch.length > 0 && rawSearch.length <= MAX_SEARCH_LENGTH
+    rawSearch.length >= MIN_SEARCH_LENGTH && rawSearch.length <= MAX_SEARCH_LENGTH
       ? rawSearch
       : '';
 

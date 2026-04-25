@@ -4,7 +4,7 @@ import { db } from '@/db';
 import { parseDataTableParams } from '@/db/queries/data-table';
 import { rolePermissions, roles } from '@/db/schema';
 import { withTransaction } from '@/db/ws';
-import { isUniqueViolation, validID } from '@/utils';
+import { isUniqueViolation } from '@/utils';
 import { auditLog, getAuditMeta } from '@/lib/audit';
 import { requirePermission } from '@/lib/http/session';
 import { enforceRateLimit, userIdentifier } from '@/lib/rate-limit';
@@ -26,6 +26,7 @@ import {
 } from '@/utils/api-messages';
 import {
   apiSuccess,
+  getErrorHeaders,
   handleApiError,
   requireJsonBody,
   resolvePermissionUniqueViolation,
@@ -45,14 +46,14 @@ const PERMISSIONS_ALLOWED_COLUMNS = new Set([
 
 export const GET: Handler = async (ctx) => {
   try {
-    const { session } = await requirePermission(ctx, {
+    const { userId } = await requirePermission(ctx, {
       resource: 'permissions',
       action: 'view',
     });
 
     await enforceRateLimit({
       scope: 'permissions.get',
-      identifier: userIdentifier(session!.user.id),
+      identifier: userIdentifier(userId),
       limit: 60,
     });
 
@@ -105,15 +106,20 @@ export const GET: Handler = async (ctx) => {
 
 export const POST: Handler = async (ctx) => {
   try {
-    const { session, permissions: actorPermissions } = await requirePermission(
-      ctx,
-      { resource: 'permissions', action: 'create' }
-    );
+    const {
+      session,
+      userId: actorUserId,
+      permissions: actorPermissions,
+    } = await requirePermission(ctx, {
+      resource: 'permissions',
+      action: 'create',
+    });
 
     await enforceRateLimit({
       scope: 'permissions.post',
-      identifier: userIdentifier(session!.user.id),
+      identifier: userIdentifier(actorUserId),
       limit: 20,
+      failClosed: true,
     });
 
     const body = requireJsonBody(ctx.body);
@@ -159,8 +165,8 @@ export const POST: Handler = async (ctx) => {
       }
 
       await auditLog(tx, {
-        userId: validID(session!.user.id),
-        userEmail: session!.user.email,
+        userId: actorUserId,
+        userEmail: session.user.email,
         action: 'INSERT',
         tableName: 'roles',
         recordId: newRole.id,
@@ -191,7 +197,9 @@ export const POST: Handler = async (ctx) => {
             fallback: MSG_CREATE_ERROR,
           }),
           HTTP_STATUS.CONFLICT
-        )
+        ),
+        undefined,
+        getErrorHeaders(error)
       );
     }
     return handleApiError(error, MSG_CREATE_ERROR);

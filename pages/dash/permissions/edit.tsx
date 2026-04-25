@@ -172,21 +172,19 @@ const EditPermission = () => {
 
               if (isActiveChanged) {
                 if (validatedData.isActive) {
-                  // Role became active: add to roles
                   const newRole: RoleOption = {
                     id: roleId,
-                    value: roleId,
-                    label: validatedData.roleName,
+                    roleName: validatedData.roleName,
                   };
                   updatedRoles = [
                     newRole,
-                    ...updatedRoles.filter(
-                      (r) => r.value !== CUSTOM_ROLE_VALUE
-                    ),
-                    { value: CUSTOM_ROLE_VALUE, label: 'مخصص' } as RoleOption,
+                    ...updatedRoles.filter((r) => r.id !== CUSTOM_ROLE_VALUE),
+                    {
+                      id: CUSTOM_ROLE_VALUE,
+                      roleName: 'مخصص',
+                    } as unknown as RoleOption,
                   ];
                 } else {
-                  // Role became inactive: remove from roles
                   updatedRoles = updatedRoles.filter((r) => r.id !== roleId);
                 }
               } else if (roleNameChanged && validatedData.isActive) {
@@ -194,7 +192,7 @@ const EditPermission = () => {
                   r.id === roleId
                     ? {
                         ...r,
-                        label: validatedData.roleName,
+                        roleName: validatedData.roleName,
                       }
                     : r
                 );

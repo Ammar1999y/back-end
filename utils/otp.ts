@@ -6,6 +6,7 @@ import { and, eq, gt, sql } from 'drizzle-orm';
 
 import { verificationCodes, verificationSessions } from '@/db/schema';
 import { withTransaction } from '@/db/ws';
+import { auditLog } from '@/lib/audit';
 import { sanitizeForLog } from '@/utils';
 import { hashPassword, verifyPassword } from 'better-auth/crypto';
 import nodemailer from 'nodemailer';
@@ -16,6 +17,7 @@ import {
   OTP_BLOCK_DURATION_HOURS,
   OTP_EXPIRY_MINUTES,
   OTP_MAX_ATTEMPTS,
+  OTP_MAX_DAILY_VERIFY_ATTEMPTS,
   OTP_MAX_VERIFY_ATTEMPTS,
 } from '@/utils/validation/constants';
 import { EntityID } from '@/types';
@@ -160,7 +162,7 @@ async function sendOtp(
   messageText?: string
 ) {
   if (channel === 'sms') return sendOtpSms(identifier, code, messageText);
-  if (channel === 'phone') return sendOtpWhatsApp(identifier, code);
+  if (channel === 'whatsapp') return sendOtpWhatsApp(identifier, code);
   return sendOtpEmail(identifier, code);
 }
 
@@ -197,12 +199,17 @@ export async function processOtpSend({
   entityName,
   smsMessage,
 }: ProcessOtpSendOptions): Promise<ProcessOtpSendResult> {
-  return withTransaction(async (tx) => {
+  // Buffer deferred errors so max-attempts block persists (commit) before we throw.
+  let deferredError: CustomError | null = null;
+
+  const result = await withTransaction(async (tx) => {
     // Advisory lock serializes concurrent first-send requests for the same user+channel.
     // FOR UPDATE only works when a row already exists — without this, two concurrent
     // requests for a new identifier both see "no row" and both proceed to INSERT.
+    // Two-argument form gives a 64-bit keyspace, avoiding the birthday-
+    // collision rate of the single-arg int4 form at high OTP concurrency.
     await tx.execute(
-      sql`SELECT pg_advisory_xact_lock(hashtext(${userId} || ${channel}))`
+      sql`SELECT pg_advisory_xact_lock(hashtext(${userId}), hashtext(${channel}))`
     );
 
     const now = new Date();
@@ -267,6 +274,8 @@ export async function processOtpSend({
     }
 
     // ── Max-attempts → block (app-level check before DB increment — prevents raw constraint violation) ──
+    // Defer the throw so the block update COMMITS with the transaction.
+    // Throwing inside withTransaction rolls back the block write.
     if (session && session.attemptNumber >= OTP_MAX_ATTEMPTS) {
       const blockedUntil = calculateBlockDuration();
       await tx
@@ -277,10 +286,11 @@ export async function processOtpSend({
         })
         .where(eq(verificationSessions.id, session.id));
 
-      throw new CustomError(
+      deferredError = new CustomError(
         `تجاوزت الحد الأقصى من المحاولات. تم حظر ${entityName} لمدة ${OTP_BLOCK_DURATION_HOURS} ساعة`,
         HTTP_STATUS.TOO_MANY_REQUESTS
       );
+      return null;
     }
 
     // ── Generate & hash OTP ──
@@ -291,7 +301,9 @@ export async function processOtpSend({
     const currentAttempts = session?.attemptNumber ?? 0;
     const nextAllowedAt = calculateNextAllowedAt(currentAttempts + 1);
 
-    // ── Upsert session (atomic) — reset verifyAttemptNumber on resend ──
+    // ── Upsert session (atomic) — reset per-cycle verifyAttemptNumber on
+    // resend, but KEEP the rolling daily counter so attackers can't reset
+    // the 24h bound by requesting a fresh code (issue 1.6).
     const [updatedSession] = await tx
       .insert(verificationSessions)
       .values({
@@ -309,6 +321,8 @@ export async function processOtpSend({
           identifier,
           attemptNumber: sql`${verificationSessions.attemptNumber} + 1`,
           verifyAttemptNumber: 0,
+          // Intentionally do NOT touch verifyAttemptDaily /
+          // verifyAttemptWindowStart — they survive resends.
           lastSentAt: now.toISOString(),
           nextAllowedAt: nextAllowedAt.toISOString(),
         },
@@ -341,6 +355,10 @@ export async function processOtpSend({
       attemptsRemaining: OTP_MAX_ATTEMPTS - updatedSession.attemptNumber,
     };
   });
+
+  if (deferredError) throw deferredError;
+  // result is non-null when no deferred error was set.
+  return result as ProcessOtpSendResult;
 }
 
 // ── Reusable OTP Verify Logic ──
@@ -348,9 +366,23 @@ export async function processOtpSend({
 interface ProcessOtpVerifyOptions {
   /** User ID that owns the verification session */
   userId: EntityID;
+  /** User email — required when auditMeta is provided so the block transition can be audited */
+  userEmail?: string;
   /** Channel used when sending */
   channel: OtpChannel;
+  /**
+   * Normalized identifier (email/phone) submitted by the client. Bound into
+   * the locked session lookup so a stale session pointing at an old contact
+   * can't be matched against a verify for a different one.
+   */
+  identifier: string;
   code: string;
+  /** Request metadata; when provided, OTP-block transitions are audited */
+  auditMeta?: {
+    ip: string | null;
+    userAgent: string | null;
+    apiPath: string;
+  };
   /** Callback executed inside the same transaction after successful verification */
   onVerified?: (tx: WsTx) => Promise<void>;
 }
@@ -359,24 +391,37 @@ interface ProcessOtpVerifyOptions {
  * Verifies an OTP code and runs an optional post-verify callback atomically.
  * Deletes the verification session (and cascaded codes) on success.
  */
+type VerifyOutcome =
+  | { kind: 'matched' }
+  | { kind: 'mismatch' }
+  | { kind: 'no-code' }
+  | { kind: 'blocked' };
+
 export async function processOtpVerify({
   userId,
+  userEmail,
   channel,
+  identifier,
   code,
+  auditMeta,
   onVerified,
 }: ProcessOtpVerifyOptions): Promise<void> {
-  await withTransaction(async (tx) => {
-    // ── Get session with row-level lock ──
+  // Deferred errors: the throw must fire AFTER the transaction commits so the
+  // increment/block writes persist. Throwing inside withTransaction rolls back.
+  const outcome = await withTransaction<VerifyOutcome>(async (tx) => {
+    // ── Get session with row-level lock — serializes concurrent verifies.
     const [session] = await tx
       .select({
         id: verificationSessions.id,
-        verifyAttemptNumber: verificationSessions.verifyAttemptNumber,
+        isBlocked: verificationSessions.isBlocked,
+        blockedUntil: verificationSessions.blockedUntil,
       })
       .from(verificationSessions)
       .where(
         and(
           eq(verificationSessions.userId, userId),
-          eq(verificationSessions.channel, channel)
+          eq(verificationSessions.channel, channel),
+          eq(verificationSessions.identifier, identifier)
         )
       )
       .for('update');
@@ -387,14 +432,99 @@ export async function processOtpVerify({
         HTTP_STATUS.NOT_FOUND
       );
 
-    // ── Brute-force protection (app-level check before DB increment) ──
-    if (session.verifyAttemptNumber >= OTP_MAX_VERIFY_ATTEMPTS)
-      throw new CustomError(
-        'تجاوزت الحد الأقصى من محاولات التحقق. يرجى طلب رمز جديد',
-        HTTP_STATUS.TOO_MANY_REQUESTS
-      );
+    // A session can be flagged blocked by processOtpSend (send-cap) while
+    // the verify counters are still under their caps. Without this guard,
+    // a leftover non-expired code could be successfully verified on a
+    // session that should be locked entirely.
+    if (
+      session.isBlocked &&
+      session.blockedUntil &&
+      new Date(session.blockedUntil) > new Date()
+    ) {
+      return { kind: 'blocked' };
+    }
 
-    // ── Get active (unexpired) code — only one exists since old codes are invalidated on resend ──
+    // ── Atomic DB-side check + increment for BOTH counters:
+    //   - verify_attempt_number: per-send-cycle counter, reset on resend.
+    //   - verify_attempt_daily: rolling 24h counter, survives resends.
+    // The WHERE clause enforces both bounds; if either is already at its
+    // cap, no row is updated and we'll block. Defense-in-depth on top of
+    // FOR UPDATE — the row lock serializes, but doing the bound check in
+    // SQL prevents regression if the lock is ever removed.
+    const windowExpired = sql`NOW() - ${verificationSessions.verifyAttemptWindowStart} > INTERVAL '24 hours'`;
+
+    const [bumped] = await tx
+      .update(verificationSessions)
+      .set({
+        verifyAttemptNumber: sql`${verificationSessions.verifyAttemptNumber} + 1`,
+        // Roll the 24h window: if the stored windowStart is older than 24h,
+        // start a fresh window with daily=1; otherwise just increment.
+        verifyAttemptDaily: sql`CASE WHEN ${windowExpired} THEN 1 ELSE ${verificationSessions.verifyAttemptDaily} + 1 END`,
+        verifyAttemptWindowStart: sql`CASE WHEN ${windowExpired} THEN NOW() ELSE ${verificationSessions.verifyAttemptWindowStart} END`,
+      })
+      .where(
+        and(
+          eq(verificationSessions.id, session.id),
+          sql`${verificationSessions.verifyAttemptNumber} < ${OTP_MAX_VERIFY_ATTEMPTS}`,
+          // Daily bound check post-roll: if the window expired, treat the
+          // stored daily value as 0 for the comparison.
+          sql`(CASE WHEN ${windowExpired} THEN 0 ELSE ${verificationSessions.verifyAttemptDaily} END) < ${OTP_MAX_DAILY_VERIFY_ATTEMPTS}`
+        )
+      )
+      .returning({
+        verifyAttemptNumber: verificationSessions.verifyAttemptNumber,
+        verifyAttemptDaily: verificationSessions.verifyAttemptDaily,
+      });
+
+    const auditBlockTransition = async (reason: string) => {
+      // Only audit the FIRST transition into blocked. If the session was
+      // already blocked, this update is a no-op and would emit a misleading
+      // "transition" event. Requires userEmail (audit_logs.user_email NOT NULL).
+      if (!auditMeta || !userEmail || session.isBlocked) return;
+      await auditLog(tx, {
+        userId,
+        userEmail,
+        action: 'UPDATE',
+        tableName: 'verification_sessions',
+        recordId: session.id,
+        oldData: { isBlocked: false },
+        newData: { isBlocked: true, channel, reason },
+        meta: auditMeta,
+      });
+    };
+
+    if (!bumped) {
+      // A bound was already at cap before this attempt. Mark the session
+      // blocked only on the FIRST transition — re-stamping blockedUntil on
+      // every subsequent attempt would silently extend the window into a
+      // rolling block, which is not the documented OTP_BLOCK_DURATION_HOURS
+      // contract and lets an attacker keep a victim locked indefinitely.
+      if (!session.isBlocked) {
+        await tx
+          .update(verificationSessions)
+          .set({
+            isBlocked: true,
+            blockedUntil: calculateBlockDuration().toISOString(),
+          })
+          .where(eq(verificationSessions.id, session.id));
+        await auditBlockTransition('cap_reached');
+      }
+      return { kind: 'blocked' };
+    }
+
+    const shouldBlock =
+      bumped.verifyAttemptNumber >= OTP_MAX_VERIFY_ATTEMPTS ||
+      bumped.verifyAttemptDaily >= OTP_MAX_DAILY_VERIFY_ATTEMPTS;
+    if (shouldBlock) {
+      await tx
+        .update(verificationSessions)
+        .set({
+          isBlocked: true,
+          blockedUntil: calculateBlockDuration().toISOString(),
+        })
+        .where(eq(verificationSessions.id, session.id));
+    }
+
     const [activeCode] = await tx
       .select({
         id: verificationCodes.id,
@@ -409,33 +539,35 @@ export async function processOtpVerify({
       )
       .limit(1);
 
-    if (!activeCode)
-      throw new CustomError(
-        'انتهت صلاحية رمز التحقق. يرجى طلب رمز جديد',
-        HTTP_STATUS.BAD_REQUEST
-      );
+    // Return (don't throw) so the increment/block writes commit.
+    if (!activeCode) return { kind: 'no-code' };
 
-    // ── Verify code ──
     const matched = await verifyOtpCode(code, activeCode.code);
 
-    if (!matched) {
-      // Increment verify attempt counter
+    if (matched) {
+      // Session deleted — no block audit even if shouldBlock fired above,
+      // because the user never actually got blocked from a usable session.
+      if (onVerified) await onVerified(tx);
       await tx
-        .update(verificationSessions)
-        .set({
-          verifyAttemptNumber: sql`${verificationSessions.verifyAttemptNumber} + 1`,
-        })
+        .delete(verificationSessions)
         .where(eq(verificationSessions.id, session.id));
-
-      throw new CustomError('رمز التحقق غير صحيح', HTTP_STATUS.BAD_REQUEST);
+      return { kind: 'matched' };
     }
 
-    // ── Post-verify callback (same transaction) ──
-    if (onVerified) await onVerified(tx);
-
-    // ── Clean up session (cascades to codes) ──
-    await tx
-      .delete(verificationSessions)
-      .where(eq(verificationSessions.id, session.id));
+    if (shouldBlock) await auditBlockTransition('threshold_crossed');
+    return { kind: shouldBlock ? 'blocked' : 'mismatch' };
   });
+
+  if (outcome.kind === 'matched') return;
+  if (outcome.kind === 'no-code')
+    throw new CustomError(
+      'انتهت صلاحية رمز التحقق. يرجى طلب رمز جديد',
+      HTTP_STATUS.BAD_REQUEST
+    );
+  if (outcome.kind === 'blocked')
+    throw new CustomError(
+      'تجاوزت الحد الأقصى من محاولات التحقق. يرجى طلب رمز جديد',
+      HTTP_STATUS.TOO_MANY_REQUESTS
+    );
+  throw new CustomError('رمز التحقق غير صحيح', HTTP_STATUS.BAD_REQUEST);
 }

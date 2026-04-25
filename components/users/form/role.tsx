@@ -38,7 +38,6 @@ import {
 } from '@/components/ui/popover';
 
 import { ROLES_QUERY_KEYS } from '../query-keys';
-import { UserClient } from '@/types/user';
 
 // Memoized icons
 const CheckIcon = memo(_CheckIcon);
@@ -49,8 +48,7 @@ ChevronDownIcon.displayName = 'ChevronDownIcon';
 
 export interface RoleOption {
   id: EntityID;
-  value: UserClient['roleId'];
-  label: string;
+  roleName: string;
 }
 
 const RoleInput = memo(() => {
@@ -124,7 +122,7 @@ const RoleLabel = memo(({ selectedValue }: RoleLabelProps) => {
   });
 
   const selectedRole = useMemo(
-    () => roles?.find((role) => role.value === selectedValue),
+    () => roles?.find((role) => role.id === selectedValue),
     [roles, selectedValue]
   );
 
@@ -133,7 +131,9 @@ const RoleLabel = memo(({ selectedValue }: RoleLabelProps) => {
   }
 
   return (
-    <span className='truncate'>{selectedRole?.label || 'اختر الصلاحية'}</span>
+    <span className='truncate'>
+      {selectedRole?.roleName || 'اختر الصلاحية'}
+    </span>
   );
 });
 
@@ -189,9 +189,9 @@ const Content = memo(({ selectedValue, onSelect, isOpen }: ContentProps) => {
             <CommandGroup>
               {roles?.map((role) => (
                 <RoleItem
-                  key={role.value}
+                  key={role.id}
                   role={role}
-                  isSelected={selectedValue === role.value}
+                  isSelected={selectedValue === role.id}
                   onSelect={onSelect}
                 />
               ))}
@@ -213,10 +213,8 @@ interface RoleItemProps {
 
 const RoleItem = memo(({ role, isSelected, onSelect }: RoleItemProps) => {
   const handleSelect = useCallback(() => {
-    onSelect(
-      role.value === CUSTOM_ROLE_VALUE ? CUSTOM_ROLE_VALUE : validID(role.value)
-    );
-  }, [role.value, onSelect]);
+    onSelect(role.id === CUSTOM_ROLE_VALUE ? CUSTOM_ROLE_VALUE : validID(role.id));
+  }, [role.id, onSelect]);
 
   const checkIconClassName = useMemo(
     () => cn('ms-auto size-4', isSelected ? 'opacity-100' : 'opacity-0'),
@@ -224,8 +222,8 @@ const RoleItem = memo(({ role, isSelected, onSelect }: RoleItemProps) => {
   );
 
   return (
-    <CommandItem value={role.label} onSelect={handleSelect}>
-      <span className='truncate'>{role.label}</span>
+    <CommandItem value={role.roleName} onSelect={handleSelect}>
+      <span className='truncate'>{role.roleName}</span>
       <CheckIcon className={checkIconClassName} />
     </CommandItem>
   );

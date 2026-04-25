@@ -1,17 +1,18 @@
 Act as a senior backend engineer, security architect, and database architect
-with 15+ years of experience designing, reviewing, and auditing production-grade
-REST APIs and database schemas for large-scale systems. Adopt a critical,
-security-first, detail-oriented mindset. Assume all endpoints are exposed to the
-public internet and all schemas are deployed in a high-traffic, real-world
-environment where security, performance, correctness, reliability, and
-scalability are paramount. Provide feedback with the depth and responsibility
-expected from a professional conducting a production security and code review.
+with 15+ years of experience designing, reviewing, and auditing
+production-grade REST APIs and database schemas for large-scale systems. Adopt a
+critical, security-first, detail-oriented mindset. Assume all endpoints are
+exposed to the public internet and all schemas are deployed in a high-traffic,
+real-world environment where security, performance, correctness, reliability,
+and scalability are paramount. Provide feedback with the depth and
+responsibility expected from a professional conducting a production security and
+code review.
 
 ---
 
 I want you to review and analyze the provided API endpoint(s) and any related
-database schema. The only API endpoints you need to read are under the folder
-@app/api/dash/ and the file for auth config @lib/auth.ts  
+database schema.
+The only API endpoints you need to read are under the folder @app/api/dash/ & @app/api/auth/ 
 and the database schema @db/schema.ts  
 @db/migrations/001_add_trgm_indexes.sql  
 Please perform a thorough evaluation and provide a structured report that
@@ -84,7 +85,7 @@ const newBalance = user.balance - 100;
 await db.update(users).set({ balance: newBalance }).where(eq(users.id, id));
 ```
 
-Correct pattern:
+  Correct pattern:
 
 ```ts
 const result = await db
@@ -93,7 +94,7 @@ const result = await db
   .where(and(eq(users.id, userId), gte(users.balance, 100)))
   .returning();
 
-if (result.length === 0) throw new Error('Insufficient balance');
+if (result.length === 0) throw new Error("Insufficient balance");
 ```
 
 - **Missing transactions** — Are multiple related DB operations wrapped in a
@@ -101,8 +102,8 @@ if (result.length === 0) throw new Error('Insufficient balance');
 - **Transaction Isolation Level** — Is the isolation level appropriate for the
   use case? Could phantom reads or non-repeatable reads cause incorrect
   behavior?
-- **Locking** — Should `FOR UPDATE` or `FOR SHARE` be used to prevent concurrent
-  modification of the same row?
+- **Locking** — Should `FOR UPDATE` or `FOR SHARE` be used to prevent
+  concurrent modification of the same row?
 - **Duplicate submissions** — Could a user submit the same request twice quickly
   and get double the effect (double charge, double entry, etc.)?
 - **Idempotency** — Are non-idempotent operations (payments, transfers, etc.)
@@ -262,26 +263,21 @@ The document should:
 - Suggest **how to fix it** with a concrete code example where possible
 - Prioritize issues by severity: 🔴 Critical / 🟠 High / 🟡 Medium / 🟢 Low
 - Tag each issue with a **scale indicator** to show when it becomes relevant:
-  - 🧪 **Early Stage** — Not a real concern yet with few users; a simpler
-    solution exists now, but flag the future risk so it's not forgotten
-  - 📈 **At Scale** — Only becomes a real problem under high traffic or with
-    many users (e.g., N+1 queries, missing indexes, race conditions under load)
-  - ⚠️ **Always** — Critical regardless of traffic or user count (e.g., auth
-    bypasses, SQL injection, data exposure)
+  - 🧪 **Early Stage** — Not a real concern yet with few users; a simpler solution exists now, but flag the future risk so it's not forgotten
+  - 📈 **At Scale** — Only becomes a real problem under high traffic or with many users (e.g., N+1 queries, missing indexes, race conditions under load)
+  - ⚠️ **Always** — Critical regardless of traffic or user count (e.g., auth bypasses, SQL injection, data exposure)
 
-  For **Early Stage** issues: briefly mention the simpler approach that works
-  now, then explain what breaks when traffic or users grow. For **At Scale**
-  issues: give a rough sense of when it starts to hurt (e.g., "noticeable above
-  ~10k rows", "problematic with concurrent requests"). Write the report as if
-  advising a competent developer who understands backend concepts but is not a
-  security or concurrency specialist.
+  For **Early Stage** issues: briefly mention the simpler approach that works now, then explain what breaks when traffic or users grow.
+  For **At Scale** issues: give a rough sense of when it starts to hurt (e.g., "noticeable above ~10k rows", "problematic with concurrent requests").
+Write the report as if advising a competent developer who understands backend
+concepts but is not a security or concurrency specialist.
 
 ---
 
 Provide your response as a **clear technical report** with explanations and
-concrete recommendations. Update the file @reports/claude-opus.md for the
-report.
+concrete recommendations. Update the file  @reports/claude-sonnet.md   for the report.
 
 ---
 
-Issues you should ignore: @reports/should-ignore.md
+Issues you should ignore:
+@reports/should-ignore.md

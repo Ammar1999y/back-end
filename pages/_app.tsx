@@ -5,7 +5,6 @@ import '@/styles/app-style.css';
 import '@/styles/icons.css';
 import '@/styles/table.css';
 // Import local storage handlers to register them
-import '@/utils/store/handlers';
 
 import type { AppProps } from 'next/app';
 

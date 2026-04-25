@@ -1,21 +1,15 @@
+import type { HandlerInput } from './contract';
 import type {
   DashboardPage,
   PermissionAction,
 } from '@/lib/permissions/constants';
 
+import { validID } from '@/utils';
 import { auth } from '@/lib/auth';
-import {
-  checkMultiplePermissions,
-  checkUserPermission,
-} from '@/lib/permissions/checker';
+import { checkUserPermission } from '@/lib/permissions/checker';
 
-import {
-  HTTP_STATUS,
-  MSG_LOGIN_REQUIRED,
-} from '@/utils/api-messages';
+import { HTTP_STATUS, MSG_LOGIN_REQUIRED } from '@/utils/api-messages';
 import { CustomError } from '@/utils/error-class';
-
-import type { HandlerInput } from './contract';
 
 /**
  * Authorisation helper that reads headers from the framework-agnostic
@@ -40,21 +34,6 @@ export function requirePermission(
   });
 }
 
-/** Multi-permission variant — delegates to `checkMultiplePermissions`. */
-export function requireMultiplePermissions(
-  ctx: HandlerInput,
-  opts: {
-    checks: Array<{ resource: DashboardPage; action: PermissionAction }>;
-    forceDB?: boolean;
-  }
-) {
-  return checkMultiplePermissions({
-    headers: ctx.headers,
-    checks: opts.checks,
-    forceDB: opts.forceDB,
-  });
-}
-
 /**
  * Loads the active Better Auth session from ctx.headers.
  * Throws 401 when no authenticated user is present.
@@ -62,7 +41,12 @@ export function requireMultiplePermissions(
  */
 export async function requireSession(ctx: HandlerInput) {
   const session = await auth.api.getSession({ headers: ctx.headers });
-  if (!session?.user?.id)
+  const userId = validID(session?.user?.id);
+  if (!session || !userId)
     throw new CustomError(MSG_LOGIN_REQUIRED, HTTP_STATUS.UNAUTHORIZED);
-  return session;
+  return {
+    session,
+    userId,
+    sessionId: validID(session.session.id),
+  };
 }

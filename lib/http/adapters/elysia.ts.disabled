@@ -38,7 +38,11 @@ type ElysiaContext = {
   query: Record<string, string>;
   body: unknown;
   headers: Record<string, string | undefined>;
-  set: { status?: number; headers: Record<string, string> };
+  set: {
+    status?: number;
+    headers: Record<string, string>;
+    cookie?: Record<string, { value: string } & Record<string, unknown>>;
+  };
 };
 
 export function toElysiaRoute(handler: Handler) {
@@ -81,6 +85,15 @@ function writeResponse(output: HandlerOutput, ctx: ElysiaContext) {
   if (output.headers) {
     for (const [key, value] of Object.entries(output.headers)) {
       ctx.set.headers[key] = value;
+    }
+  }
+  if (output.cookies) {
+    ctx.set.cookie ??= {};
+    for (const cookie of output.cookies) {
+      ctx.set.cookie[cookie.name] = {
+        value: cookie.value,
+        ...cookie.options,
+      };
     }
   }
   return output.body;
@@ -136,10 +149,10 @@ export const betterAuthPlugin = new Elysia({ name: 'better-auth' })
 //    In Elysia, add an onRequest hook that writes headers to `set.headers`,
 //    or install an equivalent plugin. Mirror the values in next.config.js.
 // -------------------------------------------------------------------------
-// 5. Cookies — our Handler contract does not yet model outgoing cookies.
-//    Better Auth manages its own auth cookies via its handler. If the app
-//    later needs to set cookies from a handler, extend HandlerOutput with a
-//    `cookies` field and update all three adapters to honour it.
+// 5. Cookies — `HandlerOutput.cookies` is translated to Elysia's reactive
+//    `set.cookie` map above. Better Auth still manages its own auth cookies
+//    via its handler. For signed cookies, use Elysia's `t.Cookie({ ... })`
+//    with `secret: [new, old]` at the app level.
 // -------------------------------------------------------------------------
 
 */

@@ -1,5 +1,5 @@
 {
-  "id": "51aab38f-b37f-4ecf-9f71-e679df7336fb",
+  "id": "9c5f2dcb-6e2a-499e-8c5c-d0cd28b08e74",
   "prevId": "00000000-0000-0000-0000-000000000000",
   "version": "7",
   "dialect": "postgresql",
@@ -95,6 +95,21 @@
           "concurrently": false,
           "method": "btree",
           "with": {}
+        },
+        "idx_accounts_user_id": {
+          "name": "idx_accounts_user_id",
+          "columns": [
+            {
+              "expression": "user_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
         }
       },
       "foreignKeys": {
@@ -102,8 +117,12 @@
           "name": "accounts_user_id_users_id_fk",
           "tableFrom": "accounts",
           "tableTo": "users",
-          "columnsFrom": ["user_id"],
-          "columnsTo": ["id"],
+          "columnsFrom": [
+            "user_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
           "onDelete": "cascade",
           "onUpdate": "no action"
         }
@@ -190,7 +209,7 @@
         },
         "user_agent": {
           "name": "user_agent",
-          "type": "varchar(2000)",
+          "type": "varchar(512)",
           "primaryKey": false,
           "notNull": false
         },
@@ -236,8 +255,12 @@
           "name": "audit_logs_user_id_users_id_fk",
           "tableFrom": "audit_logs",
           "tableTo": "users",
-          "columnsFrom": ["user_id"],
-          "columnsTo": ["id"],
+          "columnsFrom": [
+            "user_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
           "onDelete": "set null",
           "onUpdate": "no action"
         }
@@ -414,8 +437,12 @@
           "name": "files_uploaded_by_users_id_fk",
           "tableFrom": "files",
           "tableTo": "users",
-          "columnsFrom": ["uploaded_by"],
-          "columnsTo": ["id"],
+          "columnsFrom": [
+            "uploaded_by"
+          ],
+          "columnsTo": [
+            "id"
+          ],
           "onDelete": "set null",
           "onUpdate": "no action"
         }
@@ -523,8 +550,12 @@
           "name": "role_permissions_role_id_roles_id_fk",
           "tableFrom": "role_permissions",
           "tableTo": "roles",
-          "columnsFrom": ["role_id"],
-          "columnsTo": ["id"],
+          "columnsFrom": [
+            "role_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
           "onDelete": "cascade",
           "onUpdate": "no action"
         }
@@ -622,7 +653,9 @@
         "ux_roles_role_name": {
           "name": "ux_roles_role_name",
           "nullsNotDistinct": false,
-          "columns": ["role_name"]
+          "columns": [
+            "role_name"
+          ]
         }
       },
       "policies": {},
@@ -664,7 +697,7 @@
         },
         "user_agent": {
           "name": "user_agent",
-          "type": "varchar(2000)",
+          "type": "varchar(512)",
           "primaryKey": false,
           "notNull": false
         },
@@ -738,8 +771,12 @@
           "name": "sessions_user_id_users_id_fk",
           "tableFrom": "sessions",
           "tableTo": "users",
-          "columnsFrom": ["user_id"],
-          "columnsTo": ["id"],
+          "columnsFrom": [
+            "user_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
           "onDelete": "cascade",
           "onUpdate": "no action"
         }
@@ -771,6 +808,26 @@
           "type": "varchar(150)",
           "primaryKey": false,
           "notNull": true
+        },
+        "phone_number": {
+          "name": "phone_number",
+          "type": "varchar(15)",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "email_verified": {
+          "name": "email_verified",
+          "type": "boolean",
+          "primaryKey": false,
+          "notNull": true,
+          "default": false
+        },
+        "phone_number_verified": {
+          "name": "phone_number_verified",
+          "type": "boolean",
+          "primaryKey": false,
+          "notNull": true,
+          "default": false
         },
         "is_active": {
           "name": "is_active",
@@ -836,6 +893,22 @@
           "method": "btree",
           "with": {}
         },
+        "ux_users_phone_number": {
+          "name": "ux_users_phone_number",
+          "columns": [
+            {
+              "expression": "phone_number",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": true,
+          "where": "deleted_at IS NULL AND phone_number IS NOT NULL",
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
         "idx_users_role_active": {
           "name": "idx_users_role_active",
           "columns": [
@@ -874,8 +947,12 @@
           "name": "users_role_id_roles_id_fk",
           "tableFrom": "users",
           "tableTo": "roles",
-          "columnsFrom": ["role_id"],
-          "columnsTo": ["id"],
+          "columnsFrom": [
+            "role_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
           "onDelete": "restrict",
           "onUpdate": "no action"
         }
@@ -896,9 +973,261 @@
           "name": "chk_deleted_user_inactive",
           "value": "deleted_at IS NULL OR is_active = false"
         },
+        "chk_phone_number_format": {
+          "name": "chk_phone_number_format",
+          "value": "phone_number IS NULL OR phone_number ~ '^9665[0-9]{8}$'"
+        },
         "chk_active_user_has_role": {
           "name": "chk_active_user_has_role",
           "value": "deleted_at IS NOT NULL OR role_id IS NOT NULL"
+        }
+      },
+      "isRLSEnabled": false
+    },
+    "public.verification_codes": {
+      "name": "verification_codes",
+      "schema": "",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "uuid",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "session_id": {
+          "name": "session_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "code": {
+          "name": "code",
+          "type": "varchar(255)",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "expires_at": {
+          "name": "expires_at",
+          "type": "timestamp(2) with time zone",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "timestamp(2) with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        }
+      },
+      "indexes": {
+        "ux_verification_codes_session": {
+          "name": "ux_verification_codes_session",
+          "columns": [
+            {
+              "expression": "session_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": true,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        }
+      },
+      "foreignKeys": {
+        "verification_codes_session_id_verification_sessions_id_fk": {
+          "name": "verification_codes_session_id_verification_sessions_id_fk",
+          "tableFrom": "verification_codes",
+          "tableTo": "verification_sessions",
+          "columnsFrom": [
+            "session_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {},
+      "isRLSEnabled": false
+    },
+    "public.verification_sessions": {
+      "name": "verification_sessions",
+      "schema": "",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "uuid",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "user_id": {
+          "name": "user_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "channel": {
+          "name": "channel",
+          "type": "otp_channel",
+          "typeSchema": "public",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "identifier": {
+          "name": "identifier",
+          "type": "varchar(160)",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "attempt_number": {
+          "name": "attempt_number",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
+        },
+        "verify_attempt_number": {
+          "name": "verify_attempt_number",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
+        },
+        "verify_attempt_daily": {
+          "name": "verify_attempt_daily",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
+        },
+        "verify_attempt_window_start": {
+          "name": "verify_attempt_window_start",
+          "type": "timestamp(2) with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        },
+        "last_sent_at": {
+          "name": "last_sent_at",
+          "type": "timestamp(2) with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "next_allowed_at": {
+          "name": "next_allowed_at",
+          "type": "timestamp(2) with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "is_blocked": {
+          "name": "is_blocked",
+          "type": "boolean",
+          "primaryKey": false,
+          "notNull": true,
+          "default": false
+        },
+        "blocked_until": {
+          "name": "blocked_until",
+          "type": "timestamp(2) with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "timestamp(2) with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        },
+        "updated_at": {
+          "name": "updated_at",
+          "type": "timestamp(2) with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        }
+      },
+      "indexes": {
+        "ux_verification_sessions_user_channel": {
+          "name": "ux_verification_sessions_user_channel",
+          "columns": [
+            {
+              "expression": "user_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "channel",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": true,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        }
+      },
+      "foreignKeys": {
+        "verification_sessions_user_id_users_id_fk": {
+          "name": "verification_sessions_user_id_users_id_fk",
+          "tableFrom": "verification_sessions",
+          "tableTo": "users",
+          "columnsFrom": [
+            "user_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {
+        "chk_attempt_number_non_negative": {
+          "name": "chk_attempt_number_non_negative",
+          "value": "attempt_number >= 0"
+        },
+        "chk_attempt_number_max": {
+          "name": "chk_attempt_number_max",
+          "value": "attempt_number <= 5"
+        },
+        "chk_verify_attempt_number_max": {
+          "name": "chk_verify_attempt_number_max",
+          "value": "verify_attempt_number <= 5"
+        },
+        "chk_verify_attempt_daily_max": {
+          "name": "chk_verify_attempt_daily_max",
+          "value": "verify_attempt_daily <= 15"
+        },
+        "chk_verify_attempt_number_non_negative": {
+          "name": "chk_verify_attempt_number_non_negative",
+          "value": "verify_attempt_number >= 0"
+        },
+        "chk_verify_attempt_daily_non_negative": {
+          "name": "chk_verify_attempt_daily_non_negative",
+          "value": "verify_attempt_daily >= 0"
+        },
+        "chk_blocked_has_until": {
+          "name": "chk_blocked_has_until",
+          "value": "is_blocked = false OR blocked_until IS NOT NULL"
+        },
+        "chk_unblocked_no_until": {
+          "name": "chk_unblocked_no_until",
+          "value": "is_blocked = true OR blocked_until IS NULL"
         }
       },
       "isRLSEnabled": false
@@ -908,27 +1237,54 @@
     "public.audit_log_action": {
       "name": "audit_log_action",
       "schema": "public",
-      "values": ["INSERT", "UPDATE", "DELETE"]
+      "values": [
+        "INSERT",
+        "UPDATE",
+        "DELETE"
+      ]
     },
     "public.bucket_type": {
       "name": "bucket_type",
       "schema": "public",
-      "values": ["public", "private"]
+      "values": [
+        "public",
+        "private"
+      ]
     },
     "public.file_context_table": {
       "name": "file_context_table",
       "schema": "public",
-      "values": [""]
+      "values": [
+        ""
+      ]
+    },
+    "public.otp_channel": {
+      "name": "otp_channel",
+      "schema": "public",
+      "values": [
+        "email",
+        "sms",
+        "whatsapp"
+      ]
     },
     "public.page_name": {
       "name": "page_name",
       "schema": "public",
-      "values": ["home", "users", "permissions", "mainPage"]
+      "values": [
+        "home",
+        "users",
+        "permissions",
+        "mainPage"
+      ]
     },
     "public.role_scope": {
       "name": "role_scope",
       "schema": "public",
-      "values": ["system", "standard", "custom"]
+      "values": [
+        "system",
+        "standard",
+        "custom"
+      ]
     }
   },
   "schemas": {},

@@ -97,8 +97,19 @@
 51. **Self-Edit Password Change Skips Session Revocation** —
     `app/api/dash/users/[id]/route.ts` — Same reasoning as #70; `validID` always
     matches session ID format
-
----
+52. **F-8: Acting admin's permissions not re-verified inside `handleAdminEdit`** —
+    `app/api/dash/users/[id]/handler.ts` — Cookie-cached actor permissions can
+    be stale by ms-scale window relative to a concurrent demotion. A demoted
+    admin slipping one extra mutation through within ~ms of revocation is not
+    materially different from acting one second before revocation. The fix
+    (re-read actor role + permissions under `FOR SHARE` inside every admin
+    mutation tx) costs an extra round-trip on every write to close a window
+    that opens to an attacker only under a precisely-timed race. Cost > benefit.
+53. **H2: HIBP check fails open silently and has no HTTP timeout** —
+    `lib/auth/check-password.ts:18-59` — `checkPasswordCompromise` retries the
+    HIBP API up to 3 times and falls through silently on exhaustion with no
+    `AbortSignal`; during an HIBP outage, compromised passwords are silently
+    accepted and admin operations stall 10–30s on user-creation hot path
 
 # Known Issues — Will Be Fixed Later
 

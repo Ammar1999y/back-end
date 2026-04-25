@@ -17,28 +17,50 @@ const KEY_PREFIX = 'ba:rl:';
 // comfortably larger than the longest configured window is fine.
 const TTL_SECONDS = 3600;
 
+const MAX_RETRIES = 2;
+const RETRY_BASE_DELAY_MS = 50;
+
+function sleep(ms: number) {
+  return new Promise<void>((resolve) => setTimeout(resolve, ms));
+}
+
+async function withRetry<T>(op: () => Promise<T>): Promise<T> {
+  let lastError: unknown;
+  for (let attempt = 0; attempt <= MAX_RETRIES; attempt += 1) {
+    try {
+      return await op();
+    } catch (error) {
+      lastError = error;
+      if (attempt < MAX_RETRIES)
+        await sleep(RETRY_BASE_DELAY_MS * 2 ** attempt);
+    }
+  }
+  throw lastError;
+}
+
 export const authRateLimitStorage: BetterAuthRateLimitStorage = {
+  // Fail-closed: after retries are exhausted, rethrow so better-auth surfaces
+  // the error to the request instead of treating the login/signup attempt as
+  // "no prior record". Losing the limiter on /sign-in/email would let an
+  // attacker burn unlimited credential-stuffing attempts during an outage.
   async get(key: string) {
     try {
-      return await redis.get<RateLimitEntry>(`${KEY_PREFIX}${key}`);
-    } catch (error) {
-      // Fail-open: let better-auth treat this as "no prior record" and proceed.
-      console.warn(
-        '[rate-limit] redis get failed, allowing request:',
-        sanitizeForLog(error)
+      return await withRetry(() =>
+        redis.get<RateLimitEntry>(`${KEY_PREFIX}${key}`)
       );
-      return null;
+    } catch (error) {
+      console.error(sanitizeForLog(error));
+      throw error;
     }
   },
   async set(key: string, value: RateLimitEntry) {
     try {
-      await redis.set(`${KEY_PREFIX}${key}`, value, { ex: TTL_SECONDS });
-    } catch (error) {
-      // Fail-open: dropping the increment is safer than blocking legitimate users.
-      console.warn(
-        '[rate-limit] redis set failed, allowing request:',
-        sanitizeForLog(error)
+      await withRetry(() =>
+        redis.set(`${KEY_PREFIX}${key}`, value, { ex: TTL_SECONDS })
       );
+    } catch (error) {
+      console.error(sanitizeForLog(error));
+      throw error;
     }
   },
 };

@@ -26,16 +26,24 @@ export const DASHBOARD_PAGES = {
   home: 'الرئيسية',
   users: 'المستخدمين',
   permissions: 'الصلاحيات',
-  mainPage: 'الصفحه الرئيسية',
 } as const;
 
 /**
- * الصلاحيات المتاحة لكل صفحة
+ * الصلاحيات المتاحة لكل صفحة.
+ * - view/edit/delete: تطبق على كل السجلات.
+ * - viewOwn/editOwn/deleteOwn: تطبق فقط على السجلات التي أنشأها المستخدم نفسه.
+ * - create: إنشاء سجل جديد.
+ *
+ * قاعدة الـ supersession: إذا كان المستخدم يملك view فإن viewOwn مُتجاهل
+ * (لا حاجة لفحصه)، وكذلك edit ↔ editOwn و delete ↔ deleteOwn.
  */
 export const PERMISSION_ACTIONS = {
-  view: 'عرض',
-  edit: 'تعديل',
-  delete: 'حذف',
+  view: 'عرض الكل',
+  viewOwn: 'عرض الخاص',
+  edit: 'تعديل الكل',
+  editOwn: 'تعديل الخاص',
+  delete: 'حذف الكل',
+  deleteOwn: 'حذف الخاص',
   create: 'إنشاء',
 } as const;
 
@@ -47,6 +55,19 @@ export type PermissionObject = Record<
   DashboardPage,
   Record<PermissionAction, boolean>
 >;
+
+/**
+ * خريطه الـ action العام إلى نسخة "own" المقابلة.
+ * تستخدم لتطبيق قاعدة supersession ولفحص "view OR viewOwn" بشكل موحد.
+ */
+export const OWN_ACTION_MAP = {
+  view: 'viewOwn',
+  edit: 'editOwn',
+  delete: 'deleteOwn',
+} as const satisfies Partial<Record<PermissionAction, PermissionAction>>;
+
+export type AllScopedAction = keyof typeof OWN_ACTION_MAP;
+export type OwnScopedAction = (typeof OWN_ACTION_MAP)[AllScopedAction];
 
 export interface SessionMetadata {
   roleId?: string | null;
@@ -64,16 +85,28 @@ export const DEFAULT_PAGE_PERMISSIONS: Array<{
     availablePermissions: ['view'],
   },
   {
-    name: 'mainPage',
-    availablePermissions: ['view', 'edit'],
-  },
-  {
     name: 'users',
-    availablePermissions: ['view', 'edit', 'delete', 'create'],
+    availablePermissions: [
+      'view',
+      'viewOwn',
+      'edit',
+      'editOwn',
+      'delete',
+      'deleteOwn',
+      'create',
+    ],
   },
   {
     name: 'permissions',
-    availablePermissions: ['view', 'edit', 'delete', 'create'],
+    availablePermissions: [
+      'view',
+      'viewOwn',
+      'edit',
+      'editOwn',
+      'delete',
+      'deleteOwn',
+      'create',
+    ],
   },
 ];
 

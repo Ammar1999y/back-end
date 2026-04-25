@@ -80,9 +80,12 @@ export const updateUserSchema = userRoleSchema
   })
   .superRefine(validateCustomRolePermissions);
 
-export const selfUpdateUserSchema = userRoleSchema.pick({ name: true }).extend({
-  id: idSchema,
-});
+// Reject unknown keys with .strict() so a client sending email/roleId/password/
+// isActive gets a 4xx instead of a misleading 200 with the fields silently stripped.
+export const selfUpdateUserSchema = userRoleSchema
+  .pick({ name: true })
+  .extend({ id: idSchema })
+  .strict();
 
 // Self-service: change own password
 export const changePasswordSchema = z.object({
