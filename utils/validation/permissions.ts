@@ -71,15 +71,31 @@ export const pagePermissionSchema = z.preprocess(
       permissions: permissionSchema,
     })
     .superRefine(({ permissions }, ctx) => {
-      const hasWrite =
-        permissions.create === true ||
-        permissions.edit === true ||
-        permissions.delete === true;
+      // `create` alone needs no read access (per product spec).
+      // `edit`/`delete` (all-scope) require `view`.
+      // `editOwn`/`deleteOwn` require `view` OR `viewOwn`.
+      const hasAllWrite =
+        permissions.edit === true || permissions.delete === true;
+      const hasOwnWrite =
+        permissions.editOwn === true || permissions.deleteOwn === true;
 
-      if (hasWrite && permissions.view !== true) {
+      if (hasAllWrite && permissions.view !== true) {
         ctx.addIssue({
           code: z.ZodIssueCode.custom,
           path: ['permissions', 'view'],
+          message: ERROR_MESSAGES.viewRequiredForWrite,
+        });
+        return;
+      }
+
+      if (
+        hasOwnWrite &&
+        permissions.view !== true &&
+        permissions.viewOwn !== true
+      ) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['permissions', 'viewOwn'],
           message: ERROR_MESSAGES.viewRequiredForWrite,
         });
       }

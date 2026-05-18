@@ -1,3 +1,5 @@
+import '@/lib/env.server';
+
 import type { PgTransactionConfig } from 'drizzle-orm/pg-core';
 
 import { drizzle } from 'drizzle-orm/neon-serverless';

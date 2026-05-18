@@ -15,6 +15,13 @@ database schema.
 The only API endpoints you need to read are under the folder @app/api/dash/ & @app/api/auth/ 
 and the database schema @db/schema.ts  
 @db/migrations/001_add_trgm_indexes.sql  
+
+**Scope restriction — backend only:** Read **only** backend code (API endpoints,
+database schema, server-side logic, and any backend utilities they depend on).
+**Completely ignore** anything under `pages/`, `components/`, `hooks/`, and
+`styles/` folders — do not open, read, reference, or analyze any frontend code.
+This review is strictly limited to the backend / API layer.
+
 Please perform a thorough evaluation and provide a structured report that
 includes:
 

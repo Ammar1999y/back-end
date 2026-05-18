@@ -33,7 +33,7 @@ export const OTP_MAX_VERIFY_ATTEMPTS = 5;
 // cycles so an attacker cannot reset the counter by requesting a new code.
 export const OTP_MAX_DAILY_VERIFY_ATTEMPTS = 15;
 export const OTP_EXPIRY_MINUTES = 10;
-export const OTP_BLOCK_DURATION_HOURS = 24;
+export const OTP_BLOCK_DURATION_HOURS = 6;
 
 // Roles & Permissions
 export const ROLE_NAME_MIN = 1;

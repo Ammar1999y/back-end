@@ -3,7 +3,15 @@ import type {
   PermissionAction,
 } from '@/lib/permissions/constants';
 
-import { and, eq, inArray, isNotNull, isNull, sql } from 'drizzle-orm';
+import {
+  and,
+  eq,
+  inArray,
+  isNotNull,
+  isNull,
+  notInArray,
+  sql,
+} from 'drizzle-orm';
 
 import { db } from '@/db';
 import { rolePermissions, roles, sessions, users } from '@/db/schema';
@@ -54,7 +62,7 @@ import { permissionMsg } from '../messages';
 
 export const GET: Handler = async (ctx) => {
   try {
-    const { userId } = await requirePermission(ctx, {
+    const { userId, scope } = await requirePermission(ctx, {
       resource: 'permissions',
       action: 'view',
     });
@@ -71,6 +79,13 @@ export const GET: Handler = async (ctx) => {
     const roleData = await db.query.roles.findFirst({
       where: (roles, { eq, and }) =>
         and(eq(roles.id, roleId), eq(roles.scope, ROLE_SCOPE.STANDARD)),
+      columns: {
+        id: true,
+        roleName: true,
+        description: true,
+        isActive: true,
+        createdBy: true,
+      },
       with: {
         rolePermissions: {
           columns: {
@@ -82,6 +97,9 @@ export const GET: Handler = async (ctx) => {
     });
 
     if (!roleData) throw new CustomError(MSG_NOT_FOUND, HTTP_STATUS.NOT_FOUND);
+
+    if (scope === 'own' && roleData.createdBy !== userId)
+      throw new CustomError(MSG_NOT_FOUND, HTTP_STATUS.NOT_FOUND);
 
     return apiSuccess({
       message: MSG_FETCHED,
@@ -108,6 +126,7 @@ export const PUT: Handler = async (ctx) => {
       userId: actorUserId,
       permissions: actorPermissions,
       roleId: actorRoleId,
+      scope: editScope,
     } = await requirePermission(ctx, {
       resource: 'permissions',
       action: 'edit',
@@ -142,7 +161,9 @@ export const PUT: Handler = async (ctx) => {
       );
     const validatedData = validatedDataParsed.data;
 
-    if (validatedData.roleName.startsWith(`${CUSTOM_ROLE_VALUE}-`))
+    if (
+      validatedData.roleName.toLowerCase().startsWith(`${CUSTOM_ROLE_VALUE}-`)
+    )
       throw new CustomError(
         permissionMsg.customPrefixForbidden(`${CUSTOM_ROLE_VALUE}-`),
         HTTP_STATUS.BAD_REQUEST
@@ -162,6 +183,7 @@ export const PUT: Handler = async (ctx) => {
           isActive: roles.isActive,
           roleName: roles.roleName,
           description: roles.description,
+          createdBy: roles.createdBy,
         })
         .from(roles)
         .where(standardRoleFilter(roleId))
@@ -170,14 +192,22 @@ export const PUT: Handler = async (ctx) => {
       if (!existingRole?.id)
         throw new CustomError(MSG_NOT_FOUND, HTTP_STATUS.NOT_FOUND);
 
+      if (editScope === 'own' && existingRole.createdBy !== actorUserId)
+        throw new CustomError(MSG_NOT_FOUND, HTTP_STATUS.NOT_FOUND);
+
       if (actorPermissions) {
         await validateRolePermissionScope(actorPermissions, roleId, tx);
       }
 
+      const canDeactivate =
+        actorPermissions?.['permissions']?.['delete'] === true ||
+        (actorPermissions?.['permissions']?.['deleteOwn'] === true &&
+          existingRole.createdBy === actorUserId);
+
       if (
         existingRole.isActive &&
         validatedData.isActive === false &&
-        actorPermissions?.['permissions']?.['delete'] !== true
+        !canDeactivate
       ) {
         throw new CustomError(
           MSG_INSUFFICIENT_PERMISSIONS,
@@ -235,11 +265,27 @@ export const PUT: Handler = async (ctx) => {
             permissions: p.permissions,
           }));
 
+          // Per-row UPSERT against ux_role_permissions_role_page so unchanged
+          // pages keep their created_at and we only rewrite what actually
+          // differs. Rows for pages dropped from the payload are deleted in a
+          // single follow-up statement.
+          await tx
+            .insert(rolePermissions)
+            .values(permissionsData)
+            .onConflictDoUpdate({
+              target: [rolePermissions.roleId, rolePermissions.pageName],
+              set: { permissions: sql`excluded.permissions` },
+            });
+
+          const newPageNames = permissionsData.map((p) => p.pageName);
           await tx
             .delete(rolePermissions)
-            .where(eq(rolePermissions.roleId, roleId));
-
-          await tx.insert(rolePermissions).values(permissionsData);
+            .where(
+              and(
+                eq(rolePermissions.roleId, roleId),
+                notInArray(rolePermissions.pageName, newPageNames)
+              )
+            );
         }
       }
 
@@ -322,6 +368,7 @@ export const DELETE: Handler = async (ctx) => {
       session,
       userId: actorUserId,
       permissions: actorPermissions,
+      scope: deleteScope,
     } = await requirePermission(ctx, {
       resource: 'permissions',
       action: 'delete',
@@ -345,11 +392,15 @@ export const DELETE: Handler = async (ctx) => {
           id: roles.id,
           roleName: roles.roleName,
           description: roles.description,
+          createdBy: roles.createdBy,
         })
         .from(roles)
         .where(standardRoleFilter(roleId))
         .for('update');
       if (!existingRole)
+        throw new CustomError(MSG_NOT_FOUND, HTTP_STATUS.NOT_FOUND);
+
+      if (deleteScope === 'own' && existingRole.createdBy !== actorUserId)
         throw new CustomError(MSG_NOT_FOUND, HTTP_STATUS.NOT_FOUND);
 
       const existingPermissions = await tx
@@ -373,7 +424,19 @@ export const DELETE: Handler = async (ctx) => {
       // users still pinning role_id would block the role DELETE with an FK
       // violation. Null them out first so the DELETE proceeds. With the flag
       // off the FK is `set null` and Postgres handles this on its own.
+      //
+      // FOR UPDATE on every user pinning this role first: under READ
+      // COMMITTED a concurrent restore (`deleted_at = NULL`) committing
+      // between our UPDATE-soft-deleted and the DELETE-not-exists check
+      // would either trip the RESTRICT FK or leave the restored user with
+      // role_id = NULL. Locking serialises the restore against this delete.
       if (REQUIRE_ROLE_FOR_LOGIN) {
+        await tx
+          .select({ id: users.id })
+          .from(users)
+          .where(eq(users.roleId, roleId))
+          .for('update');
+
         await tx
           .update(users)
           .set({ roleId: null })

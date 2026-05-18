@@ -1,6 +1,5 @@
 import { EntityID } from '@/types';
 
-import { extractIdFromUrl } from '.';
 import { CustomError } from './error-class';
 
 type MutationMethod = 'POST' | 'PUT' | 'DELETE';
@@ -49,30 +48,6 @@ export const mutate = async <TData = unknown, TVariables = unknown>({
   message?: string;
 }> => {
   try {
-    // Check if endpoint has a local storage handler
-    for (const [pattern, handler] of localStorageHandlers) {
-      if (pattern.test(href)) {
-        const id = extractIdFromUrl(href);
-
-        let result: { data: TData; message: string };
-
-        if (method === 'POST' && handler.create) {
-          result = await handler.create(data);
-        } else if (method === 'PUT' && handler.update && id) {
-          result = await handler.update(id, data);
-        } else if (method === 'DELETE' && handler.delete && id) {
-          result = await handler.delete(id);
-        } else {
-          throw new CustomError('عملية غير صحيحة', 400);
-        }
-
-        if (onSuccess && result.data) await onSuccess(result.data);
-
-        return result;
-      }
-    }
-
-    // Original fetch code for endpoints without local storage handler
     const isFormData = data instanceof FormData || useFormData;
 
     const response = await fetch(href, {

@@ -1,5 +1,3 @@
-import type { PermissionAction } from '@/lib/permissions/constants';
-
 import { and, desc, eq, gt, isNull, sql } from 'drizzle-orm';
 
 import { db } from '@/db';
@@ -75,7 +73,7 @@ export const GET: Handler = async (ctx) => {
       session,
       userId,
       sessionId,
-      allowed,
+      scope: viewScope,
       permissions: actorViewPermissions,
     } = await requirePermission(ctx, {
       resource: 'users',
@@ -94,7 +92,7 @@ export const GET: Handler = async (ctx) => {
 
     const isSelf = userId === targetId;
 
-    if (!isSelf && !allowed)
+    if (!isSelf && !viewScope)
       throw new CustomError(
         MSG_INSUFFICIENT_PERMISSIONS,
         HTTP_STATUS.FORBIDDEN
@@ -106,8 +104,11 @@ export const GET: Handler = async (ctx) => {
         HTTP_STATUS.FORBIDDEN
       );
 
-    const canViewSessions =
-      isSelf || actorViewPermissions?.users?.edit === true;
+    const editAll = actorViewPermissions?.users?.edit === true;
+    const editOwn = actorViewPermissions?.users?.editOwn === true;
+    // Sessions are fetched optimistically when the actor *might* be allowed to
+    // see them. Final visibility is decided after we know target.createdBy.
+    const canFetchSessions = isSelf || editAll || editOwn;
 
     const userDataPromise = db.query.users.findFirst({
       where: (users, { eq, and, isNull }) =>
@@ -118,6 +119,7 @@ export const GET: Handler = async (ctx) => {
         email: true,
         isActive: true,
         roleId: true,
+        createdBy: true,
         createdAt: true,
         updatedAt: true,
       },
@@ -140,7 +142,7 @@ export const GET: Handler = async (ctx) => {
       },
     });
 
-    const sessionsPromise = canViewSessions
+    const sessionsPromise = canFetchSessions
       ? db
           .select({
             id: sessions.id,
@@ -173,18 +175,25 @@ export const GET: Handler = async (ctx) => {
     if (!userData.roleId)
       throw new CustomError(MSG_NOT_FOUND, HTTP_STATUS.NOT_FOUND);
 
+    if (!isSelf && viewScope === 'own' && userData.createdBy !== userId)
+      throw new CustomError(MSG_NOT_FOUND, HTTP_STATUS.NOT_FOUND);
+
+    const showSessions =
+      isSelf || editAll || (editOwn && userData.createdBy === userId);
+
     const permissions =
       userData.role?.rolePermissions?.map((p) => ({
         name: p.pageName,
         permissions: p.permissions,
       })) || [];
 
-    const userSessions = sessionRows
-      ? sessionRows.map((s) => ({
-          ...s,
-          isCurrent: s.id === sessionId,
-        }))
-      : undefined;
+    const userSessions =
+      showSessions && sessionRows
+        ? sessionRows.map((s) => ({
+            ...s,
+            isCurrent: s.id === sessionId,
+          }))
+        : undefined;
 
     return apiSuccess({
       message: MSG_FETCHED,
@@ -270,6 +279,7 @@ async function handleAdminEdit(
   actorPermissions: Awaited<
     ReturnType<typeof checkUserPermission>
   >['permissions'],
+  editScope: 'all' | 'own',
   targetId: EntityID,
   body: Record<string, unknown>,
   auditMeta: AuditMeta
@@ -301,8 +311,10 @@ async function handleAdminEdit(
         email: users.email,
         roleId: users.roleId,
         isActive: users.isActive,
+        createdBy: users.createdBy,
         roleName: roles.roleName,
         roleScope: roles.scope,
+        roleCreatedBy: roles.createdBy,
       })
       .from(users)
       .innerJoin(roles, eq(users.roleId, roles.id))
@@ -318,6 +330,9 @@ async function handleAdminEdit(
         scope: lockedUser.roleScope,
       })
     )
+      throw new CustomError(MSG_NOT_FOUND, HTTP_STATUS.NOT_FOUND);
+
+    if (editScope === 'own' && lockedUser.createdBy !== actor.userId)
       throw new CustomError(MSG_NOT_FOUND, HTTP_STATUS.NOT_FOUND);
 
     const isCurrentlyCustom = lockedUser.roleScope === CUSTOM_ROLE_VALUE;
@@ -345,12 +360,23 @@ async function handleAdminEdit(
     }
 
     if (isCustomRole) {
-      const required: PermissionAction = isCurrentlyCustom ? 'edit' : 'create';
-      if (actorPermissions?.['permissions']?.[required] !== true)
+      if (isCurrentlyCustom) {
+        const hasEditAll =
+          actorPermissions?.['permissions']?.['edit'] === true;
+        const hasEditOwn =
+          actorPermissions?.['permissions']?.['editOwn'] === true &&
+          lockedUser.roleCreatedBy === actor.userId;
+        if (!hasEditAll && !hasEditOwn)
+          throw new CustomError(
+            MSG_INSUFFICIENT_PERMISSIONS,
+            HTTP_STATUS.FORBIDDEN
+          );
+      } else if (actorPermissions?.['permissions']?.['create'] !== true) {
         throw new CustomError(
           MSG_INSUFFICIENT_PERMISSIONS,
           HTTP_STATUS.FORBIDDEN
         );
+      }
     }
 
     let assignedRoleId: EntityID;
@@ -391,7 +417,8 @@ async function handleAdminEdit(
         assignedRoleId = await createCustomRole(
           tx,
           validatedData.permissions,
-          null
+          null,
+          actor.userId
         );
       }
     } else {
@@ -406,6 +433,10 @@ async function handleAdminEdit(
         email: validatedData.email,
         isActive: validatedData.isActive,
         roleId: assignedRoleId,
+        // Admin-issued password reset is the supported recovery path for a
+        // locked-out user; clear the brute-force counters atomically with the
+        // password change so the user can sign in immediately.
+        ...(password ? { failedLoginAttempts: 0, lockedUntil: null } : {}),
       })
       .where(and(eq(users.id, userId), isNull(users.deletedAt)))
       .returning({ id: users.id });
@@ -466,39 +497,47 @@ async function handleAdminEdit(
         );
     }
 
-    await auditLog(tx, {
-      userId: actor.userId,
-      userEmail: actor.userEmail,
-      action: 'UPDATE',
-      tableName: 'users',
-      recordId: userId,
-      oldData: {
-        name: lockedUser.name,
-        email: lockedUser.email,
-        roleId: lockedUser.roleId,
-        isActive: lockedUser.isActive,
-      },
-      newData: {
-        name: validatedData.name,
-        email: validatedData.email,
-        roleId: assignedRoleId,
-        isActive: validatedData.isActive,
-        ...(password ? { passwordChanged: true } : {}),
-      },
-      meta: auditMeta,
-    });
+    // After the main UPDATE the audit insert, session housekeeping, and
+    // verification-session cleanup are independent of each other — fan them
+    // out so they don't pay sequential round-trip latency.
+    const sessionWork: Promise<unknown> = shouldDeleteAllSessions
+      ? tx.delete(sessions).where(eq(sessions.userId, userId))
+      : shouldRefreshSessions
+        ? refreshUserSessions(userId, tx)
+        : Promise.resolve();
 
-    if (shouldDeleteAllSessions) {
-      await tx.delete(sessions).where(eq(sessions.userId, userId));
-    } else if (shouldRefreshSessions) {
-      await refreshUserSessions(userId, tx);
-    }
+    const verificationCleanup: Promise<unknown> =
+      emailChanged || shouldDeleteAllSessions
+        ? tx
+            .delete(verificationSessions)
+            .where(eq(verificationSessions.userId, userId))
+        : Promise.resolve();
 
-    if (emailChanged || shouldDeleteAllSessions) {
-      await tx
-        .delete(verificationSessions)
-        .where(eq(verificationSessions.userId, userId));
-    }
+    await Promise.all([
+      auditLog(tx, {
+        userId: actor.userId,
+        userEmail: actor.userEmail,
+        action: 'UPDATE',
+        tableName: 'users',
+        recordId: userId,
+        oldData: {
+          name: lockedUser.name,
+          email: lockedUser.email,
+          roleId: lockedUser.roleId,
+          isActive: lockedUser.isActive,
+        },
+        newData: {
+          name: validatedData.name,
+          email: validatedData.email,
+          roleId: assignedRoleId,
+          isActive: validatedData.isActive,
+          ...(password ? { passwordChanged: true } : {}),
+        },
+        meta: auditMeta,
+      }),
+      sessionWork,
+      verificationCleanup,
+    ]);
   });
 }
 
@@ -507,7 +546,7 @@ export const PUT: Handler = async (ctx) => {
     const {
       session,
       userId,
-      allowed,
+      scope: editScope,
       permissions: actorPermissions,
     } = await requirePermission(ctx, {
       resource: 'users',
@@ -539,13 +578,20 @@ export const PUT: Handler = async (ctx) => {
       return apiSuccess({ message: MSG_UPDATED });
     }
 
-    if (!allowed)
+    if (!editScope)
       throw new CustomError(
         MSG_INSUFFICIENT_PERMISSIONS,
         HTTP_STATUS.FORBIDDEN
       );
 
-    await handleAdminEdit(actor, actorPermissions, targetId, body, auditMeta);
+    await handleAdminEdit(
+      actor,
+      actorPermissions,
+      editScope,
+      targetId,
+      body,
+      auditMeta
+    );
     return apiSuccess({ message: MSG_UPDATED });
   } catch (error) {
     if (isUniqueViolation(error)) {
@@ -578,6 +624,7 @@ export const DELETE: Handler = async (ctx) => {
       session,
       userId: actorUserId,
       permissions: actorPermissions,
+      scope: deleteScope,
     } = await requirePermission(ctx, { resource: 'users', action: 'delete' });
 
     await enforceRateLimit({
@@ -605,8 +652,9 @@ export const DELETE: Handler = async (ctx) => {
         role_id: EntityID;
         role_name: string;
         role_scope: string;
+        created_by: EntityID | null;
       }>(sql`
-        SELECT u.email, u.phone_number, u.role_id, r.role_name, r.scope AS role_scope
+        SELECT u.email, u.phone_number, u.role_id, u.created_by, r.role_name, r.scope AS role_scope
         FROM users u
         INNER JOIN roles r ON r.id = u.role_id
         WHERE u.id = ${userId}
@@ -618,6 +666,9 @@ export const DELETE: Handler = async (ctx) => {
 
       const lockedUser = locked.rows[0];
       if (!lockedUser?.role_id)
+        throw new CustomError(MSG_NOT_FOUND, HTTP_STATUS.NOT_FOUND);
+
+      if (deleteScope === 'own' && lockedUser.created_by !== actorUserId)
         throw new CustomError(MSG_NOT_FOUND, HTTP_STATUS.NOT_FOUND);
 
       if (actorPermissions) {

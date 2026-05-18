@@ -69,6 +69,13 @@ export const OWN_ACTION_MAP = {
 export type AllScopedAction = keyof typeof OWN_ACTION_MAP;
 export type OwnScopedAction = (typeof OWN_ACTION_MAP)[AllScopedAction];
 
+/**
+ * Access scope resolved from a user's permissions for a given action:
+ * - 'all': user has the unrestricted action (e.g. `view`).
+ * - 'own': user has only the own-scoped variant (e.g. `viewOwn`) — must filter by created_by.
+ */
+export type AccessScope = 'all' | 'own';
+
 export interface SessionMetadata {
   roleId?: string | null;
   roleName?: string | null;

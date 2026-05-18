@@ -12,6 +12,10 @@ const CAPTCHA_HEADER = 'x-captcha-response';
 
 const MAX_TOKEN_LENGTH = 2048;
 
+// Cap the outbound siteverify call so a Cloudflare slowdown can't stall
+// OTP/auth handlers indefinitely. Failure here flows through fail-closed.
+const SITEVERIFY_TIMEOUT_MS = 3000;
+
 /** Fails closed on any error. */
 export async function verifyTurnstileToken(
   token: string,
@@ -32,11 +36,17 @@ export async function verifyTurnstileToken(
   const body = new URLSearchParams({ secret: secretKey, response: token });
   if (remoteIp) body.set('remoteip', remoteIp);
 
+  const controller = new AbortController();
+  const timeout = setTimeout(
+    () => controller.abort(),
+    SITEVERIFY_TIMEOUT_MS
+  );
   try {
     const response = await fetch(SITEVERIFY_URL, {
       method: 'POST',
       headers: { 'content-type': 'application/x-www-form-urlencoded' },
       body,
+      signal: controller.signal,
     });
     if (!response.ok) return false;
     const data = (await response.json()) as { success?: boolean };
@@ -44,6 +54,8 @@ export async function verifyTurnstileToken(
   } catch (error) {
     console.error(sanitizeForLog(error));
     return false;
+  } finally {
+    clearTimeout(timeout);
   }
 }
 

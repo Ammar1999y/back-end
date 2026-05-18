@@ -92,32 +92,50 @@ export const POST: Handler = async (ctx) => {
       code,
       auditMeta,
       onVerified: async (tx) => {
-        const verifiedField =
-          channel === 'email'
-            ? { emailVerified: true }
-            : { phoneNumberVerified: true };
-        const alreadyVerifiedCondition =
-          channel === 'email'
-            ? eq(users.emailVerified, false)
-            : eq(users.phoneNumberVerified, false);
-
-        const [updated] = await tx
-          .update(users)
-          .set(verifiedField)
+        // Look up the current state under the active filter so we can
+        // distinguish "user is still active and we are flipping the flag"
+        // from "user vanished mid-flow". Without this split, a deactivation
+        // between OTP send and verify would be silently reported as success.
+        const [currentUser] = await tx
+          .select({
+            emailVerified: users.emailVerified,
+            phoneNumberVerified: users.phoneNumberVerified,
+          })
+          .from(users)
           .where(
             and(
               eq(users.id, userData.id),
               isNull(users.deletedAt),
-              eq(users.isActive, true),
-              alreadyVerifiedCondition
+              eq(users.isActive, true)
             )
           )
-          .returning({ id: users.id });
+          .for('update');
 
-        // No row matched either because the user vanished or the flag was
-        // already true. Treat already-verified as a no-op success and skip
-        // the audit row so the log reflects real transitions only.
-        if (!updated) return;
+        if (!currentUser) {
+          throw new CustomError(
+            otpMsg.invalidOrExpired,
+            HTTP_STATUS.BAD_REQUEST
+          );
+        }
+
+        const isAlreadyVerified =
+          channel === 'email'
+            ? currentUser.emailVerified
+            : currentUser.phoneNumberVerified;
+
+        // Idempotent re-verification: skip the UPDATE and the audit row so
+        // the log only reflects real transitions.
+        if (isAlreadyVerified) return;
+
+        const verifiedField =
+          channel === 'email'
+            ? { emailVerified: true }
+            : { phoneNumberVerified: true };
+
+        await tx
+          .update(users)
+          .set(verifiedField)
+          .where(eq(users.id, userData.id));
 
         const verifiedFieldName =
           channel === 'email' ? 'emailVerified' : 'phoneNumberVerified';

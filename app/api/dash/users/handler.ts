@@ -57,7 +57,7 @@ const USERS_ALLOWED_COLUMNS = new Set([
 
 export const GET: Handler = async (ctx) => {
   try {
-    const { userId } = await requirePermission(ctx, {
+    const { userId, scope } = await requirePermission(ctx, {
       resource: 'users',
       action: 'view',
     });
@@ -79,6 +79,7 @@ export const GET: Handler = async (ctx) => {
     const baseFilter = and(
       isNull(users.deletedAt),
       nonSystemRoleFilter(),
+      scope === 'own' ? eq(users.createdBy, userId) : undefined,
       where
     );
 
@@ -185,7 +186,12 @@ export const POST: Handler = async (ctx) => {
 
       const assignedRoleId =
         isCustomRole && validatedData.permissions?.length
-          ? await createCustomRole(tx, validatedData.permissions)
+          ? await createCustomRole(
+              tx,
+              validatedData.permissions,
+              null,
+              actorUserId
+            )
           : validatedData.roleId;
 
       const [newUser] = await tx
@@ -195,6 +201,7 @@ export const POST: Handler = async (ctx) => {
           email: validatedData.email,
           roleId: validID(assignedRoleId),
           isActive: validatedData.isActive,
+          createdBy: actorUserId,
         })
         .returning({ id: users.id });
 

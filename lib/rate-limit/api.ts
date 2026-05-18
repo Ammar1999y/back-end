@@ -23,6 +23,47 @@ import { EntityID } from '@/types';
 // for a normal client error and silently return a fake success.
 const MSG_MISSING_CLIENT_IP = 'لا يمكن تحديد عنوان الاتصال للطلب';
 
+/**
+ * Collapse IPv6 addresses to their /64 prefix before bucketing them into a
+ * rate-limit key. ISPs hand entire /64 blocks (~1.8×10¹⁹ addresses) to single
+ * customers, so keying on the full address lets a single host trivially rotate
+ * past per-IP caps. IPv4 is unchanged — full address.
+ *
+ * Inputs already passed `getClientIp`'s ipv4/ipv6 validator, so colon-form is
+ * a sufficient discriminator.
+ */
+function ipBucket(ip: string): string {
+  if (!ip.includes(':')) return ip;
+
+  // IPv4-mapped IPv6 (e.g. ::ffff:1.2.3.4): keep the full address, the v4
+  // suffix is not a /64 block.
+  if (ip.includes('.')) return ip;
+
+  // Expand "::" so we can take exactly four hextets without losing prefix
+  // information when the address is compressed.
+  const hasDoubleColon = ip.includes('::');
+  const segments = ip.split(':');
+  if (hasDoubleColon) {
+    const filled: string[] = [];
+    let used = false;
+    for (const seg of segments) {
+      if (seg === '' && !used) {
+        used = true;
+        const missing = 8 - segments.filter((s) => s !== '').length;
+        for (let i = 0; i < missing; i++) filled.push('0');
+        continue;
+      }
+      if (seg === '') continue;
+      filled.push(seg);
+    }
+    while (filled.length < 8) filled.push('0');
+    return filled.slice(0, 4).join(':') + '::/64';
+  }
+
+  return segments.slice(0, 4).join(':') + '::/64';
+}
+
+// TODO: set the right header to get the IP when deplay the app
 export function ipIdentifier(headers: Headers): string {
   const ip = getClientIp(headers);
   if (!ip) {
@@ -41,7 +82,7 @@ export function ipIdentifier(headers: Headers): string {
       HTTP_STATUS.SERVICE_UNAVAILABLE
     );
   }
-  return `ip:${ip}`;
+  return `ip:${ipBucket(ip)}`;
 }
 
 export function userIdentifier(userId: EntityID): string {

@@ -13,7 +13,7 @@ import { apiSuccess, handleApiError } from '@/utils/api-response';
 
 export const GET: Handler = async (ctx) => {
   try {
-    const { userId } = await requirePermission(ctx, {
+    const { userId, scope } = await requirePermission(ctx, {
       resource: 'permissions',
       action: 'view',
     });
@@ -31,7 +31,11 @@ export const GET: Handler = async (ctx) => {
       })
       .from(roles)
       .where(
-        and(eq(roles.isActive, true), eq(roles.scope, ROLE_SCOPE.STANDARD))
+        and(
+          eq(roles.isActive, true),
+          eq(roles.scope, ROLE_SCOPE.STANDARD),
+          scope === 'own' ? eq(roles.createdBy, userId) : undefined
+        )
       )
       .orderBy(asc(roles.createdAt), asc(roles.id))
       .limit(1000);

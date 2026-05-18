@@ -7,7 +7,7 @@ import { cva } from 'class-variance-authority';
 import { cn } from '@/lib/utils';
 
 const buttonVariants = cva(
-  'inline-flex shrink-0 items-center justify-center space-x-2 whitespace-nowrap rounded-md font-medium transition-all duration-300',
+  'inline-flex shrink-0 items-center justify-center gap-2 whitespace-nowrap rounded-md font-medium transition-all duration-300',
   {
     variants: {
       variant: {

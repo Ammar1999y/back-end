@@ -6,7 +6,6 @@ import { useShallow } from 'zustand/shallow';
 
 import { useDataTableStore } from '@/utils/store/data-table-store';
 
-import { extractIdFromUrl } from '.';
 import { CustomError } from './error-class';
 
 // Type for local storage query handlers
@@ -44,18 +43,6 @@ export const useQueryData = <TData = unknown>({
     queryFn: async () => {
       if (!requiredData)
         throw new CustomError('البيانات غير صحيحة، اعد المحاوله', 400);
-
-      // Check if endpoint has a local storage query handler
-      for (const [pattern, handler] of localStorageQueryHandlers) {
-        if (pattern.test(href)) {
-          const id = extractIdFromUrl(href);
-          if (id && handler.getById) {
-            return await handler.getById(id);
-          } else if (handler.getAll) {
-            return await handler.getAll();
-          }
-        }
-      }
 
       try {
         const response = await fetch(href);

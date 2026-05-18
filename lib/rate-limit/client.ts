@@ -1,3 +1,5 @@
+import '@/lib/env.server';
+
 import { Redis } from '@upstash/redis';
 
 // Shared Redis client for rate-limit storage (auth + API routes).

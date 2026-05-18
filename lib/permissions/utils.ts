@@ -59,8 +59,9 @@ export function standardRoleFilter(roleId: EntityID) {
 
 /**
  * Create a custom role with permissions inside a transaction.
- * If existingRoleId is provided, reuses it (clears old permissions first).
- * Otherwise creates a new role with scope='custom'.
+ * If existingRoleId is provided, reuses it (clears old permissions first) and
+ * leaves the existing `createdBy` untouched.
+ * Otherwise creates a new role with scope='custom' stamped with `createdBy`.
  */
 export async function createCustomRole(
   tx: WsTx,
@@ -68,7 +69,8 @@ export async function createCustomRole(
     name: DashboardPage;
     permissions: Record<string, boolean>;
   }>,
-  existingRoleId?: EntityID | null
+  existingRoleId?: EntityID | null,
+  createdBy?: EntityID
 ): Promise<EntityID> {
   let roleId: EntityID;
 
@@ -88,6 +90,7 @@ export async function createCustomRole(
         roleName: `custom-${uuidv7()}`,
         scope: CUSTOM_ROLE_VALUE,
         isActive: true,
+        createdBy: createdBy ?? null,
       })
       .returning({ id: roles.id });
     roleId = customRole.id;

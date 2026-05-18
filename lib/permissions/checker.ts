@@ -1,4 +1,9 @@
-import type { DashboardPage, PermissionAction } from './constants';
+import type {
+  AccessScope,
+  AllScopedAction,
+  DashboardPage,
+  PermissionAction,
+} from './constants';
 
 import { and, eq, isNull } from 'drizzle-orm';
 
@@ -14,8 +19,37 @@ import {
 } from '@/utils/api-messages';
 import { CustomError } from '@/utils/error-class';
 
+import { OWN_ACTION_MAP } from './constants';
 import { getUserPermissions, sanitizePermissions } from './utils';
 import { EntityID } from '@/types';
+
+const SCOPED_ACTIONS = new Set<PermissionAction>(
+  Object.keys(OWN_ACTION_MAP) as PermissionAction[]
+);
+const READ_ACTIONS = new Set<PermissionAction>(['view', 'viewOwn']);
+
+/**
+ * Resolve allowed/scope for a given action against a permissions matrix:
+ * - For scoped actions (`view`/`edit`/`delete`): tries the unrestricted
+ *   action first, then falls back to the `Own` variant.
+ * - For all other actions: only the exact action is considered.
+ */
+function resolveActionScope(
+  permissions: Record<string, Record<string, boolean>> | Partial<
+    Record<DashboardPage, Record<PermissionAction, boolean>>
+  >,
+  resource: DashboardPage,
+  action: PermissionAction
+): { allowed: boolean; scope: AccessScope | null } {
+  const pagePerms = permissions?.[resource];
+  if (pagePerms?.[action] === true) return { allowed: true, scope: 'all' };
+  if (SCOPED_ACTIONS.has(action)) {
+    const ownAction = OWN_ACTION_MAP[action as AllScopedAction];
+    if (pagePerms?.[ownAction] === true)
+      return { allowed: true, scope: 'own' };
+  }
+  return { allowed: false, scope: null };
+}
 
 export async function checkUserPermission(params: {
   headers: Headers;
@@ -37,8 +71,8 @@ export async function checkUserPermission(params: {
   if (!userId)
     throw new CustomError(MSG_LOGIN_REQUIRED, HTTP_STATUS.UNAUTHORIZED);
 
-  // Write operations always verify from DB; reads use cache
-  const shouldForceDB = forceDB || action !== 'view';
+  // Write/mutation actions always verify from DB; read actions use cache
+  const shouldForceDB = forceDB || !READ_ACTIONS.has(action);
 
   if (shouldForceDB) {
     // Single query: fetch user + role + permissions in one round-trip
@@ -87,7 +121,11 @@ export async function checkUserPermission(params: {
 
     const permissions = sanitizePermissions(rolePerms);
 
-    const allowed = permissions?.[resource]?.[action] === true;
+    const { allowed, scope } = resolveActionScope(
+      permissions,
+      resource,
+      action
+    );
     if (!allowed && throwError)
       throw new CustomError(
         MSG_INSUFFICIENT_PERMISSIONS,
@@ -96,6 +134,7 @@ export async function checkUserPermission(params: {
 
     return {
       allowed,
+      scope,
       source: 'database' as const,
       session: session!,
       userId,
@@ -105,7 +144,7 @@ export async function checkUserPermission(params: {
     };
   }
 
-  // Cache path (view operations)
+  // Cache path (read operations)
   const roleId = validID(session?.user.roleId) ?? null;
 
   if (!roleId)
@@ -117,12 +156,13 @@ export async function checkUserPermission(params: {
     forceDB: false,
   });
 
-  const allowed = permissions?.[resource]?.[action] === true;
+  const { allowed, scope } = resolveActionScope(permissions, resource, action);
   if (!allowed && throwError)
     throw new CustomError(MSG_INSUFFICIENT_PERMISSIONS, HTTP_STATUS.FORBIDDEN);
 
   return {
     allowed,
+    scope,
     source: 'cache' as const,
     session: session!,
     userId,
@@ -153,7 +193,7 @@ export async function checkMultiplePermissions(params: {
   if (!userId)
     throw new CustomError(MSG_LOGIN_REQUIRED, HTTP_STATUS.UNAUTHORIZED);
 
-  const hasWriteAction = checks.some((c) => c.action !== 'view');
+  const hasWriteAction = checks.some((c) => !READ_ACTIONS.has(c.action));
   const shouldForceDB = forceDB || hasWriteAction;
 
   let roleId: EntityID | null = validID(session?.user.roleId) ?? null;
@@ -204,8 +244,11 @@ export async function checkMultiplePermissions(params: {
 
   const permissions = checks.reduce(
     (acc, { resource, action }) => {
-      acc[`${resource}.${action}`] =
-        allPermissions?.[resource]?.[action] === true;
+      acc[`${resource}.${action}`] = resolveActionScope(
+        allPermissions,
+        resource,
+        action
+      ).allowed;
       return acc;
     },
     {} as Record<string, boolean>

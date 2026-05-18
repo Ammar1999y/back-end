@@ -16,7 +16,7 @@ import {
 } from '@/utils/api-messages';
 import { loginSchema } from '@/utils/validation/auth';
 
-import { getClientIp, USER_AGENT_MAX } from './audit';
+import { API_PATH_MAX, getClientIp, USER_AGENT_MAX } from './audit';
 import { BASE_ERROR_CODES } from './auth/code-errors';
 import { LoginRejected, verifyLoginAttempt } from './auth/login-guard';
 import { REQUIRE_ROLE_FOR_LOGIN } from './permissions/constants';
@@ -82,7 +82,7 @@ export const auth = betterAuth({
           ip: getClientIp(reqHeaders),
           userAgent:
             reqHeaders.get('user-agent')?.slice(0, USER_AGENT_MAX) ?? null,
-          apiPath: ctx.path.slice(0, 255),
+          apiPath: ctx.path.slice(0, API_PATH_MAX),
         };
 
         // Atomic: lock row → check lock → verify password → update attempts

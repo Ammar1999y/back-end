@@ -332,17 +332,23 @@ export async function processOtpSend({
         attemptNumber: verificationSessions.attemptNumber,
       });
 
-    // ── Invalidate old codes so only the latest is valid (fixes sequential argon2 cost) ──
+    // ── Invalidate old codes by upserting the latest into the
+    //    one-row-per-session slot guarded by `ux_verification_codes_session`.
+    //    Single round-trip vs DELETE+INSERT.
     await tx
-      .delete(verificationCodes)
-      .where(eq(verificationCodes.sessionId, updatedSession.id));
-
-    // ── Save hashed OTP code ──
-    await tx.insert(verificationCodes).values({
-      sessionId: updatedSession.id,
-      code: hashedCode,
-      expiresAt: expiresAt.toISOString(),
-    });
+      .insert(verificationCodes)
+      .values({
+        sessionId: updatedSession.id,
+        code: hashedCode,
+        expiresAt: expiresAt.toISOString(),
+      })
+      .onConflictDoUpdate({
+        target: verificationCodes.sessionId,
+        set: {
+          code: hashedCode,
+          expiresAt: expiresAt.toISOString(),
+        },
+      });
 
     // TODO: Test this, if it takes more than 1s, move it outside the transaction — see `External OTP Delivery Inside Database Transaction` from TODO.md
     // ── Send OTP (still inside tx so a delivery failure rolls back) ──

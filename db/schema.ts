@@ -5,6 +5,7 @@
 // data-table UI, you MUST also add a corresponding trigram (GIN) index in:
 //   db/migrations/001_add_trgm_indexes.sql
 // Without a trgm index, ILIKE '%text%' queries will cause full table scans.
+import type { AnyPgColumn } from 'drizzle-orm/pg-core';
 
 import { relations, sql } from 'drizzle-orm';
 import {
@@ -22,7 +23,7 @@ import {
 } from 'drizzle-orm/pg-core';
 
 import { v7 as generateId } from 'uuid';
-import { USER_AGENT_MAX } from '@/lib/audit';
+import { API_PATH_MAX, USER_AGENT_MAX } from '@/lib/audit/constants';
 import {
   CUSTOM_ROLE_VALUE,
   DASHBOARD_PAGES,
@@ -97,6 +98,11 @@ export const auditLogAction = pgEnum('audit_log_action', auditLogActionEnum);
 export const pageName = pgEnum('page_name', pageNameValues);
 export const roleScope = pgEnum('role_scope', roleScopeValues);
 export const otpChannel = pgEnum('otp_channel', OTP_CHANNELS);
+// Whitelist of supported auth providers — extend here when adding OAuth.
+// Constraining the column to a known set prevents direct writes from
+// introducing provider IDs that downstream code cannot handle.
+export const providerIdEnumValues = ['credential'] as const;
+export const providerId = pgEnum('provider_id', providerIdEnumValues);
 export const fileContextTablesEnum = [''] as const;
 
 export const fileContextTable = pgEnum(
@@ -128,7 +134,7 @@ export const users = pgTable(
     roleId: uuid('role_id').references(() => roles.id, {
       onDelete: REQUIRE_ROLE_FOR_LOGIN ? 'restrict' : 'set null',
     }),
-    createdBy: uuid('created_by').references(() => users.id, {
+    createdBy: uuid('created_by').references((): AnyPgColumn => users.id, {
       onDelete: 'set null',
     }),
     // TODO: Remove failedLoginAttempts & lockedUntil, and convert it to Redis or any KV store
@@ -158,6 +164,9 @@ export const users = pgTable(
     index('idx_users_created_at')
       .on(t.createdAt)
       .where(sql`deleted_at IS NULL`),
+    index('idx_users_created_by')
+      .on(t.createdBy)
+      .where(sql`deleted_at IS NULL AND created_by IS NOT NULL`),
     check('chk_email_lowercase', sql`email = LOWER(email)`),
     check(
       'chk_failed_login_attempts_non_negative',
@@ -206,7 +215,14 @@ export const sessions = pgTable(
     ...timestamps,
   },
   (t) => [
-    index('idx_sessions_user_expires').on(t.userId, t.expiresAt),
+    // The third column lets the per-user "active sessions ordered by
+    // createdAt DESC" query satisfy its sort from the index instead of an
+    // in-memory pass after the (userId, expiresAt) filter.
+    index('idx_sessions_user_expires_created').on(
+      t.userId,
+      t.expiresAt,
+      t.createdAt
+    ),
     uniqueIndex('ux_sessions_token').on(t.token),
   ]
 );
@@ -219,7 +235,7 @@ export const accounts = pgTable(
   {
     id: uuid('id').primaryKey().$defaultFn(generateId),
     accountId: varchar('account_id', { length: 255 }).notNull(),
-    providerId: varchar('provider_id', { length: 100 }).notNull(),
+    providerId: providerId('provider_id').notNull(),
     userId: uuid('user_id')
       .notNull()
       .references(() => users.id, { onDelete: 'cascade' }),
@@ -311,7 +327,7 @@ export const auditLogs = pgTable(
   {
     id: uuid('id').primaryKey().$defaultFn(generateId),
     userId: uuid('user_id').references(() => users.id, {
-      onDelete: 'set null',
+      onDelete: 'restrict',
     }),
     userEmail: varchar('user_email', { length: EMAIL_MAX }).notNull(),
     tableName: varchar('table_name', { length: 50 }).notNull(),
@@ -322,7 +338,7 @@ export const auditLogs = pgTable(
     changedFields: jsonb('changed_fields'),
     ipAddress: varchar('ip_address', { length: 45 }),
     userAgent: varchar('user_agent', { length: USER_AGENT_MAX }),
-    apiPath: varchar('api_path', { length: 255 }),
+    apiPath: varchar('api_path', { length: API_PATH_MAX }),
     createdAt: timestamp('created_at', {
       withTimezone: true,
       precision: 2,
@@ -348,6 +364,9 @@ export const roles = pgTable(
     description: varchar('description', { length: ROLE_DESCRIPTION_MAX }),
     isActive: boolean('is_active').default(true).notNull(),
     scope: roleScope('scope').notNull().default(ROLE_SCOPE.STANDARD),
+    createdBy: uuid('created_by').references((): AnyPgColumn => users.id, {
+      onDelete: 'set null',
+    }),
     ...timestamps,
   },
   (t) => [
@@ -356,10 +375,13 @@ export const roles = pgTable(
       t.isActive,
       t.createdAt
     ),
+    index('idx_roles_created_by')
+      .on(t.createdBy)
+      .where(sql`created_by IS NOT NULL`),
     check(
       'chk_custom_prefix_scope',
       sql.raw(
-        `(role_name LIKE '${CUSTOM_ROLE_VALUE}-%' AND scope = '${CUSTOM_ROLE_VALUE}') OR (role_name NOT LIKE '${CUSTOM_ROLE_VALUE}-%' AND scope <> '${CUSTOM_ROLE_VALUE}')`
+        `(role_name ILIKE '${CUSTOM_ROLE_VALUE}-%' AND scope = '${CUSTOM_ROLE_VALUE}') OR (role_name NOT ILIKE '${CUSTOM_ROLE_VALUE}-%' AND scope <> '${CUSTOM_ROLE_VALUE}')`
       )
     ),
   ]

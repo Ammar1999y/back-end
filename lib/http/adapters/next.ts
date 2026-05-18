@@ -37,11 +37,16 @@ export function toNextHandler(
     try {
       const ctx = await buildContext(request, context);
       if (opts?.preAuthIpLimit) {
+        // Fail-closed: this limiter exists specifically so unauthenticated
+        // traffic can't hammer session lookup. Letting requests through on
+        // an Upstash outage would silently strip the protection it exists
+        // for, so a 503 is the correct shape during a degraded store.
         await enforceRateLimit({
           scope: 'dash.preauth',
           identifier: ipIdentifier(ctx.headers),
           limit: DASH_PRE_AUTH_LIMIT,
           window: DASH_PRE_AUTH_WINDOW_S,
+          failClosed: true,
         });
       }
       const output = await handler(ctx);

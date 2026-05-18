@@ -10,6 +10,7 @@ const CSP = `
   font-src 'self';
   connect-src 'self';
   frame-src 'self' https://challenges.cloudflare.com/;
+  worker-src 'self' blob:;
   img-src 'self' data: blob:;
   media-src 'self';
   object-src 'none';
@@ -17,6 +18,11 @@ const CSP = `
   frame-ancestors 'none';
   upgrade-insecure-requests;
 `;
+// TODO: try to add this in production
+/* 
+Content-Security-Policy: require-trusted-types-for 'script';
+                         trusted-types default;
+*/
 
 // TODO: activate the caches in production
 const headers = isDev

@@ -1,4 +1,4 @@
-import { and, eq, inArray } from 'drizzle-orm';
+import { and, eq, inArray, isNull } from 'drizzle-orm';
 
 import { sessions, users } from '@/db/schema';
 import { withTransaction } from '@/db/ws';
@@ -40,7 +40,7 @@ export const DELETE: Handler = async (ctx) => {
       session,
       userId: currentUserId,
       sessionId: currentSessionId,
-      allowed,
+      scope: editScope,
       permissions: actorPermissions,
     } = await requirePermission(ctx, {
       resource: 'users',
@@ -60,7 +60,7 @@ export const DELETE: Handler = async (ctx) => {
 
     const isSelf = currentUserId === targetId;
 
-    if (!isSelf && !allowed)
+    if (!isSelf && !editScope)
       throw new CustomError(
         MSG_INSUFFICIENT_PERMISSIONS,
         HTTP_STATUS.FORBIDDEN
@@ -94,12 +94,22 @@ export const DELETE: Handler = async (ctx) => {
           .select({
             id: users.id,
             roleId: users.roleId,
+            createdBy: users.createdBy,
           })
           .from(users)
-          .where(and(eq(users.id, targetId), eq(users.isActive, true)))
+          .where(
+            and(
+              eq(users.id, targetId),
+              isNull(users.deletedAt),
+              eq(users.isActive, true)
+            )
+          )
           .for('share');
 
         if (!targetUser?.roleId)
+          throw new CustomError(MSG_NOT_FOUND, HTTP_STATUS.NOT_FOUND);
+
+        if (editScope === 'own' && targetUser.createdBy !== currentUserId)
           throw new CustomError(MSG_NOT_FOUND, HTTP_STATUS.NOT_FOUND);
 
         if (actorPermissions) {

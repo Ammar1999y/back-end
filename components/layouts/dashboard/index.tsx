@@ -23,14 +23,14 @@ export default function DashboardLayout({
   children: React.ReactNode;
 }) {
   const isMobile = useMediaQuery(down('md2'));
-  const { push, asPath } = useRouter();
+  const { replace, asPath } = useRouter();
   const { data: session, isPending } = useSession();
   useEffect(() => {
     if (!isPending && !session?.user?.id) {
-      push('/dash/sign-in');
+      replace('/dash/sign-in');
       localStorage.setItem('redirect-path', asPath);
     }
-  }, [session?.user?.id, push, isPending, asPath]);
+  }, [session?.user?.id, replace, isPending, asPath]);
   if (isPending || !session?.user?.id) return null;
   return (
     <div

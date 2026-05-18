@@ -11,9 +11,10 @@ import type { HandlerInput } from '@/lib/http/contract';
 // Max valid IP length: IPv6 mapped IPv4 = 45 chars
 const MAX_IP_LENGTH = 45;
 const IP_SCHEMA = z.union([z.ipv4(), z.ipv6()]);
-// ⚠️ Changing this value requires generating a new migration to keep the DB in sync.
-export const USER_AGENT_MAX = 512; 
-const API_PATH_MAX = 255;
+// Re-exported from a leaf module so db/schema.ts can import these without
+// reaching back into lib/audit.ts → a Turbopack-breaking import cycle.
+export { API_PATH_MAX, USER_AGENT_MAX } from './audit/constants';
+import { API_PATH_MAX, USER_AGENT_MAX } from './audit/constants';
 
 /**
  * Extracts the client IP from trusted proxy headers only.

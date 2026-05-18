@@ -1,5 +1,35 @@
 {
   "permissions": {
-    "allow": ["Bash(dir:*)"]
+    "allow": [
+      "Bash(dir:*)",
+      "Bash(bun:*)",
+      "Bash(bun test:*)",
+      "Bash(bun run:*)",
+      "Bash(bun -e:*)",
+      "Bash(bun drizzle-kit:*)",
+      "Bash(mkdir:*)",
+      "Bash(touch:*)",
+      "Bash(echo:*)",
+      "Bash(until*)",
+      "Bash(cat:*)",
+      "Bash(tail:*)",
+      "Bash(head:*)",
+      "Bash(grep:*)",
+      "Bash(ls:*)",
+      "Bash(rm:*)",
+      "Bash(wait:*)",
+      "Bash(find:*)",
+      "Bash(xargs:*)",
+      "Bash(sleep:*)",
+      "Bash(awk:*)",
+      "Bash(sed:*)",
+      "Bash(sort:*)",
+      "Bash(uniq:*)",
+      "Bash(node:*)",
+      "Bash(find:*)",
+      "Bash(*)",
+      "Grep(*)",
+      "Glob(*)"
+    ]
   }
 }

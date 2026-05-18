@@ -37,6 +37,7 @@ import {
   ROLE_NAME_MAX,
   URL_MAX,
 } from '@/utils/validation/constants';
+import { API_PATH_MAX } from '@/lib/audit';
 
 export type PermissionActions = Record<PermissionAction, boolean>;
 
@@ -297,7 +298,7 @@ export const auditLogs = pgTable(
     changedFields: jsonb('changed_fields'),
     ipAddress: varchar('ip_address', { length: 45 }),
     userAgent: varchar('user_agent', { length: 2000 }),
-    apiPath: varchar('api_path', { length: 255 }),
+    apiPath: varchar('api_path', { length: API_PATH_MAX }),
     createdAt: timestamp('created_at', {
       withTimezone: true,
       precision: 2,

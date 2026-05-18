@@ -13,7 +13,9 @@ import {
   PermissionAction,
   ROLE_SCOPE,
 } from '@/lib/permissions/constants';
-import { validatePermissionScope } from '@/lib/permissions/utils';
+import {
+  validatePermissionScope,
+} from '@/lib/permissions/utils';
 
 import type { Handler } from '@/lib/http/contract';
 
@@ -46,7 +48,7 @@ const PERMISSIONS_ALLOWED_COLUMNS = new Set([
 
 export const GET: Handler = async (ctx) => {
   try {
-    const { userId } = await requirePermission(ctx, {
+    const { userId, scope } = await requirePermission(ctx, {
       resource: 'permissions',
       action: 'view',
     });
@@ -65,7 +67,11 @@ export const GET: Handler = async (ctx) => {
         defaultSort: { id: 'createdAt', desc: true },
       });
 
-    const baseFilter = and(eq(roles.scope, ROLE_SCOPE.STANDARD), where);
+    const baseFilter = and(
+      eq(roles.scope, ROLE_SCOPE.STANDARD),
+      scope === 'own' ? eq(roles.createdBy, userId) : undefined,
+      where
+    );
 
     const [rolesWithCounts, [{ total }]] = await Promise.all([
       db
@@ -133,7 +139,9 @@ export const POST: Handler = async (ctx) => {
 
     const validatedData = validatedDataParsed.data;
 
-    if (validatedData.roleName.startsWith(`${CUSTOM_ROLE_VALUE}-`))
+    if (
+      validatedData.roleName.toLowerCase().startsWith(`${CUSTOM_ROLE_VALUE}-`)
+    )
       throw new CustomError(
         permissionMsg.customPrefixForbidden(`${CUSTOM_ROLE_VALUE}-`),
         HTTP_STATUS.BAD_REQUEST
@@ -152,6 +160,7 @@ export const POST: Handler = async (ctx) => {
           roleName: validatedData.roleName,
           description: validatedData.description,
           isActive: validatedData.isActive,
+          createdBy: actorUserId,
         })
         .returning({ id: roles.id });
 
