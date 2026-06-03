@@ -679,11 +679,16 @@ export const DELETE: Handler = async (ctx) => {
         );
       }
 
-      const DELETED_SUFFIX_LEN = 41;
+      // Anonymize the email on soft-delete while staying within EMAIL_MAX.
+      // gen_random_uuid()::text is always 36 chars; the '_del_' marker is 5.
+      // Deriving the length from the marker keeps the two in sync.
+      const DELETED_EMAIL_SUFFIX = '_del_';
+      const UUID_TEXT_LENGTH = 36;
+      const DELETED_SUFFIX_LEN = DELETED_EMAIL_SUFFIX.length + UUID_TEXT_LENGTH;
       await tx
         .update(users)
         .set({
-          email: sql`LEFT(email, ${EMAIL_MAX - DELETED_SUFFIX_LEN}) || '_del_' || gen_random_uuid()`,
+          email: sql`LEFT(email, ${EMAIL_MAX - DELETED_SUFFIX_LEN}) || ${DELETED_EMAIL_SUFFIX} || gen_random_uuid()`,
           phoneNumber: null,
           deletedAt: sql`now()`,
           updatedAt: sql`now()`,

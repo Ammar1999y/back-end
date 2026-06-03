@@ -12,4 +12,13 @@ export const userMsg = {
   newPasswordSameAsCurrent: 'كلمة المرور الجديدة مطابقة للحالية',
   ssoCannotModifyPassword:
     'لا يمكن تعديل كلمة المرور لحساب مرتبط بتسجيل دخول خارجي',
+  // OTP-based contact change
+  emailChangeCodeSent:
+    'تم إرسال رمز التحقق إلى البريد الإلكتروني الجديد. أدخل الرمز لتأكيد التغيير',
+  phoneChanged: 'تم تغيير رقم الهاتف بنجاح',
+  phoneChangeCodeSent:
+    'تم إرسال رمز التحقق إلى رقم الهاتف الجديد. أدخل الرمز لتأكيد التغيير',
+  newPhoneSameAsCurrent: 'رقم الهاتف الجديد مطابق للحالي',
+  verificationUnavailable:
+    'خدمة التحقق غير متاحة حالياً. يرجى المحاولة لاحقاً',
 };

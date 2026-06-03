@@ -289,8 +289,12 @@ describe('POST /api/auth/otp/send — rate limiting & IP enforcement', () => {
   test(
     'per-identifier hour limit never leaks 429 to client (collapsed to 200)',
     async () => {
+      // emailVerified=true → the handler short-circuits before the slow
+      // processOtpSend / SMTP attempt path. That keeps each call to ~MIN
+      // _RESPONSE_MS (1.5s floor) while still exercising the per-identifier
+      // rate-limit that fires BEFORE the user lookup.
       const role = await createRole();
-      const user = await createUser({ roleId: role.id, emailVerified: false });
+      const user = await createUser({ roleId: role.id, emailVerified: true });
 
       // Per-identifier cap is 5/hour. Run 7 sequential sends from rotating
       // IPs so the per-IP cap isn't the gate.
@@ -306,7 +310,7 @@ describe('POST /api/auth/otp/send — rate limiting & IP enforcement', () => {
       // privacy contract.
       expect(statuses.every((s) => s === 200)).toBe(true);
     },
-    45_000
+    90_000
   );
 });
 

@@ -1,10 +1,10 @@
 import crypto from 'node:crypto';
 import type { WsTx } from '@/db/ws';
-import type { OtpChannel } from '@/utils/validation/otp';
+import type { OtpChannel, OtpPurpose } from '@/utils/validation/otp';
 
 import { and, eq, gt, sql } from 'drizzle-orm';
 
-import { verificationCodes, verificationSessions } from '@/db/schema';
+import { users, verificationCodes, verificationSessions } from '@/db/schema';
 import { withTransaction } from '@/db/ws';
 import { auditLog } from '@/lib/audit';
 import { sanitizeForLog } from '@/utils';
@@ -174,6 +174,17 @@ interface ProcessOtpSendOptions {
   /** Unique key for the verification session (e.g. email, phone) */
   identifier: string;
   channel: OtpChannel;
+  /**
+   * Reason the code is being issued. Bound into the session so a code proven
+   * for one purpose can never authorize a different sensitive action.
+   */
+  purpose: OtpPurpose;
+  /**
+   * For contact-change purposes (change_email/change_phone): the NEW contact
+   * whose ownership is being proven. Persisted so verify can commit exactly
+   * that value. Must be null for every other purpose.
+   */
+  targetIdentifier?: string | null;
   /** The actual phone number or email to deliver the OTP to */
   sendTo: string;
   /** Human-readable label for error messages (e.g. "رقم الهاتف") */
@@ -195,6 +206,8 @@ export async function processOtpSend({
   userId,
   identifier,
   channel,
+  purpose,
+  targetIdentifier = null,
   sendTo,
   entityName,
   smsMessage,
@@ -209,7 +222,7 @@ export async function processOtpSend({
     // Two-argument form gives a 64-bit keyspace, avoiding the birthday-
     // collision rate of the single-arg int4 form at high OTP concurrency.
     await tx.execute(
-      sql`SELECT pg_advisory_xact_lock(hashtext(${userId}), hashtext(${channel}))`
+      sql`SELECT pg_advisory_xact_lock(hashtext(${userId}), hashtext(${channel} || ':' || ${purpose}))`
     );
 
     const now = new Date();
@@ -225,7 +238,8 @@ export async function processOtpSend({
       .where(
         and(
           eq(verificationSessions.userId, userId),
-          eq(verificationSessions.channel, channel)
+          eq(verificationSessions.channel, channel),
+          eq(verificationSessions.purpose, purpose)
         )
       )
       .for('update');
@@ -310,17 +324,29 @@ export async function processOtpSend({
         userId,
         channel,
         identifier,
+        purpose,
+        targetIdentifier,
         attemptNumber: 1,
         verifyAttemptNumber: 0,
         lastSentAt: now.toISOString(),
         nextAllowedAt: nextAllowedAt.toISOString(),
       })
       .onConflictDoUpdate({
-        target: [verificationSessions.userId, verificationSessions.channel],
+        // Must match ux_verification_sessions_user_channel_purpose — otherwise a
+        // change_email send would clobber an in-flight verify_contact code.
+        target: [
+          verificationSessions.userId,
+          verificationSessions.channel,
+          verificationSessions.purpose,
+        ],
         set: {
           identifier,
+          targetIdentifier,
           attemptNumber: sql`${verificationSessions.attemptNumber} + 1`,
           verifyAttemptNumber: 0,
+          // A fresh code voids any prior proof for this (user, channel, purpose).
+          verifiedAt: null,
+          consumedAt: null,
           // Intentionally do NOT touch verifyAttemptDaily /
           // verifyAttemptWindowStart — they survive resends.
           lastSentAt: now.toISOString(),
@@ -377,6 +403,11 @@ interface ProcessOtpVerifyOptions {
   /** Channel used when sending */
   channel: OtpChannel;
   /**
+   * Reason the code was issued. Bound into the locked lookup so a code proven
+   * for one purpose cannot be matched against a verify for another.
+   */
+  purpose: OtpPurpose;
+  /**
    * Normalized identifier (email/phone) submitted by the client. Bound into
    * the locked session lookup so a stale session pointing at an old contact
    * can't be matched against a verify for a different one.
@@ -407,6 +438,7 @@ export async function processOtpVerify({
   userId,
   userEmail,
   channel,
+  purpose,
   identifier,
   code,
   auditMeta,
@@ -415,6 +447,18 @@ export async function processOtpVerify({
   // Deferred errors: the throw must fire AFTER the transaction commits so the
   // increment/block writes persist. Throwing inside withTransaction rolls back.
   const outcome = await withTransaction<VerifyOutcome>(async (tx) => {
+    // ── Lock the user row FIRST to keep a single, consistent lock order
+    // (users → verification_sessions) across all flows. The email-change,
+    // admin-edit, and user-delete paths all lock `users` before touching
+    // verification_sessions; without this, verify's reverse order
+    // (verification_sessions → users via onVerified) can deadlock under
+    // concurrent requests. onVerified re-reads under this same lock.
+    await tx
+      .select({ id: users.id })
+      .from(users)
+      .where(eq(users.id, userId))
+      .for('update');
+
     // ── Get session with row-level lock — serializes concurrent verifies.
     const [session] = await tx
       .select({
@@ -427,6 +471,7 @@ export async function processOtpVerify({
         and(
           eq(verificationSessions.userId, userId),
           eq(verificationSessions.channel, channel),
+          eq(verificationSessions.purpose, purpose),
           eq(verificationSessions.identifier, identifier)
         )
       )
@@ -551,12 +596,30 @@ export async function processOtpVerify({
     const matched = await verifyOtpCode(code, activeCode.code);
 
     if (matched) {
-      // Session deleted — no block audit even if shouldBlock fired above,
-      // because the user never actually got blocked from a usable session.
+      // onVerified runs first so the sensitive action (e.g. committing the new
+      // email + flipping the verified flag) and the proof bookkeeping below
+      // commit atomically — there is no verify→action window.
+      // No block audit even if shouldBlock fired above: the user never actually
+      // got blocked from a usable session.
       if (onVerified) await onVerified(tx);
-      await tx
-        .delete(verificationSessions)
-        .where(eq(verificationSessions.id, session.id));
+
+      if (purpose === 'verify_contact') {
+        // Pure ownership proof — nothing downstream consumes it later.
+        await tx
+          .delete(verificationSessions)
+          .where(eq(verificationSessions.id, session.id));
+      } else {
+        // Sensitive-action proof (change_email/change_phone, …): keep the row
+        // as an auditable single-use record, but drop the code so the same
+        // proof can never be replayed.
+        await tx
+          .update(verificationSessions)
+          .set({ verifiedAt: sql`now()`, consumedAt: sql`now()` })
+          .where(eq(verificationSessions.id, session.id));
+        await tx
+          .delete(verificationCodes)
+          .where(eq(verificationCodes.sessionId, session.id));
+      }
       return { kind: 'matched' };
     }
 

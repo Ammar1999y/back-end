@@ -9,6 +9,23 @@ import { emailSchema, phoneSchema, sanitizeStrictSingleLine } from './rules';
 export const OTP_CHANNELS = ['email', 'sms', 'whatsapp'] as const;
 export type OtpChannel = (typeof OTP_CHANNELS)[number];
 
+// ── OTP Purpose ──
+// Every verification session is bound to exactly one purpose so an OTP proven
+// for one reason can never authorize a different sensitive action. Wired today:
+// 'verify_contact' (public ownership proof) and 'change_email' / 'change_phone'
+// (authenticated, pending-until-verified). The remaining values are reserved
+// for future flows and are not produced by any endpoint yet.
+// ⚠️ Changing this list requires a DB migration (otp_purpose pgEnum).
+export const OTP_PURPOSES = [
+  'verify_contact',
+  'passwordless_login',
+  'forgot_password',
+  'change_password',
+  'change_email',
+  'change_phone',
+] as const;
+export type OtpPurpose = (typeof OTP_PURPOSES)[number];
+
 // Currently enabled channels — change this to enable SMS/WhatsApp later.
 // If not set, OTP is completely disabled (empty array).
 // Exposed to the client via NEXT_PUBLIC_ so the UI can adapt.
@@ -31,13 +48,15 @@ export const channelSchema = z
     message: MSG_CHANNEL_DISABLED,
   });
 
-const codeSchema = z.preprocess(
+export const otpCodeSchema = z.preprocess(
   sanitizeStrictSingleLine,
   z
     .string('رمز التحقق مطلوب')
     .length(OTP_CODE_LENGTH, `رمز التحقق يجب أن يكون ${OTP_CODE_LENGTH} أرقام`)
     .regex(/^[0-9]+$/, 'رمز التحقق يجب أن يحتوي على أرقام فقط')
 );
+
+const codeSchema = otpCodeSchema;
 
 // ── Send OTP Schemas ──
 const sendOtpPhoneSchema = z.object({

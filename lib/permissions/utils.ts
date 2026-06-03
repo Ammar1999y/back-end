@@ -6,7 +6,7 @@ import type {
 } from './constants';
 import type { WsTx } from '@/db/ws';
 
-import { and, eq, isNull, ne, sql } from 'drizzle-orm';
+import { and, eq, isNull, ne, notInArray, sql } from 'drizzle-orm';
 
 import { db } from '@/db';
 import { rolePermissions, roles, users } from '@/db/schema';
@@ -76,13 +76,14 @@ export async function createCustomRole(
 
   if (existingRoleId) {
     roleId = existingRoleId;
-    // Lock the role row to prevent concurrent reads from seeing empty permissions
+    // Lock the role row so concurrent writers serialize. FOR UPDATE does not
+    // block readers, so a DELETE+INSERT would briefly expose zero permissions
+    // to a concurrent session load — use per-row upsert + prune below instead.
     await tx
       .select({ id: roles.id })
       .from(roles)
       .where(eq(roles.id, roleId))
       .for('update');
-    await tx.delete(rolePermissions).where(eq(rolePermissions.roleId, roleId));
   } else {
     const [customRole] = await tx
       .insert(roles)
@@ -101,7 +102,31 @@ export async function createCustomRole(
     pageName: p.name,
     permissions: p.permissions as Record<PermissionAction, boolean>,
   }));
-  await tx.insert(rolePermissions).values(permsData);
+
+  // Per-row UPSERT against ux_role_permissions_role_page: unchanged pages keep
+  // their row (and created_at), changed pages are rewritten in place — the role
+  // is never momentarily empty. For a brand-new role there are no conflicts.
+  await tx
+    .insert(rolePermissions)
+    .values(permsData)
+    .onConflictDoUpdate({
+      target: [rolePermissions.roleId, rolePermissions.pageName],
+      set: { permissions: sql`excluded.permissions` },
+    });
+
+  // Reusing an existing role: prune pages dropped from the new payload so the
+  // final set matches exactly, still without a zero-permission window.
+  if (existingRoleId) {
+    const newPageNames = permsData.map((p) => p.pageName);
+    await tx
+      .delete(rolePermissions)
+      .where(
+        and(
+          eq(rolePermissions.roleId, roleId),
+          notInArray(rolePermissions.pageName, newPageNames)
+        )
+      );
+  }
 
   return roleId;
 }

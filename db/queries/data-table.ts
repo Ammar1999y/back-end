@@ -97,6 +97,16 @@ export function parseDataTableParams<T extends Table>(
       const col = getColumn(t, s.id as keyof T);
       if (col) orderBy.push(s.desc ? desc(col) : asc(col));
     }
+    // Deterministic tiebreaker: append the unique primary key so rows sharing
+    // a sort value (low-cardinality columns like isActive/scope, or createdAt
+    // stored at centisecond precision) keep a stable order across LIMIT/OFFSET
+    // pages — without it a tied row can be skipped or shown twice between
+    // pages. UUID v7 is time-sortable, so desc(id) aligns with the createdAt
+    // desc default. Skipped if the caller already sorts by id.
+    if (!safeSorts.some((s) => s.id === 'id')) {
+      const idCol = getColumn(t, 'id' as keyof T);
+      if (idCol) orderBy.push(desc(idCol));
+    }
     return orderBy;
   }
 

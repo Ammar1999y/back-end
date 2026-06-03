@@ -3,11 +3,13 @@ import * as z from 'zod';
 import { CUSTOM_ROLE_VALUE } from '@/lib/permissions/constants';
 
 import { NAME_MAX } from './constants';
+import { otpCodeSchema } from './otp';
 import { permissionsArraySchema } from './permissions';
 import {
   emailSchema,
   idSchema,
   passwordSchema,
+  phoneSchema,
   sanitizeStrictSingleLine,
 } from './rules';
 
@@ -93,10 +95,30 @@ export const changePasswordSchema = z.object({
   newPassword: passwordSchema,
 });
 
-// Self-service: change own email
+// Self-service: change own email — step 1 (initiate). Requires current-password
+// re-auth; the new address is NOT written until ownership is proven via OTP.
 export const changeEmailSchema = z.object({
   currentPassword: passwordSchema,
   newEmail: emailSchema,
+});
+
+// Self-service: change own email — step 2 (verify + commit). `newEmail` must
+// match the address the OTP was sent to (enforced by the session lookup).
+export const changeEmailVerifySchema = z.object({
+  newEmail: emailSchema,
+  code: otpCodeSchema,
+});
+
+// Self-service: change own phone — step 1 (initiate).
+export const changePhoneSchema = z.object({
+  currentPassword: passwordSchema,
+  newPhoneNumber: phoneSchema,
+});
+
+// Self-service: change own phone — step 2 (verify + commit).
+export const changePhoneVerifySchema = z.object({
+  newPhoneNumber: phoneSchema,
+  code: otpCodeSchema,
 });
 
 // Type inference

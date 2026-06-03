@@ -46,7 +46,8 @@ import {
   ROLE_NAME_MAX,
   URL_MAX,
 } from '@/utils/validation/constants';
-import { OTP_CHANNELS } from '@/utils/validation/otp';
+import { OTP_CHANNELS, OTP_PURPOSES } from '@/utils/validation/otp';
+import { PHONE_NUMBER_MODE, PHONE_REQUIRED } from '@/utils/config';
 
 export type PermissionActions = Record<PermissionAction, boolean>;
 
@@ -98,6 +99,7 @@ export const auditLogAction = pgEnum('audit_log_action', auditLogActionEnum);
 export const pageName = pgEnum('page_name', pageNameValues);
 export const roleScope = pgEnum('role_scope', roleScopeValues);
 export const otpChannel = pgEnum('otp_channel', OTP_CHANNELS);
+export const otpPurpose = pgEnum('otp_purpose', OTP_PURPOSES);
 // Whitelist of supported auth providers — extend here when adding OAuth.
 // Constraining the column to a known set prevents direct writes from
 // introducing provider IDs that downstream code cannot handle.
@@ -125,7 +127,11 @@ export const users = pgTable(
     id: uuid('id').primaryKey().$defaultFn(generateId),
     name: varchar('name', { length: NAME_MAX }).notNull(),
     email: varchar('email', { length: EMAIL_MAX }).notNull(),
-    phoneNumber: varchar('phone_number', { length: PHONE_NUMBER_MAX }),
+    // Nullability is driven by PHONE_NUMBER_MODE (see @/utils/config). When the
+    // mode is 'required' the column is NOT NULL; otherwise it is optional.
+    phoneNumber: PHONE_REQUIRED
+      ? varchar('phone_number', { length: PHONE_NUMBER_MAX }).notNull()
+      : varchar('phone_number', { length: PHONE_NUMBER_MAX }),
     emailVerified: boolean('email_verified').default(false).notNull(),
     phoneNumberVerified: boolean('phone_number_verified')
       .default(false)
@@ -180,6 +186,23 @@ export const users = pgTable(
       'chk_phone_number_format',
       sql`phone_number IS NULL OR phone_number ~ '^9665[0-9]{8}$'`
     ),
+    // Phone-mode invariants (see @/utils/config PHONE_NUMBER_MODE):
+    // - disabled: phone must never be set or verified.
+    // - optional/required: a verified flag requires a present number, so the
+    //   "verified but NULL phone" state (DATA-1) can never arise.
+    ...(PHONE_NUMBER_MODE === 'disabled'
+      ? [
+          check(
+            'chk_phone_disabled',
+            sql`phone_number IS NULL AND phone_number_verified = false`
+          ),
+        ]
+      : [
+          check(
+            'chk_phone_verified_requires_phone',
+            sql`phone_number_verified = false OR phone_number IS NOT NULL`
+          ),
+        ]),
     ...(REQUIRE_ROLE_FOR_LOGIN
       ? [
           check(
@@ -422,6 +445,15 @@ export const verificationSessions = pgTable(
       .references(() => users.id, { onDelete: 'cascade' }),
     channel: otpChannel('channel').notNull(),
     identifier: varchar('identifier', { length: OTP_IDENTIFIER_MAX }).notNull(),
+    // Binds the session to a single reason so a code proven for one purpose can
+    // never authorize a different sensitive action.
+    purpose: otpPurpose('purpose').notNull().default('verify_contact'),
+    // For change_email / change_phone: the NEW contact whose ownership is being
+    // proven and which is committed to the user on success. NULL for every
+    // other purpose (the target is the user's existing contact in `identifier`).
+    targetIdentifier: varchar('target_identifier', {
+      length: OTP_IDENTIFIER_MAX,
+    }),
     attemptNumber: integer('attempt_number').notNull().default(0),
     verifyAttemptNumber: integer('verify_attempt_number').notNull().default(0),
     // Rolling 24h counter of failed verifies. Unlike verifyAttemptNumber,
@@ -450,12 +482,30 @@ export const verificationSessions = pgTable(
       precision: 2,
       mode: 'string',
     }),
+    // Single-use proof lifecycle for sensitive-action OTPs (change_email/phone).
+    // `verifiedAt` is stamped when the code matches; `consumedAt` when the proof
+    // is spent to commit the action. Both are written in the SAME transaction as
+    // the action, so there is no verify→action replay window.
+    verifiedAt: timestamp('verified_at', {
+      withTimezone: true,
+      precision: 2,
+      mode: 'string',
+    }),
+    consumedAt: timestamp('consumed_at', {
+      withTimezone: true,
+      precision: 2,
+      mode: 'string',
+    }),
     ...timestamps,
   },
   (t) => [
-    uniqueIndex('ux_verification_sessions_user_channel').on(
+    // Widened to include `purpose`: one in-flight session per (user, channel,
+    // purpose). The send upsert's onConflict target MUST match this key, or a
+    // change_email send would clobber an in-flight verify_contact code.
+    uniqueIndex('ux_verification_sessions_user_channel_purpose').on(
       t.userId,
-      t.channel
+      t.channel,
+      t.purpose
     ),
     check('chk_attempt_number_non_negative', sql`attempt_number >= 0`),
     check(
@@ -486,6 +536,18 @@ export const verificationSessions = pgTable(
       'chk_unblocked_no_until',
       sql`is_blocked = true OR blocked_until IS NULL`
     ),
+    // A target identifier exists iff the purpose is a contact-change. Keeps the
+    // "new contact to commit" coherent with the reason it was collected.
+    check(
+      'chk_change_purpose_has_target',
+      sql`(purpose IN ('change_email', 'change_phone')) = (target_identifier IS NOT NULL)`
+    ),
+    // consumedAt cannot precede verifiedAt existing — a proof must be verified
+    // before it can be spent.
+    check(
+      'chk_consumed_requires_verified',
+      sql`consumed_at IS NULL OR verified_at IS NOT NULL`
+    ),
   ]
 );
 
@@ -499,7 +561,7 @@ export const verificationCodes = pgTable(
     sessionId: uuid('session_id')
       .notNull()
       .references(() => verificationSessions.id, { onDelete: 'cascade' }),
-    // Stored as argon2 hash, not plaintext
+    // Stored hashed (better-auth scrypt via hashOtpCode), never plaintext.
     code: varchar('code', { length: 255 }).notNull(),
     expiresAt: timestamp('expires_at', {
       withTimezone: true,

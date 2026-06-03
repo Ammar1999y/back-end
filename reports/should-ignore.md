@@ -97,19 +97,47 @@
 51. **Self-Edit Password Change Skips Session Revocation** —
     `app/api/dash/users/[id]/route.ts` — Same reasoning as #70; `validID` always
     matches session ID format
-52. **F-8: Acting admin's permissions not re-verified inside `handleAdminEdit`** —
-    `app/api/dash/users/[id]/handler.ts` — Cookie-cached actor permissions can
-    be stale by ms-scale window relative to a concurrent demotion. A demoted
-    admin slipping one extra mutation through within ~ms of revocation is not
-    materially different from acting one second before revocation. The fix
-    (re-read actor role + permissions under `FOR SHARE` inside every admin
-    mutation tx) costs an extra round-trip on every write to close a window
-    that opens to an attacker only under a precisely-timed race. Cost > benefit.
-53. **H2: HIBP check fails open silently and has no HTTP timeout** —
+52. **H2: HIBP check fails open silently and has no HTTP timeout** —
     `lib/auth/check-password.ts:18-59` — `checkPasswordCompromise` retries the
     HIBP API up to 3 times and falls through silently on exhaustion with no
     `AbortSignal`; during an HIBP outage, compromised passwords are silently
     accepted and admin operations stall 10–30s on user-creation hot path
+53. **Better Auth `password.verify: () => true` Stub** — `lib/auth.ts:26-47` —
+    Built-in verify is stubbed; the before-hook runs the real
+    `verifyLoginAttempt` and only 3 paths are allowlisted (`/get-session`,
+    `/sign-out`, `/sign-in/email`) — all others 404. Safe today; latent bypass
+    only if a future password-bearing path is added to `ALLOWED_PATHS` without
+    wiring verification. Mitigate later with a regression test.
+54. **TOCTOU Between Re-auth Verify Tx and Mutation Tx** —
+    `app/api/dash/users/me/change-password/handler.ts`,
+    `app/api/dash/users/me/change-email/handler.ts` — `verifyLoginAttempt` runs
+    in its own short tx before the mutation tx, so two concurrent self-credential
+    changes can both pass verify (last-write-wins). Acknowledged by in-code TODO;
+    self-contention on one's own credential is rare.
+55. **`audit_logs` Missing `user_id` Index** — `db/schema.ts` — "All actions by
+    user X" forensic query full-scans the table; slow only at 1M+ rows.
+56. **Phone-number CHECK Regex Hardcodes Saudi Format** — `db/schema.ts` —
+    `chk_phone_number_format` enforces `^9665[0-9]{8}$`; future international /
+    non-mobile support would require a migration. Acceptable for current local
+    launch (does not contradict #11, which is about email/password checks).
+57. **User-delete ↔ Role-delete Opposite Lock Order** —
+    `app/api/dash/users/[id]/handler.ts`,
+    `app/api/dash/permissions/[id]/handler.ts` — user→role vs role→users lock
+    acquisition can deadlock under concurrent destructive admin actions;
+    PostgreSQL aborts one transaction (no corruption). Intermittent only.
+58. **OTP Send Collapses 429 to Generic 200 (by design)** —
+    `app/api/auth/otp/send/handler.ts` — masking `TOO_MANY_REQUESTS` is a
+    deliberate privacy contract: the endpoint returns an identical
+    `200 + nextAllowedIn:30` for every case (real / fake / verified / throttled)
+    so timing and status leak nothing. Enforced by the test "per-identifier hour
+    limit never leaks 429 to client (collapsed to 200)". The client already gets
+    a constant `nextAllowedIn` for its countdown. Surfacing 429 (the original
+    ERR-1 suggestion) would break this contract — not worth the UX gain.
+59. **Custom IPv6 `/64` Bucketing in `ipBucket`** — `lib/rate-limit/api.ts:35-63`
+    — manual `::` expansion; verified correct for all valid inputs and
+    `getClientIp` blocks malformed ones upstream. The only proposed remedy adds
+    the `ip-address` dependency — supply-chain/maintenance risk with no real
+    defect fixed. Leave as-is.
 
 # Known Issues — Will Be Fixed Later
 
@@ -136,9 +164,6 @@
     race
 53. **GIN Indexes Built Without `CONCURRENTLY`** —
     `db/migrations/001_add_trgm_indexes.sql` — Blocking on live tables
-54. **Email Change Without Ownership Verification** —
-    `app/api/dash/users/me/change-email/route.ts` — New email is not verified
-    via OTP before updating; `emailVerified` stays `true` after change
-55. **External OTP Delivery Inside DB Transaction** — `utils/otp.ts:306` —
+54. **External OTP Delivery Inside DB Transaction** — `utils/otp.ts:306` —
     `sendOtp()` runs inside `withTransaction`, holding a DB connection and row
     lock during the full external HTTP call; needs benchmarking before splitting
