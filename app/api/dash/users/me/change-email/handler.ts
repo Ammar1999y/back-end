@@ -1,18 +1,17 @@
-import type { Handler, HandlerCookie } from '@/lib/http/contract';
+import type { Handler } from '@/lib/http/contract';
 
-import { and, eq, isNull, ne } from 'drizzle-orm';
+import { and, eq, isNull } from 'drizzle-orm';
 
 import { otpMsg } from '@/app/api/auth/otp/messages';
-import { sessions, users, verificationSessions } from '@/db/schema';
+import { db } from '@/db';
+import { users } from '@/db/schema';
 import { withTransaction } from '@/db/ws';
-import { isUniqueViolation, sanitizeForLog } from '@/utils';
-import { auditLog, getAuditMeta } from '@/lib/audit';
-import { auth } from '@/lib/auth';
+import { isUniqueViolation } from '@/utils';
+import { getAuditMeta } from '@/lib/audit';
 import { LoginRejected, verifyLoginAttempt } from '@/lib/auth/login-guard';
 import { verifyTurnstileRequest } from '@/lib/captcha';
-import { parseSetCookieHeaders } from '@/lib/http/contract';
 import { requireSession } from '@/lib/http/session';
-import { enforceRateLimit, userIdentifier } from '@/lib/rate-limit';
+import { enforceRateLimit, otpSendScope, userIdentifier } from '@/lib/rate-limit';
 
 import {
   HTTP_STATUS,
@@ -27,11 +26,25 @@ import {
   requireJsonBody,
   resolveUserUniqueViolation,
 } from '@/utils/api-response';
+import { OTP_AUTO_VERIFY } from '@/utils/config';
 import { CustomError } from '@/utils/error-class';
+import { processOtpSend } from '@/utils/otp';
 import { changeEmailSchema } from '@/utils/validation/auth';
+import { EMAIL_OTP_AVAILABLE } from '@/utils/validation/otp';
 
 import { userMsg } from '../../messages';
+import { commitEmailChange, refreshSessionCookies } from '../contact-change';
 
+/**
+ * Initiate an email change. The new address is NEVER written to `users.email`
+ * here — it stays a pending, unverified change until ownership of the new
+ * address is proven:
+ *  - normal flow: an OTP is sent to the NEW address; the change is committed at
+ *    POST /change-email/verify only after the code matches.
+ *  - OTP_AUTO_VERIFY: the change is committed immediately (no code), since the
+ *    deployment has opted out of real verification.
+ * Either way the current password re-auth is required to initiate.
+ */
 export const POST: Handler = async (ctx) => {
   try {
     const { userId, sessionId } = await requireSession(ctx);
@@ -55,15 +68,19 @@ export const POST: Handler = async (ctx) => {
         HTTP_STATUS.UNPROCESSABLE
       );
 
+    const newEmail = parsed.data.newEmail;
     const auditMeta = getAuditMeta(ctx);
 
-    // Run the password check in its own short tx so the outer mutation
-    // doesn't hold FOR UPDATE across argon2.
-    // TODO: test moving verifyLoginAttempt INSIDE the
-    // mutation tx below (under the same FOR UPDATE on users) so two
-    // concurrent self-credential submissions can't both pass verify and
-    // race to write. Measure the latency impact of holding the user row
-    // lock across argon2 (~100-500ms) before committing to this.
+    // Verification must be possible before we accept the request — otherwise we
+    // would either send to a dead channel or strand the change forever.
+    if (!OTP_AUTO_VERIFY && !EMAIL_OTP_AVAILABLE)
+      throw new CustomError(
+        userMsg.verificationUnavailable,
+        HTTP_STATUS.SERVICE_UNAVAILABLE
+      );
+
+    // Re-auth in its own short tx so the later mutation doesn't hold a row lock
+    // across argon2.
     try {
       await verifyLoginAttempt({
         userId,
@@ -80,91 +97,76 @@ export const POST: Handler = async (ctx) => {
       throw e;
     }
 
-    await withTransaction(async (tx) => {
-      // Fresh DB read under FOR UPDATE — the cookie-cached session can be up
-      // to 5 minutes stale. A freshly-deactivated or demoted admin must be
-      // blocked from rotating their email during the staleness window.
-      const [currentUser] = await tx
-        .select({
-          id: users.id,
-          email: users.email,
-          roleId: users.roleId,
-        })
-        .from(users)
-        .where(
-          and(
-            eq(users.id, userId),
-            isNull(users.deletedAt),
-            eq(users.isActive, true)
-          )
-        )
-        .for('update');
+    // A "taken" address is NOT rejected here: revealing it before the user
+    // proves ownership of the new address would be an account-enumeration
+    // oracle. Uniqueness is enforced authoritatively by the unique index at
+    // commit time (→ 409). We only reject same-as-current (reveals nothing).
+    const [currentUser] = await db
+      .select({
+        email: users.email,
+        roleId: users.roleId,
+        isActive: users.isActive,
+      })
+      .from(users)
+      .where(and(eq(users.id, userId), isNull(users.deletedAt)))
+      .limit(1);
 
-      if (!currentUser)
-        throw new CustomError(MSG_NOT_FOUND, HTTP_STATUS.NOT_FOUND);
-
-      if (!currentUser.roleId)
-        throw new CustomError(
-          MSG_INSUFFICIENT_PERMISSIONS,
-          HTTP_STATUS.FORBIDDEN
-        );
-
-      if (currentUser.email === parsed.data.newEmail)
-        throw new CustomError(
-          userMsg.newEmailSameAsCurrent,
-          HTTP_STATUS.BAD_REQUEST
-        );
-
-      // The partial unique index on email enforces uniqueness — any collision
-      // surfaces as a unique-violation caught below and mapped to CONFLICT.
-      await tx
-        .update(users)
-        .set({ email: parsed.data.newEmail })
-        .where(eq(users.id, userId));
-
-      if (sessionId) {
-        await tx
-          .delete(sessions)
-          .where(and(eq(sessions.userId, userId), ne(sessions.id, sessionId)));
-      }
-
-      await tx
-        .delete(verificationSessions)
-        .where(eq(verificationSessions.userId, userId));
-
-      await auditLog(tx, {
-        userId,
-        userEmail: currentUser.email,
-        action: 'UPDATE',
-        tableName: 'users',
-        recordId: userId,
-        oldData: { email: currentUser.email },
-        newData: { email: parsed.data.newEmail },
-        meta: auditMeta,
-      });
-    });
-
-    // Refresh cookie cache outside the try/catch that reports update failure —
-    // the DB change already committed. Pipe the refreshed Set-Cookie values
-    // into HandlerOutput.cookies so the framework adapter writes them; the
-    // Next adapter's implicit cookie mutation is not portable to other adapters.
-    let refreshedCookies: HandlerCookie[] = [];
-    try {
-      const refreshed = await auth.api.getSession({
-        headers: ctx.headers,
-        query: { disableCookieCache: true },
-        returnHeaders: true,
-      });
-      refreshedCookies = parseSetCookieHeaders(
-        refreshed.headers.getSetCookie()
+    if (!currentUser || !currentUser.isActive)
+      throw new CustomError(MSG_NOT_FOUND, HTTP_STATUS.NOT_FOUND);
+    if (!currentUser.roleId)
+      throw new CustomError(
+        MSG_INSUFFICIENT_PERMISSIONS,
+        HTTP_STATUS.FORBIDDEN
       );
-    } catch (e) {
-      console.error('cookie cache refresh failed:', sanitizeForLog(e));
+    if (currentUser.email === newEmail)
+      throw new CustomError(
+        userMsg.newEmailSameAsCurrent,
+        HTTP_STATUS.BAD_REQUEST
+      );
+
+    if (OTP_AUTO_VERIFY) {
+      // Bypass: commit the change now, no code entry.
+      await withTransaction((tx) =>
+        commitEmailChange({
+          tx,
+          userId,
+          newEmail,
+          keepSessionId: sessionId,
+          auditMeta,
+        })
+      );
+
+      return apiSuccess({
+        message: userMsg.emailChanged,
+        data: { autoVerified: true },
+        cookies: await refreshSessionCookies(ctx.headers),
+      });
     }
 
+    // Per-destination cap (shared with the public OTP send budget) so the same
+    // address can't be targeted repeatedly across actors/endpoints.
+    await enforceRateLimit({
+      scope: otpSendScope('email'),
+      identifier: newEmail.toLowerCase(),
+      limit: 5,
+      window: 3600,
+      failClosed: true,
+    });
+
+    // Normal flow: send the code to the NEW address bound to change_email.
+    await processOtpSend({
+      userId,
+      identifier: newEmail,
+      channel: 'email',
+      purpose: 'change_email',
+      targetIdentifier: newEmail,
+      sendTo: newEmail,
+      entityName: 'البريد الإلكتروني',
+    });
+
     return apiSuccess({
-      message: userMsg.emailChanged,
-      cookies: refreshedCookies.length ? refreshedCookies : undefined,
+      message: userMsg.emailChangeCodeSent,
+      data: { otpSent: true },
     });
   } catch (error) {
     if (isUniqueViolation(error)) {

@@ -1,8 +1,8 @@
 I have used multiple AI modules to analyze my API endpoints, and they generated four separate reports.
-@reports/gemini.md 
-@reports/codex.md 
-@reports/claude-opus.md 
-@reports/claude-sonnet.md  
+@reports/codex.md
+@reports/claude-opus.md
+@reports/claude-sonnet.md
+@reports/claude-fable.md
 
 I want you to act as a senior technical reviewer and consolidate these four reports into a single, comprehensive final report.
 
@@ -21,3 +21,5 @@ I want you to make sure that the issues are not already listed in
 @reports/should-ignore.md  or  @TODO.md  
 
 And feel free to remove even part of an issue if it’s already covered.
+And you dont need to read the files to check if the error are real.
+and add who is reporting each issue.

@@ -1,7 +1,13 @@
 import * as z from 'zod';
 
+import { OTP_AUTO_VERIFY, PHONE_ENABLED } from '../config';
 import { OTP_CODE_LENGTH } from './constants';
-import { emailSchema, phoneSchema, sanitizeStrictSingleLine } from './rules';
+import {
+  emailSchema,
+  passwordSchema,
+  phoneSchema,
+  sanitizeStrictSingleLine,
+} from './rules';
 
 // ── Channel Configuration ──
 // All supported channels — any change here requires a DB migration
@@ -26,21 +32,56 @@ export const OTP_PURPOSES = [
 ] as const;
 export type OtpPurpose = (typeof OTP_PURPOSES)[number];
 
-// Currently enabled channels — change this to enable SMS/WhatsApp later.
-// If not set, OTP is completely disabled (empty array).
-// Exposed to the client via NEXT_PUBLIC_ so the UI can adapt.
-export const ENABLED_OTP_CHANNELS: readonly OtpChannel[] = process.env
-  .NEXT_PUBLIC_ENABLED_OTP_CHANNELS
-  ? process.env.NEXT_PUBLIC_ENABLED_OTP_CHANNELS.split(',')
-      .map((c) => c.trim())
-      .filter((c): c is OtpChannel =>
-        (OTP_CHANNELS as readonly string[]).includes(c)
-      )
+const isPhoneChannel = (c: OtpChannel) => c === 'sms' || c === 'whatsapp';
+
+// Channels listed in the env, filtered to real ones and — when phone is
+// disabled (PHONE_NUMBER_MODE) — with the phone channels stripped so the
+// config can't contradict itself.
+const envChannels: OtpChannel[] = (
+  process.env.NEXT_PUBLIC_ENABLED_OTP_CHANNELS
+    ? process.env.NEXT_PUBLIC_ENABLED_OTP_CHANNELS.split(',')
+        .map((c) => c.trim())
+        .filter((c): c is OtpChannel =>
+          (OTP_CHANNELS as readonly string[]).includes(c)
+        )
+    : []
+).filter((c) => PHONE_ENABLED || !isPhoneChannel(c));
+
+// When OTP is bypassed (OTP_AUTO_VERIFY), no real delivery happens, but the
+// verification UI still needs channels to offer and the flag-flip endpoints
+// must stay reachable. Email is always available; phone channels only when
+// phone is enabled.
+const bypassChannels: OtpChannel[] = OTP_AUTO_VERIFY
+  ? (['email', ...(PHONE_ENABLED ? (['sms', 'whatsapp'] as const) : [])] as OtpChannel[])
   : [];
+
+// Enabled channels — exposed to the client via NEXT_PUBLIC_ so the UI adapts.
+// Empty array means OTP is completely disabled.
+export const ENABLED_OTP_CHANNELS: readonly OtpChannel[] = Array.from(
+  new Set([...envChannels, ...bypassChannels])
+);
 
 export const OTP_ENABLED = ENABLED_OTP_CHANNELS.length > 0;
 
+/** A channel capable of verifying the email is enabled. */
+export const EMAIL_OTP_AVAILABLE = (
+  ENABLED_OTP_CHANNELS as readonly string[]
+).includes('email');
+
+/** A channel capable of verifying the phone (sms/whatsapp) is enabled. */
+export const PHONE_OTP_AVAILABLE = ENABLED_OTP_CHANNELS.some(isPhoneChannel);
+
 const MSG_CHANNEL_DISABLED = 'طريقة الإرسال غير مسموحة حالياً';
+
+/** Shared superRefine: the requested channel must be currently enabled. */
+export function channelEnabledRefine(
+  data: { channel: string },
+  ctx: z.RefinementCtx
+) {
+  if (!(ENABLED_OTP_CHANNELS as readonly string[]).includes(data.channel)) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, message: MSG_CHANNEL_DISABLED });
+  }
+}
 
 export const channelSchema = z
   .enum(OTP_CHANNELS)
@@ -83,14 +124,7 @@ export const sendOtpSchema = z
     sendOtpEmailSchema,
     sendOtpSmsSchema,
   ])
-  .superRefine((data, ctx) => {
-    if (!(ENABLED_OTP_CHANNELS as readonly string[]).includes(data.channel)) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        message: MSG_CHANNEL_DISABLED,
-      });
-    }
-  });
+  .superRefine(channelEnabledRefine);
 
 export type SendOtpInput = z.infer<typeof sendOtpSchema>;
 
@@ -119,13 +153,18 @@ export const verifyOtpSchema = z
     verifyOtpEmailSchema,
     verifyOtpSmsSchema,
   ])
-  .superRefine((data, ctx) => {
-    if (!(ENABLED_OTP_CHANNELS as readonly string[]).includes(data.channel)) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        message: MSG_CHANNEL_DISABLED,
-      });
-    }
-  });
+  .superRefine(channelEnabledRefine);
 
 export type VerifyOtpInput = z.infer<typeof verifyOtpSchema>;
+
+// ── Reset-Password Schema (forgot-password) ──
+// Same shape as verify (channel + identifier + code) plus the new password.
+export const resetPasswordSchema = z
+  .discriminatedUnion('channel', [
+    verifyOtpPhoneSchema.extend({ newPassword: passwordSchema }),
+    verifyOtpEmailSchema.extend({ newPassword: passwordSchema }),
+    verifyOtpSmsSchema.extend({ newPassword: passwordSchema }),
+  ])
+  .superRefine(channelEnabledRefine);
+
+export type ResetPasswordInput = z.infer<typeof resetPasswordSchema>;

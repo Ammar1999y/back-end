@@ -1,3 +1,6 @@
+import type { Handler } from '@/lib/http/contract';
+import type { checkUserPermission } from '@/lib/permissions/checker';
+
 import { and, desc, eq, gt, isNull, sql } from 'drizzle-orm';
 
 import { db } from '@/db';
@@ -18,12 +21,11 @@ import {
   validID,
 } from '@/utils';
 import { auditLog, getAuditMeta } from '@/lib/audit';
-import { hashPassword } from '@/lib/auth';
 import { checkPasswordCompromise } from '@/lib/auth/check-password';
+import { hashPassword } from '@/lib/auth/password';
+import { PHONE_ENABLED, PHONE_REQUIRED } from '@/utils/config';
 import { requirePermission } from '@/lib/http/session';
-import { enforceRateLimit, userIdentifier } from '@/lib/rate-limit';
 import { CUSTOM_ROLE_VALUE, ROLE_SCOPE } from '@/lib/permissions/constants';
-import type { checkUserPermission } from '@/lib/permissions/checker';
 import {
   createCustomRole,
   isProtectedSystemRole,
@@ -33,8 +35,7 @@ import {
   validatePermissionScope,
   validateRolePermissionScope,
 } from '@/lib/permissions/utils';
-
-import type { Handler } from '@/lib/http/contract';
+import { enforceRateLimit, userIdentifier } from '@/lib/rate-limit';
 
 import {
   CREDENTIAL_PROVIDER_ID,
@@ -117,6 +118,9 @@ export const GET: Handler = async (ctx) => {
         id: true,
         name: true,
         email: true,
+        emailVerified: true,
+        phoneNumber: true,
+        phoneNumberVerified: true,
         isActive: true,
         roleId: true,
         createdBy: true,
@@ -201,6 +205,9 @@ export const GET: Handler = async (ctx) => {
         id: userData.id,
         name: userData.name,
         email: userData.email,
+        emailVerified: userData.emailVerified,
+        phoneNumber: userData.phoneNumber,
+        phoneNumberVerified: userData.phoneNumberVerified,
         isActive: userData.isActive,
         roleId:
           userData.role?.scope === CUSTOM_ROLE_VALUE
@@ -309,6 +316,7 @@ async function handleAdminEdit(
         id: users.id,
         name: users.name,
         email: users.email,
+        phoneNumber: users.phoneNumber,
         roleId: users.roleId,
         isActive: users.isActive,
         createdBy: users.createdBy,
@@ -361,8 +369,7 @@ async function handleAdminEdit(
 
     if (isCustomRole) {
       if (isCurrentlyCustom) {
-        const hasEditAll =
-          actorPermissions?.['permissions']?.['edit'] === true;
+        const hasEditAll = actorPermissions?.['permissions']?.['edit'] === true;
         const hasEditOwn =
           actorPermissions?.['permissions']?.['editOwn'] === true &&
           lockedUser.roleCreatedBy === actor.userId;
@@ -426,6 +433,18 @@ async function handleAdminEdit(
     }
 
     const emailChanged = lockedUser.email !== validatedData.email;
+    // Phone is only persisted when enabled. An omitted key means "keep current"
+    // — only an explicit null/'' clears it — so a partial update can't silently
+    // wipe the number. The schema coerces both omitted and explicit-empty to
+    // null, so presence is read from the raw body. An admin-set number is
+    // unproven, so the verified flag resets to false on any change.
+    const phoneProvided = 'phoneNumber' in body;
+    const newPhoneNumber = validatedData.phoneNumber ?? null;
+    const phoneChanged =
+      PHONE_ENABLED &&
+      phoneProvided &&
+      lockedUser.phoneNumber !== newPhoneNumber;
+
     const [userUpdated] = await tx
       .update(users)
       .set({
@@ -433,6 +452,14 @@ async function handleAdminEdit(
         email: validatedData.email,
         isActive: validatedData.isActive,
         roleId: assignedRoleId,
+        // An admin edit must never flip the account onto a verified-but-unproven
+        // address. The address changes by admin authority, but
+        // the verified flag resets to false so nothing trusts it until the
+        // owner re-proves it via OTP. emailVerified is never set true here.
+        ...(emailChanged ? { emailVerified: false } : {}),
+        ...(phoneChanged
+          ? { phoneNumber: newPhoneNumber, phoneNumberVerified: false }
+          : {}),
         // Admin-issued password reset is the supported recovery path for a
         // locked-out user; clear the brute-force counters atomically with the
         // password change so the user can sign in immediately.
@@ -506,8 +533,10 @@ async function handleAdminEdit(
         ? refreshUserSessions(userId, tx)
         : Promise.resolve();
 
+    // Drop pending verification sessions on any contact/credential mutation so a
+    // stale change_* proof can't later commit over the admin's change.
     const verificationCleanup: Promise<unknown> =
-      emailChanged || shouldDeleteAllSessions
+      emailChanged || phoneChanged || shouldDeleteAllSessions
         ? tx
             .delete(verificationSessions)
             .where(eq(verificationSessions.userId, userId))
@@ -531,6 +560,10 @@ async function handleAdminEdit(
           email: validatedData.email,
           roleId: assignedRoleId,
           isActive: validatedData.isActive,
+          ...(emailChanged ? { emailVerified: false } : {}),
+          ...(phoneChanged
+            ? { phoneNumber: newPhoneNumber, phoneNumberVerified: false }
+            : {}),
           ...(password ? { passwordChanged: true } : {}),
         },
         meta: auditMeta,
@@ -689,7 +722,18 @@ export const DELETE: Handler = async (ctx) => {
         .update(users)
         .set({
           email: sql`LEFT(email, ${EMAIL_MAX - DELETED_SUFFIX_LEN}) || ${DELETED_EMAIL_SUFFIX} || gen_random_uuid()`,
-          phoneNumber: null,
+          // In 'required' mode the column is NOT NULL, so nulling it would make
+          // every soft-delete fail. Anonymize to a format-valid dummy instead;
+          // the partial unique index excludes soft-deleted rows so it can't
+          // collide. In other modes a NULL is the clean wipe.
+          phoneNumber: PHONE_REQUIRED
+            ? sql`'9665' || LPAD((FLOOR(RANDOM() * 100000000))::bigint::text, 8, '0')`
+            : null,
+          // The anonymized email is not a proven address, and clearing the
+          // phone would otherwise violate chk_phone_verified_requires_phone —
+          // reset both verified flags alongside the contact wipe.
+          emailVerified: false,
+          phoneNumberVerified: false,
           deletedAt: sql`now()`,
           updatedAt: sql`now()`,
           isActive: false,

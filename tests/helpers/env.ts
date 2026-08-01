@@ -36,5 +36,13 @@ loadDotEnv(resolve(process.cwd(), '.env.local'));
 
 if (!process.env.NODE_ENV) process.env.NODE_ENV = 'development';
 
-export const BASE_URL =
-  process.env.TEST_BASE_URL ?? 'http://localhost:3000';
+if (
+  !process.env.PASSWORD_PEPPER_ACTIVE_ID &&
+  !process.env.PASSWORD_PEPPER_KEYRING
+) {
+  process.env.PASSWORD_PEPPER_ACTIVE_ID = 'test_v1';
+  process.env.PASSWORD_PEPPER_KEYRING =
+    '{"test_v1":{"generation":1,"secret":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}}';
+}
+
+export const BASE_URL = process.env.TEST_BASE_URL ?? 'http://localhost:3000';

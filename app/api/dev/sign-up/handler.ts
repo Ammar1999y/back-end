@@ -2,7 +2,7 @@ import { accounts, rolePermissions, roles, users } from '@/db/schema';
 import { withTransaction } from '@/db/ws';
 import { getConstraintName, isUniqueViolation } from '@/utils';
 import * as z from 'zod';
-import { hashPassword } from '@/lib/auth';
+import { hashPassword } from '@/lib/auth/password';
 import {
   DEFAULT_PAGE_PERMISSIONS,
   ROLE_SCOPE,

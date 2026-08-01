@@ -4,21 +4,35 @@ import { sanitizeForLog, validID } from '@/utils';
 import { betterAuth } from 'better-auth';
 import { drizzleAdapter } from 'better-auth/adapters/drizzle';
 import { APIError, createAuthMiddleware } from 'better-auth/api';
-import { hashPassword, verifyPassword } from 'better-auth/crypto';
 import { captcha, haveIBeenPwned } from 'better-auth/plugins';
 
 import {
+  CUSTOM_AUTH_CODE,
+  EMAIL_NOT_VERIFIED_CODE,
   HTTP_STATUS,
+  MSG_EMAIL_NOT_VERIFIED,
   MSG_INVALID_CREDENTIALS,
   MSG_INVALID_INPUT,
   MSG_PAGE_NOT_FOUND,
   MSG_PASSWORD_COMPROMISED,
+  MSG_PHONE_NOT_VERIFIED,
+  PHONE_NOT_VERIFIED_CODE,
 } from '@/utils/api-messages';
+import {
+  REQUIRE_EMAIL_VERIFICATION,
+  REQUIRE_PHONE_VERIFICATION,
+} from '@/utils/config';
 import { loginSchema } from '@/utils/validation/auth';
+import {
+  EMAIL_OTP_AVAILABLE,
+  PHONE_OTP_AVAILABLE,
+} from '@/utils/validation/otp';
 
 import { API_PATH_MAX, getClientIp, USER_AGENT_MAX } from './audit';
 import { BASE_ERROR_CODES } from './auth/code-errors';
 import { LoginRejected, verifyLoginAttempt } from './auth/login-guard';
+import { hashPassword } from './auth/password';
+import { passwordless } from './auth/passwordless';
 import { REQUIRE_ROLE_FOR_LOGIN } from './permissions/constants';
 import { sanitizePermissions } from './permissions/utils';
 import { authRateLimitStorage } from './rate-limit/auth-storage';
@@ -27,9 +41,15 @@ import { authRateLimitStorage } from './rate-limit/auth-storage';
 // hook already verifies credentials via verifyLoginAttempt(). If you add a new
 // path that relies on Better Auth's built-in password verification, you MUST
 // either add verification logic in the before hook or restore the real verify.
-const ALLOWED_PATHS = new Set(['/get-session', '/sign-out', '/sign-in/email']);
+const ALLOWED_PATHS = new Set([
+  '/get-session',
+  '/sign-out',
+  '/sign-in/email',
+  // Passwordless plugin endpoint — does its own captcha/rate-limit/OTP verify.
+  '/passwordless/verify',
+]);
 
-const CUSTOM_CODE = '__';
+const CUSTOM_CODE = CUSTOM_AUTH_CODE;
 
 export const auth = betterAuth({
   baseURL: process.env.NEXT_PUBLIC_URL!,
@@ -42,7 +62,6 @@ export const auth = betterAuth({
       // Always true — the before hook already verifies via verifyLoginAttempt().
       // See ALLOWED_PATHS warning above before adding new password-based paths.
       verify: async () => true,
-      // verify: verifyPassword,
     },
   },
 
@@ -128,7 +147,12 @@ export const auth = betterAuth({
             code: CUSTOM_CODE,
           }
         );
-      } else if (errorCode && errorCode !== CUSTOM_CODE)
+      } else if (
+        errorCode &&
+        errorCode !== CUSTOM_CODE &&
+        errorCode !== EMAIL_NOT_VERIFIED_CODE &&
+        errorCode !== PHONE_NOT_VERIFIED_CODE
+      )
         console.error(sanitizeForLog(ctx.context?.returned));
     }),
   },
@@ -179,6 +203,8 @@ export const auth = betterAuth({
             columns: {
               isActive: true,
               roleId: true,
+              emailVerified: true,
+              phoneNumberVerified: true,
             },
             with: {
               role: {
@@ -206,6 +232,42 @@ export const auth = betterAuth({
             throw new APIError(HTTP_STATUS.UNAUTHORIZED, {
               message: MSG_INVALID_CREDENTIALS,
               code: CUSTOM_CODE,
+            });
+          }
+
+          // Verification gates. These run AFTER the password has already been
+          // verified (verifyLoginAttempt in the /sign-in/email before hook), so
+          // revealing the distinct signal leaks nothing to someone who doesn't
+          // know the password — every other login failure still returns the
+          // generic 401 above. The frontend keys on the code to start the OTP
+          // flow.
+          //
+          // Enforced ONLY when the contact can actually be verified right now
+          // (an OTP channel for it is enabled). This is the deliberate design
+          // (report/owner decision): the verified flag always reflects reality
+          // and is never auto-flipped. So when OTP is off the gate is inert and
+          // users work freely; turning OTP on later makes unverified users
+          // verify at their next login, without ever losing track of who is
+          // genuinely verified.
+          if (
+            REQUIRE_EMAIL_VERIFICATION &&
+            EMAIL_OTP_AVAILABLE &&
+            !userData.emailVerified
+          ) {
+            throw new APIError(HTTP_STATUS.FORBIDDEN, {
+              message: MSG_EMAIL_NOT_VERIFIED,
+              code: EMAIL_NOT_VERIFIED_CODE,
+            });
+          }
+
+          if (
+            REQUIRE_PHONE_VERIFICATION &&
+            PHONE_OTP_AVAILABLE &&
+            !userData.phoneNumberVerified
+          ) {
+            throw new APIError(HTTP_STATUS.FORBIDDEN, {
+              message: MSG_PHONE_NOT_VERIFIED,
+              code: PHONE_NOT_VERIFIED_CODE,
             });
           }
 
@@ -289,7 +351,7 @@ export const auth = betterAuth({
           : process.env.TURNSTILE_SECRET_KEY!,
       endpoints: ['/sign-in/email'], // TODO: add the proper endpoints
     }),
+    // Passwordless sign-in (OTP → session). Verifies its own captcha/OTP.
+    passwordless(),
   ],
 });
-// eslint-disable-next-line unicorn/prefer-export-from
-export { hashPassword, verifyPassword };

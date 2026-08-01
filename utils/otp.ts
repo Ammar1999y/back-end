@@ -2,13 +2,14 @@ import crypto from 'node:crypto';
 import type { WsTx } from '@/db/ws';
 import type { OtpChannel, OtpPurpose } from '@/utils/validation/otp';
 
-import { and, eq, gt, sql } from 'drizzle-orm';
+import { and, eq, gt, isNull, sql } from 'drizzle-orm';
 
 import { users, verificationCodes, verificationSessions } from '@/db/schema';
 import { withTransaction } from '@/db/ws';
 import { auditLog } from '@/lib/audit';
+import { hashPassword, verifyPassword } from '@/lib/auth/password';
+import { EntityID } from '@/types';
 import { sanitizeForLog } from '@/utils';
-import { hashPassword, verifyPassword } from 'better-auth/crypto';
 import nodemailer from 'nodemailer';
 
 import { HTTP_STATUS } from '@/utils/api-messages';
@@ -20,7 +21,6 @@ import {
   OTP_MAX_DAILY_VERIFY_ATTEMPTS,
   OTP_MAX_VERIFY_ATTEMPTS,
 } from '@/utils/validation/constants';
-import { EntityID } from '@/types';
 
 // ── Email Transport (lazy-initialized to avoid crash when env vars are missing) ──
 let _transporter: nodemailer.Transporter | null = null;
@@ -200,7 +200,7 @@ interface ProcessOtpSendResult {
 
 /**
  * Handles rate-limiting, OTP generation, storage, and delivery.
- * Runs inside a transaction with row-level locking.
+ * Storage and delivery run inside a transaction with row-level locking.
  */
 export async function processOtpSend({
   userId,
@@ -212,6 +212,10 @@ export async function processOtpSend({
   entityName,
   smsMessage,
 }: ProcessOtpSendOptions): Promise<ProcessOtpSendResult> {
+  // Argon2id is intentionally computed before acquiring advisory or row locks.
+  const otpCode = generateOtpCode();
+  const hashedCode = await hashOtpCode(otpCode);
+
   // Buffer deferred errors so max-attempts block persists (commit) before we throw.
   let deferredError: CustomError | null = null;
 
@@ -307,9 +311,6 @@ export async function processOtpSend({
       return null;
     }
 
-    // ── Generate & hash OTP ──
-    const otpCode = generateOtpCode();
-    const hashedCode = await hashOtpCode(otpCode);
     const expiresAt = calculateOtpExpiry();
 
     const currentAttempts = session?.attemptNumber ?? 0;
@@ -393,6 +394,75 @@ export async function processOtpSend({
   return result as ProcessOtpSendResult;
 }
 
+// ── Contact Verified Flag ──
+
+/**
+ * Idempotently flip a contact's verified flag and audit the transition, under a
+ * row lock on the user. Shared by the OTP verify success path and the
+ * OTP_AUTO_VERIFY bypass so the flag is set in exactly one place. Runs inside
+ * the caller's transaction. The flag is only set here — never carried onto an
+ * unproven address.
+ */
+export async function markContactVerified(
+  tx: WsTx,
+  opts: {
+    userId: EntityID;
+    channel: OtpChannel;
+    auditMeta?: {
+      ip: string | null;
+      userAgent: string | null;
+      apiPath: string;
+    };
+    /** Invoked (must throw) when the user vanished/deactivated mid-flow. */
+    onMissing: () => never;
+  }
+): Promise<void> {
+  const [currentUser] = await tx
+    .select({
+      email: users.email,
+      emailVerified: users.emailVerified,
+      phoneNumberVerified: users.phoneNumberVerified,
+    })
+    .from(users)
+    .where(
+      and(
+        eq(users.id, opts.userId),
+        isNull(users.deletedAt),
+        eq(users.isActive, true)
+      )
+    )
+    .for('update');
+
+  if (!currentUser) opts.onMissing();
+
+  const isEmail = opts.channel === 'email';
+  const alreadyVerified = isEmail
+    ? currentUser.emailVerified
+    : currentUser.phoneNumberVerified;
+
+  // Idempotent re-verification: skip the UPDATE and the audit row so the log
+  // only reflects real transitions.
+  if (alreadyVerified) return;
+
+  await tx
+    .update(users)
+    .set(isEmail ? { emailVerified: true } : { phoneNumberVerified: true })
+    .where(eq(users.id, opts.userId));
+
+  const fieldName = isEmail ? 'emailVerified' : 'phoneNumberVerified';
+  if (opts.auditMeta)
+    await auditLog(tx, {
+      userId: opts.userId,
+      userEmail: currentUser.email,
+      action: 'UPDATE',
+      tableName: 'users',
+      recordId: opts.userId,
+      oldData: { [fieldName]: false },
+      newData: { [fieldName]: true },
+      meta: opts.auditMeta,
+    });
+}
+
 // ── Reusable OTP Verify Logic ──
 
 interface ProcessOtpVerifyOptions {
@@ -420,8 +490,17 @@ interface ProcessOtpVerifyOptions {
     userAgent: string | null;
     apiPath: string;
   };
-  /** Callback executed inside the same transaction after successful verification */
-  onVerified?: (tx: WsTx) => Promise<void>;
+  /**
+   * Callback executed inside the same transaction after successful verification.
+   * Receives the matched session's authoritative `targetIdentifier` so the
+   * committed value comes from the proven row, never from the request body — a
+   * future change to the lookup can't let the written value diverge from what
+   * was proven.
+   */
+  onVerified?: (
+    tx: WsTx,
+    matched: { targetIdentifier: string | null }
+  ) => Promise<void>;
 }
 
 /**
@@ -465,6 +544,7 @@ export async function processOtpVerify({
         id: verificationSessions.id,
         isBlocked: verificationSessions.isBlocked,
         blockedUntil: verificationSessions.blockedUntil,
+        targetIdentifier: verificationSessions.targetIdentifier,
       })
       .from(verificationSessions)
       .where(
@@ -487,12 +567,19 @@ export async function processOtpVerify({
     // the verify counters are still under their caps. Without this guard,
     // a leftover non-expired code could be successfully verified on a
     // session that should be locked entirely.
-    if (
-      session.isBlocked &&
-      session.blockedUntil &&
-      new Date(session.blockedUntil) > new Date()
-    ) {
-      return { kind: 'blocked' };
+    if (session.isBlocked && session.blockedUntil) {
+      if (new Date(session.blockedUntil) > new Date())
+        return { kind: 'blocked' };
+
+      // Block expired — clear the stale flag in-place (parallel to the
+      // processOtpSend reset). Otherwise the row lingers with isBlocked = true
+      // and a past blockedUntil, and the next cap-hit would start a fresh
+      // full-duration block instead of treating the prior one as served.
+      await tx
+        .update(verificationSessions)
+        .set({ isBlocked: false, blockedUntil: null })
+        .where(eq(verificationSessions.id, session.id));
+      session.isBlocked = false;
     }
 
     // ── Atomic DB-side check + increment for BOTH counters:
@@ -601,7 +688,8 @@ export async function processOtpVerify({
       // commit atomically — there is no verify→action window.
       // No block audit even if shouldBlock fired above: the user never actually
       // got blocked from a usable session.
-      if (onVerified) await onVerified(tx);
+      if (onVerified)
+        await onVerified(tx, { targetIdentifier: session.targetIdentifier });
 
       if (purpose === 'verify_contact') {
         // Pure ownership proof — nothing downstream consumes it later.
@@ -611,14 +699,17 @@ export async function processOtpVerify({
       } else {
         // Sensitive-action proof (change_email/change_phone, …): keep the row
         // as an auditable single-use record, but drop the code so the same
-        // proof can never be replayed.
-        await tx
-          .update(verificationSessions)
-          .set({ verifiedAt: sql`now()`, consumedAt: sql`now()` })
-          .where(eq(verificationSessions.id, session.id));
-        await tx
-          .delete(verificationCodes)
-          .where(eq(verificationCodes.sessionId, session.id));
+        // proof can never be replayed. The two writes target different tables
+        // with no dependency — run them in one round-trip.
+        await Promise.all([
+          tx
+            .update(verificationSessions)
+            .set({ verifiedAt: sql`now()`, consumedAt: sql`now()` })
+            .where(eq(verificationSessions.id, session.id)),
+          tx
+            .delete(verificationCodes)
+            .where(eq(verificationCodes.sessionId, session.id)),
+        ]);
       }
       return { kind: 'matched' };
     }

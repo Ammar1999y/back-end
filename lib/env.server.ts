@@ -1,5 +1,7 @@
 import 'server-only';
 
+import { validatePasswordPepperConfiguration } from '@/lib/auth/password-pepper';
+
 /**
  * Hard-fail at module-load time when a required server env var is missing.
  *
@@ -10,6 +12,8 @@ import 'server-only';
  */
 const REQUIRED_SERVER_ENV = [
   'DATABASE_URL',
+  'PASSWORD_PEPPER_ACTIVE_ID',
+  'PASSWORD_PEPPER_KEYRING',
   'UPSTASH_REDIS_REST_URL',
   'UPSTASH_REDIS_REST_TOKEN',
 ] as const;
@@ -40,5 +44,4 @@ function assertEnv(): void {
 }
 
 assertEnv();
-
-export {};
+validatePasswordPepperConfiguration();

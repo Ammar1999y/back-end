@@ -561,7 +561,7 @@ export const verificationCodes = pgTable(
     sessionId: uuid('session_id')
       .notNull()
       .references(() => verificationSessions.id, { onDelete: 'cascade' }),
-    // Stored hashed (better-auth scrypt via hashOtpCode), never plaintext.
+    // Stored as an Argon2id hash via hashOtpCode, never plaintext.
     code: varchar('code', { length: 255 }).notNull(),
     expiresAt: timestamp('expires_at', {
       withTimezone: true,

@@ -1,4 +1,4 @@
-/**
+/** TODO: try if it steal works
  * Unified entity identifier type used across the project.
  *
  * ⚠️ When switching this type between `number` and `string` (UUID v7),

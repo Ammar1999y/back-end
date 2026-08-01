@@ -206,3 +206,12 @@ export const phoneSchema = z.preprocess(
       return val;
     })
 );
+
+// Optional phone: empty string / null → no number (null); otherwise validated
+// and normalized by phoneSchema. The key is always present (nullable, not
+// optional) so the inferred input/output shapes stay consistent for
+// react-hook-form resolvers — callers send `null` to mean "no number".
+export const optionalPhoneSchema = z.preprocess(
+  (v) => (v == null || (typeof v === 'string' && v.trim() === '') ? null : v),
+  phoneSchema.nullable()
+);

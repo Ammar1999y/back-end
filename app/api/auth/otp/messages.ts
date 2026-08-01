@@ -24,4 +24,9 @@ export const otpMsg = {
   invalidOrExpired: 'رمز التحقق غير صحيح أو منتهي الصلاحية',
   captchaFailed: 'حدث خطاء اثناء التحقق من انك انسان، اعد المحاولة',
   invalidInput: 'صيغة المدخلات غير صحيحة',
+  // Forgot-password / passwordless
+  passwordResetSuccess: 'تم تعيين كلمة المرور الجديدة بنجاح',
+  passwordResetError: 'حدث خطأ أثناء إعادة تعيين كلمة المرور',
+  loginSuccess: 'تم تسجيل الدخول بنجاح',
+  loginError: 'حدث خطأ أثناء تسجيل الدخول',
 } as const;

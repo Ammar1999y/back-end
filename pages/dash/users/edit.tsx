@@ -82,6 +82,7 @@ const EditUser = () => {
       reset({
         ...userData,
         roleId: userData.roleId || undefined,
+        phoneNumber: userData.phoneNumber ?? '',
       });
       initialDataRef.current = userData;
 
@@ -121,6 +122,7 @@ const EditUser = () => {
           id: validatedData.id,
           name: validatedData.name,
           email: validatedData.email,
+          phoneNumber: validatedData.phoneNumber,
           isActive: validatedData.isActive,
           roleId: validatedData.roleId,
           password: validatedData.password,

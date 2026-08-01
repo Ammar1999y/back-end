@@ -1,6 +1,6 @@
 import { sql, and, eq } from 'drizzle-orm';
 
-import { hashPassword } from 'better-auth/crypto';
+import { hashPassword } from '@/lib/auth/password';
 
 import {
   accounts,
@@ -154,12 +154,23 @@ export async function seedOtp({
   userId,
   channel,
   identifier,
+  purpose = 'verify_contact',
+  targetIdentifier,
   code = '123456',
   expiresInMs = 10 * 60 * 1000,
 }: {
   userId: EntityID;
   channel: 'email' | 'sms' | 'whatsapp';
   identifier: string;
+  purpose?:
+    | 'verify_contact'
+    | 'passwordless_login'
+    | 'forgot_password'
+    | 'change_password'
+    | 'change_email'
+    | 'change_phone';
+  /** New contact for change_* purposes; required by chk_change_purpose_has_target. */
+  targetIdentifier?: string | null;
   code?: string;
   expiresInMs?: number;
 }) {
@@ -168,16 +179,21 @@ export async function seedOtp({
     .where(
       and(
         eq(verificationSessions.userId, userId),
-        eq(verificationSessions.channel, channel)
+        eq(verificationSessions.channel, channel),
+        eq(verificationSessions.purpose, purpose)
       )
     );
 
+  const isChange = purpose === 'change_email' || purpose === 'change_phone';
   const [session] = await tdb
     .insert(verificationSessions)
     .values({
       userId,
       channel,
       identifier,
+      purpose,
+      // Satisfy chk_change_purpose_has_target: target present iff change_*.
+      targetIdentifier: isChange ? (targetIdentifier ?? identifier) : null,
       attemptNumber: 1,
       verifyAttemptNumber: 0,
       verifyAttemptDaily: 0,

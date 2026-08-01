@@ -2,12 +2,15 @@ import { EntityID } from '@/types';
 import * as z from 'zod';
 import { CUSTOM_ROLE_VALUE } from '@/lib/permissions/constants';
 
+import { PHONE_ENABLED, PHONE_REQUIRED } from '@/utils/config';
+
 import { NAME_MAX } from './constants';
-import { otpCodeSchema } from './otp';
+import { channelEnabledRefine, otpCodeSchema } from './otp';
 import { permissionsArraySchema } from './permissions';
 import {
   emailSchema,
   idSchema,
+  optionalPhoneSchema,
   passwordSchema,
   phoneSchema,
   sanitizeStrictSingleLine,
@@ -37,7 +40,36 @@ const userRoleSchema = z.object({
   isActive: z.boolean().default(true),
   roleId: z.union([z.literal(CUSTOM_ROLE_VALUE), idSchema]),
   permissions: permissionsArraySchema.optional(),
+  // Always parsed (so the type is stable); the mode-specific rules below reject
+  // it when phone is disabled and require it when phone is mandatory. Handlers
+  // only persist it when PHONE_ENABLED.
+  phoneNumber: optionalPhoneSchema,
 });
+
+/**
+ * Enforce PHONE_NUMBER_MODE at the app boundary:
+ * - disabled: a phone must not be supplied.
+ * - required: a phone must be supplied.
+ */
+function validatePhoneByMode(
+  data: { phoneNumber?: string | null },
+  ctx: z.RefinementCtx
+) {
+  if (!PHONE_ENABLED && data.phoneNumber) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: 'رقم الهاتف غير مُفعّل في النظام',
+      path: ['phoneNumber'],
+    });
+  }
+  if (PHONE_REQUIRED && !data.phoneNumber) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: 'رقم الهاتف مطلوب',
+      path: ['phoneNumber'],
+    });
+  }
+}
 
 function validateCustomRolePermissions(
   data: {
@@ -63,9 +95,10 @@ function validateCustomRolePermissions(
   }
 }
 
-export const createUserSchema = userRoleSchema.superRefine(
-  validateCustomRolePermissions
-);
+export const createUserSchema = userRoleSchema.superRefine((data, ctx) => {
+  validateCustomRolePermissions(data, ctx);
+  validatePhoneByMode(data, ctx);
+});
 
 export const updateUserSchema = userRoleSchema
   .omit({ password: true })
@@ -80,7 +113,10 @@ export const updateUserSchema = userRoleSchema
       .optional()
       .nullish(),
   })
-  .superRefine(validateCustomRolePermissions);
+  .superRefine((data, ctx) => {
+    validateCustomRolePermissions(data, ctx);
+    validatePhoneByMode(data, ctx);
+  });
 
 // Reject unknown keys with .strict() so a client sending email/roleId/password/
 // isActive gets a 4xx instead of a misleading 200 with the fields silently stripped.
@@ -109,17 +145,25 @@ export const changeEmailVerifySchema = z.object({
   code: otpCodeSchema,
 });
 
+// Phone OTP delivery channel (email is never a phone channel).
+const phoneOtpChannelSchema = z.enum(['sms', 'whatsapp']);
+
 // Self-service: change own phone — step 1 (initiate).
 export const changePhoneSchema = z.object({
   currentPassword: passwordSchema,
   newPhoneNumber: phoneSchema,
+  channel: phoneOtpChannelSchema,
 });
 
-// Self-service: change own phone — step 2 (verify + commit).
-export const changePhoneVerifySchema = z.object({
-  newPhoneNumber: phoneSchema,
-  code: otpCodeSchema,
-});
+// Self-service: change own phone — step 2 (verify + commit). Re-checks channel
+// availability so a channel disabled between initiate and verify is rejected.
+export const changePhoneVerifySchema = z
+  .object({
+    newPhoneNumber: phoneSchema,
+    channel: phoneOtpChannelSchema,
+    code: otpCodeSchema,
+  })
+  .superRefine(channelEnabledRefine);
 
 // Type inference
 export type CreateUserInput = z.input<typeof createUserSchema>;

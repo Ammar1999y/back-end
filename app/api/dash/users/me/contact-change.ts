@@ -1,9 +1,13 @@
 import type { WsTx } from '@/db/ws';
+import type { HandlerCookie } from '@/lib/http/contract';
 
 import { and, eq, isNull, ne } from 'drizzle-orm';
 
 import { sessions, users } from '@/db/schema';
 import { auditLog, getAuditMeta } from '@/lib/audit';
+import { auth } from '@/lib/auth';
+import { parseSetCookieHeaders } from '@/lib/http/contract';
+import { sanitizeForLog } from '@/utils';
 import { EntityID } from '@/types';
 
 import {
@@ -16,12 +20,34 @@ import { CustomError } from '@/utils/error-class';
 type AuditMeta = ReturnType<typeof getAuditMeta>;
 
 /**
+ * Refresh the cookie-cached session after an identity field (email) changed so
+ * the stale cached identity is replaced. Failure is non-fatal — the DB change
+ * already committed.
+ */
+export async function refreshSessionCookies(
+  headers: Headers
+): Promise<HandlerCookie[] | undefined> {
+  try {
+    const refreshed = await auth.api.getSession({
+      headers,
+      query: { disableCookieCache: true },
+      returnHeaders: true,
+    });
+    const cookies = parseSetCookieHeaders(refreshed.headers.getSetCookie());
+    return cookies.length ? cookies : undefined;
+  } catch (e) {
+    console.error('cookie cache refresh failed:', sanitizeForLog(e));
+    return undefined;
+  }
+}
+
+/**
  * Atomically commit a verified contact change. Called either from inside
  * `processOtpVerify`'s transaction (real OTP path) or from a fresh transaction
  * when OTP_AUTO_VERIFY bypasses code entry. The verified flag is only ever set
  * here — i.e. as the direct result of a proven (or explicitly bypassed)
  * verification — so `email`/`phone_number` can never carry a stale verified
- * state onto an unproven address (report SEC-1 / DATA-1).
+ * state onto an unproven address.
  *
  * A unique-constraint violation (address already taken) propagates to the
  * caller, which maps it to 409.
@@ -117,6 +143,7 @@ export async function commitPhoneChange({
 }: CommitPhoneChangeOpts): Promise<void> {
   const [current] = await tx
     .select({
+      email: users.email,
       phoneNumber: users.phoneNumber,
       phoneNumberVerified: users.phoneNumberVerified,
       roleId: users.roleId,
@@ -151,7 +178,7 @@ export async function commitPhoneChange({
 
   await auditLog(tx, {
     userId,
-    userEmail: current.phoneNumber ?? '',
+    userEmail: current.email,
     action: 'UPDATE',
     tableName: 'users',
     recordId: userId,

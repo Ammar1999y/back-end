@@ -2,9 +2,10 @@ import { and, eq, isNull } from 'drizzle-orm';
 
 import { db } from '@/db';
 import { users } from '@/db/schema';
-import { auditLog, getAuditMeta } from '@/lib/audit';
+import { getAuditMeta } from '@/lib/audit';
 import { verifyTurnstileRequest } from '@/lib/captcha';
-import { enforceRateLimit, ipIdentifier } from '@/lib/rate-limit';
+import { enforceRateLimit, ipIdentifier, otpVerifyScope } from '@/lib/rate-limit';
+import { sanitizeForLog } from '@/utils';
 
 import type { Handler } from '@/lib/http/contract';
 
@@ -15,8 +16,10 @@ import {
   requireJsonBody,
 } from '@/utils/api-response';
 import { CustomError } from '@/utils/error-class';
-import { processOtpVerify } from '@/utils/otp';
+import { markContactVerified, processOtpVerify } from '@/utils/otp';
 import { OTP_ENABLED, verifyOtpSchema } from '@/utils/validation/otp';
+import { OTP_AUTO_VERIFY } from '@/utils/config';
+import { withTransaction } from '@/db/ws';
 
 import { ensureMinDelay, otpMsg } from '../messages';
 
@@ -27,16 +30,9 @@ export const POST: Handler = async (ctx) => {
     if (!OTP_ENABLED)
       throw new CustomError(MSG_PAGE_NOT_FOUND, HTTP_STATUS.NOT_FOUND);
 
-    const captchaOk = await verifyTurnstileRequest(ctx.headers);
-    if (!captchaOk) {
-      return handleApiError(
-        new CustomError(otpMsg.captchaFailed, HTTP_STATUS.FORBIDDEN)
-      );
-    }
-
-    // Coarse per-IP cap to stop a single IP / botnet node from spraying
-    // 6-digit codes across many identifiers and side-stepping the
-    // per-identifier verify cap.
+    // Coarse per-IP cap BEFORE captcha so the outbound siteverify call is
+    // bounded per IP, and a single IP / botnet node can't spray 6-digit codes
+    // across identifiers to side-step the per-identifier verify cap.
     await enforceRateLimit({
       scope: 'otp.verify.ip',
       identifier: ipIdentifier(ctx.headers),
@@ -44,6 +40,13 @@ export const POST: Handler = async (ctx) => {
       window: 60,
       failClosed: true,
     });
+
+    const captchaOk = await verifyTurnstileRequest(ctx.headers);
+    if (!captchaOk) {
+      return handleApiError(
+        new CustomError(otpMsg.captchaFailed, HTTP_STATUS.FORBIDDEN)
+      );
+    }
 
     const body = requireJsonBody(ctx.body);
 
@@ -56,7 +59,7 @@ export const POST: Handler = async (ctx) => {
       channel === 'email' ? parsed.data.email : parsed.data.phoneNumber;
 
     await enforceRateLimit({
-      scope: `otp.verify.${channel}`,
+      scope: otpVerifyScope(channel),
       identifier: identifier.toLowerCase(),
       limit: 10,
       window: 600,
@@ -84,73 +87,48 @@ export const POST: Handler = async (ctx) => {
 
     const auditMeta = getAuditMeta(ctx);
 
-    await processOtpVerify({
-      userId: userData.id,
-      userEmail: userData.email,
-      channel,
-      identifier,
-      code,
-      auditMeta,
-      onVerified: async (tx) => {
-        // Look up the current state under the active filter so we can
-        // distinguish "user is still active and we are flipping the flag"
-        // from "user vanished mid-flow". Without this split, a deactivation
-        // between OTP send and verify would be silently reported as success.
-        const [currentUser] = await tx
-          .select({
-            emailVerified: users.emailVerified,
-            phoneNumberVerified: users.phoneNumberVerified,
+    const onMissing = (): never => {
+      // user vanished/deactivated mid-flow — distinct internal signal so this
+      // isn't confused with a wrong code; client still sees the generic error.
+      console.error(
+        sanitizeForLog({
+          msg: 'otp.verify.userVanished',
+          userId: userData.id,
+          channel,
+        })
+      );
+      throw new CustomError(otpMsg.invalidOrExpired, HTTP_STATUS.BAD_REQUEST);
+    };
+
+    // OTP_AUTO_VERIFY bypass flips the flag on request without validating a
+    // code (lets a frontend that still calls verify succeed idempotently).
+    // Otherwise markContactVerified runs inside the verify transaction, after a
+    // real code match, under the FOR UPDATE lock on the user row.
+    await (OTP_AUTO_VERIFY
+      ? withTransaction((tx) =>
+          markContactVerified(tx, {
+            userId: userData.id,
+            channel,
+            auditMeta,
+            onMissing,
           })
-          .from(users)
-          .where(
-            and(
-              eq(users.id, userData.id),
-              isNull(users.deletedAt),
-              eq(users.isActive, true)
-            )
-          )
-          .for('update');
-
-        if (!currentUser) {
-          throw new CustomError(
-            otpMsg.invalidOrExpired,
-            HTTP_STATUS.BAD_REQUEST
-          );
-        }
-
-        const isAlreadyVerified =
-          channel === 'email'
-            ? currentUser.emailVerified
-            : currentUser.phoneNumberVerified;
-
-        // Idempotent re-verification: skip the UPDATE and the audit row so
-        // the log only reflects real transitions.
-        if (isAlreadyVerified) return;
-
-        const verifiedField =
-          channel === 'email'
-            ? { emailVerified: true }
-            : { phoneNumberVerified: true };
-
-        await tx
-          .update(users)
-          .set(verifiedField)
-          .where(eq(users.id, userData.id));
-
-        const verifiedFieldName =
-          channel === 'email' ? 'emailVerified' : 'phoneNumberVerified';
-        await auditLog(tx, {
+        )
+      : processOtpVerify({
           userId: userData.id,
           userEmail: userData.email,
-          action: 'UPDATE',
-          tableName: 'users',
-          recordId: userData.id,
-          oldData: { [verifiedFieldName]: false },
-          newData: { [verifiedFieldName]: true },
-          meta: auditMeta,
-        });
-      },
-    });
+          channel,
+          purpose: 'verify_contact',
+          identifier,
+          code,
+          auditMeta,
+          onVerified: (tx) =>
+            markContactVerified(tx, {
+              userId: userData.id,
+              channel,
+              auditMeta,
+              onMissing,
+            }),
+        }));
 
     await ensureMinDelay(Date.now() - start);
 

@@ -23,7 +23,7 @@ export type PhoneNumberMode = 'required' | 'optional' | 'disabled';
  * gates the `chk_phone_required` / `chk_phone_verified_requires_phone` CHECK
  * constraints and the `phone_number` nullability on the users table.
  */
-export const PHONE_NUMBER_MODE: PhoneNumberMode = 'optional';
+export const PHONE_NUMBER_MODE = 'optional' as PhoneNumberMode;
 
 /** Phone participates in the app at all (present in some form). */
 export const PHONE_ENABLED = PHONE_NUMBER_MODE !== 'disabled';
@@ -43,6 +43,13 @@ export const PHONE_REQUIRED = PHONE_NUMBER_MODE === 'required';
 export const REQUIRE_EMAIL_VERIFICATION = false as boolean;
 
 /**
+ * Same policy for the phone number. Only enforced when phone is actually part
+ * of the app (PHONE_ENABLED) and OTP can actually verify it (OTP_ENABLED + an
+ * enabled phone channel) — see the login gate in lib/auth.ts. Default off.
+ */
+export const REQUIRE_PHONE_VERIFICATION = false as boolean;
+
+/**
  * OTP bypass. When enabled, an OTP "send" request marks the target contact
  * verified immediately — and a sensitive change (email/phone) is committed
  * immediately — WITHOUT generating or validating a code. The frontend can run
@@ -52,8 +59,6 @@ export const REQUIRE_EMAIL_VERIFICATION = false as boolean;
  * and the owner does not want OTP verification. Exposed to the client via
  * NEXT_PUBLIC_ so the UI can skip the code-entry step.
  *
- * ⚠️ NEVER enable in a production deployment that has real users — it turns
- * every verification into a no-op.
+ * ⚠️ when change it, you need to update NEXT_PUBLIC_OTP_AUTO_VERIFY in .env to update the UI
  */
-export const OTP_AUTO_VERIFY =
-  process.env.NEXT_PUBLIC_OTP_AUTO_VERIFY === 'true';
+export const OTP_AUTO_VERIFY = true;

@@ -14,6 +14,9 @@ export interface UserClient {
   id: EntityID;
   name: string;
   email: string;
+  emailVerified?: boolean;
+  phoneNumber?: string | null;
+  phoneNumberVerified?: boolean;
   isActive: boolean;
   roleId: EntityID | typeof CUSTOM_ROLE_VALUE | null;
   role: UserRole | null;

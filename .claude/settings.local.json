@@ -1,11 +1,6 @@
 {
   "permissions": {
     "allow": [
-      "Bash(dir:*)",
-      "Bash(wc -l app/api/auth/*/route.ts app/api/dash/**/route.ts app/api/dash/**/*.ts)",
-      "Bash(ls lib *)",
-      "Bash(bash -c 'find app/api lib utils db -type f -name \"*.ts\" 2>/dev/null | while read f; do n=$\\(wc -l < \"$f\"\\); echo \"$n $f\"; done | sort -n')",
-      "Bash(Find lib *)"
     ]
   }
 }

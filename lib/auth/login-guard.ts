@@ -4,14 +4,31 @@ import { and, eq, isNull, sql } from 'drizzle-orm';
 
 import { accounts, users } from '@/db/schema';
 import { withTransaction } from '@/db/ws';
-import { auditLog } from '@/lib/audit';
 import { EntityID } from '@/types';
-import { verifyPassword } from 'better-auth/crypto';
+import { auditLog } from '@/lib/audit';
 
 import { CREDENTIAL_PROVIDER_ID } from '@/utils/api-messages';
 
+import {
+  hashPassword,
+  runPasswordTimingGuard,
+  verifyPasswordDetailed,
+} from './password';
+
 const MAX_FAILED_ATTEMPTS = 5;
 const LOCK_DURATION_SECONDS = 5 * 60; // 5 minutes
+
+interface AuditMeta {
+  ip: string | null;
+  userAgent: string | null;
+  apiPath: string;
+}
+
+const PASSWORD_UPGRADE_AUDIT_META = {
+  ip: null,
+  userAgent: null,
+  apiPath: 'internal/password-hash-upgrade',
+} satisfies AuditMeta;
 
 export interface VerifyAttemptOptions {
   password: string;
@@ -19,8 +36,10 @@ export interface VerifyAttemptOptions {
   email?: string;
   /** Find user by ID (authenticated endpoints — skips email lookup) */
   userId?: EntityID;
-  /** Skip the fake-hash timing guard (for authenticated endpoints where user is known) */
+  /** Skip the Argon2 timing guard (for authenticated endpoints where user is known) */
   skipTimingGuard?: boolean;
+  /** Return a CAS proof and leave the verified hash unchanged for an immediate password mutation */
+  returnPasswordProof?: boolean;
   /** Reuse an existing transaction instead of creating a new one */
   tx?: WsTx;
   /**
@@ -28,18 +47,35 @@ export interface VerifyAttemptOptions {
    * recorded in audit_logs. Failed-password attempts are intentionally not
    * audited (high volume, low signal); only the lockout transition is.
    */
-  auditMeta?: {
-    ip: string | null;
-    userAgent: string | null;
-    apiPath: string;
-  };
+  auditMeta?: AuditMeta;
 }
 
-type Outcome =
-  | 'success'
+export interface VerifiedPasswordProof {
+  readonly accountId: EntityID;
+  readonly expectedHash: string;
+}
+
+type RejectedOutcome =
   | 'reject_unknown_or_inactive'
   | 'reject_locked'
   | 'reject_bad_password';
+
+interface PendingPasswordUpgrade {
+  accountId: EntityID;
+  userId: EntityID;
+  userEmail: string;
+  expectedHash: string;
+  previousPepperId: string;
+  activePepperId: string;
+}
+
+type AttemptResult =
+  | {
+      outcome: 'success';
+      passwordProof: VerifiedPasswordProof;
+      passwordUpgrade?: PendingPasswordUpgrade;
+    }
+  | { outcome: RejectedOutcome; passwordCostPaid: boolean };
 
 /**
  * Atomic login verification: locks the user row, checks lock status,
@@ -51,21 +87,30 @@ type Outcome =
  * commits so the failed-attempt increment and lockout audit persist
  * (a throw inside withTransaction would roll the writes back).
  *
- * Returns true on successful verification, throws LoginRejected on any failure.
+ * Returns true on successful verification and throws LoginRejected on any
+ * credential rejection. The explicit proof mode returns a compare-and-swap
+ * proof instead and suppresses the automatic hash upgrade.
  */
+export function verifyLoginAttempt(
+  options: VerifyAttemptOptions & { returnPasswordProof: true }
+): Promise<VerifiedPasswordProof>;
+export function verifyLoginAttempt(
+  options: VerifyAttemptOptions & { returnPasswordProof?: false }
+): Promise<true>;
 export async function verifyLoginAttempt(
   options: VerifyAttemptOptions
-): Promise<true> {
+): Promise<true | VerifiedPasswordProof> {
   const {
     password,
     email,
     userId,
     skipTimingGuard = false,
+    returnPasswordProof = false,
     tx: externalTx,
     auditMeta,
   } = options;
 
-  const executor = async (tx: WsTx): Promise<Outcome> => {
+  const executor = async (tx: WsTx): Promise<AttemptResult> => {
     const whereClause = userId
       ? and(eq(users.id, userId), isNull(users.deletedAt))
       : and(eq(users.email, email!), isNull(users.deletedAt));
@@ -84,13 +129,25 @@ export async function verifyLoginAttempt(
       .limit(1);
 
     // User not found — don't reveal whether account exists
-    if (!user) return 'reject_unknown_or_inactive';
-    if (!user.isActive) return 'reject_unknown_or_inactive';
+    if (!user) {
+      return {
+        outcome: 'reject_unknown_or_inactive',
+        passwordCostPaid: false,
+      };
+    }
+    if (!user.isActive) {
+      return {
+        outcome: 'reject_unknown_or_inactive',
+        passwordCostPaid: false,
+      };
+    }
 
     // Account locked and lock not yet expired
     if (user.lockedUntil) {
       const lockTime = new Date(user.lockedUntil).getTime();
-      if (lockTime > Date.now()) return 'reject_locked';
+      if (lockTime > Date.now()) {
+        return { outcome: 'reject_locked', passwordCostPaid: false };
+      }
 
       // Lock expired — reset within the same transaction before proceeding
       await tx
@@ -120,7 +177,7 @@ export async function verifyLoginAttempt(
     }
 
     const [account] = await tx
-      .select({ password: accounts.password })
+      .select({ id: accounts.id, password: accounts.password })
       .from(accounts)
       .where(
         and(
@@ -129,14 +186,14 @@ export async function verifyLoginAttempt(
         )
       );
 
-    const ok = await verifyPassword({
-      hash: account?.password ?? '',
+    const storedHash = account?.password ?? '';
+    const verification = await verifyPasswordDetailed({
+      hash: storedHash,
       password,
     });
 
-    if (!ok) {
-      const willLock =
-        user.failedLoginAttempts + 1 >= MAX_FAILED_ATTEMPTS;
+    if (!verification.valid) {
+      const willLock = user.failedLoginAttempts + 1 >= MAX_FAILED_ATTEMPTS;
 
       // Increment counter + lock if threshold reached — single atomic UPDATE
       await tx
@@ -175,7 +232,14 @@ export async function verifyLoginAttempt(
         });
       }
 
-      return 'reject_bad_password';
+      return {
+        outcome: 'reject_bad_password',
+        passwordCostPaid: verification.costPaid,
+      };
+    }
+
+    if (!account?.password) {
+      throw new Error('Verified credential account is missing its hash');
     }
 
     // Successful — reset attempts (no-op if already 0)
@@ -206,28 +270,99 @@ export async function verifyLoginAttempt(
       });
     }
 
-    return 'success';
+    const passwordUpgrade = verification.needsRehash
+      ? {
+          accountId: account.id,
+          userId: user.id,
+          userEmail: user.email,
+          expectedHash: account.password,
+          previousPepperId: verification.pepperId,
+          activePepperId: verification.activePepperId,
+        }
+      : undefined;
+
+    return {
+      outcome: 'success',
+      passwordProof: {
+        accountId: account.id,
+        expectedHash: account.password,
+      },
+      passwordUpgrade,
+    };
   };
 
-  const outcome = externalTx
+  const result = externalTx
     ? await executor(externalTx)
-    : await withTransaction<Outcome>(executor);
+    : await withTransaction<AttemptResult>(executor);
 
-  if (outcome === 'success') return true;
+  if (result.outcome === 'success') {
+    if (returnPasswordProof) return result.passwordProof;
 
-  // Bad password: verifyPassword already ran, so timing is naturally normalised.
-  // Unknown user / locked: run the dummy hash to equalise timing with the real path.
-  if (outcome !== 'reject_bad_password' && !skipTimingGuard) {
-    await verifyPassword({ hash: DUMMY_HASH, password });
+    if (result.passwordUpgrade && !externalTx) {
+      try {
+        await upgradePasswordHash({
+          password,
+          upgrade: result.passwordUpgrade,
+          auditMeta,
+        });
+      } catch (error) {
+        console.error(
+          'Automatic password hash upgrade failed; it will be retried after a later successful verification',
+          { errorName: error instanceof Error ? error.name : 'UnknownError' }
+        );
+      }
+    }
+    return true;
+  }
+
+  // Any branch that did not verify a PHC hash pays the active Argon2 cost after
+  // the transaction commits, including missing or unsupported credentials.
+  if (!result.passwordCostPaid && !skipTimingGuard) {
+    await runPasswordTimingGuard(password);
   }
   throw new LoginRejected();
 }
 
-// Pre-computed hash of a dummy password — guarantees the full scrypt computation
-// runs even when the user doesn't exist, equalizing response timing.
-// Generated via: hashPassword('__timing_guard_dummy__')
-const DUMMY_HASH =
-  '87d098331f88fd6812baa9e6d1d7bf2d:8fbe29d3b3bfb0e282b0687f5f6e097920bcd715261674570ba60881289bb47c585ca68c7095d2768c42c900406c464a302e167076a09cac2e1320c662be229d';
+async function upgradePasswordHash({
+  password,
+  upgrade,
+  auditMeta,
+}: {
+  password: string;
+  upgrade: PendingPasswordUpgrade;
+  auditMeta?: AuditMeta;
+}): Promise<void> {
+  const upgradedHash = await hashPassword(password);
+
+  await withTransaction(async (tx) => {
+    const [updated] = await tx
+      .update(accounts)
+      .set({ password: upgradedHash })
+      .where(
+        and(
+          eq(accounts.id, upgrade.accountId),
+          eq(accounts.password, upgrade.expectedHash)
+        )
+      )
+      .returning({ id: accounts.id });
+
+    if (!updated) return;
+
+    await auditLog(tx, {
+      userId: upgrade.userId,
+      userEmail: upgrade.userEmail,
+      action: 'UPDATE',
+      tableName: 'accounts',
+      recordId: updated.id,
+      oldData: { passwordPepperId: upgrade.previousPepperId },
+      newData: {
+        passwordPepperId: upgrade.activePepperId,
+        passwordHashUpgraded: true,
+      },
+      meta: auditMeta ?? PASSWORD_UPGRADE_AUDIT_META,
+    });
+  });
+}
 
 export class LoginRejected extends Error {
   constructor() {

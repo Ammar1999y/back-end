@@ -13,8 +13,9 @@ import {
   validID,
 } from '@/utils';
 import { auditLog, getAuditMeta } from '@/lib/audit';
-import { hashPassword } from '@/lib/auth';
 import { checkPasswordCompromise } from '@/lib/auth/check-password';
+import { hashPassword } from '@/lib/auth/password';
+import { PHONE_ENABLED } from '@/utils/config';
 import { requirePermission } from '@/lib/http/session';
 import { CUSTOM_ROLE_VALUE } from '@/lib/permissions/constants';
 import {
@@ -202,6 +203,11 @@ export const POST: Handler = async (ctx) => {
           roleId: validID(assignedRoleId),
           isActive: validatedData.isActive,
           createdBy: actorUserId,
+          // Admin-set number is unproven → phoneNumberVerified stays false
+          // (the DB default). Only persisted when phone is enabled.
+          ...(PHONE_ENABLED && validatedData.phoneNumber
+            ? { phoneNumber: validatedData.phoneNumber }
+            : {}),
         })
         .returning({ id: users.id });
 
@@ -225,6 +231,9 @@ export const POST: Handler = async (ctx) => {
           email: validatedData.email,
           roleId: assignedRoleId,
           isActive: validatedData.isActive,
+          ...(PHONE_ENABLED && validatedData.phoneNumber
+            ? { phoneNumber: validatedData.phoneNumber }
+            : {}),
         },
         meta: auditMeta,
       });

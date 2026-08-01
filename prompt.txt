@@ -1,0 +1,16 @@
+@.claude/skills/backend/SKILL.md 
+@.claude/skills/caveman/SKILL.md
+@CLAUDE.xml
+
+**First, for clarification:**
+This will serve as a **starter kit** for most upcoming projects, meaning there is no real data yet — but it will be heavily relied upon going forward.
+
+---
+
+**Resolve the following issues after verifying their validity and confirming that fixing them won't introduce new problems elsewhere.**
+
+When I ask you to verify that the code hasn't broken anything in another place, I don't mean just running `bun tsc` — I mean a thorough check. If certain points require tests, it's preferable to write and run them for proper validation. You're also welcome to ask for my help if needed.
+
+For example, if you modify a function or variable, search for all places it's referenced in the project — it may be called somewhere that still uses the old implementation.
+
+**You decide the order in which to resolve the issues, as some are related to one another. It's perfectly fine to fix multiple issues at the same time. Before starting on any issue or group of issues, explicitly state their numbers so I know exactly what's being worked on.**

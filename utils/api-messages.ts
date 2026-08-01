@@ -14,6 +14,22 @@ export const MSG_PAGE_NOT_FOUND = 'الصفحة غير موجودة';
 export const MSG_NOT_FOUND = 'البيانات غير موجودة';
 export const MSG_INVALID_INPUT = 'قم بالتحقق من البيانات المدخله';
 export const MSG_INVALID_CREDENTIALS = 'البيانات المدخله غير صحيحه';
+export const MSG_EMAIL_NOT_VERIFIED =
+  'يجب تفعيل البريد الإلكتروني قبل تسجيل الدخول';
+
+/**
+ * Distinct error code returned ONLY when login is blocked because the email is
+ * unverified (REQUIRE_EMAIL_VERIFICATION). Every other login failure keeps the
+ * generic invalid-credentials response, so this leaks nothing pre-password.
+ * The frontend keys on it to route the user into the OTP verification flow.
+ */
+export const EMAIL_NOT_VERIFIED_CODE = 'EMAIL_NOT_VERIFIED' as const;
+
+export const MSG_PHONE_NOT_VERIFIED =
+  'يجب تفعيل رقم الهاتف قبل تسجيل الدخول';
+
+/** Distinct code for the phone-verification login gate (REQUIRE_PHONE_VERIFICATION). */
+export const PHONE_NOT_VERIFIED_CODE = 'PHONE_NOT_VERIFIED' as const;
 
 export const MSG_FETCHED = 'تم جلب البيانات بنجاح';
 export const MSG_CREATED = 'تم الإنشاء بنجاح';
@@ -35,6 +51,13 @@ export const MSG_PASSWORD_COMPROMISED =
   'هذه الكلمة مستخدمة بكثرة أو مُسرّبة سابقًا، لذلك لا تُعد آمنة. يرجى اختيار كلمة مرور مختلفة.';
 
 export const CREDENTIAL_PROVIDER_ID = 'credential' as const;
+
+/**
+ * Sentinel error `code` used for all of our own better-auth APIError throws, so
+ * the after-hook can distinguish them from Better Auth's built-in error codes
+ * and leave their (already-localized) message untouched.
+ */
+export const CUSTOM_AUTH_CODE = '__' as const;
 
 export const HTTP_STATUS = {
   OK: 200,

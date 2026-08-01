@@ -6,6 +6,7 @@ import {
   CreateUserFormData,
   UpdateUserFormData,
 } from '@/utils/validation/auth';
+import { PHONE_ENABLED, PHONE_REQUIRED } from '@/utils/config';
 
 import { Input } from '@/components/ui/input';
 import Label from '@/components/ui/label';
@@ -64,6 +65,24 @@ const UserForm = memo(({ isEdit = false }: UserFormProps) => {
         <ErrorMessage path={register('password').name} />
         <PasswordStrength />
       </div>
+      {PHONE_ENABLED && (
+        <div>
+          <Label
+            title='رقم الهاتف'
+            require={PHONE_REQUIRED}
+            htmlFor={register('phoneNumber').name}
+          />
+          <Input
+            id={register('phoneNumber').name}
+            type='tel'
+            dir='ltr'
+            placeholder='05XXXXXXXX'
+            autoComplete='off'
+            {...register('phoneNumber')}
+          />
+          <ErrorMessage path={register('phoneNumber').name} />
+        </div>
+      )}
       <div>
         <RoleInput />
         <ErrorMessage path={register('roleId').name} />

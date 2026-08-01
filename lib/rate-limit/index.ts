@@ -5,7 +5,13 @@ import { sanitizeForLog } from '@/utils';
 import { redis } from './client';
 
 export { authRateLimitStorage } from './auth-storage';
-export { enforceRateLimit, ipIdentifier, userIdentifier } from './api';
+export {
+  enforceRateLimit,
+  ipIdentifier,
+  userIdentifier,
+  otpSendScope,
+  otpVerifyScope,
+} from './api';
 
 export interface RateLimitResult {
   success: boolean;

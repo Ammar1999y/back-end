@@ -1,16 +1,18 @@
+import type { VerifiedPasswordProof } from '@/lib/auth/login-guard';
+import type { Handler } from '@/lib/http/contract';
+
 import { and, eq, isNull, ne } from 'drizzle-orm';
 
+import { otpMsg } from '@/app/api/auth/otp/messages';
 import { accounts, sessions, users } from '@/db/schema';
 import { withTransaction } from '@/db/ws';
 import { auditLog, getAuditMeta } from '@/lib/audit';
-import { hashPassword } from '@/lib/auth';
 import { checkPasswordCompromise } from '@/lib/auth/check-password';
 import { LoginRejected, verifyLoginAttempt } from '@/lib/auth/login-guard';
+import { hashPassword } from '@/lib/auth/password';
 import { verifyTurnstileRequest } from '@/lib/captcha';
 import { requireSession } from '@/lib/http/session';
 import { enforceRateLimit, userIdentifier } from '@/lib/rate-limit';
-
-import type { Handler } from '@/lib/http/contract';
 
 import {
   CREDENTIAL_PROVIDER_ID,
@@ -26,7 +28,6 @@ import {
 import { CustomError } from '@/utils/error-class';
 import { changePasswordSchema } from '@/utils/validation/auth';
 
-import { otpMsg } from '@/app/api/auth/otp/messages';
 import { userMsg } from '../../messages';
 
 export const POST: Handler = async (ctx) => {
@@ -62,18 +63,15 @@ export const POST: Handler = async (ctx) => {
 
     const auditMeta = getAuditMeta(ctx);
 
-    // Run the password check in its own short tx so the outer mutation
-    // doesn't hold FOR UPDATE across argon2.
-    // TODO: test moving verifyLoginAttempt INSIDE the
-    // mutation tx below (under the same FOR UPDATE on accounts) so two
-    // concurrent self-credential submissions can't both pass verify and
-    // race to write. Measure the latency impact of holding the account
-    // row lock across argon2 (~100-500ms) before committing to this.
+    // Keep Argon2 outside the mutation transaction. The returned proof is
+    // consumed with a compare-and-swap condition under the account row lock.
+    let passwordProof: VerifiedPasswordProof;
     try {
-      await verifyLoginAttempt({
+      passwordProof = await verifyLoginAttempt({
         userId,
         password: parsed.data.currentPassword,
         skipTimingGuard: true,
+        returnPasswordProof: true,
         auditMeta,
       });
     } catch (e) {
@@ -109,8 +107,10 @@ export const POST: Handler = async (ctx) => {
         .from(accounts)
         .where(
           and(
+            eq(accounts.id, passwordProof.accountId),
             eq(accounts.userId, userId),
-            eq(accounts.providerId, CREDENTIAL_PROVIDER_ID)
+            eq(accounts.providerId, CREDENTIAL_PROVIDER_ID),
+            eq(accounts.password, passwordProof.expectedHash)
           )
         )
         .for('update');
@@ -129,9 +129,7 @@ export const POST: Handler = async (ctx) => {
       if (sessionId) {
         await tx
           .delete(sessions)
-          .where(
-            and(eq(sessions.userId, userId), ne(sessions.id, sessionId))
-          );
+          .where(and(eq(sessions.userId, userId), ne(sessions.id, sessionId)));
       }
 
       await auditLog(tx, {

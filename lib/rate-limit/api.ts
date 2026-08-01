@@ -89,6 +89,16 @@ export function userIdentifier(userId: EntityID): string {
   return `user:${userId}`;
 }
 
+// One send budget per channel, shared across every send surface (otp /
+// passwordless / forgot + authenticated change-email/phone) so rotating
+// endpoints can't multiply the per-destination cap. Key with the destination.
+export const otpSendScope = (channel: string) => `otp.send.${channel}`;
+
+// One verify budget per channel, shared across all verification purposes so
+// rotating the purpose can't multiply the per-identifier attempt budget. Key
+// with the contact identifier.
+export const otpVerifyScope = (channel: string) => `otp.verify.${channel}`;
+
 /**
  * Check a sliding-window rate limit for the current request.
  *
