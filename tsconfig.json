@@ -14,10 +14,9 @@
     "jsx": "react-jsx",
     "incremental": true,
     "useDefineForClassFields": true,
-    "noImplicitAny": false,
+    "noImplicitAny": true,
     "allowImportingTsExtensions": true,
     "moduleDetection": "force",
-    "downlevelIteration": true,
     "noUnusedLocals": true,
     "noUnusedParameters": true,
     "noFallthroughCasesInSwitch": true,
@@ -28,8 +27,7 @@
       {
         "name": "next"
       }
-    ],
-    "types": ["@types/bun"]
+    ]
   },
   "include": [
     "next-env.d.ts",
@@ -37,9 +35,7 @@
     "**/*.tsx",
     ".next/types/**/*.ts",
     ".next/dev/types/**/*.ts",
-    "**/*.mts",
-    ".next\\dev/types/**/*.ts",
-    ".next\\dev/types/**/*.ts"
+    "**/*.mts"
   ],
-  "exclude": ["node_modules", "learn", ".next"]
+  "exclude": ["node_modules", ".next"]
 }

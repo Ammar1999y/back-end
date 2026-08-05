@@ -10,9 +10,9 @@ import { and, eq, isNull, ne, notInArray, sql } from 'drizzle-orm';
 
 import { db } from '@/db';
 import { rolePermissions, roles, users } from '@/db/schema';
-import { auditLog } from '@/lib/audit';
 import { EntityID } from '@/types';
 import { v7 as uuidv7 } from 'uuid';
+import { auditLog } from '@/lib/audit';
 
 import {
   HTTP_STATUS,
@@ -32,9 +32,7 @@ import {
 
 type DbOrTx = typeof db | WsTx;
 type RolePolicyTarget =
-  | { roleName?: string | null; scope?: string | null }
-  | null
-  | undefined;
+  { roleName?: string | null; scope?: string | null } | null | undefined;
 
 /**
  * Reusable predicate for roles that are editable/visible in dashboard handlers.
@@ -230,9 +228,7 @@ export function permissionsEqual(
   a: Array<{ pageName: string; permissions: unknown }>,
   b: Array<{ pageName: string; permissions: unknown }>
 ): boolean {
-  const toKey = (
-    rows: Array<{ pageName: string; permissions: unknown }>
-  ) => {
+  const toKey = (rows: Array<{ pageName: string; permissions: unknown }>) => {
     const normalized = normalizeFullPermissions(rows);
     return JSON.stringify(
       Object.entries(normalized)

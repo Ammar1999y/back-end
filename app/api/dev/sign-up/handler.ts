@@ -1,3 +1,5 @@
+import type { Handler } from '@/lib/http/contract';
+
 import { accounts, rolePermissions, roles, users } from '@/db/schema';
 import { withTransaction } from '@/db/ws';
 import * as z from 'zod';
@@ -6,8 +8,6 @@ import {
   DEFAULT_PAGE_PERMISSIONS,
   ROLE_SCOPE,
 } from '@/lib/permissions/constants';
-
-import type { Handler } from '@/lib/http/contract';
 
 import {
   CREDENTIAL_PROVIDER_ID,

@@ -1,11 +1,11 @@
+import type { Handler, HandlerInput, HandlerOutput } from '../contract';
+
 import { NextResponse } from 'next/server';
 
 import { getClientIp } from '@/lib/audit';
 import { enforceRateLimit, ipIdentifier } from '@/lib/rate-limit';
 
 import { handleApiError } from '@/utils/api-response';
-
-import type { Handler, HandlerInput, HandlerOutput } from '../contract';
 
 // Coarse pre-auth limit so traffic without a valid session can't force
 // repeated session lookups. Generous enough that a shared NAT egress isn't
@@ -149,10 +149,12 @@ function toNextResponse(output: HandlerOutput): NextResponse {
         if (lastIdx >= 0) {
           let line = setCookieValues[lastIdx];
           for (const flag of extraFlags ?? []) line += `; ${flag}`;
-          for (const [k, v] of Object.entries(extra ?? {})) line += `; ${k}=${v}`;
+          for (const [k, v] of Object.entries(extra ?? {}))
+            line += `; ${k}=${v}`;
           setCookieValues[lastIdx] = line;
           response.headers.delete('set-cookie');
-          for (const v of setCookieValues) response.headers.append('set-cookie', v);
+          for (const v of setCookieValues)
+            response.headers.append('set-cookie', v);
         }
       }
     }

@@ -1,12 +1,12 @@
-import * as z from 'zod';
-
 import type { AuditAction } from '@/db/schema';
 import type { WsTx } from '@/db/ws';
+import type { HandlerInput } from '@/lib/http/contract';
 
 import { auditLogs } from '@/db/schema';
 import { EntityID } from '@/types';
+import * as z from 'zod';
 
-import type { HandlerInput } from '@/lib/http/contract';
+import { API_PATH_MAX, USER_AGENT_MAX } from './audit/constants';
 
 // Max valid IP length: IPv6 mapped IPv4 = 45 chars
 const MAX_IP_LENGTH = 45;
@@ -14,7 +14,6 @@ const IP_SCHEMA = z.union([z.ipv4(), z.ipv6()]);
 // Re-exported from a leaf module so db/schema.ts can import these without
 // reaching back into lib/audit.ts → a Turbopack-breaking import cycle.
 export { API_PATH_MAX, USER_AGENT_MAX } from './audit/constants';
-import { API_PATH_MAX, USER_AGENT_MAX } from './audit/constants';
 
 /**
  * Trusted edge headers, in priority order. Shared with Better Auth
@@ -287,9 +286,7 @@ interface AuditLogParams {
 export async function auditLog(tx: WsTx, params: AuditLogParams) {
   const { userId, userEmail, action, tableName, recordId, meta } = params;
 
-  const safeFields = params.safeFields
-    ? new Set(params.safeFields)
-    : undefined;
+  const safeFields = params.safeFields ? new Set(params.safeFields) : undefined;
 
   const oldData = params.oldData
     ? stripSensitive(params.oldData, safeFields)

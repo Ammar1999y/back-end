@@ -55,7 +55,14 @@ function zoneParts(instant: Date, timeZone: string): Record<string, number> {
 /** Offset of `timeZone` from UTC at `instant`, in milliseconds. */
 function zoneOffsetMs(instant: Date, timeZone: string): number {
   const p = zoneParts(instant, timeZone);
-  const asUtc = Date.UTC(p.year, p.month - 1, p.day, p.hour, p.minute, p.second);
+  const asUtc = Date.UTC(
+    p.year,
+    p.month - 1,
+    p.day,
+    p.hour,
+    p.minute,
+    p.second
+  );
   const whole = Math.floor(instant.getTime() / 1000) * 1000;
   return asUtc - whole;
 }

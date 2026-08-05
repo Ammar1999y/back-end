@@ -24,7 +24,8 @@ module.exports = {
   importOrderParserPlugins: ['typescript', 'jsx', 'decorators-legacy'],
   plugins: [
     '@ianvs/prettier-plugin-sort-imports',
-    'prettier-plugin-tailwindcss',
+    // TODO: uncomment after install tailwind
+    // 'prettier-plugin-tailwindcss',
   ],
 
   semi: true,
@@ -34,7 +35,8 @@ module.exports = {
   printWidth: 80,
   tabWidth: 2,
   importOrderTypeScriptVersion: '5.0.0',
-  tailwindConfig: './tailwind.config.ts',
+  // TODO: uncomment after install tailwind
+  // tailwindConfig: './tailwind.config.ts',
   proseWrap: 'always',
   bracketSameLine: false,
   bracketSpacing: true,

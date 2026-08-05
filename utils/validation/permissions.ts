@@ -101,7 +101,8 @@ export const pagePermissionSchema = rawPagePermissionSchema
     // `create` alone needs no read access (per product spec).
     // `edit`/`delete` (all-scope) require `view`.
     // `editOwn`/`deleteOwn` require `view` OR `viewOwn`.
-    const hasAllWrite = permissions.edit === true || permissions.delete === true;
+    const hasAllWrite =
+      permissions.edit === true || permissions.delete === true;
     const hasOwnWrite =
       permissions.editOwn === true || permissions.deleteOwn === true;
 

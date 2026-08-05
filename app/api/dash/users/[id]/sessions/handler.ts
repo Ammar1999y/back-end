@@ -1,3 +1,8 @@
+import type { WsTx } from '@/db/ws';
+import type { Handler, HandlerInput } from '@/lib/http/contract';
+import type { PermissionObject } from '@/lib/permissions/constants';
+import type { EntityID } from '@/types';
+
 import { and, desc, eq, gt, inArray, isNull, ne, sql } from 'drizzle-orm';
 
 import { db } from '@/db';
@@ -9,18 +14,6 @@ import { auditLog, getAuditMeta } from '@/lib/audit';
 import { requirePermission } from '@/lib/http/session';
 import { validateRolePermissionScope } from '@/lib/permissions/utils';
 import { enforceRateLimit, userIdentifier } from '@/lib/rate-limit';
-
-import { formatCursor, parseCursor, parseLimit } from './pagination';
-
-// Re-exported for the parent user GET, which renders the first page inline.
-export { SESSIONS_PAGE_SIZE } from './pagination';
-
-import { assertTargetUserVisible } from '../target-user';
-
-import type { WsTx } from '@/db/ws';
-import type { Handler, HandlerInput } from '@/lib/http/contract';
-import type { PermissionObject } from '@/lib/permissions/constants';
-import type { EntityID } from '@/types';
 
 import {
   HTTP_STATUS,
@@ -39,6 +32,12 @@ import {
 import { CustomError } from '@/utils/error-class';
 import { IDS_ARRAY_MAX } from '@/utils/validation/constants';
 import { idRequired, idSchema } from '@/utils/validation/rules';
+
+import { assertTargetUserVisible } from '../target-user';
+import { formatCursor, parseCursor, parseLimit } from './pagination';
+
+// Re-exported for the parent user GET, which renders the first page inline.
+export { SESSIONS_PAGE_SIZE } from './pagination';
 
 const deleteSessionsSchema = z.union([
   z

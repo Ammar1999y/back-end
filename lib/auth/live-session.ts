@@ -1,3 +1,5 @@
+import type { EntityID } from '@/types';
+
 import { and, eq, gt, sql } from 'drizzle-orm';
 
 import { db } from '@/db';
@@ -6,8 +8,6 @@ import { validID } from '@/utils';
 
 import { HTTP_STATUS, MSG_LOGIN_REQUIRED } from '@/utils/api-messages';
 import { CustomError } from '@/utils/error-class';
-
-import type { EntityID } from '@/types';
 
 /**
  * Proves the session row behind a cached session still exists.

@@ -117,12 +117,8 @@
           "name": "accounts_user_id_users_id_fk",
           "tableFrom": "accounts",
           "tableTo": "users",
-          "columnsFrom": [
-            "user_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
+          "columnsFrom": ["user_id"],
+          "columnsTo": ["id"],
           "onDelete": "cascade",
           "onUpdate": "no action"
         }
@@ -255,12 +251,8 @@
           "name": "audit_logs_user_id_users_id_fk",
           "tableFrom": "audit_logs",
           "tableTo": "users",
-          "columnsFrom": [
-            "user_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
+          "columnsFrom": ["user_id"],
+          "columnsTo": ["id"],
           "onDelete": "set null",
           "onUpdate": "no action"
         }
@@ -437,12 +429,8 @@
           "name": "files_uploaded_by_users_id_fk",
           "tableFrom": "files",
           "tableTo": "users",
-          "columnsFrom": [
-            "uploaded_by"
-          ],
-          "columnsTo": [
-            "id"
-          ],
+          "columnsFrom": ["uploaded_by"],
+          "columnsTo": ["id"],
           "onDelete": "set null",
           "onUpdate": "no action"
         }
@@ -550,12 +538,8 @@
           "name": "role_permissions_role_id_roles_id_fk",
           "tableFrom": "role_permissions",
           "tableTo": "roles",
-          "columnsFrom": [
-            "role_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
+          "columnsFrom": ["role_id"],
+          "columnsTo": ["id"],
           "onDelete": "cascade",
           "onUpdate": "no action"
         }
@@ -653,9 +637,7 @@
         "ux_roles_role_name": {
           "name": "ux_roles_role_name",
           "nullsNotDistinct": false,
-          "columns": [
-            "role_name"
-          ]
+          "columns": ["role_name"]
         }
       },
       "policies": {},
@@ -771,12 +753,8 @@
           "name": "sessions_user_id_users_id_fk",
           "tableFrom": "sessions",
           "tableTo": "users",
-          "columnsFrom": [
-            "user_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
+          "columnsFrom": ["user_id"],
+          "columnsTo": ["id"],
           "onDelete": "cascade",
           "onUpdate": "no action"
         }
@@ -947,12 +925,8 @@
           "name": "users_role_id_roles_id_fk",
           "tableFrom": "users",
           "tableTo": "roles",
-          "columnsFrom": [
-            "role_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
+          "columnsFrom": ["role_id"],
+          "columnsTo": ["id"],
           "onDelete": "restrict",
           "onUpdate": "no action"
         }
@@ -1042,12 +1016,8 @@
           "name": "verification_codes_session_id_verification_sessions_id_fk",
           "tableFrom": "verification_codes",
           "tableTo": "verification_sessions",
-          "columnsFrom": [
-            "session_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
+          "columnsFrom": ["session_id"],
+          "columnsTo": ["id"],
           "onDelete": "cascade",
           "onUpdate": "no action"
         }
@@ -1183,12 +1153,8 @@
           "name": "verification_sessions_user_id_users_id_fk",
           "tableFrom": "verification_sessions",
           "tableTo": "users",
-          "columnsFrom": [
-            "user_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
+          "columnsFrom": ["user_id"],
+          "columnsTo": ["id"],
           "onDelete": "cascade",
           "onUpdate": "no action"
         }
@@ -1237,54 +1203,32 @@
     "public.audit_log_action": {
       "name": "audit_log_action",
       "schema": "public",
-      "values": [
-        "INSERT",
-        "UPDATE",
-        "DELETE"
-      ]
+      "values": ["INSERT", "UPDATE", "DELETE"]
     },
     "public.bucket_type": {
       "name": "bucket_type",
       "schema": "public",
-      "values": [
-        "public",
-        "private"
-      ]
+      "values": ["public", "private"]
     },
     "public.file_context_table": {
       "name": "file_context_table",
       "schema": "public",
-      "values": [
-        ""
-      ]
+      "values": [""]
     },
     "public.otp_channel": {
       "name": "otp_channel",
       "schema": "public",
-      "values": [
-        "email",
-        "sms",
-        "whatsapp"
-      ]
+      "values": ["email", "sms", "whatsapp"]
     },
     "public.page_name": {
       "name": "page_name",
       "schema": "public",
-      "values": [
-        "home",
-        "users",
-        "permissions",
-        "mainPage"
-      ]
+      "values": ["home", "users", "permissions", "mainPage"]
     },
     "public.role_scope": {
       "name": "role_scope",
       "schema": "public",
-      "values": [
-        "system",
-        "standard",
-        "custom"
-      ]
+      "values": ["system", "standard", "custom"]
     }
   },
   "schemas": {},

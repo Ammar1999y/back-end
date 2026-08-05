@@ -4,12 +4,12 @@ import type { HandlerCookie } from '@/lib/http/contract';
 import { and, eq, isNull } from 'drizzle-orm';
 
 import { users } from '@/db/schema';
+import { EntityID } from '@/types';
+import { sanitizeForLog } from '@/utils';
 import { auditLog, getAuditMeta } from '@/lib/audit';
 import { auth } from '@/lib/auth';
 import { revokeOtherSessions, revokePendingProofs } from '@/lib/auth/rotation';
 import { parseSetCookieHeaders } from '@/lib/http/contract';
-import { sanitizeForLog } from '@/utils';
-import { EntityID } from '@/types';
 
 import {
   HTTP_STATUS,

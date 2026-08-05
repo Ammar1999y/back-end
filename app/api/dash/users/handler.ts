@@ -11,7 +11,6 @@ import { validID } from '@/utils';
 import { auditLog, getAuditMeta } from '@/lib/audit';
 import { checkPasswordCompromise } from '@/lib/auth/check-password';
 import { hashPassword } from '@/lib/auth/password';
-import { PHONE_ENABLED } from '@/utils/config';
 import { requirePermission } from '@/lib/http/session';
 import { CUSTOM_ROLE_VALUE } from '@/lib/permissions/constants';
 import {
@@ -37,9 +36,10 @@ import {
   apiSuccess,
   handleApiError,
   handleUserForeignKeyViolation,
-  requireJsonBody,
   handleUserUniqueViolation,
+  requireJsonBody,
 } from '@/utils/api-response';
+import { PHONE_ENABLED } from '@/utils/config';
 import { CustomError } from '@/utils/error-class';
 import { createUserSchema } from '@/utils/validation/auth';
 import { zodIssueMessage } from '@/utils/validation/rules';

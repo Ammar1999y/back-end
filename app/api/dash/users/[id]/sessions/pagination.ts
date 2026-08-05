@@ -1,8 +1,8 @@
 import { validID } from '@/utils';
-import { safeDate } from '@/utils/time';
 
 import { HTTP_STATUS } from '@/utils/api-messages';
 import { CustomError } from '@/utils/error-class';
+import { safeDate } from '@/utils/time';
 
 /**
  * Page size for the cursor-paginated session list. The previous fixed cap of
@@ -45,10 +45,7 @@ const daysInMonth = (year: number, month: number) =>
  * disagree without anything failing loudly. Now a cursor this function did not
  * produce cannot be parsed, and the round trip is asserted in the tests.
  */
-export function formatCursor(
-  createdAt: string | Date,
-  id: string
-): string {
+export function formatCursor(createdAt: string | Date, id: string): string {
   const date = safeDate(createdAt);
   if (!date) throw new Error('formatCursor received an unparseable timestamp');
   return `${date.toISOString()}|${id}`;

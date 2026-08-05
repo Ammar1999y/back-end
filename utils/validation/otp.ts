@@ -52,7 +52,10 @@ const envChannels: OtpChannel[] = (
 // must stay reachable. Email is always available; phone channels only when
 // phone is enabled.
 const bypassChannels: OtpChannel[] = OTP_AUTO_VERIFY
-  ? (['email', ...(PHONE_ENABLED ? (['sms', 'whatsapp'] as const) : [])] as OtpChannel[])
+  ? ([
+      'email',
+      ...(PHONE_ENABLED ? (['sms', 'whatsapp'] as const) : []),
+    ] as OtpChannel[])
   : [];
 
 // Enabled channels — exposed to the client via NEXT_PUBLIC_ so the UI adapts.
@@ -79,7 +82,10 @@ export function channelEnabledRefine(
   ctx: z.RefinementCtx
 ) {
   if (!(ENABLED_OTP_CHANNELS as readonly string[]).includes(data.channel)) {
-    ctx.addIssue({ code: z.ZodIssueCode.custom, message: MSG_CHANNEL_DISABLED });
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: MSG_CHANNEL_DISABLED,
+    });
   }
 }
 

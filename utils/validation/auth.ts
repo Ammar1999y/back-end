@@ -164,8 +164,9 @@ const updateUserObject = userRoleSchema.omit({ password: true }).extend({
     .nullish(),
 });
 
-export const updateUserSchema =
-  updateUserObject.superRefine(refineUserUpdatePayload);
+export const updateUserSchema = updateUserObject.superRefine(
+  refineUserUpdatePayload
+);
 
 /**
  * Server-side admin update contract.

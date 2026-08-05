@@ -1,7 +1,11 @@
+import type { Handler } from '@/lib/http/contract';
+
 import { and, eq, isNull } from 'drizzle-orm';
 
 import { db } from '@/db';
 import { users } from '@/db/schema';
+import { withTransaction } from '@/db/ws';
+import { sanitizeForLog } from '@/utils';
 import { getAuditMeta } from '@/lib/audit';
 import { verifyTurnstileRequest } from '@/lib/captcha';
 import {
@@ -9,9 +13,6 @@ import {
   enforceRateLimit,
   ipIdentifier,
 } from '@/lib/rate-limit';
-import { sanitizeForLog } from '@/utils';
-
-import type { Handler } from '@/lib/http/contract';
 
 import { HTTP_STATUS, MSG_PAGE_NOT_FOUND } from '@/utils/api-messages';
 import {
@@ -19,11 +20,10 @@ import {
   handleApiError,
   requireJsonBody,
 } from '@/utils/api-response';
+import { OTP_AUTO_VERIFY } from '@/utils/config';
 import { CustomError } from '@/utils/error-class';
 import { markContactVerified, processOtpVerify } from '@/utils/otp';
 import { OTP_ENABLED, verifyOtpSchema } from '@/utils/validation/otp';
-import { OTP_AUTO_VERIFY } from '@/utils/config';
-import { withTransaction } from '@/db/ws';
 
 import { ensureMinDelay, otpMsg } from '../messages';
 

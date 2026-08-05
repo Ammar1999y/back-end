@@ -2,13 +2,13 @@
 // Applies the proposed fix: requests `returnHeaders: true` from Better Auth
 // so the Set-Cookie values are addressable, then forwards them on the
 // outgoing response. Adapter-agnostic — does not rely on next/headers.
-import { eq } from 'drizzle-orm';
 import { NextResponse } from 'next/server';
+import { eq } from 'drizzle-orm';
 
 import { db } from '@/db';
 import { users } from '@/db/schema';
-import { auth } from '@/lib/auth';
 import { validID } from '@/utils';
+import { auth } from '@/lib/auth';
 
 export async function GET(request: Request) {
   if (process.env.NODE_ENV !== 'development') {

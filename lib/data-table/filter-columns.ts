@@ -33,13 +33,12 @@ import {
   isSearchOperator,
   operatorAllowedForType,
 } from './column-specs';
+import { MIN_SEARCH_LENGTH } from './parsers';
 
 /** Same trigram floor quick search uses; defined with the shared parsers. */
 export { MIN_SEARCH_LENGTH } from './parsers';
-import { MIN_SEARCH_LENGTH } from './parsers';
 
-export const MSG_INVALID_FILTER =
-  'أحد عوامل التصفية غير صالح، أعد ضبط التصفية';
+export const MSG_INVALID_FILTER = 'أحد عوامل التصفية غير صالح، أعد ضبط التصفية';
 const MSG_SHORT_SEARCH = `نص البحث في التصفية يجب أن يكون ${MIN_SEARCH_LENGTH} أحرف على الأقل`;
 
 /**

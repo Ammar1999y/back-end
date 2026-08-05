@@ -1,6 +1,5 @@
-import { Ratelimit } from '@upstash/ratelimit';
-
 import { sanitizeForLog } from '@/utils';
+import { Ratelimit } from '@upstash/ratelimit';
 
 import { redis } from './client';
 

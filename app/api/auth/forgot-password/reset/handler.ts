@@ -20,7 +20,11 @@ import {
   HTTP_STATUS,
   MSG_PAGE_NOT_FOUND,
 } from '@/utils/api-messages';
-import { apiSuccess, handleApiError, requireJsonBody } from '@/utils/api-response';
+import {
+  apiSuccess,
+  handleApiError,
+  requireJsonBody,
+} from '@/utils/api-response';
 import { CustomError } from '@/utils/error-class';
 import { processOtpVerify } from '@/utils/otp';
 import { OTP_ENABLED, resetPasswordSchema } from '@/utils/validation/otp';
@@ -133,7 +137,11 @@ export const POST: Handler = async (ctx) => {
         // user's other pending proofs, keeping only the one being consumed so
         // it survives as an auditable single-use record.
         await revokeOtherSessions(tx, userData.id);
-        await revokePendingProofs(tx, userData.id, matched.verificationSessionId);
+        await revokePendingProofs(
+          tx,
+          userData.id,
+          matched.verificationSessionId
+        );
 
         await auditLog(tx, {
           userId: userData.id,

@@ -111,9 +111,9 @@
 54. **TOCTOU Between Re-auth Verify Tx and Mutation Tx** —
     `app/api/dash/users/me/change-password/handler.ts`,
     `app/api/dash/users/me/change-email/handler.ts` — `verifyLoginAttempt` runs
-    in its own short tx before the mutation tx, so two concurrent self-credential
-    changes can both pass verify (last-write-wins). Acknowledged by in-code TODO;
-    self-contention on one's own credential is rare.
+    in its own short tx before the mutation tx, so two concurrent
+    self-credential changes can both pass verify (last-write-wins). Acknowledged
+    by in-code TODO; self-contention on one's own credential is rare.
 55. **`audit_logs` Missing `user_id` Index** — `db/schema.ts` — "All actions by
     user X" forensic query full-scans the table; slow only at 1M+ rows.
 56. **Phone-number CHECK Regex Hardcodes Saudi Format** — `db/schema.ts` —
@@ -133,11 +133,11 @@
     limit never leaks 429 to client (collapsed to 200)". The client already gets
     a constant `nextAllowedIn` for its countdown. Surfacing 429 (the original
     ERR-1 suggestion) would break this contract — not worth the UX gain.
-59. **Custom IPv6 `/64` Bucketing in `ipBucket`** — `lib/rate-limit/api.ts:35-63`
-    — manual `::` expansion; verified correct for all valid inputs and
-    `getClientIp` blocks malformed ones upstream. The only proposed remedy adds
-    the `ip-address` dependency — supply-chain/maintenance risk with no real
-    defect fixed. Leave as-is.
+59. **Custom IPv6 `/64` Bucketing in `ipBucket`** —
+    `lib/rate-limit/api.ts:35-63` — manual `::` expansion; verified correct for
+    all valid inputs and `getClientIp` blocks malformed ones upstream. The only
+    proposed remedy adds the `ip-address` dependency — supply-chain/maintenance
+    risk with no real defect fixed. Leave as-is.
 
 # Known Issues — Will Be Fixed Later
 

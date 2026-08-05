@@ -7,15 +7,12 @@ import { verifyTurnstileRequest } from '@/lib/captcha';
 import { requireSession } from '@/lib/http/session';
 import { enforceRateLimit, userIdentifier } from '@/lib/rate-limit';
 
-import {
-  HTTP_STATUS,
-  MSG_UPDATE_ERROR,
-} from '@/utils/api-messages';
+import { HTTP_STATUS, MSG_UPDATE_ERROR } from '@/utils/api-messages';
 import {
   apiSuccess,
   handleApiError,
-  requireJsonBody,
   handleUserUniqueViolation,
+  requireJsonBody,
 } from '@/utils/api-response';
 import { OTP_AUTO_VERIFY } from '@/utils/config';
 import { CustomError } from '@/utils/error-class';

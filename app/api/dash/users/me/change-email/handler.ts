@@ -25,8 +25,8 @@ import {
 import {
   apiSuccess,
   handleApiError,
-  requireJsonBody,
   handleUserUniqueViolation,
+  requireJsonBody,
 } from '@/utils/api-response';
 import { OTP_AUTO_VERIFY } from '@/utils/config';
 import { CustomError } from '@/utils/error-class';

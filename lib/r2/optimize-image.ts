@@ -1,3 +1,5 @@
+import type { OutputInfo } from 'sharp';
+
 import sharp from 'sharp';
 
 import {
@@ -83,7 +85,7 @@ export async function optimizeImage(
   let iterations = 0;
   let result: Buffer;
   let resultSize: number;
-  let resultMetadata: sharp.OutputInfo;
+  let resultMetadata: OutputInfo;
 
   const firstAttempt = await sharp(input, {
     limitInputPixels: MAX_IMAGE_PIXELS,

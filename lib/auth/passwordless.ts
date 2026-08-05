@@ -2,15 +2,14 @@ import type { BetterAuthPlugin } from 'better-auth';
 
 import { and, eq, isNull } from 'drizzle-orm';
 
-import { APIError, createAuthEndpoint } from 'better-auth/api';
-import { setSessionCookie } from 'better-auth/cookies';
-import * as z from 'zod';
-
 import { ensureMinDelay, otpMsg } from '@/app/api/auth/otp/messages';
 import { db } from '@/db';
 import { users } from '@/db/schema';
 import { withTransaction } from '@/db/ws';
 import { sanitizeForLog } from '@/utils';
+import { APIError, createAuthEndpoint } from 'better-auth/api';
+import { setSessionCookie } from 'better-auth/cookies';
+import * as z from 'zod';
 
 import {
   CUSTOM_AUTH_CODE,
@@ -23,12 +22,12 @@ import { OTP_ENABLED, verifyOtpSchema } from '@/utils/validation/otp';
 
 import { API_PATH_MAX, auditLog, getClientIp, USER_AGENT_MAX } from '../audit';
 import { verifyTurnstileRequest } from '../captcha';
-import { toAuthApiError } from './api-error';
 import {
   enforceOtpVerifyQuota,
   enforceRateLimit,
   ipIdentifier,
 } from '../rate-limit';
+import { toAuthApiError } from './api-error';
 
 /**
  * Passwordless login (step 2 / verify). Reuses the project's hardened OTP
@@ -192,8 +191,9 @@ export const passwordless = () =>
             // databaseHook (active/role/verification gates + permission
             // metadata), so passwordless logins are gated exactly like password
             // logins. A gate failure surfaces as its own APIError.
-            const session =
-              await ctx.context.internalAdapter.createSession(userData.id);
+            const session = await ctx.context.internalAdapter.createSession(
+              userData.id
+            );
             if (!session)
               throw new CustomError(
                 otpMsg.invalidOrExpired,

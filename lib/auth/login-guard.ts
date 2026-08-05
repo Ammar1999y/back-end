@@ -56,9 +56,7 @@ export interface VerifiedPasswordProof {
 }
 
 type RejectedOutcome =
-  | 'reject_unknown_or_inactive'
-  | 'reject_locked'
-  | 'reject_bad_password';
+  'reject_unknown_or_inactive' | 'reject_locked' | 'reject_bad_password';
 
 interface PendingPasswordUpgrade {
   accountId: EntityID;

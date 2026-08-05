@@ -50,14 +50,15 @@ export async function checkPasswordCompromise(password: string): Promise<void> {
           .split('\n')
           .some((line) => line.split(':')[0].toUpperCase() === suffix)
       ) {
-        throw new CustomError(MSG_PASSWORD_COMPROMISED, HTTP_STATUS.BAD_REQUEST);
+        throw new CustomError(
+          MSG_PASSWORD_COMPROMISED,
+          HTTP_STATUS.BAD_REQUEST
+        );
       }
       return;
     } catch (error) {
       if (error instanceof CustomError) throw error;
-      console.error(
-        sanitizeForLog({ msg: 'hibp.degraded', attempt, error })
-      );
+      console.error(sanitizeForLog({ msg: 'hibp.degraded', attempt, error }));
       if (attempt < HIBP_RETRIES) {
         await new Promise((r) =>
           setTimeout(r, HIBP_RETRY_BASE_MS * (attempt + 1))

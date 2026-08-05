@@ -9,6 +9,7 @@ import { and, eq, gt, isNull, sql } from 'drizzle-orm';
 
 import { db } from '@/db';
 import { rolePermissions, roles, sessions, users } from '@/db/schema';
+import { EntityID } from '@/types';
 import { validID } from '@/utils';
 import { auth } from '@/lib/auth';
 import { assertLiveSession } from '@/lib/auth/live-session';
@@ -22,7 +23,6 @@ import { CustomError } from '@/utils/error-class';
 
 import { OWN_ACTION_MAP } from './constants';
 import { getUserPermissions, sanitizePermissions } from './utils';
-import { EntityID } from '@/types';
 
 const SCOPED_ACTIONS = new Set<PermissionAction>(
   Object.keys(OWN_ACTION_MAP) as PermissionAction[]
@@ -44,9 +44,9 @@ const SUPERSEDING_ACTION = Object.fromEntries(
  * - Anything else: exact match only.
  */
 export function resolveActionScope(
-  permissions: Record<string, Record<string, boolean>> | Partial<
-    Record<DashboardPage, Record<PermissionAction, boolean>>
-  >,
+  permissions:
+    | Record<string, Record<string, boolean>>
+    | Partial<Record<DashboardPage, Record<PermissionAction, boolean>>>,
   resource: DashboardPage,
   action: PermissionAction
 ): { allowed: boolean; scope: AccessScope | null } {
@@ -70,8 +70,7 @@ export function resolveActionScope(
   if (pagePerms?.[action] === true) return { allowed: true, scope: 'all' };
   if (SCOPED_ACTIONS.has(action)) {
     const ownAction = OWN_ACTION_MAP[action as AllScopedAction];
-    if (pagePerms?.[ownAction] === true)
-      return { allowed: true, scope: 'own' };
+    if (pagePerms?.[ownAction] === true) return { allowed: true, scope: 'own' };
   }
   return { allowed: false, scope: null };
 }

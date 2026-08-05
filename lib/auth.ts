@@ -22,6 +22,7 @@ import {
   REQUIRE_EMAIL_VERIFICATION,
   REQUIRE_PHONE_VERIFICATION,
 } from '@/utils/config';
+import { CustomError } from '@/utils/error-class';
 import { loginSchema } from '@/utils/validation/auth';
 import {
   EMAIL_OTP_AVAILABLE,
@@ -43,7 +44,6 @@ import { REQUIRE_ROLE_FOR_LOGIN } from './permissions/constants';
 import { sanitizePermissions } from './permissions/utils';
 import { enforceRateLimit, ipIdentifier } from './rate-limit';
 import { authRateLimitStorage } from './rate-limit/auth-storage';
-import { CustomError } from '@/utils/error-class';
 
 /**
  * Per-IP sign-in budget. Generous enough that an office behind one NAT egress
@@ -194,7 +194,8 @@ export const auth = betterAuth({
       // inherited members — `constructor` or `toString` would look like a
       // mapped code and put a function where the message belongs.
       const mappedMessage =
-        typeof errorCode === 'string' && Object.hasOwn(BASE_ERROR_CODES, errorCode)
+        typeof errorCode === 'string' &&
+        Object.hasOwn(BASE_ERROR_CODES, errorCode)
           ? BASE_ERROR_CODES[errorCode]
           : undefined;
 

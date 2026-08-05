@@ -16,12 +16,7 @@ import { dataTableConfig } from './config';
  */
 
 export type FilterColumnType =
-  | 'text'
-  | 'number'
-  | 'boolean'
-  | 'date'
-  | 'select'
-  | 'multiSelect';
+  'text' | 'number' | 'boolean' | 'date' | 'select' | 'multiSelect';
 
 export interface FilterColumnSpec {
   /** Actual database type of the column. Drives coercion and operators. */

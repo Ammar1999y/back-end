@@ -34,6 +34,7 @@ import {
   SessionMetadata,
 } from '@/lib/permissions/constants';
 
+import { PHONE_NUMBER_MODE, PHONE_REQUIRED } from '@/utils/config';
 import {
   EMAIL_MAX,
   NAME_MAX,
@@ -47,7 +48,6 @@ import {
   URL_MAX,
 } from '@/utils/validation/constants';
 import { OTP_CHANNELS, OTP_PURPOSES } from '@/utils/validation/otp';
-import { PHONE_NUMBER_MODE, PHONE_REQUIRED } from '@/utils/config';
 
 export type PermissionActions = Record<PermissionAction, boolean>;
 

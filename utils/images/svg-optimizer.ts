@@ -1,6 +1,6 @@
 import type { SanitizeResult } from './config';
 
-import DOMPurify from 'isomorphic-dompurify';
+import { sanitize } from 'isomorphic-dompurify';
 
 import {
   DANGEROUS_ATTRIBUTES,
@@ -233,7 +233,7 @@ export function sanitizeSvg(
     });
 
     const cleanedSvg = xmlSerializer.serializeToString(svgElement);
-    const sanitized = DOMPurify.sanitize(cleanedSvg, {
+    const sanitized = sanitize(cleanedSvg, {
       USE_PROFILES: { svg: true, svgFilters: true },
     });
 

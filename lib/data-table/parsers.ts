@@ -323,7 +323,11 @@ export function parseSearchParams<T = any>(
       }
     : undefined;
 
-  const sort = parseSortingState<T>(safeParam(params.sort), undefined, reportOnce);
+  const sort = parseSortingState<T>(
+    safeParam(params.sort),
+    undefined,
+    reportOnce
+  );
   const filters = parseFiltersState<T>(
     safeParam(params.filters),
     undefined,

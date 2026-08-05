@@ -4,16 +4,20 @@ import { and, eq, isNull } from 'drizzle-orm';
 
 import { db } from '@/db';
 import { users } from '@/db/schema';
+import { sanitizeForLog } from '@/utils';
 import { verifyTurnstileRequest } from '@/lib/captcha';
 import {
   enforceOtpSendQuota,
   enforceRateLimit,
   ipIdentifier,
 } from '@/lib/rate-limit';
-import { sanitizeForLog } from '@/utils';
 
 import { HTTP_STATUS, MSG_PAGE_NOT_FOUND } from '@/utils/api-messages';
-import { apiSuccess, handleApiError, requireJsonBody } from '@/utils/api-response';
+import {
+  apiSuccess,
+  handleApiError,
+  requireJsonBody,
+} from '@/utils/api-response';
 import { CustomError } from '@/utils/error-class';
 import { processOtpSend } from '@/utils/otp';
 import { OTP_ENABLED, sendOtpSchema } from '@/utils/validation/otp';
@@ -113,7 +117,10 @@ export const POST: Handler = async (ctx) => {
       (error.status === HTTP_STATUS.BAD_REQUEST ||
         error.status === HTTP_STATUS.NOT_FOUND)
     ) {
-      return apiSuccess({ message: otpMsg.sendSuccess, data: GENERIC_SEND_DATA });
+      return apiSuccess({
+        message: otpMsg.sendSuccess,
+        data: GENERIC_SEND_DATA,
+      });
     }
     return handleApiError(error, otpMsg.sendError);
   }

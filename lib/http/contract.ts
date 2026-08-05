@@ -1,7 +1,7 @@
 /* eslint-disable unicorn/prefer-switch */
-import { HTTP_STATUS } from '@/utils/api-messages';
-
 import type { PaginationMeta } from '@/utils/api-response';
+
+import { HTTP_STATUS } from '@/utils/api-messages';
 
 /**
  * Framework-agnostic request context passed to every handler.
@@ -106,7 +106,10 @@ export const DEFAULT_STATUS = HTTP_STATUS.OK;
 export function parseSetCookieHeaders(values: string[]): HandlerCookie[] {
   const parsed: HandlerCookie[] = [];
   for (const raw of values) {
-    const segments = raw.split(';').map((s) => s.trim()).filter(Boolean);
+    const segments = raw
+      .split(';')
+      .map((s) => s.trim())
+      .filter(Boolean);
     if (!segments.length) continue;
     const [nameValue, ...attrs] = segments;
     const eqIdx = nameValue.indexOf('=');

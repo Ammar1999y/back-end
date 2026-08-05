@@ -1,3 +1,4 @@
+import type { Handler } from '@/lib/http/contract';
 import type {
   DashboardPage,
   PermissionAction,
@@ -19,7 +20,6 @@ import { withTransaction } from '@/db/ws';
 import { validID } from '@/utils';
 import { auditLog, getAuditMeta } from '@/lib/audit';
 import { requirePermission } from '@/lib/http/session';
-import { enforceRateLimit, userIdentifier } from '@/lib/rate-limit';
 import {
   CUSTOM_ROLE_VALUE,
   REQUIRE_ROLE_FOR_LOGIN,
@@ -36,8 +36,7 @@ import {
   validatePermissionScope,
   validateRolePermissionScope,
 } from '@/lib/permissions/utils';
-
-import type { Handler } from '@/lib/http/contract';
+import { enforceRateLimit, userIdentifier } from '@/lib/rate-limit';
 
 import {
   HTTP_STATUS,
@@ -53,8 +52,8 @@ import {
 import {
   apiSuccess,
   handleApiError,
-  requireJsonBody,
   handlePermissionUniqueViolation,
+  requireJsonBody,
 } from '@/utils/api-response';
 import { CustomError } from '@/utils/error-class';
 import { adminUpdatePermissionSchema } from '@/utils/validation/permissions';

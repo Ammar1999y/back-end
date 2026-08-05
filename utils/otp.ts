@@ -240,7 +240,10 @@ const SAFE_DELIVERY_MESSAGES: ReadonlySet<string> = new Set([
  * A property getter can itself raise, and an exception from inside the catch
  * block escapes the boundary the block exists to enforce.
  */
-function readErrorField(error: unknown, key: 'message' | 'name'): string | null {
+function readErrorField(
+  error: unknown,
+  key: 'message' | 'name'
+): string | null {
   try {
     const value = (error as Record<string, unknown> | null | undefined)?.[key];
     return typeof value === 'string' ? value : null;
@@ -352,7 +355,11 @@ async function sendOtp(
   } catch (error) {
     const message = readErrorField(error, 'message');
 
-    if (isCustomError(error) && message && SAFE_DELIVERY_MESSAGES.has(message)) {
+    if (
+      isCustomError(error) &&
+      message &&
+      SAFE_DELIVERY_MESSAGES.has(message)
+    ) {
       // A FRESH error, not the original. Rethrowing carried whatever `code`,
       // `status`, `responseHeaders` — or any field added later — the thrower
       // attached, and the serializer copies several of those. Only the message

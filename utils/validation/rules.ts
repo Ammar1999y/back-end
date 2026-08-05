@@ -87,7 +87,14 @@ export const datePreprocess = (val: any) => {
   return date ? date.toISOString() : null;
 };
 
-export const fileUploadSchema = ({ max, withPdf = false }) =>
+export const fileUploadSchema = ({
+  max,
+  withPdf = false,
+}: {
+  /** Maximum file size in bytes */
+  max: number;
+  withPdf?: boolean;
+}) =>
   z
     .file(`قم برفع صور ${withPdf ? 'أو ملف PDF' : ''} صحيحة`)
     .min(1000, `حجم الصورة  ${withPdf ? 'أو ملف PDF' : ''} صغير للغايه`)

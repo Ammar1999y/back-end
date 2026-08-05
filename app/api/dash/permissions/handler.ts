@@ -1,3 +1,6 @@
+import type { FilterColumnSpecs } from '@/lib/data-table/column-specs';
+import type { Handler } from '@/lib/http/contract';
+
 import { and, count, eq, sql } from 'drizzle-orm';
 
 import { db } from '@/db';
@@ -6,7 +9,6 @@ import { rolePermissions, roles } from '@/db/schema';
 import { withTransaction } from '@/db/ws';
 import { auditLog, getAuditMeta } from '@/lib/audit';
 import { requirePermission } from '@/lib/http/session';
-import { enforceRateLimit, userIdentifier } from '@/lib/rate-limit';
 import {
   CUSTOM_ROLE_VALUE,
   PermissionAction,
@@ -17,9 +19,7 @@ import {
   PERMISSION_AUDIT_VERSION,
   validatePermissionScope,
 } from '@/lib/permissions/utils';
-
-import type { FilterColumnSpecs } from '@/lib/data-table/column-specs';
-import type { Handler } from '@/lib/http/contract';
+import { enforceRateLimit, userIdentifier } from '@/lib/rate-limit';
 
 import {
   HTTP_STATUS,
@@ -31,8 +31,8 @@ import {
 import {
   apiSuccess,
   handleApiError,
-  requireJsonBody,
   handlePermissionUniqueViolation,
+  requireJsonBody,
 } from '@/utils/api-response';
 import { CustomError } from '@/utils/error-class';
 import { adminCreatePermissionSchema } from '@/utils/validation/permissions';
@@ -203,7 +203,10 @@ export const POST: Handler = async (ctx) => {
           // keys pages as `name`, so it is mapped rather than stored verbatim.
           ...(newPermissionsForAudit.length && {
             permissions: newPermissionsForAudit,
-            changedPermissions: diffPermissionMatrices([], newPermissionsForAudit),
+            changedPermissions: diffPermissionMatrices(
+              [],
+              newPermissionsForAudit
+            ),
           }),
         },
         meta: auditMeta,

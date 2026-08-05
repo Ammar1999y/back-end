@@ -25,8 +25,7 @@ export const MSG_EMAIL_NOT_VERIFIED =
  */
 export const EMAIL_NOT_VERIFIED_CODE = 'EMAIL_NOT_VERIFIED' as const;
 
-export const MSG_PHONE_NOT_VERIFIED =
-  'يجب تفعيل رقم الهاتف قبل تسجيل الدخول';
+export const MSG_PHONE_NOT_VERIFIED = 'يجب تفعيل رقم الهاتف قبل تسجيل الدخول';
 
 /** Distinct code for the phone-verification login gate (REQUIRE_PHONE_VERIFICATION). */
 export const PHONE_NOT_VERIFIED_CODE = 'PHONE_NOT_VERIFIED' as const;
@@ -41,8 +40,7 @@ export const MSG_CREATE_ERROR = 'حدث خطأ في الإنشاء';
 export const MSG_UPDATE_ERROR = 'حدث خطأ في التحديث';
 export const MSG_DELETE_ERROR = 'حدث خطأ في الحذف';
 
-export const MSG_TOO_MANY_REQUESTS =
-  'طلبات كثيرة جدًا، حاول مرة أخرى لاحقًا';
+export const MSG_TOO_MANY_REQUESTS = 'طلبات كثيرة جدًا، حاول مرة أخرى لاحقًا';
 
 export const MSG_SERVICE_UNAVAILABLE =
   'الخدمة غير متاحة مؤقتًا، حاول مرة أخرى بعد قليل';

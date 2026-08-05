@@ -37,10 +37,7 @@ export async function verifyTurnstileToken(
   if (remoteIp) body.set('remoteip', remoteIp);
 
   const controller = new AbortController();
-  const timeout = setTimeout(
-    () => controller.abort(),
-    SITEVERIFY_TIMEOUT_MS
-  );
+  const timeout = setTimeout(() => controller.abort(), SITEVERIFY_TIMEOUT_MS);
   try {
     const response = await fetch(SITEVERIFY_URL, {
       method: 'POST',

@@ -1,3 +1,5 @@
+import type { Handler } from '@/lib/http/contract';
+
 import { and, asc, eq } from 'drizzle-orm';
 
 import { db } from '@/db';
@@ -5,8 +7,6 @@ import { roles } from '@/db/schema';
 import { requirePermission } from '@/lib/http/session';
 import { ROLE_SCOPE } from '@/lib/permissions/constants';
 import { enforceRateLimit, userIdentifier } from '@/lib/rate-limit';
-
-import type { Handler } from '@/lib/http/contract';
 
 import { MSG_FETCH_ERROR, MSG_FETCHED } from '@/utils/api-messages';
 import { apiSuccess, handleApiError } from '@/utils/api-response';

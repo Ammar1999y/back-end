@@ -20,6 +20,5 @@ export const userMsg = {
   phoneChangeCodeSent:
     'تم إرسال رمز التحقق إلى رقم الهاتف الجديد. أدخل الرمز لتأكيد التغيير',
   newPhoneSameAsCurrent: 'رقم الهاتف الجديد مطابق للحالي',
-  verificationUnavailable:
-    'خدمة التحقق غير متاحة حالياً. يرجى المحاولة لاحقاً',
+  verificationUnavailable: 'خدمة التحقق غير متاحة حالياً. يرجى المحاولة لاحقاً',
 };

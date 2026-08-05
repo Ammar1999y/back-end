@@ -99,7 +99,8 @@ export function parseDataTableParams<T extends Table>(
   const rawSearch = searchParams.get('search')?.trim() ?? '';
   if (
     rawSearch.length > 0 &&
-    (rawSearch.length < MIN_SEARCH_LENGTH || rawSearch.length > MAX_SEARCH_LENGTH)
+    (rawSearch.length < MIN_SEARCH_LENGTH ||
+      rawSearch.length > MAX_SEARCH_LENGTH)
   )
     throw new CustomError(MSG_INVALID_FILTER, HTTP_STATUS.UNPROCESSABLE);
   const search = rawSearch;

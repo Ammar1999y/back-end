@@ -1,5 +1,6 @@
-import { getClientIp } from '@/lib/audit';
+import { EntityID } from '@/types';
 import { sanitizeForLog } from '@/utils';
+import { getClientIp } from '@/lib/audit';
 
 import {
   HTTP_STATUS,
@@ -9,7 +10,6 @@ import {
 import { CustomError } from '@/utils/error-class';
 
 import { rateLimit, refundRateLimit } from './index';
-import { EntityID } from '@/types';
 
 // The app runs on Vercel, or on a VPS behind Cloudflare — both always inject
 // a trusted IP header (`cf-connecting-ip` / `x-vercel-forwarded-for`). A null
@@ -110,10 +110,7 @@ export const otpContactKind = (channel: string): OtpContactKind =>
 
 /** Independent send budgets so one surface can't starve another. */
 export type OtpSendSurface =
-  | 'verify_contact'
-  | 'recovery'
-  | 'passwordless'
-  | 'contact_change';
+  'verify_contact' | 'recovery' | 'passwordless' | 'contact_change';
 
 /** Aggregate outbound send ATTEMPTS per contact kind per day. */
 export const OTP_GLOBAL_SEND_CAP_PER_DAY = 2000;
