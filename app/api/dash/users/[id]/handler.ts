@@ -4,31 +4,21 @@ import type { checkUserPermission } from '@/lib/permissions/checker';
 import { and, desc, eq, gt, isNull, sql } from 'drizzle-orm';
 
 import { db } from '@/db';
-import {
-  accounts,
-  rolePermissions,
-  roles,
-  sessions,
-  users,
-  verificationSessions,
-} from '@/db/schema';
+import { accounts, rolePermissions, roles, sessions, users } from '@/db/schema';
 import { withTransaction } from '@/db/ws';
 import { EntityID } from '@/types';
-import {
-  getConstraintName,
-  isForeignKeyViolation,
-  isUniqueViolation,
-  validID,
-} from '@/utils';
+import { validID } from '@/utils';
 import { auditLog, getAuditMeta } from '@/lib/audit';
 import { checkPasswordCompromise } from '@/lib/auth/check-password';
 import { hashPassword } from '@/lib/auth/password';
-import { PHONE_ENABLED, PHONE_REQUIRED } from '@/utils/config';
+import { revokeOtherSessions, revokePendingProofs } from '@/lib/auth/rotation';
 import { requirePermission } from '@/lib/http/session';
 import { CUSTOM_ROLE_VALUE, ROLE_SCOPE } from '@/lib/permissions/constants';
 import {
+  auditCustomRolePermissions,
   createCustomRole,
   isProtectedSystemRole,
+  PERMISSION_AUDIT_VERSION,
   permissionsEqual,
   refreshUserSessions,
   validateAssignableRole,
@@ -51,20 +41,24 @@ import {
 } from '@/utils/api-messages';
 import {
   apiSuccess,
-  getErrorHeaders,
   handleApiError,
+  handleUserForeignKeyViolation,
+  handleUserUniqueViolation,
   requireJsonBody,
-  resolveUserUniqueViolation,
 } from '@/utils/api-response';
+import { PHONE_ENABLED, PHONE_REQUIRED } from '@/utils/config';
 import { CustomError } from '@/utils/error-class';
 import {
+  adminUpdateUserSchema,
   selfUpdateUserSchema,
-  updateUserSchema,
 } from '@/utils/validation/auth';
 import { EMAIL_MAX } from '@/utils/validation/constants';
-import { idRequired } from '@/utils/validation/rules';
+import { idRequired, zodIssueMessage } from '@/utils/validation/rules';
 
 import { userMsg } from '../messages';
+import { SESSIONS_PAGE_SIZE } from './sessions/handler';
+import { formatCursor } from './sessions/pagination';
+import { actorCoversTargetRole, assertTargetUserVisible } from './target-user';
 
 type AuditMeta = ReturnType<typeof getAuditMeta>;
 
@@ -107,11 +101,8 @@ export const GET: Handler = async (ctx) => {
 
     const editAll = actorViewPermissions?.users?.edit === true;
     const editOwn = actorViewPermissions?.users?.editOwn === true;
-    // Sessions are fetched optimistically when the actor *might* be allowed to
-    // see them. Final visibility is decided after we know target.createdBy.
-    const canFetchSessions = isSelf || editAll || editOwn;
 
-    const userDataPromise = db.query.users.findFirst({
+    const userData = await db.query.users.findFirst({
       where: (users, { eq, and, isNull }) =>
         and(eq(users.id, targetId), isNull(users.deletedAt)),
       columns: {
@@ -146,8 +137,46 @@ export const GET: Handler = async (ctx) => {
       },
     });
 
-    const sessionsPromise = canFetchSessions
-      ? db
+    if (!userData) throw new CustomError(MSG_NOT_FOUND, HTTP_STATUS.NOT_FOUND);
+
+    // Shared with the sessions subresource so parent and child can't drift:
+    // protected-system, role presence, and ownership are one predicate.
+    assertTargetUserVisible({
+      isSelf,
+      roleId: userData.roleId,
+      createdBy: userData.createdBy,
+      role: userData.role,
+      actorUserId: userId,
+      scope: viewScope,
+    });
+
+    // Session metadata (IP, user-agent) is gated by the same role authority the
+    // sessions endpoints require. Without it the child route's check was
+    // bypassable: page one arrived here, only page two was refused.
+    const showSessions =
+      (isSelf || editAll || (editOwn && userData.createdBy === userId)) &&
+      (isSelf ||
+        (await actorCoversTargetRole(
+          actorViewPermissions,
+          userData.roleId!,
+          db
+        )));
+
+    const permissions =
+      userData.role?.rolePermissions?.map((p) => ({
+        name: p.pageName,
+        permissions: p.permissions,
+      })) || [];
+
+    // Fetched only after every visibility gate above has passed — the sessions
+    // of a target the actor may not reach must not be read at all, and the
+    // ownership gate needs `createdBy`, which is only known once the user row
+    // is in hand. Sequential by necessity, not an oversight.
+    // First page only: older sessions are reachable through the cursor-paginated
+    // GET /dash/users/:id/sessions, and `sessionsHasMore` tells the client when
+    // it must go there instead of assuming this list is complete.
+    const sessionRows = showSessions
+      ? await db
           .select({
             id: sessions.id,
             ipAddress: sessions.ipAddress,
@@ -161,43 +190,29 @@ export const GET: Handler = async (ctx) => {
               gt(sessions.expiresAt, sql`now()`)
             )
           )
-          .orderBy(desc(sessions.createdAt))
-          .limit(50)
-      : Promise.resolve(null);
+          .orderBy(desc(sessions.createdAt), desc(sessions.id))
+          .limit(SESSIONS_PAGE_SIZE + 1)
+      : null;
 
-    const [userData, sessionRows] = await Promise.all([
-      userDataPromise,
-      sessionsPromise,
-    ]);
+    const sessionsHasMore =
+      !!sessionRows && sessionRows.length > SESSIONS_PAGE_SIZE;
 
-    if (!userData) throw new CustomError(MSG_NOT_FOUND, HTTP_STATUS.NOT_FOUND);
+    const userSessions = sessionRows
+      ? sessionRows.slice(0, SESSIONS_PAGE_SIZE).map((s) => ({
+          ...s,
+          isCurrent: s.id === sessionId,
+        }))
+      : undefined;
 
-    // System-scoped owner can read their own profile; hide from others.
-    if (!isSelf && isProtectedSystemRole(userData.role))
-      throw new CustomError(MSG_NOT_FOUND, HTTP_STATUS.NOT_FOUND);
-
-    if (!userData.roleId)
-      throw new CustomError(MSG_NOT_FOUND, HTTP_STATUS.NOT_FOUND);
-
-    if (!isSelf && viewScope === 'own' && userData.createdBy !== userId)
-      throw new CustomError(MSG_NOT_FOUND, HTTP_STATUS.NOT_FOUND);
-
-    const showSessions =
-      isSelf || editAll || (editOwn && userData.createdBy === userId);
-
-    const permissions =
-      userData.role?.rolePermissions?.map((p) => ({
-        name: p.pageName,
-        permissions: p.permissions,
-      })) || [];
-
-    const userSessions =
-      showSessions && sessionRows
-        ? sessionRows.map((s) => ({
-            ...s,
-            isCurrent: s.id === sessionId,
-          }))
-        : undefined;
+    // The cursor for page two, in the child route's exact format. Sending only
+    // `hasMore` forced the client to call the child endpoint with no cursor,
+    // which re-serves page one — the duplicate the keyset design exists to
+    // avoid.
+    const lastSession = userSessions?.at(-1);
+    const sessionsNextCursor =
+      sessionsHasMore && lastSession
+        ? formatCursor(lastSession.createdAt, lastSession.id)
+        : null;
 
     return apiSuccess({
       message: MSG_FETCHED,
@@ -222,7 +237,9 @@ export const GET: Handler = async (ctx) => {
         createdAt: userData.createdAt,
         updatedAt: userData.updatedAt,
         permissions,
-        ...(userSessions ? { sessions: userSessions } : {}),
+        ...(userSessions
+          ? { sessions: userSessions, sessionsHasMore, sessionsNextCursor }
+          : {}),
       },
     });
   } catch (error) {
@@ -235,24 +252,27 @@ async function handleSelfEdit(
   targetId: EntityID,
   body: Record<string, unknown>,
   auditMeta: AuditMeta
-) {
+): Promise<{ updatedAt: string }> {
   if (!actor.hasRole)
     throw new CustomError(MSG_INSUFFICIENT_PERMISSIONS, HTTP_STATUS.FORBIDDEN);
 
   const parsed = selfUpdateUserSchema.safeParse({ ...body, id: targetId });
   if (!parsed.success)
     throw new CustomError(
-      parsed.error.issues[0].message,
+      zodIssueMessage(parsed.error),
       HTTP_STATUS.UNPROCESSABLE
     );
 
-  await withTransaction(async (tx) => {
+  return withTransaction(async (tx) => {
     // Single-round-trip self-edit: capture the old name via a CTE so the
     // UPDATE ... RETURNING has both the new value (for audit parity) and
     // the pre-update value. FOR UPDATE is unnecessary — a user can't race
     // themselves meaningfully, and the WHERE filter blocks updates against
     // a concurrently deactivated/soft-deleted row.
-    const updated = await tx.execute<{ old_name: string }>(sql`
+    const updated = await tx.execute<{
+      old_name: string;
+      updated_at: string;
+    }>(sql`
       WITH prev AS (
         SELECT id, name FROM users WHERE id = ${targetId}
       )
@@ -262,7 +282,7 @@ async function handleSelfEdit(
       WHERE u.id = prev.id
         AND u.deleted_at IS NULL
         AND u.is_active = true
-      RETURNING prev.name AS old_name
+      RETURNING prev.name AS old_name, u.updated_at AS updated_at
     `);
 
     const row = updated.rows[0];
@@ -278,6 +298,8 @@ async function handleSelfEdit(
       newData: { name: parsed.data.name },
       meta: auditMeta,
     });
+
+    return { updatedAt: row.updated_at };
   });
 }
 
@@ -290,15 +312,18 @@ async function handleAdminEdit(
   targetId: EntityID,
   body: Record<string, unknown>,
   auditMeta: AuditMeta
-) {
-  const validatedDataParsed = updateUserSchema.safeParse({
+): Promise<{ updatedAt: string }> {
+  // Strict server contract: unknown keys are rejected (422) instead of
+  // stripped, so a misspelled `phone_number` / `passwrod` can't be read as
+  // "field not supplied" and return a misleading 200.
+  const validatedDataParsed = adminUpdateUserSchema.safeParse({
     ...body,
     id: targetId,
   });
 
   if (!validatedDataParsed.success)
     throw new CustomError(
-      validatedDataParsed.error.issues[0].message,
+      zodIssueMessage(validatedDataParsed.error),
       HTTP_STATUS.UNPROCESSABLE
     );
 
@@ -310,13 +335,15 @@ async function handleAdminEdit(
   if (password) await checkPasswordCompromise(password);
   const hashedPassword = password ? await hashPassword(password) : null;
 
-  await withTransaction(async (tx) => {
+  return withTransaction(async (tx) => {
     const [lockedUser] = await tx
       .select({
         id: users.id,
         name: users.name,
         email: users.email,
+        emailVerified: users.emailVerified,
         phoneNumber: users.phoneNumber,
+        phoneNumberVerified: users.phoneNumberVerified,
         roleId: users.roleId,
         isActive: users.isActive,
         createdBy: users.createdBy,
@@ -367,8 +394,57 @@ async function handleAdminEdit(
       }
     }
 
+    // The matrix diff is computed BEFORE the authority gate below, because the
+    // gate depends on it. A supplied matrix is only a permission mutation if it
+    // differs from the stored one — renaming a custom-role user changes no
+    // permissions and must not require `permissions.edit`. Authorize the actual
+    // mutation, not the shape of the requested object.
+    const suppliedMatrix = validatedData.permissions?.length
+      ? validatedData.permissions
+      : null;
+    const newPermsForAudit =
+      isCustomRole && suppliedMatrix
+        ? suppliedMatrix.map((p) => ({
+            pageName: p.name as string,
+            permissions: p.permissions as unknown,
+          }))
+        : null;
+
+    let oldPermsForAudit: Array<{
+      pageName: string;
+      permissions: unknown;
+    }> | null = null;
+    let customPermsChanged = false;
+
+    if (newPermsForAudit && isCurrentlyCustom) {
+      const oldPerms = await tx
+        .select({
+          pageName: rolePermissions.pageName,
+          permissions: rolePermissions.permissions,
+        })
+        .from(rolePermissions)
+        .where(eq(rolePermissions.roleId, lockedUser.roleId));
+
+      oldPermsForAudit = oldPerms.map((p) => ({
+        pageName: p.pageName as string,
+        permissions: p.permissions as unknown,
+      }));
+
+      customPermsChanged = !permissionsEqual(
+        oldPermsForAudit,
+        newPermsForAudit
+      );
+    }
+
     if (isCustomRole) {
-      if (isCurrentlyCustom) {
+      if (!isCurrentlyCustom) {
+        // Switching TO custom mints a role.
+        if (actorPermissions?.['permissions']?.['create'] !== true)
+          throw new CustomError(
+            MSG_INSUFFICIENT_PERMISSIONS,
+            HTTP_STATUS.FORBIDDEN
+          );
+      } else if (customPermsChanged) {
         const hasEditAll = actorPermissions?.['permissions']?.['edit'] === true;
         const hasEditOwn =
           actorPermissions?.['permissions']?.['editOwn'] === true &&
@@ -378,56 +454,69 @@ async function handleAdminEdit(
             MSG_INSUFFICIENT_PERMISSIONS,
             HTTP_STATUS.FORBIDDEN
           );
-      } else if (actorPermissions?.['permissions']?.['create'] !== true) {
-        throw new CustomError(
-          MSG_INSUFFICIENT_PERMISSIONS,
-          HTTP_STATUS.FORBIDDEN
-        );
       }
     }
 
     let assignedRoleId: EntityID;
-    let customPermsChanged = false;
+    // Deferred so the dedicated permission-matrix audit row is written after
+    // the user UPDATE succeeds, alongside the other audit work.
+    let customRoleAudit: (() => Promise<void>) | null = null;
 
-    if (isCustomRole && validatedData.permissions?.length) {
+    if (newPermsForAudit && suppliedMatrix) {
       if (isCurrentlyCustom) {
-        const oldPerms = await tx
-          .select({
-            pageName: rolePermissions.pageName,
-            permissions: rolePermissions.permissions,
-          })
-          .from(rolePermissions)
-          .where(eq(rolePermissions.roleId, lockedUser.roleId));
-
-        customPermsChanged = !permissionsEqual(
-          oldPerms.map((p) => ({
-            pageName: p.pageName,
-            permissions: p.permissions,
-          })),
-          validatedData.permissions.map((p) => ({
-            pageName: p.name,
-            permissions: p.permissions,
-          }))
-        );
-
         // Skip rewriting role_permissions rows when nothing changed — avoids
         // a useless DELETE/INSERT cycle that resets created_at and briefly
         // leaves the role with zero permission rows.
         assignedRoleId = customPermsChanged
-          ? await createCustomRole(
-              tx,
-              validatedData.permissions,
-              lockedUser.roleId
-            )
+          ? await createCustomRole(tx, suppliedMatrix, lockedUser.roleId)
           : lockedUser.roleId;
+
+        // An in-place custom edit keeps the same role_id, so the user audit
+        // row below shows no change at all. Record the matrix separately.
+        if (customPermsChanged) {
+          const roleIdForAudit = assignedRoleId;
+          const oldPermissions = oldPermsForAudit ?? [];
+          customRoleAudit = () =>
+            auditCustomRolePermissions(tx, {
+              actorUserId: actor.userId,
+              actorEmail: actor.userEmail,
+              roleId: roleIdForAudit,
+              oldPermissions,
+              newPermissions: newPermsForAudit,
+              targetUserId: userId,
+              meta: auditMeta,
+            });
+        }
       } else {
         assignedRoleId = await createCustomRole(
           tx,
-          validatedData.permissions,
+          suppliedMatrix,
           null,
           actor.userId
         );
+
+        const roleIdForAudit = assignedRoleId;
+        customRoleAudit = () =>
+          auditCustomRolePermissions(tx, {
+            actorUserId: actor.userId,
+            actorEmail: actor.userEmail,
+            roleId: roleIdForAudit,
+            newPermissions: newPermsForAudit,
+            targetUserId: userId,
+            meta: auditMeta,
+          });
       }
+    } else if (isCustomRole) {
+      // Custom role with no matrix in the payload = "keep the current one".
+      // The client only sends `permissions` when it changed, so requiring it
+      // made every other edit to a custom-role user fail. Switching TO custom
+      // still needs one — there is nothing to keep.
+      if (!isCurrentlyCustom)
+        throw new CustomError(
+          userMsg.customRoleNeedsPermissions,
+          HTTP_STATUS.UNPROCESSABLE
+        );
+      assignedRoleId = lockedUser.roleId;
     } else {
       assignedRoleId = validatedData.roleId as EntityID;
     }
@@ -435,10 +524,11 @@ async function handleAdminEdit(
     const emailChanged = lockedUser.email !== validatedData.email;
     // Phone is only persisted when enabled. An omitted key means "keep current"
     // — only an explicit null/'' clears it — so a partial update can't silently
-    // wipe the number. The schema coerces both omitted and explicit-empty to
-    // null, so presence is read from the raw body. An admin-set number is
-    // unproven, so the verified flag resets to false on any change.
-    const phoneProvided = 'phoneNumber' in body;
+    // wipe the number. Presence comes from the PARSED value (`undefined` only
+    // when the key was absent): reading the raw body let a stripped typo look
+    // like "not supplied". An admin-set number is unproven, so the verified
+    // flag resets to false on any change.
+    const phoneProvided = validatedData.phoneNumber !== undefined;
     const newPhoneNumber = validatedData.phoneNumber ?? null;
     const phoneChanged =
       PHONE_ENABLED &&
@@ -466,7 +556,7 @@ async function handleAdminEdit(
         ...(password ? { failedLoginAttempts: 0, lockedUntil: null } : {}),
       })
       .where(and(eq(users.id, userId), isNull(users.deletedAt)))
-      .returning({ id: users.id });
+      .returning({ id: users.id, updatedAt: users.updatedAt });
 
     if (!userUpdated)
       throw new CustomError(MSG_NOT_FOUND, HTTP_STATUS.NOT_FOUND);
@@ -488,17 +578,30 @@ async function handleAdminEdit(
         action: 'DELETE',
         tableName: 'roles',
         recordId: lockedUser.roleId,
-        oldData: { scope: 'custom', permissions: oldCustomPerms },
+        oldData: {
+          auditVersion: PERMISSION_AUDIT_VERSION,
+          scope: CUSTOM_ROLE_VALUE,
+          // The user this role existed for. Every other custom-role event
+          // records it; without it this one cannot be tied back to the user
+          // whose edit destroyed the role.
+          forUserId: userId,
+          permissions: oldCustomPerms,
+        },
+        metadataFields: ['auditVersion', 'scope', 'forUserId'],
         meta: auditMeta,
       });
     }
 
     const roleChanged = lockedUser.roleId !== assignedRoleId;
-    // Email mutation is an identity change — invalidate other sessions so the
-    // victim can't keep using stale identity in cached cookies.
+    // Any credential/identity mutation invalidates existing sessions. Phone is
+    // included for the same reason the self-service flow revokes on phone
+    // change: it is a passwordless login factor, so a session obtained through
+    // the old number must not outlive it. Leaving it out here was exactly the
+    // policy drift the shared rotation helper exists to prevent.
     const shouldDeleteAllSessions =
       !!password ||
       emailChanged ||
+      phoneChanged ||
       (lockedUser.isActive && validatedData.isActive === false);
     const shouldRefreshSessions =
       !shouldDeleteAllSessions && (roleChanged || customPermsChanged);
@@ -524,53 +627,63 @@ async function handleAdminEdit(
         );
     }
 
-    // After the main UPDATE the audit insert, session housekeeping, and
-    // verification-session cleanup are independent of each other — fan them
-    // out so they don't pay sequential round-trip latency.
-    const sessionWork: Promise<unknown> = shouldDeleteAllSessions
-      ? tx.delete(sessions).where(eq(sessions.userId, userId))
-      : shouldRefreshSessions
-        ? refreshUserSessions(userId, tx)
-        : Promise.resolve();
+    // Sequential, not `Promise.all`. These four statements are logically
+    // independent, but they all run on the transaction's single connection, so
+    // the driver serializes them anyway — the previous fan-out bought no
+    // round-trip saving and only made it arbitrary which of several failures
+    // surfaced. Explicit order is what actually helps when one of them throws.
+    await auditLog(tx, {
+      userId: actor.userId,
+      userEmail: actor.userEmail,
+      action: 'UPDATE',
+      tableName: 'users',
+      recordId: userId,
+      // Every mutated field records both sides: an identity change must be
+      // reconstructable from this event alone, without a second lookup.
+      oldData: {
+        name: lockedUser.name,
+        email: lockedUser.email,
+        roleId: lockedUser.roleId,
+        isActive: lockedUser.isActive,
+        ...(emailChanged ? { emailVerified: lockedUser.emailVerified } : {}),
+        ...(phoneChanged
+          ? {
+              phoneNumber: lockedUser.phoneNumber,
+              phoneNumberVerified: lockedUser.phoneNumberVerified,
+            }
+          : {}),
+      },
+      newData: {
+        name: validatedData.name,
+        email: validatedData.email,
+        roleId: assignedRoleId,
+        isActive: validatedData.isActive,
+        ...(emailChanged ? { emailVerified: false } : {}),
+        ...(phoneChanged
+          ? { phoneNumber: newPhoneNumber, phoneNumberVerified: false }
+          : {}),
+        ...(password ? { passwordChanged: true } : {}),
+      },
+      // A custom-permissions-only edit changes nothing on the user row: the real
+      // change is the roles event below. Without this the pair was a users
+      // UPDATE with `changedFields: []` sitting next to it, which during an
+      // investigation is indistinguishable from a genuine no-change write.
+      skipIfUnchanged: true,
+      meta: auditMeta,
+    });
 
-    // Drop pending verification sessions on any contact/credential mutation so a
-    // stale change_* proof can't later commit over the admin's change.
-    const verificationCleanup: Promise<unknown> =
-      emailChanged || phoneChanged || shouldDeleteAllSessions
-        ? tx
-            .delete(verificationSessions)
-            .where(eq(verificationSessions.userId, userId))
-        : Promise.resolve();
+    if (customRoleAudit) await customRoleAudit();
 
-    await Promise.all([
-      auditLog(tx, {
-        userId: actor.userId,
-        userEmail: actor.userEmail,
-        action: 'UPDATE',
-        tableName: 'users',
-        recordId: userId,
-        oldData: {
-          name: lockedUser.name,
-          email: lockedUser.email,
-          roleId: lockedUser.roleId,
-          isActive: lockedUser.isActive,
-        },
-        newData: {
-          name: validatedData.name,
-          email: validatedData.email,
-          roleId: assignedRoleId,
-          isActive: validatedData.isActive,
-          ...(emailChanged ? { emailVerified: false } : {}),
-          ...(phoneChanged
-            ? { phoneNumber: newPhoneNumber, phoneNumberVerified: false }
-            : {}),
-          ...(password ? { passwordChanged: true } : {}),
-        },
-        meta: auditMeta,
-      }),
-      sessionWork,
-      verificationCleanup,
-    ]);
+    // Shared rotation helpers, not inline deletes — one definition of the
+    // policy. No session kept: the actor is an admin, not the target.
+    if (shouldDeleteAllSessions) await revokeOtherSessions(tx, userId);
+    else if (shouldRefreshSessions) await refreshUserSessions(userId, tx);
+
+    // A stale change_* proof must not commit over the admin's change.
+    if (emailChanged || phoneChanged || shouldDeleteAllSessions)
+      await revokePendingProofs(tx, userId);
+
+    return { updatedAt: userUpdated.updatedAt };
   });
 }
 
@@ -607,8 +720,8 @@ export const PUT: Handler = async (ctx) => {
     };
 
     if (userId === targetId) {
-      await handleSelfEdit(actor, targetId, body, auditMeta);
-      return apiSuccess({ message: MSG_UPDATED });
+      const selfResult = await handleSelfEdit(actor, targetId, body, auditMeta);
+      return apiSuccess({ message: MSG_UPDATED, data: selfResult });
     }
 
     if (!editScope)
@@ -617,7 +730,7 @@ export const PUT: Handler = async (ctx) => {
         HTTP_STATUS.FORBIDDEN
       );
 
-    await handleAdminEdit(
+    const adminResult = await handleAdminEdit(
       actor,
       actorPermissions,
       editScope,
@@ -625,28 +738,16 @@ export const PUT: Handler = async (ctx) => {
       body,
       auditMeta
     );
-    return apiSuccess({ message: MSG_UPDATED });
+    return apiSuccess({ message: MSG_UPDATED, data: adminResult });
   } catch (error) {
-    if (isUniqueViolation(error)) {
-      return handleApiError(
-        new CustomError(
-          resolveUserUniqueViolation(error),
-          HTTP_STATUS.CONFLICT
-        ),
-        undefined,
-        getErrorHeaders(error)
-      );
-    }
-    if (isForeignKeyViolation(error)) {
-      const constraint = getConstraintName(error);
-      if (constraint.includes('role_id')) {
-        return handleApiError(
-          new CustomError(userMsg.roleNotFound, HTTP_STATUS.BAD_REQUEST),
-          undefined,
-          getErrorHeaders(error)
-        );
-      }
-    }
+    // Only a KNOWN constraint becomes a 409; an unrecognized one falls
+    // through to the 500 path so the schema/code mismatch is visible.
+    const conflict = handleUserUniqueViolation(error);
+    if (conflict) return conflict;
+    const badRole = handleUserForeignKeyViolation(error, {
+      roleNotFound: userMsg.roleNotFound,
+    });
+    if (badRole) return badRole;
     return handleApiError(error, MSG_UPDATE_ERROR);
   }
 };
@@ -743,13 +844,40 @@ export const DELETE: Handler = async (ctx) => {
         })
         .where(eq(users.id, userId));
 
-      await tx.delete(sessions).where(eq(sessions.userId, userId));
+      // Soft-delete is the most total rotation there is; same policy.
+      await revokeOtherSessions(tx, userId);
+      await revokePendingProofs(tx, userId);
       await tx.delete(accounts).where(eq(accounts.userId, userId));
-      await tx
-        .delete(verificationSessions)
-        .where(eq(verificationSessions.userId, userId));
       if (lockedUser.role_scope === CUSTOM_ROLE_VALUE) {
+        // Capture the matrix before the role disappears. Deleting a user also
+        // destroys their custom role, and the user event below records only
+        // the role id — so without this the permissions that role carried are
+        // unrecoverable, and this deletion is the one custom-role removal with
+        // no versioned `roles` event of its own.
+        const deletedRolePerms = await tx
+          .select({
+            pageName: rolePermissions.pageName,
+            permissions: rolePermissions.permissions,
+          })
+          .from(rolePermissions)
+          .where(eq(rolePermissions.roleId, lockedUser.role_id));
+
         await tx.delete(roles).where(eq(roles.id, lockedUser.role_id));
+
+        await auditLog(tx, {
+          userId: actorUserId,
+          userEmail: session.user.email,
+          action: 'DELETE',
+          tableName: 'roles',
+          recordId: lockedUser.role_id,
+          oldData: {
+            auditVersion: PERMISSION_AUDIT_VERSION,
+            scope: CUSTOM_ROLE_VALUE,
+            forUserId: userId,
+            permissions: deletedRolePerms,
+          },
+          meta: auditMeta,
+        });
       }
 
       await auditLog(tx, {

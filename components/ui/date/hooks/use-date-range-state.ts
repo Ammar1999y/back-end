@@ -35,9 +35,12 @@ export const useDateRangeState = ({
   const [tempRange, setTempRange] = useState<DateRange>(committedRange);
 
   // Controlled month for calendar navigation
+  // Falls back to `to` before today: an upper-only range would otherwise open
+  // the calendar on the current month with its own selection off-screen.
   const [month, setMonth] = useState<Date>(
     () =>
       committedRange.from ??
+      committedRange.to ??
       new Date(new Date().setMonth(new Date().getMonth() - 1))
   );
 
@@ -49,9 +52,11 @@ export const useDateRangeState = ({
       setTempRange((prevRange) => {
         const updatedRange =
           typeof newRange === 'function' ? newRange(prevRange) : newRange;
-        // Navigate calendar to show the "from" date
-        if (updatedRange.from) {
-          setMonth(new Date(updatedRange.from));
+        // Navigate to whichever bound the range actually has. `from` only meant
+        // an upper-only range never moved the calendar to its own selection.
+        const anchor = updatedRange.from ?? updatedRange.to;
+        if (anchor) {
+          setMonth(new Date(anchor));
         }
         return updatedRange;
       });
@@ -127,8 +132,12 @@ export const useDateRangeState = ({
     (open: boolean) => {
       if (open) {
         setTempRange(committedRange);
-        if (committedRange.from) {
-          setMonth(new Date(committedRange.from));
+        // Same fallback as the initial state and `setRange`: without it,
+        // reopening after navigating elsewhere left an upper-only range showing
+        // the wrong month.
+        const anchor = committedRange.from ?? committedRange.to;
+        if (anchor) {
+          setMonth(new Date(anchor));
         }
       }
       setIsOpen(open);

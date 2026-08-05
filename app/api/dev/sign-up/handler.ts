@@ -1,6 +1,5 @@
 import { accounts, rolePermissions, roles, users } from '@/db/schema';
 import { withTransaction } from '@/db/ws';
-import { getConstraintName, isUniqueViolation } from '@/utils';
 import * as z from 'zod';
 import { hashPassword } from '@/lib/auth/password';
 import {
@@ -15,12 +14,12 @@ import {
   HTTP_STATUS,
   MSG_CREATE_ERROR,
   MSG_CREATED,
-  MSG_EMAIL_EXISTS,
 } from '@/utils/api-messages';
 import {
   apiError,
   apiSuccess,
   handleApiError,
+  handleUserUniqueViolation,
   requireJsonBody,
 } from '@/utils/api-response';
 import { CustomError } from '@/utils/error-class';
@@ -104,14 +103,12 @@ export const POST: Handler = async (ctx) => {
       status: HTTP_STATUS.CREATED,
     });
   } catch (error) {
-    if (isUniqueViolation(error)) {
-      const constraint = getConstraintName(error);
-      if (constraint.includes('ux_users_email')) {
-        return handleApiError(
-          new CustomError(MSG_EMAIL_EXISTS, HTTP_STATUS.CONFLICT)
-        );
-      }
-    }
+    // Shared exact-name resolver, like every other user endpoint: `includes()`
+    // would classify any constraint whose name merely CONTAINS a known one, and
+    // an unrecognized constraint must reach the logged 500 rather than be
+    // reported to the client as a conflict it can fix.
+    const conflict = handleUserUniqueViolation(error);
+    if (conflict) return conflict;
     return handleApiError(error, MSG_CREATE_ERROR);
   }
 };

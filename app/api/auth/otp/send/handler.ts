@@ -7,7 +7,11 @@ import { users } from '@/db/schema';
 import { withTransaction } from '@/db/ws';
 import { getAuditMeta } from '@/lib/audit';
 import { verifyTurnstileRequest } from '@/lib/captcha';
-import { enforceRateLimit, ipIdentifier, otpSendScope } from '@/lib/rate-limit';
+import {
+  enforceOtpSendQuota,
+  enforceRateLimit,
+  ipIdentifier,
+} from '@/lib/rate-limit';
 import { sanitizeForLog } from '@/utils';
 
 import { HTTP_STATUS, MSG_PAGE_NOT_FOUND } from '@/utils/api-messages';
@@ -72,14 +76,14 @@ export const POST: Handler = async (ctx) => {
       channel === 'email' ? parsed.data.email : parsed.data.phoneNumber;
     const entityName = channel === 'email' ? 'البريد الإلكتروني' : 'رقم الهاتف';
 
-    // Per-identifier cap applied after privacy unification so real and fake
-    // paths are capped the same way.
-    await enforceRateLimit({
-      scope: otpSendScope(channel),
-      identifier: identifier.toLowerCase(),
-      limit: 5,
-      window: 3600,
-      failClosed: true,
+    // Per-destination quota chain, applied after privacy unification so real
+    // and fake paths are capped the same way. The `verify_contact` surface has
+    // its own slice of the destination budget, so public verification traffic
+    // can no longer drain a victim's password-recovery delivery allowance.
+    await enforceOtpSendQuota({
+      channel,
+      destination: identifier,
+      surface: 'verify_contact',
     });
 
     const genericResponse = () =>

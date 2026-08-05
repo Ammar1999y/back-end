@@ -1,11 +1,12 @@
 import type { WsTx } from '@/db/ws';
 import type { HandlerCookie } from '@/lib/http/contract';
 
-import { and, eq, isNull, ne } from 'drizzle-orm';
+import { and, eq, isNull } from 'drizzle-orm';
 
-import { sessions, users } from '@/db/schema';
+import { users } from '@/db/schema';
 import { auditLog, getAuditMeta } from '@/lib/audit';
 import { auth } from '@/lib/auth';
+import { revokeOtherSessions, revokePendingProofs } from '@/lib/auth/rotation';
 import { parseSetCookieHeaders } from '@/lib/http/contract';
 import { sanitizeForLog } from '@/utils';
 import { EntityID } from '@/types';
@@ -53,13 +54,22 @@ export async function refreshSessionCookies(
  * caller, which maps it to 409.
  */
 
-interface CommitEmailChangeOpts {
+interface CommitContactChangeOpts {
   tx: WsTx;
   userId: EntityID;
-  newEmail: string;
   /** Auth session to preserve; all the user's other sessions are revoked. */
   keepSessionId?: string | null;
+  /**
+   * The verification session being consumed right now. It survives the
+   * sibling-proof purge so the caller can still stamp it verified/consumed;
+   * every other pending proof for this user is dropped.
+   */
+  keepVerificationSessionId?: string | null;
   auditMeta: AuditMeta;
+}
+
+interface CommitEmailChangeOpts extends CommitContactChangeOpts {
+  newEmail: string;
 }
 
 export async function commitEmailChange({
@@ -67,6 +77,7 @@ export async function commitEmailChange({
   userId,
   newEmail,
   keepSessionId,
+  keepVerificationSessionId,
   auditMeta,
 }: CommitEmailChangeOpts): Promise<void> {
   // Fresh read under FOR UPDATE — a concurrently deactivated/demoted user must
@@ -107,14 +118,11 @@ export async function commitEmailChange({
     .set({ email: newEmail, emailVerified: true })
     .where(eq(users.id, userId));
 
-  // Email is an identity/credential change — revoke the user's other sessions.
-  await tx
-    .delete(sessions)
-    .where(
-      keepSessionId
-        ? and(eq(sessions.userId, userId), ne(sessions.id, keepSessionId))
-        : eq(sessions.userId, userId)
-    );
+  // Email is an identity/credential change — same revocation policy as every
+  // other rotation: other sessions die, and sibling proofs issued against the
+  // old identity die with them.
+  await revokeOtherSessions(tx, userId, keepSessionId);
+  await revokePendingProofs(tx, userId, keepVerificationSessionId);
 
   await auditLog(tx, {
     userId,
@@ -128,17 +136,16 @@ export async function commitEmailChange({
   });
 }
 
-interface CommitPhoneChangeOpts {
-  tx: WsTx;
-  userId: EntityID;
+interface CommitPhoneChangeOpts extends CommitContactChangeOpts {
   newPhoneNumber: string;
-  auditMeta: AuditMeta;
 }
 
 export async function commitPhoneChange({
   tx,
   userId,
   newPhoneNumber,
+  keepSessionId,
+  keepVerificationSessionId,
   auditMeta,
 }: CommitPhoneChangeOpts): Promise<void> {
   const [current] = await tx
@@ -175,6 +182,12 @@ export async function commitPhoneChange({
     .update(users)
     .set({ phoneNumber: newPhoneNumber, phoneNumberVerified: true })
     .where(eq(users.id, userId));
+
+  // The phone is a passwordless login factor, so replacing it is a credential
+  // rotation exactly like email: a session obtained through the OLD number
+  // must not outlive it.
+  await revokeOtherSessions(tx, userId, keepSessionId);
+  await revokePendingProofs(tx, userId, keepVerificationSessionId);
 
   await auditLog(tx, {
     userId,

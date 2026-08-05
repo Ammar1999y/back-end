@@ -17,6 +17,17 @@ export { API_PATH_MAX, USER_AGENT_MAX } from './audit/constants';
 import { API_PATH_MAX, USER_AGENT_MAX } from './audit/constants';
 
 /**
+ * Trusted edge headers, in priority order. Shared with Better Auth
+ * (`advanced.ipAddress.ipAddressHeaders`) so every IP-derived decision in the
+ * app — our limiters, Better Auth's limiter, and session IP metadata — reads
+ * the same source instead of Better Auth defaulting to `x-forwarded-for`.
+ */
+export const TRUSTED_IP_HEADERS = [
+  'cf-connecting-ip',
+  'x-vercel-forwarded-for',
+] as const;
+
+/**
  * Extracts the client IP from trusted proxy headers only.
  * Priority: cf-connecting-ip (Cloudflare) → x-vercel-forwarded-for (Vercel).
  * `x-forwarded-for` is intentionally NOT accepted — it is client-controllable
@@ -26,8 +37,8 @@ import { API_PATH_MAX, USER_AGENT_MAX } from './audit/constants';
  */
 export function getClientIp(headers: Headers): string | null {
   const raw =
-    headers.get('cf-connecting-ip') ??
-    headers.get('x-vercel-forwarded-for')?.split(',')[0]?.trim() ??
+    headers.get(TRUSTED_IP_HEADERS[0]) ??
+    headers.get(TRUSTED_IP_HEADERS[1])?.split(',')[0]?.trim() ??
     null;
 
   if (!raw || raw.length > MAX_IP_LENGTH) return null;
@@ -47,44 +58,182 @@ export function getAuditMeta(ctx: HandlerInput): {
   };
 }
 
-// Fields that must never appear in audit log data
-const SENSITIVE_KEYS = new Set([
+/**
+ * Key fragments whose values must never be stored in an audit row.
+ *
+ * Fragments, not exact names: the previous exact set (`password`, `token`,
+ * `secret`, `hashedPassword`) let `newPassword`, `currentPassword` and
+ * `sessionToken` straight through — the same blacklist-too-narrow failure the
+ * log serializer had. Matched against a normalised key so `new_password` and
+ * `newPassword` behave alike.
+ *
+ * Still a net, not a boundary: a secret inside a free-text value is invisible
+ * to it. Callers pass explicit, named fields; nothing here licenses handing
+ * this function a credential.
+ */
+const SENSITIVE_KEY_FRAGMENTS = [
   'password',
-  'token',
+  'passwd',
+  'pwd',
   'secret',
-  'hashedPassword',
-]);
+  'token',
+  'credential',
+  'pepper',
+  'apikey',
+  'privatekey',
+  'passphrase',
+  'signature',
+  'authorization',
+  'cookie',
+  'bearer',
+  'jwt',
+  'salt',
+  'hash',
+];
 
-// Hard cap for JSONB audit payloads. Anything bigger is replaced with a
-// truncated marker so a buggy caller can't bloat the table.
-const MAX_AUDIT_JSON_BYTES = 32_768;
+/**
+ * Is this key/value pair a secret?
+ *
+ * Two rules, in order, replacing what was a fragment denylist plus a hand-kept
+ * list of exceptions:
+ *
+ * 1. **A boolean is never a secret.** `true`/`false` cannot carry a credential,
+ *    so a flag ABOUT one is safe by construction. The denylist could not tell
+ *    `password` from `passwordChanged`, and because it dropped the flag from
+ *    `oldData`, `newData` and `changedFields` alike, an admin resetting a
+ *    password produced an audit row with no trace of it — as did every
+ *    `passwordHashUpgraded` and `passwordlessProofVerified` event. Adding two
+ *    names fixed two reports; this rule fixes the class, including flags nobody
+ *    has written yet.
+ * 2. **`safeFields`, declared by the event.** Non-boolean metadata whose name
+ *    mentions a credential — a pepper VERSION id, not the pepper — is named by
+ *    the call site that knows the shape of its own event. Generic redaction then
+ *    only has to be defense in depth for everything not declared.
+ *
+ * Anything else still falls to the fragment denylist.
+ */
+function isSensitiveAuditKey(
+  key: string,
+  value: unknown,
+  safeFields?: ReadonlySet<string>
+): boolean {
+  if (typeof value === 'boolean') return false;
+  if (safeFields?.has(key)) return false;
+  const normalized = key.toLowerCase().replace(/[^a-z0-9]/g, '');
+  return SENSITIVE_KEY_FRAGMENTS.some((fragment) =>
+    normalized.includes(fragment)
+  );
+}
+
+// Cap for JSONB audit payloads, in JSON *characters* (not UTF-8 bytes — Arabic
+// text costs 2 bytes per character, so the stored row can be ~2x this). Anything
+// bigger is replaced with a truncated marker so a buggy caller can't bloat the
+// table.
+const MAX_AUDIT_JSON_CHARS = 32_768;
+/** Guard against a pathological nested payload; audit data is 2–3 deep. */
+const MAX_AUDIT_DEPTH = 6;
 
 function clampJson<T>(value: T): T | { _truncated: true; preview: string } {
   if (value == null) return value;
   const s = JSON.stringify(value);
-  if (s.length <= MAX_AUDIT_JSON_BYTES) return value;
+  if (s.length <= MAX_AUDIT_JSON_CHARS) return value;
   return { _truncated: true, preview: s.slice(0, 1024) };
 }
 
-/** Strips sensitive fields from an object before storing in audit logs */
-function stripSensitive<T extends Record<string, unknown>>(
-  data: T
-): Partial<T> {
-  const safe: Record<string, unknown> = {};
-  for (const [key, value] of Object.entries(data)) {
-    if (!SENSITIVE_KEYS.has(key)) safe[key] = value;
+/**
+ * Removes sensitive fields at every level, within a fixed work budget.
+ *
+ * Recursive because a shallow pass only protected top-level keys — a secret
+ * nested inside `{ payload: { password } }` was stored verbatim.
+ *
+ * The node budget bounds the WORK, not just the output — and it has to STOP the
+ * traversal to do that, which the first version did not:
+ *
+ * - `value.map(...)` visited every element of a 100k array regardless of budget;
+ * - `Object.entries(value)` materialised every key AND read every value, running
+ *   any getters, before the budget was consulted;
+ * - the loop then kept going, writing `[budget-limit]` once per remaining key.
+ *
+ * So the output was bounded while the work was not. Iteration now breaks at the
+ * limit and leaves a single marker. `for...in` + `hasOwn` is lazy where
+ * `Object.entries` is eager, and it keeps inherited keys out.
+ */
+const MAX_AUDIT_NODES = 2000;
+const BUDGET_MARKER = '_truncated';
+
+function redactValue(
+  value: unknown,
+  depth: number,
+  budget: { nodes: number },
+  safeFields?: ReadonlySet<string>
+): unknown {
+  if (budget.nodes <= 0) return '[budget-limit]';
+  budget.nodes -= 1;
+  if (depth >= MAX_AUDIT_DEPTH) return '[depth-limit]';
+
+  if (Array.isArray(value)) {
+    const items: unknown[] = [];
+    for (const item of value) {
+      if (budget.nodes <= 0) {
+        items.push('[budget-limit]');
+        break;
+      }
+      items.push(redactValue(item, depth + 1, budget, safeFields));
+    }
+    return items;
   }
-  return safe as Partial<T>;
+
+  if (value === null || typeof value !== 'object') return value;
+
+  // Prototype-free: `safe['__proto__'] = v` on a plain object mutates the
+  // prototype instead of recording a key, so the field would silently vanish.
+  const safe: Record<string, unknown> = Object.create(null);
+  for (const key in value) {
+    if (!Object.hasOwn(value, key)) continue;
+    if (budget.nodes <= 0) {
+      safe[BUDGET_MARKER] = true;
+      break;
+    }
+    // Read only after the budget check — the read itself is the expensive part
+    // when the property is a getter.
+    const item = (value as Record<string, unknown>)[key];
+    if (isSensitiveAuditKey(key, item, safeFields)) continue;
+    safe[key] = redactValue(item, depth + 1, budget, safeFields);
+  }
+  return safe;
 }
 
-/** Computes only the fields that actually changed between old and new data */
+function stripSensitive<T extends Record<string, unknown>>(
+  data: T,
+  safeFields?: ReadonlySet<string>
+): Partial<T> {
+  return redactValue(
+    data,
+    0,
+    { nodes: MAX_AUDIT_NODES },
+    safeFields
+  ) as Partial<T>;
+}
+
+/**
+ * Fields that actually changed between old and new data.
+ *
+ * `metadataFields` are excluded: an event's own bookkeeping (`auditVersion`,
+ * `forUserId`, `changedPermissions`) is not business state, and counting it
+ * made every permission event report metadata as a changed field — and an
+ * event whose only "changes" were metadata look like a real mutation.
+ */
 function computeChangedFields(
   oldData: Record<string, unknown>,
-  newData: Record<string, unknown>
+  newData: Record<string, unknown>,
+  metadataFields?: readonly string[],
+  safeFields?: ReadonlySet<string>
 ): string[] {
+  const skip = new Set(metadataFields);
   const changed: string[] = [];
   for (const key of Object.keys(newData)) {
-    if (SENSITIVE_KEYS.has(key)) continue;
+    if (skip.has(key) || isSensitiveAuditKey(key, newData[key], safeFields))
+      continue;
     const oldVal = JSON.stringify(oldData[key] ?? null);
     const newVal = JSON.stringify(newData[key] ?? null);
     if (oldVal !== newVal) changed.push(key);
@@ -100,6 +249,29 @@ interface AuditLogParams {
   recordId: EntityID;
   oldData?: Record<string, unknown> | null;
   newData?: Record<string, unknown> | null;
+  /**
+   * Keys in `oldData`/`newData` that describe the EVENT rather than the record
+   * (`auditVersion`, `forUserId`, `changedPermissions`). Excluded from
+   * `changedFields` so it only ever lists real business changes.
+   */
+  metadataFields?: readonly string[];
+  /**
+   * Keys this event declares non-secret despite matching the generic denylist —
+   * a pepper VERSION id, for instance, which is metadata about a credential and
+   * not the credential. Booleans never need listing here; see
+   * `isSensitiveAuditKey`.
+   */
+  safeFields?: readonly string[];
+  /**
+   * Skip the insert when an UPDATE turns out to have changed nothing.
+   *
+   * A custom-permissions-only edit still ran the users UPDATE event, storing a
+   * row with `changedFields: []` beside the roles event that carried the real
+   * change — noise that makes a genuine no-change event indistinguishable from a
+   * real one during an investigation. Opt-in, because "no changed business
+   * fields" is meaningful for some events and not others.
+   */
+  skipIfUnchanged?: boolean;
   /** Request metadata (from `getAuditMeta(ctx)`). */
   meta: { ip: string | null; userAgent: string | null; apiPath: string };
 }
@@ -115,16 +287,30 @@ interface AuditLogParams {
 export async function auditLog(tx: WsTx, params: AuditLogParams) {
   const { userId, userEmail, action, tableName, recordId, meta } = params;
 
-  const oldData = params.oldData ? stripSensitive(params.oldData) : null;
-  const newData = params.newData ? stripSensitive(params.newData) : null;
+  const safeFields = params.safeFields
+    ? new Set(params.safeFields)
+    : undefined;
+
+  const oldData = params.oldData
+    ? stripSensitive(params.oldData, safeFields)
+    : null;
+  const newData = params.newData
+    ? stripSensitive(params.newData, safeFields)
+    : null;
 
   const changedFields =
     action === 'UPDATE' && oldData && newData
       ? computeChangedFields(
           oldData as Record<string, unknown>,
-          newData as Record<string, unknown>
+          newData as Record<string, unknown>,
+          params.metadataFields,
+          safeFields
         )
       : null;
+
+  // Only when both sides were supplied — `changedFields` is null (not empty)
+  // when the caller gave no before/after pair, and that is not a no-op.
+  if (params.skipIfUnchanged && changedFields?.length === 0) return;
 
   await tx.insert(auditLogs).values({
     userId,

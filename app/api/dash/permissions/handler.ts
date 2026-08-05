@@ -4,7 +4,6 @@ import { db } from '@/db';
 import { parseDataTableParams } from '@/db/queries/data-table';
 import { rolePermissions, roles } from '@/db/schema';
 import { withTransaction } from '@/db/ws';
-import { isUniqueViolation } from '@/utils';
 import { auditLog, getAuditMeta } from '@/lib/audit';
 import { requirePermission } from '@/lib/http/session';
 import { enforceRateLimit, userIdentifier } from '@/lib/rate-limit';
@@ -14,9 +13,12 @@ import {
   ROLE_SCOPE,
 } from '@/lib/permissions/constants';
 import {
+  diffPermissionMatrices,
+  PERMISSION_AUDIT_VERSION,
   validatePermissionScope,
 } from '@/lib/permissions/utils';
 
+import type { FilterColumnSpecs } from '@/lib/data-table/column-specs';
 import type { Handler } from '@/lib/http/contract';
 
 import {
@@ -28,23 +30,23 @@ import {
 } from '@/utils/api-messages';
 import {
   apiSuccess,
-  getErrorHeaders,
   handleApiError,
   requireJsonBody,
-  resolvePermissionUniqueViolation,
+  handlePermissionUniqueViolation,
 } from '@/utils/api-response';
 import { CustomError } from '@/utils/error-class';
-import { createPermissionSchema } from '@/utils/validation/permissions';
+import { adminCreatePermissionSchema } from '@/utils/validation/permissions';
 
 import { permissionMsg } from './messages';
 
-const PERMISSIONS_ALLOWED_COLUMNS = new Set([
-  'roleName',
-  'description',
-  'isActive',
-  'createdAt',
-  'updatedAt',
-]);
+// See USERS_FILTER_COLUMNS for why the scan-only operator is permitted here.
+const PERMISSIONS_FILTER_COLUMNS: FilterColumnSpecs = {
+  roleName: { type: 'text', allowScanOnly: true },
+  description: { type: 'text', allowScanOnly: true },
+  isActive: { type: 'boolean' },
+  createdAt: { type: 'date' },
+  updatedAt: { type: 'date' },
+};
 
 export const GET: Handler = async (ctx) => {
   try {
@@ -62,7 +64,7 @@ export const GET: Handler = async (ctx) => {
     const { where, orderBy, limit, offset, page, perPage, buildPageCount } =
       parseDataTableParams(roles, {
         url: ctx.url,
-        allowedColumns: PERMISSIONS_ALLOWED_COLUMNS,
+        filterableColumns: PERMISSIONS_FILTER_COLUMNS,
         searchableColumns: ['roleName', 'description'],
         defaultSort: { id: 'createdAt', desc: true },
       });
@@ -130,7 +132,8 @@ export const POST: Handler = async (ctx) => {
 
     const body = requireJsonBody(ctx.body);
 
-    const validatedDataParsed = createPermissionSchema.safeParse(body);
+    // Strict server contract: unknown keys are rejected rather than stripped.
+    const validatedDataParsed = adminCreatePermissionSchema.safeParse(body);
     if (!validatedDataParsed.success)
       throw new CustomError(
         validatedDataParsed.error.issues[0].message,
@@ -164,6 +167,11 @@ export const POST: Handler = async (ctx) => {
         })
         .returning({ id: roles.id });
 
+      const newPermissionsForAudit: Array<{
+        pageName: string;
+        permissions: unknown;
+      }> = [];
+
       if (validatedData.permissions && validatedData.permissions.length > 0) {
         const permissionsData = validatedData.permissions.map((p) => ({
           roleId: newRole.id,
@@ -171,6 +179,12 @@ export const POST: Handler = async (ctx) => {
           permissions: p.permissions as Record<PermissionAction, boolean>,
         }));
         await tx.insert(rolePermissions).values(permissionsData);
+        newPermissionsForAudit.push(
+          ...permissionsData.map((p) => ({
+            pageName: p.pageName as string,
+            permissions: p.permissions as unknown,
+          }))
+        );
       }
 
       await auditLog(tx, {
@@ -180,10 +194,17 @@ export const POST: Handler = async (ctx) => {
         tableName: 'roles',
         recordId: newRole.id,
         newData: {
+          auditVersion: PERMISSION_AUDIT_VERSION,
           roleName: validatedData.roleName,
           description: validatedData.description,
           isActive: validatedData.isActive,
-          permissions: validatedData.permissions,
+          // Same `{ pageName, permissions }` shape and `changedPermissions`
+          // summary the update and custom-role events use. The request payload
+          // keys pages as `name`, so it is mapped rather than stored verbatim.
+          ...(newPermissionsForAudit.length && {
+            permissions: newPermissionsForAudit,
+            changedPermissions: diffPermissionMatrices([], newPermissionsForAudit),
+          }),
         },
         meta: auditMeta,
       });
@@ -197,20 +218,13 @@ export const POST: Handler = async (ctx) => {
       status: HTTP_STATUS.CREATED,
     });
   } catch (error) {
-    if (isUniqueViolation(error)) {
-      return handleApiError(
-        new CustomError(
-          resolvePermissionUniqueViolation(error, {
-            nameExists: permissionMsg.nameExists,
-            duplicatePagePermission: permissionMsg.duplicatePagePermission,
-            fallback: MSG_CREATE_ERROR,
-          }),
-          HTTP_STATUS.CONFLICT
-        ),
-        undefined,
-        getErrorHeaders(error)
-      );
-    }
+    // Only a KNOWN constraint becomes a 409; an unrecognized one falls
+    // through to the 500 path so the schema/code mismatch is visible.
+    const conflict = handlePermissionUniqueViolation(error, {
+      nameExists: permissionMsg.nameExists,
+      duplicatePagePermission: permissionMsg.duplicatePagePermission,
+    });
+    if (conflict) return conflict;
     return handleApiError(error, MSG_CREATE_ERROR);
   }
 };

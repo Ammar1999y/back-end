@@ -16,7 +16,7 @@ import {
 import { db } from '@/db';
 import { rolePermissions, roles, sessions, users } from '@/db/schema';
 import { withTransaction } from '@/db/ws';
-import { isUniqueViolation, validID } from '@/utils';
+import { validID } from '@/utils';
 import { auditLog, getAuditMeta } from '@/lib/audit';
 import { requirePermission } from '@/lib/http/session';
 import { enforceRateLimit, userIdentifier } from '@/lib/rate-limit';
@@ -26,6 +26,9 @@ import {
   ROLE_SCOPE,
 } from '@/lib/permissions/constants';
 import {
+  diffPermissionMatrices,
+  PERMISSION_AUDIT_METADATA_FIELDS,
+  PERMISSION_AUDIT_VERSION,
   permissionsEqual,
   refreshRoleSessions,
   sanitizePermissions,
@@ -49,13 +52,12 @@ import {
 } from '@/utils/api-messages';
 import {
   apiSuccess,
-  getErrorHeaders,
   handleApiError,
   requireJsonBody,
-  resolvePermissionUniqueViolation,
+  handlePermissionUniqueViolation,
 } from '@/utils/api-response';
 import { CustomError } from '@/utils/error-class';
-import { updatePermissionSchema } from '@/utils/validation/permissions';
+import { adminUpdatePermissionSchema } from '@/utils/validation/permissions';
 import { idRequired } from '@/utils/validation/rules';
 
 import { permissionMsg } from '../messages';
@@ -141,7 +143,8 @@ export const PUT: Handler = async (ctx) => {
 
     const body = requireJsonBody(ctx.body);
 
-    const validatedDataParsed = updatePermissionSchema.safeParse({
+    // Strict server contract: unknown keys are rejected rather than stripped.
+    const validatedDataParsed = adminUpdatePermissionSchema.safeParse({
       ...body,
       id: ctx.params.id,
     });
@@ -175,7 +178,7 @@ export const PUT: Handler = async (ctx) => {
 
     const auditMeta = getAuditMeta(ctx);
 
-    await withTransaction(async (tx) => {
+    const updated = await withTransaction(async (tx) => {
       let permissionsChanged = false;
       const [existingRole] = await tx
         .select({
@@ -223,12 +226,16 @@ export const PUT: Handler = async (ctx) => {
           isActive: validatedData.isActive,
         })
         .where(standardRoleFilter(roleId))
-        .returning({ id: roles.id });
+        .returning({ id: roles.id, updatedAt: roles.updatedAt });
 
       if (!roleUpdated)
         throw new CustomError(MSG_NOT_FOUND, HTTP_STATUS.NOT_FOUND);
 
       let oldPermissionsForAudit: Array<{
+        pageName: string;
+        permissions: unknown;
+      }> = [];
+      let newPermissionsForAudit: Array<{
         pageName: string;
         permissions: unknown;
       }> = [];
@@ -264,6 +271,10 @@ export const PUT: Handler = async (ctx) => {
             pageName: p.pageName,
             permissions: p.permissions,
           }));
+          newPermissionsForAudit = permissionsData.map((p) => ({
+            pageName: p.pageName as string,
+            permissions: p.permissions as unknown,
+          }));
 
           // Per-row UPSERT against ux_role_permissions_role_page so unchanged
           // pages keep their created_at and we only rewrite what actually
@@ -295,7 +306,12 @@ export const PUT: Handler = async (ctx) => {
         action: 'UPDATE',
         tableName: 'roles',
         recordId: roleId,
+        // Permission matrices use the SAME `{ pageName, permissions }` shape on
+        // both sides, plus the same `changedPermissions` summary the custom-role
+        // audit emits — one forensic contract for both role types. The request
+        // payload uses `name`, so it is mapped rather than stored verbatim.
         oldData: {
+          auditVersion: PERMISSION_AUDIT_VERSION,
           roleName: existingRole.roleName,
           description: existingRole.description,
           isActive: existingRole.isActive,
@@ -304,11 +320,19 @@ export const PUT: Handler = async (ctx) => {
           }),
         },
         newData: {
+          auditVersion: PERMISSION_AUDIT_VERSION,
           roleName: validatedData.roleName,
           description: validatedData.description,
           isActive: validatedData.isActive,
-          ...(permissionsChanged && { permissions: validatedData.permissions }),
+          ...(permissionsChanged && {
+            permissions: newPermissionsForAudit,
+            changedPermissions: diffPermissionMatrices(
+              oldPermissionsForAudit,
+              newPermissionsForAudit
+            ),
+          }),
         },
+        metadataFields: PERMISSION_AUDIT_METADATA_FIELDS,
         meta: auditMeta,
       });
 
@@ -340,24 +364,21 @@ export const PUT: Handler = async (ctx) => {
           : undefined;
         await refreshRoleSessions(roleId, tx, precomputed);
       }
+
+      return { updatedAt: roleUpdated.updatedAt };
     });
 
-    return apiSuccess({ message: MSG_UPDATED });
+    // The client reads `updatedAt` off the response to refresh its cache;
+    // returning `data: null` made it throw and surface as a false 503.
+    return apiSuccess({ message: MSG_UPDATED, data: updated });
   } catch (error) {
-    if (isUniqueViolation(error)) {
-      return handleApiError(
-        new CustomError(
-          resolvePermissionUniqueViolation(error, {
-            nameExists: permissionMsg.nameExists,
-            duplicatePagePermission: permissionMsg.duplicatePagePermission,
-            fallback: MSG_UPDATE_ERROR,
-          }),
-          HTTP_STATUS.CONFLICT
-        ),
-        undefined,
-        getErrorHeaders(error)
-      );
-    }
+    // Only a KNOWN constraint becomes a 409; an unrecognized one falls
+    // through to the 500 path so the schema/code mismatch is visible.
+    const conflict = handlePermissionUniqueViolation(error, {
+      nameExists: permissionMsg.nameExists,
+      duplicatePagePermission: permissionMsg.duplicatePagePermission,
+    });
+    if (conflict) return conflict;
     return handleApiError(error, MSG_UPDATE_ERROR);
   }
 };
@@ -392,6 +413,7 @@ export const DELETE: Handler = async (ctx) => {
           id: roles.id,
           roleName: roles.roleName,
           description: roles.description,
+          isActive: roles.isActive,
           createdBy: roles.createdBy,
         })
         .from(roles)
@@ -464,11 +486,19 @@ export const DELETE: Handler = async (ctx) => {
         action: 'DELETE',
         tableName: 'roles',
         recordId: roleId,
+        // Same field set the UPDATE and custom-role events record, so a
+        // deleted role can be reconstructed from its own event: the snapshot
+        // used to omit isActive/scope/createdBy that every sibling kept.
         oldData: {
+          auditVersion: PERMISSION_AUDIT_VERSION,
+          scope: ROLE_SCOPE.STANDARD,
           roleName: existingRole.roleName,
           description: existingRole.description,
+          isActive: existingRole.isActive,
+          createdBy: existingRole.createdBy,
           permissions: existingPermissions,
         },
+        metadataFields: PERMISSION_AUDIT_METADATA_FIELDS,
         meta: auditMeta,
       });
     });

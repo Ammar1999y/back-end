@@ -10,6 +10,7 @@ import { and, eq, isNull, ne, notInArray, sql } from 'drizzle-orm';
 
 import { db } from '@/db';
 import { rolePermissions, roles, users } from '@/db/schema';
+import { auditLog } from '@/lib/audit';
 import { EntityID } from '@/types';
 import { v7 as uuidv7 } from 'uuid';
 
@@ -24,6 +25,7 @@ import {
   CUSTOM_ROLE_VALUE,
   DASHBOARD_PAGES,
   DEFAULT_PAGE_PERMISSIONS,
+  OWN_ACTION_MAP,
   PERMISSION_ACTIONS,
   ROLE_SCOPE,
 } from './constants';
@@ -76,9 +78,14 @@ export async function createCustomRole(
 
   if (existingRoleId) {
     roleId = existingRoleId;
-    // Lock the role row so concurrent writers serialize. FOR UPDATE does not
-    // block readers, so a DELETE+INSERT would briefly expose zero permissions
-    // to a concurrent session load — use per-row upsert + prune below instead.
+    // Lock the role row so concurrent writers serialize.
+    //
+    // The reason for upsert + prune below is NOT that readers could see an
+    // intermediate empty state — under MVCC no other transaction observes this
+    // one's uncommitted writes, so that earlier justification was wrong. It is
+    // kept because it preserves row identity and timestamps (a DELETE+INSERT
+    // resets `created_at` and breaks anything referencing the row), writes only
+    // what changed, and keeps the audit diff meaningful.
     await tx
       .select({ id: roles.id })
       .from(roles)
@@ -104,8 +111,8 @@ export async function createCustomRole(
   }));
 
   // Per-row UPSERT against ux_role_permissions_role_page: unchanged pages keep
-  // their row (and created_at), changed pages are rewritten in place — the role
-  // is never momentarily empty. For a brand-new role there are no conflicts.
+  // their row and its `created_at`, changed pages are rewritten in place. For a
+  // brand-new role there are no conflicts.
   await tx
     .insert(rolePermissions)
     .values(permsData)
@@ -115,7 +122,7 @@ export async function createCustomRole(
     });
 
   // Reusing an existing role: prune pages dropped from the new payload so the
-  // final set matches exactly, still without a zero-permission window.
+  // final set matches exactly.
   if (existingRoleId) {
     const newPageNames = permsData.map((p) => p.pageName);
     await tx
@@ -154,7 +161,9 @@ export async function validateAssignableRole(
  * Type guard to check if a string is a valid DashboardPage key
  */
 function isValidDashboardPage(page: string): page is DashboardPage {
-  return page in DASHBOARD_PAGES;
+  // `hasOwn`, not `in`: `in` admits `constructor`/`__proto__`, and
+  // `sanitized[pageName] =` below would then set the prototype, not a key.
+  return Object.hasOwn(DASHBOARD_PAGES, page);
 }
 
 const ALL_ACTIONS = Object.keys(PERMISSION_ACTIONS) as PermissionAction[];
@@ -238,6 +247,113 @@ export function permissionsEqual(
 }
 
 /**
+ * List the `page.action` pairs that differ between two permission sets, in the
+ * form `users.delete: false -> true`. Both sides are normalised to the full
+ * dashboard matrix first so ordering and missing pages can't fake a change.
+ */
+export function diffPermissionMatrices(
+  before: Array<{ pageName: string; permissions: unknown }>,
+  after: Array<{ pageName: string; permissions: unknown }>
+): string[] {
+  const from = normalizeFullPermissions(before);
+  const to = normalizeFullPermissions(after);
+  const changed: string[] = [];
+
+  for (const page of DEFAULT_PAGE_PERMISSIONS) {
+    for (const action of ALL_ACTIONS) {
+      const wasGranted = from[page.name]?.[action] === true;
+      const isGranted = to[page.name]?.[action] === true;
+      if (wasGranted !== isGranted)
+        changed.push(`${page.name}.${action}: ${wasGranted} -> ${isGranted}`);
+    }
+  }
+
+  return changed;
+}
+
+type PermissionAuditRows = Array<{ pageName: string; permissions: unknown }>;
+
+/**
+ * Version marker on every role/permission audit payload.
+ *
+ * Consumers need to know which contract a stored row follows: matrices are
+ * recorded as submitted (`{ pageName, permissions }`, listing only the pages
+ * involved) with `changedPermissions` carrying the normalised
+ * `page.action: before -> after` diff. Storing the full dashboard matrix on
+ * every row instead would be mostly zeros and would push large grants past the
+ * audit byte cap. Bump this if either side of that contract changes.
+ */
+export const PERMISSION_AUDIT_VERSION = 1;
+
+/**
+ * Keys in a role/permission audit payload that describe the event, not the
+ * role. They must not appear in `changedFields` — `forUserId` and
+ * `changedPermissions` exist only on the new side, so counting them reported a
+ * changed field on every event, including ones that changed nothing.
+ */
+export const PERMISSION_AUDIT_METADATA_FIELDS = [
+  'auditVersion',
+  'scope',
+  'forUserId',
+  'changedPermissions',
+] as const;
+
+/**
+ * Write the forensic record for a CUSTOM role's permission matrix.
+ *
+ * Custom roles are created/mutated as a side effect of a user create or
+ * update. The user audit row carries no matrix, and an in-place custom edit
+ * doesn't even change `role_id` — so without this event there is no way to
+ * reconstruct who granted a sensitive permission. Format mirrors the
+ * standard-role audit in the permissions endpoints so both role types share
+ * one contract.
+ */
+export async function auditCustomRolePermissions(
+  tx: WsTx,
+  params: {
+    actorUserId: EntityID;
+    actorEmail: string;
+    roleId: EntityID;
+    /** Absent for a freshly created custom role. */
+    oldPermissions?: PermissionAuditRows;
+    newPermissions: PermissionAuditRows;
+    /** The user the custom role belongs to — the reason it exists. */
+    targetUserId: EntityID;
+    meta: { ip: string | null; userAgent: string | null; apiPath: string };
+  }
+): Promise<void> {
+  const isCreate = params.oldPermissions === undefined;
+  const changedPermissions = diffPermissionMatrices(
+    params.oldPermissions ?? [],
+    params.newPermissions
+  );
+
+  await auditLog(tx, {
+    userId: params.actorUserId,
+    userEmail: params.actorEmail,
+    action: isCreate ? 'INSERT' : 'UPDATE',
+    tableName: 'roles',
+    recordId: params.roleId,
+    oldData: isCreate
+      ? null
+      : {
+          auditVersion: PERMISSION_AUDIT_VERSION,
+          scope: CUSTOM_ROLE_VALUE,
+          permissions: params.oldPermissions,
+        },
+    newData: {
+      auditVersion: PERMISSION_AUDIT_VERSION,
+      scope: CUSTOM_ROLE_VALUE,
+      forUserId: params.targetUserId,
+      permissions: params.newPermissions,
+      changedPermissions,
+    },
+    metadataFields: PERMISSION_AUDIT_METADATA_FIELDS,
+    meta: params.meta,
+  });
+}
+
+/**
  * Sanitize cached permissions from session metadata.
  * Converts the PermissionObject format to the array format expected by sanitizePermissions.
  */
@@ -290,6 +406,34 @@ export async function getUserPermissions({
  * Compares each `true` permission in `targetPermissions` against the acting user's own permissions.
  * Throws if any granted permission is not held by the acting user.
  */
+/**
+ * Own-scoped action → the all-scoped action that supersedes it.
+ *
+ * The inverse of `OWN_ACTION_MAP`, derived from it so the two can't drift.
+ */
+const SUPERSEDING_ACTION = Object.fromEntries(
+  Object.entries(OWN_ACTION_MAP).map(([all, own]) => [own, all])
+) as Record<string, PermissionAction | undefined>;
+
+/**
+ * Does the actor hold `action`, directly or through supersession?
+ *
+ * `PERMISSION_ACTIONS` states the rule the rest of the system follows: holding
+ * `view` makes `viewOwn` redundant, and likewise for edit/delete. An exact-match
+ * comparison contradicted it — an actor with `edit` on all records was refused
+ * when granting `editOwn`, a strict subset of what they already hold. That is a
+ * wrong denial, not a safe default: it blocks legitimate role assignment and
+ * hides sessions the actor is entitled to see.
+ */
+function actorHoldsAction(
+  actorPagePerms: Partial<Record<PermissionAction, boolean>> | undefined,
+  action: string
+): boolean {
+  if (actorPagePerms?.[action as PermissionAction] === true) return true;
+  const superseding = SUPERSEDING_ACTION[action];
+  return !!superseding && actorPagePerms?.[superseding] === true;
+}
+
 export function validatePermissionScope(
   actorPermissions: Partial<PermissionObject>,
   targetPermissions: Array<{
@@ -301,10 +445,7 @@ export function validatePermissionScope(
     const actorPagePerms = actorPermissions[target.name];
 
     for (const [action, granted] of Object.entries(target.permissions)) {
-      if (
-        granted === true &&
-        actorPagePerms?.[action as PermissionAction] !== true
-      )
+      if (granted === true && !actorHoldsAction(actorPagePerms, action))
         throw new CustomError(
           MSG_CANNOT_GRANT_UNOWNED_PERMISSIONS,
           HTTP_STATUS.FORBIDDEN

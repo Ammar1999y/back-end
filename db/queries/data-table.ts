@@ -1,3 +1,4 @@
+import type { FilterColumnSpecs } from '@/lib/data-table/column-specs';
 import type { ExtendedColumnSort } from '@/types/data-table';
 import type { AnyColumn, SQL, Table } from 'drizzle-orm';
 
@@ -7,17 +8,26 @@ import {
   escapeLike,
   filterColumns,
   getColumn,
+  MSG_INVALID_FILTER,
 } from '@/lib/data-table/filter-columns';
-import { MAX_PER_PAGE, parseSearchParams } from '@/lib/data-table/parsers';
+import {
+  MAX_PER_PAGE,
+  MAX_SEARCH_LENGTH,
+  MIN_SEARCH_LENGTH,
+  parseSearchParams,
+} from '@/lib/data-table/parsers';
 
-const MAX_SEARCH_LENGTH = 200;
-// pg_trgm's GIN index is only chosen when the input has ≥ 3 distinct trigrams;
-// shorter inputs would fall back to a full table scan, so treat them as empty.
-const MIN_SEARCH_LENGTH = 3;
+import { HTTP_STATUS } from '@/utils/api-messages';
+import { CustomError } from '@/utils/error-class';
 
 interface DataTableQueryParams {
+  /**
+   * Server-owned descriptors for every filterable/sortable column. Its keys
+   * ARE the allowlist — a column with no descriptor can be neither filtered
+   * nor sorted, and an unknown one is rejected rather than dropped.
+   */
   url: string;
-  allowedColumns: Set<string>;
+  filterableColumns: FilterColumnSpecs;
   /** Columns to match against for quick search (?search=) */
   searchableColumns?: string[];
   defaultSort?: ExtendedColumnSort<any>;
@@ -40,7 +50,12 @@ interface DataTableQueryResult<T extends Table> {
  */
 export function parseDataTableParams<T extends Table>(
   table: T,
-  { url, allowedColumns, searchableColumns, defaultSort }: DataTableQueryParams
+  {
+    url,
+    filterableColumns,
+    searchableColumns,
+    defaultSort,
+  }: DataTableQueryParams
 ): DataTableQueryResult<T> {
   const { searchParams } = new URL(url);
 
@@ -49,29 +64,45 @@ export function parseDataTableParams<T extends Table>(
     params[key] = value;
   }
 
-  const parsed = parseSearchParams(params, defaultSort);
+  // A filter the parser could not read is a client error, not a filter to
+  // ignore: dropping it silently broadens an `and` query and narrows an `or`
+  // one, so the caller gets rows they never asked for with a 200.
+  const parsed = parseSearchParams(params, defaultSort, () => {
+    throw new CustomError(MSG_INVALID_FILTER, HTTP_STATUS.UNPROCESSABLE);
+  });
 
   // Clamp perPage to MAX_PER_PAGE ceiling
   const safePerPage = Math.min(parsed.perPage, MAX_PER_PAGE);
 
   // --- Filters ---
-  const safeFilters = parsed.filters.filter((f) => allowedColumns.has(f.id));
-
+  // Validation lives in `filterColumns`: an unknown column, an operator the
+  // column's type can't support, or a sub-trigram search term is a 422, not a
+  // silently discarded predicate.
   const filterWhere =
-    safeFilters.length > 0
+    parsed.filters.length > 0
       ? filterColumns({
           table,
-          filters: safeFilters,
+          filters: parsed.filters,
           joinOperator: parsed.joinOperator,
+          specs: filterableColumns,
         })
       : undefined;
 
   // --- Quick search (mutually exclusive with filters on the client) ---
+  // An explicitly supplied term outside the accepted length is REJECTED, not
+  // ignored. The debounce that makes 1–2 characters a normal in-progress state
+  // lives on the client, which already omits the parameter below the trigram
+  // floor (`utils/query.ts`) — so a short term arriving here is not a user
+  // mid-keystroke, it is a request whose search this endpoint cannot honour.
+  // Answering it with unfiltered rows and a 200 is the same fail-open the filter
+  // path rejects.
   const rawSearch = searchParams.get('search')?.trim() ?? '';
-  const search =
-    rawSearch.length >= MIN_SEARCH_LENGTH && rawSearch.length <= MAX_SEARCH_LENGTH
-      ? rawSearch
-      : '';
+  if (
+    rawSearch.length > 0 &&
+    (rawSearch.length < MIN_SEARCH_LENGTH || rawSearch.length > MAX_SEARCH_LENGTH)
+  )
+    throw new CustomError(MSG_INVALID_FILTER, HTTP_STATUS.UNPROCESSABLE);
+  const search = rawSearch;
 
   let searchWhere: SQL | undefined;
   if (search && searchableColumns?.length) {
@@ -89,7 +120,13 @@ export function parseDataTableParams<T extends Table>(
   const where = and(filterWhere, searchWhere) || filterWhere || searchWhere;
 
   // --- Sorting ---
-  const safeSorts = parsed.sort.filter((s) => allowedColumns.has(s.id));
+  // Sorting stays lenient: an unknown sort key only changes row ORDER, never
+  // which rows are returned, so dropping it can't mislead the caller.
+  // `Object.hasOwn`, not `in` — `in` walks the prototype chain, so a sort id of
+  // `constructor` would be treated as allowlisted.
+  const safeSorts = parsed.sort.filter((s) =>
+    Object.hasOwn(filterableColumns, s.id)
+  );
 
   function applySorting(t: T) {
     const orderBy: ReturnType<typeof asc>[] = [];

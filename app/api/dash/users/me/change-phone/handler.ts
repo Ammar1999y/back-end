@@ -6,12 +6,15 @@ import { otpMsg } from '@/app/api/auth/otp/messages';
 import { db } from '@/db';
 import { users } from '@/db/schema';
 import { withTransaction } from '@/db/ws';
-import { isUniqueViolation } from '@/utils';
 import { getAuditMeta } from '@/lib/audit';
 import { LoginRejected, verifyLoginAttempt } from '@/lib/auth/login-guard';
 import { verifyTurnstileRequest } from '@/lib/captcha';
 import { requireSession } from '@/lib/http/session';
-import { enforceRateLimit, otpSendScope, userIdentifier } from '@/lib/rate-limit';
+import {
+  enforceOtpSendQuota,
+  enforceRateLimit,
+  userIdentifier,
+} from '@/lib/rate-limit';
 
 import {
   HTTP_STATUS,
@@ -22,10 +25,9 @@ import {
 } from '@/utils/api-messages';
 import {
   apiSuccess,
-  getErrorHeaders,
   handleApiError,
   requireJsonBody,
-  resolveUserUniqueViolation,
+  handleUserUniqueViolation,
 } from '@/utils/api-response';
 import { OTP_AUTO_VERIFY, PHONE_ENABLED } from '@/utils/config';
 import { CustomError } from '@/utils/error-class';
@@ -47,7 +49,7 @@ export const POST: Handler = async (ctx) => {
     if (!PHONE_ENABLED)
       throw new CustomError(MSG_PAGE_NOT_FOUND, HTTP_STATUS.NOT_FOUND);
 
-    const { userId } = await requireSession(ctx);
+    const { userId, sessionId } = await requireSession(ctx);
 
     await enforceRateLimit({
       scope: 'users.me.change-phone.post',
@@ -124,7 +126,13 @@ export const POST: Handler = async (ctx) => {
 
     if (OTP_AUTO_VERIFY) {
       await withTransaction((tx) =>
-        commitPhoneChange({ tx, userId, newPhoneNumber, auditMeta })
+        commitPhoneChange({
+          tx,
+          userId,
+          newPhoneNumber,
+          keepSessionId: sessionId,
+          auditMeta,
+        })
       );
 
       return apiSuccess({
@@ -133,14 +141,13 @@ export const POST: Handler = async (ctx) => {
       });
     }
 
-    // Per-destination cap (shared with the public OTP send budget) so the same
-    // number can't be targeted repeatedly across actors/endpoints.
-    await enforceRateLimit({
-      scope: otpSendScope(channel),
-      identifier: newPhoneNumber.toLowerCase(),
-      limit: 5,
-      window: 3600,
-      failClosed: true,
+    // Aggregate per-destination cap. `sms` and `whatsapp` collapse onto one
+    // phone budget, so switching transport no longer doubles the number of
+    // paid messages a single number can be sent.
+    await enforceOtpSendQuota({
+      channel,
+      destination: newPhoneNumber,
+      surface: 'contact_change',
     });
 
     await processOtpSend({
@@ -158,16 +165,10 @@ export const POST: Handler = async (ctx) => {
       data: { otpSent: true },
     });
   } catch (error) {
-    if (isUniqueViolation(error)) {
-      return handleApiError(
-        new CustomError(
-          resolveUserUniqueViolation(error),
-          HTTP_STATUS.CONFLICT
-        ),
-        undefined,
-        getErrorHeaders(error)
-      );
-    }
+    // Only a KNOWN constraint becomes a 409; an unrecognized one falls
+    // through to the 500 path so the schema/code mismatch is visible.
+    const conflict = handleUserUniqueViolation(error);
+    if (conflict) return conflict;
     return handleApiError(error, MSG_UPDATE_ERROR);
   }
 };

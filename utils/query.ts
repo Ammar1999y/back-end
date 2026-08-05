@@ -2,9 +2,17 @@ import type { PaginationMeta } from '@/utils/api-response';
 
 import { EntityID } from '@/types';
 import { keepPreviousData, useQuery } from '@tanstack/react-query';
+import { useRouter } from 'next/router';
 import { useShallow } from 'zustand/shallow';
 
-import { useDataTableStore } from '@/utils/store/data-table-store';
+import useIsomorphicLayoutEffect from '@/hooks/use-layout-effect';
+
+import { MIN_SEARCH_LENGTH } from '@/lib/data-table/parsers';
+
+import {
+  readUrlDataTableState,
+  useDataTableStore,
+} from '@/utils/store/data-table-store';
 
 import { CustomError } from './error-class';
 
@@ -97,7 +105,10 @@ function buildDataTableUrl(
     params.set('filters', JSON.stringify(state.filters));
   if (state.joinOperator !== 'and')
     params.set('joinOperator', state.joinOperator);
-  if (state.search) params.set('search', state.search);
+  // Below the trigram floor the server ignores the term, so sending it would
+  // put a filter in the URL that has no effect on the response.
+  if (state.search.length >= MIN_SEARCH_LENGTH)
+    params.set('search', state.search);
 
   const qs = params.toString();
   return qs ? `${baseHref}?${qs}` : baseHref;
@@ -115,17 +126,32 @@ export const useServerDataTable = <TData = unknown>({
   queryKey: (string | number | EntityID)[];
   href: string;
 }) => {
-  const { page, perPage, sort, filters, joinOperator, search } =
-    useDataTableStore(
-      useShallow((s) => ({
-        page: s.page,
-        perPage: s.perPage,
-        sort: s.sort,
-        filters: s.filters,
-        joinOperator: s.joinOperator,
-        search: s.search,
-      }))
-    );
+  const { pathname } = useRouter();
+  const stored = useDataTableStore(
+    useShallow((s) => ({
+      page: s.page,
+      perPage: s.perPage,
+      sort: s.sort,
+      filters: s.filters,
+      joinOperator: s.joinOperator,
+      search: s.search,
+      tableKey: s.tableKey,
+    }))
+  );
+
+  // The store is a module singleton: after a client-side navigation between two
+  // table pages it still holds the previous table's page/filters/search. Read
+  // this page's own URL until the reset below lands, so the first request is
+  // never the other table's filters — which the strict server column specs
+  // answer with a 422, or worse, silently apply on a shared column id.
+  const state =
+    stored.tableKey === pathname ? stored : readUrlDataTableState();
+
+  useIsomorphicLayoutEffect(() => {
+    useDataTableStore.getState().actions.initTable(pathname);
+  }, [pathname]);
+
+  const { page, perPage, sort, filters, joinOperator, search } = state;
 
   const fullUrl = buildDataTableUrl(href, {
     page,

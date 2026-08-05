@@ -1,3 +1,4 @@
+import type { FilterColumnSpecs } from '@/lib/data-table/column-specs';
 import type { Handler } from '@/lib/http/contract';
 
 import { and, count, eq, isNull } from 'drizzle-orm';
@@ -6,12 +7,7 @@ import { db } from '@/db';
 import { parseDataTableParams } from '@/db/queries/data-table';
 import { accounts, roles, users } from '@/db/schema';
 import { withTransaction } from '@/db/ws';
-import {
-  getConstraintName,
-  isForeignKeyViolation,
-  isUniqueViolation,
-  validID,
-} from '@/utils';
+import { validID } from '@/utils';
 import { auditLog, getAuditMeta } from '@/lib/audit';
 import { checkPasswordCompromise } from '@/lib/auth/check-password';
 import { hashPassword } from '@/lib/auth/password';
@@ -19,6 +15,7 @@ import { PHONE_ENABLED } from '@/utils/config';
 import { requirePermission } from '@/lib/http/session';
 import { CUSTOM_ROLE_VALUE } from '@/lib/permissions/constants';
 import {
+  auditCustomRolePermissions,
   createCustomRole,
   nonSystemRoleFilter,
   validateAssignableRole,
@@ -38,23 +35,29 @@ import {
 } from '@/utils/api-messages';
 import {
   apiSuccess,
-  getErrorHeaders,
   handleApiError,
+  handleUserForeignKeyViolation,
   requireJsonBody,
-  resolveUserUniqueViolation,
+  handleUserUniqueViolation,
 } from '@/utils/api-response';
 import { CustomError } from '@/utils/error-class';
 import { createUserSchema } from '@/utils/validation/auth';
+import { zodIssueMessage } from '@/utils/validation/rules';
 
 import { userMsg } from './messages';
 
-const USERS_ALLOWED_COLUMNS = new Set([
-  'name',
-  'email',
-  'isActive',
-  'createdAt',
-  'updatedAt',
-]);
+// Server-owned filter contract. Keys are the allowlist; the type decides
+// which operators and value shapes are accepted (see lib/data-table/column-specs).
+// `allowScanOnly` enables the "does not contain" operator the UI offers. It is
+// a guaranteed sequential scan, which is acceptable on a dashboard-sized users
+// table; turn it off here first if this table ever grows.
+const USERS_FILTER_COLUMNS: FilterColumnSpecs = {
+  name: { type: 'text', allowScanOnly: true },
+  email: { type: 'text', allowScanOnly: true },
+  isActive: { type: 'boolean' },
+  createdAt: { type: 'date' },
+  updatedAt: { type: 'date' },
+};
 
 export const GET: Handler = async (ctx) => {
   try {
@@ -72,7 +75,7 @@ export const GET: Handler = async (ctx) => {
     const { where, orderBy, limit, offset, page, perPage, buildPageCount } =
       parseDataTableParams(users, {
         url: ctx.url,
-        allowedColumns: USERS_ALLOWED_COLUMNS,
+        filterableColumns: USERS_FILTER_COLUMNS,
         searchableColumns: ['name', 'email'],
         defaultSort: { id: 'createdAt', desc: true },
       });
@@ -153,7 +156,7 @@ export const POST: Handler = async (ctx) => {
     const validatedDataParsed = createUserSchema.safeParse(body);
     if (!validatedDataParsed.success)
       throw new CustomError(
-        validatedDataParsed.error.issues[0].message,
+        zodIssueMessage(validatedDataParsed.error),
         HTTP_STATUS.UNPROCESSABLE
       );
 
@@ -185,15 +188,14 @@ export const POST: Handler = async (ctx) => {
           tx
         );
 
-      const assignedRoleId =
+      const customPermissions =
         isCustomRole && validatedData.permissions?.length
-          ? await createCustomRole(
-              tx,
-              validatedData.permissions,
-              null,
-              actorUserId
-            )
-          : validatedData.roleId;
+          ? validatedData.permissions
+          : null;
+
+      const assignedRoleId = customPermissions
+        ? await createCustomRole(tx, customPermissions, null, actorUserId)
+        : validatedData.roleId;
 
       const [newUser] = await tx
         .insert(users)
@@ -238,6 +240,21 @@ export const POST: Handler = async (ctx) => {
         meta: auditMeta,
       });
 
+      // The user event above records only the role id. Without this the
+      // permission matrix a custom role was born with is unrecoverable.
+      if (customPermissions)
+        await auditCustomRolePermissions(tx, {
+          actorUserId,
+          actorEmail: session.user.email,
+          roleId: validID(assignedRoleId),
+          newPermissions: customPermissions.map((p) => ({
+            pageName: p.name as string,
+            permissions: p.permissions as unknown,
+          })),
+          targetUserId: userId,
+          meta: auditMeta,
+        });
+
       return userId;
     });
 
@@ -247,26 +264,14 @@ export const POST: Handler = async (ctx) => {
       status: HTTP_STATUS.CREATED,
     });
   } catch (error) {
-    if (isUniqueViolation(error)) {
-      return handleApiError(
-        new CustomError(
-          resolveUserUniqueViolation(error),
-          HTTP_STATUS.CONFLICT
-        ),
-        undefined,
-        getErrorHeaders(error)
-      );
-    }
-    if (isForeignKeyViolation(error)) {
-      const constraint = getConstraintName(error);
-      if (constraint.includes('role_id')) {
-        return handleApiError(
-          new CustomError(userMsg.roleNotFound, HTTP_STATUS.BAD_REQUEST),
-          undefined,
-          getErrorHeaders(error)
-        );
-      }
-    }
+    // Only a KNOWN constraint becomes a 409; an unrecognized one falls
+    // through to the 500 path so the schema/code mismatch is visible.
+    const conflict = handleUserUniqueViolation(error);
+    if (conflict) return conflict;
+    const badRole = handleUserForeignKeyViolation(error, {
+      roleNotFound: userMsg.roleNotFound,
+    });
+    if (badRole) return badRole;
     return handleApiError(error, MSG_CREATE_ERROR);
   }
 };

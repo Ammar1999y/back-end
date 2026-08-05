@@ -55,11 +55,12 @@ export const columns: ColumnDef<User>[] = [
       variant: 'multiSelect',
       placeholder: 'اختر...',
     },
-    filterFn: (row, columnId, filterValue) =>
-      Array.isArray(filterValue) && filterValue.length > 0
-        ? filterValue.includes(row.getValue(columnId))
-        : row.getValue(columnId) === filterValue,
-    enableColumnFilter: true,
+    // Neither filterable NOR sortable on the server: `role` is not a column on
+    // `users`, it comes from the joined roles table. Both controls were always
+    // discarded server-side, so leaving either enabled just renders a widget
+    // that does nothing.
+    enableColumnFilter: false,
+    enableSorting: false,
     header: ({ column }) => (
       <DataTableColumnHeader column={column} title='الصلاحية' />
     ),

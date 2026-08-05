@@ -183,8 +183,8 @@ const nextConfig = {
       fullUrl: true,
     },
   },
-  experimental: {
-    scrollRestoration: false,
-  },
+  // experimental: {
+  //   scrollRestoration: false,
+  // },
 };
 module.exports = nextConfig;

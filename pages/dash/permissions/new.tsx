@@ -9,7 +9,7 @@ import { zodResolver } from '@hookform/resolvers/zod';
 import { useQueryClient } from '@tanstack/react-query';
 import { FormProvider, useForm } from 'react-hook-form';
 import { toast } from 'sonner';
-import { CUSTOM_ROLE_VALUE, ROLE_SCOPE } from '@/lib/permissions/constants';
+import { CUSTOM_ROLE_VALUE } from '@/lib/permissions/constants';
 import { cn } from '@/lib/utils';
 
 import { CustomError } from '@/utils/error-class';
@@ -64,41 +64,24 @@ const NewPermission = () => {
           method: 'POST',
           data: validatedData,
           onSuccess: (serverData) => {
-            const newPermission: Permission = {
-              ...validatedData,
-              scope: ROLE_SCOPE.STANDARD, // For local cache type only - API sets this on the server
-              id: serverData.id,
-              createdAt: serverData.createdAt || new Date().toISOString(),
-              usersCount: 0,
-            };
-
-            // Update permissions cache
-            const existingPermissions = queryClient.getQueryData<Permission[]>(
-              PERMISSIONS_QUERY_KEYS.list
-            );
-
-            queryClient.setQueryData(
-              PERMISSIONS_QUERY_KEYS.detail(serverData.id),
-              newPermission
-            );
-
-            if (existingPermissions) {
-              queryClient.setQueryData(PERMISSIONS_QUERY_KEYS.list, [
-                newPermission,
-                ...existingPermissions,
-              ]);
-            }
+            // The roles cache below is a plain array under its own key and is
+            // still patched. The permissions LIST is not: it is keyed by
+            // page/sort/filters/search with a `{ data, meta }` value, so
+            // prepending to `getQueryData(list)` never reached the table.
+            queryClient.invalidateQueries({
+              queryKey: PERMISSIONS_QUERY_KEYS.list,
+            });
 
             // Update roles cache if role is active
-            if (newPermission.isActive) {
+            if (validatedData.isActive) {
               const existingRoles = queryClient.getQueryData<RoleOption[]>(
                 ROLES_QUERY_KEYS.list
               );
 
               if (existingRoles) {
                 const newRole: RoleOption = {
-                  id: newPermission.id,
-                  roleName: newPermission.roleName,
+                  id: serverData.id,
+                  roleName: validatedData.roleName,
                 };
 
                 queryClient.setQueryData(ROLES_QUERY_KEYS.list, [

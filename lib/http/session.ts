@@ -6,6 +6,7 @@ import type {
 
 import { validID } from '@/utils';
 import { auth } from '@/lib/auth';
+import { assertLiveSession } from '@/lib/auth/live-session';
 import { checkUserPermission } from '@/lib/permissions/checker';
 
 import { HTTP_STATUS, MSG_LOGIN_REQUIRED } from '@/utils/api-messages';
@@ -38,15 +39,24 @@ export function requirePermission(
  * Loads the active Better Auth session from ctx.headers.
  * Throws 401 when no authenticated user is present.
  * Use this when you need the session but don't need a permission check.
+ *
+ * The session ROW is verified, not just the cookie. Every caller of this helper
+ * is a mutation — change-password and both contact-change flows — and the cookie
+ * cache stays valid for minutes after the row is deleted, so a session revoked by
+ * credential rotation could still finish a contact change it had started. See
+ * `assertLiveSession`.
  */
 export async function requireSession(ctx: HandlerInput) {
   const session = await auth.api.getSession({ headers: ctx.headers });
   const userId = validID(session?.user?.id);
   if (!session || !userId)
     throw new CustomError(MSG_LOGIN_REQUIRED, HTTP_STATUS.UNAUTHORIZED);
+
+  const sessionId = await assertLiveSession(session.session.id, userId);
+
   return {
     session,
     userId,
-    sessionId: validID(session.session.id),
+    sessionId,
   };
 }

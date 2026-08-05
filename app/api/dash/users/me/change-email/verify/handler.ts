@@ -2,7 +2,6 @@ import type { Handler } from '@/lib/http/contract';
 
 import { otpMsg } from '@/app/api/auth/otp/messages';
 import { withTransaction } from '@/db/ws';
-import { isUniqueViolation } from '@/utils';
 import { getAuditMeta } from '@/lib/audit';
 import { verifyTurnstileRequest } from '@/lib/captcha';
 import { requireSession } from '@/lib/http/session';
@@ -14,10 +13,9 @@ import {
 } from '@/utils/api-messages';
 import {
   apiSuccess,
-  getErrorHeaders,
   handleApiError,
   requireJsonBody,
-  resolveUserUniqueViolation,
+  handleUserUniqueViolation,
 } from '@/utils/api-response';
 import { OTP_AUTO_VERIFY } from '@/utils/config';
 import { CustomError } from '@/utils/error-class';
@@ -87,6 +85,7 @@ export const POST: Handler = async (ctx) => {
               userId,
               newEmail: matched.targetIdentifier ?? newEmail,
               keepSessionId: sessionId,
+              keepVerificationSessionId: matched.verificationSessionId,
               auditMeta,
             }),
         }));
@@ -97,16 +96,10 @@ export const POST: Handler = async (ctx) => {
       cookies: await refreshSessionCookies(ctx.headers),
     });
   } catch (error) {
-    if (isUniqueViolation(error)) {
-      return handleApiError(
-        new CustomError(
-          resolveUserUniqueViolation(error),
-          HTTP_STATUS.CONFLICT
-        ),
-        undefined,
-        getErrorHeaders(error)
-      );
-    }
+    // Only a KNOWN constraint becomes a 409; an unrecognized one falls
+    // through to the 500 path so the schema/code mismatch is visible.
+    const conflict = handleUserUniqueViolation(error);
+    if (conflict) return conflict;
     return handleApiError(error, MSG_UPDATE_ERROR);
   }
 };

@@ -56,7 +56,10 @@ export const columns: ColumnDef<Permission>[] = [
       variant: 'range',
       placeholder: 'بحث...',
     },
-    enableColumnFilter: true,
+    // Neither filterable NOR sortable on the server: it is a computed
+    // subquery, not a column on `roles`, so both were already discarded.
+    enableColumnFilter: false,
+    enableSorting: false,
     header: ({ column }) => (
       <DataTableColumnHeader column={column} title='عدد المستخدمين' />
     ),

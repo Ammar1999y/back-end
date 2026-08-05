@@ -1,3 +1,4 @@
+import type { FilterColumnSpec, FilterColumnSpecs } from './column-specs';
 import type { ExtendedColumnFilter, JoinOperator } from '@/types/data-table';
 import type { AnyColumn, SQL, Table } from 'drizzle-orm';
 
@@ -8,6 +9,8 @@ import {
   gte,
   ilike,
   inArray,
+  isNotNull,
+  isNull,
   lt,
   lte,
   ne,
@@ -19,11 +22,51 @@ import {
 
 import { isEmpty } from '@/db/queries';
 
-import { safeDate } from '@/utils/time';
+import { HTTP_STATUS } from '@/utils/api-messages';
+import { CustomError } from '@/utils/error-class';
+import { toCalendarDate, zonedDayStart, zonedNextDayStart } from '@/utils/time';
+
+import {
+  isArrayValueOperator,
+  isNoValueOperator,
+  isScanOnlyOperator,
+  isSearchOperator,
+  operatorAllowedForType,
+} from './column-specs';
+
+/** Same trigram floor quick search uses; defined with the shared parsers. */
+export { MIN_SEARCH_LENGTH } from './parsers';
+import { MIN_SEARCH_LENGTH } from './parsers';
+
+export const MSG_INVALID_FILTER =
+  'أحد عوامل التصفية غير صالح، أعد ضبط التصفية';
+const MSG_SHORT_SEARCH = `نص البحث في التصفية يجب أن يكون ${MIN_SEARCH_LENGTH} أحرف على الأقل`;
+
+/**
+ * Reject instead of silently dropping. A dropped filter does not merely
+ * "ignore" the client's request — under `and` it broadens the result set and
+ * under `or` it narrows it, so the caller is shown data they did not ask for
+ * while receiving a 200.
+ */
+function invalidFilter(message = MSG_INVALID_FILTER): never {
+  throw new CustomError(message, HTTP_STATUS.UNPROCESSABLE);
+}
+
+/** Types whose column can actually hold an empty string. */
+function isStringLike(type: FilterColumnSpec['type']): boolean {
+  return type === 'text' || type === 'select' || type === 'multiSelect';
+}
 
 function safeNumber(value: unknown): number | null {
   const num = Number(value);
   return Number.isFinite(num) ? num : null;
+}
+
+function parseBoolean(value: unknown): boolean | null {
+  if (typeof value === 'boolean') return value;
+  if (value === 'true') return true;
+  if (value === 'false') return false;
+  return null;
 }
 
 /** Escape SQL LIKE/ILIKE wildcards to prevent wildcard injection */
@@ -31,228 +74,230 @@ export function escapeLike(value: string): string {
   return value.replace(/[%_\\]/g, '\\$&');
 }
 
+/** Half-open UTC bounds for one calendar day in the business timezone. */
+function dayBounds(raw: unknown): { start: Date; next: Date } {
+  const calendarDate = toCalendarDate(raw);
+  if (!calendarDate) invalidFilter();
+  const start = zonedDayStart(calendarDate);
+  const next = zonedNextDayStart(calendarDate);
+  if (!start || !next) invalidFilter();
+  return { start, next };
+}
+
+/**
+ * Validate one filter against its column descriptor. Runs before any SQL is
+ * built so an impossible combination becomes a 422, never a PostgreSQL cast
+ * error surfacing as a 500.
+ */
+function assertFilterAllowed(
+  filter: ExtendedColumnFilter<Table>,
+  spec: FilterColumnSpec
+): 'apply' | 'skip' {
+  if (!operatorAllowedForType(spec.type, filter.operator)) invalidFilter();
+
+  if (isNoValueOperator(filter.operator)) return 'apply';
+
+  const valueIsArray = Array.isArray(filter.value);
+  if (isArrayValueOperator(filter.operator) !== valueIsArray) invalidFilter();
+
+  // `isBetween` is a fixed [lower, upper] pair. A third slot used to be read as
+  // far as index 1 and the rest ignored, so `['1','2','3']` answered a question
+  // nobody asked with a 200 instead of reporting the malformed range.
+  if (
+    filter.operator === 'isBetween' &&
+    (filter.value as string[]).length !== 2
+  )
+    invalidFilter();
+
+  // No value chosen yet — not an invalid filter, an unexpressed one. The
+  // parse layer already drops empty scalars for the same reason; treating the
+  // array case differently would 422 the whole list on a half-filled chip.
+  // Checked on content, not length: positional slots mean a cleared range
+  // arrives as ['', ''] rather than [].
+  if (valueIsArray && !(filter.value as string[]).some(Boolean)) return 'skip';
+
+  if (isScanOnlyOperator(filter.operator) && !spec.allowScanOnly)
+    invalidFilter();
+
+  if (isSearchOperator(filter.operator)) {
+    if (typeof filter.value !== 'string') invalidFilter();
+    const min = spec.minSearchLength ?? MIN_SEARCH_LENGTH;
+    if (filter.value.length < min) invalidFilter(MSG_SHORT_SEARCH);
+  }
+
+  return 'apply';
+}
+
+function buildCondition(
+  column: AnyColumn,
+  filter: ExtendedColumnFilter<Table>,
+  spec: FilterColumnSpec
+): SQL | undefined {
+  const value = filter.value;
+
+  switch (filter.operator) {
+    case 'iLike':
+      return ilike(column, `%${escapeLike(value as string)}%`);
+    case 'notILike':
+      return notIlike(column, `%${escapeLike(value as string)}%`);
+    case 'startsWith':
+      return ilike(column, `${escapeLike(value as string)}%`);
+    case 'endsWith':
+      return ilike(column, `%${escapeLike(value as string)}`);
+
+    case 'eq':
+    case 'ne': {
+      const negated = filter.operator === 'ne';
+
+      if (spec.type === 'boolean') {
+        const bool = parseBoolean(value);
+        if (bool === null) invalidFilter();
+        return negated ? ne(column, bool) : eq(column, bool);
+      }
+      if (spec.type === 'date') {
+        const { start, next } = dayBounds(value);
+        return negated
+          ? or(lt(column, start), gte(column, next))
+          : and(gte(column, start), lt(column, next));
+      }
+      if (spec.type === 'number') {
+        const num = safeNumber(value);
+        if (num === null) invalidFilter();
+        return negated ? ne(column, num) : eq(column, num);
+      }
+      return negated ? ne(column, value) : eq(column, value);
+    }
+
+    case 'inArray':
+    case 'notInArray': {
+      const negated = filter.operator === 'notInArray';
+      // Set semantics: empty positional slots carry no meaning here.
+      const values = (value as string[]).filter(Boolean);
+      if (values.length === 0) invalidFilter();
+
+      if (spec.type === 'boolean') {
+        const bools = values.map(parseBoolean);
+        if (bools.includes(null)) invalidFilter();
+        return negated
+          ? notInArray(column, bools as boolean[])
+          : inArray(column, bools as boolean[]);
+      }
+      if (spec.type === 'number') {
+        const nums = values.map(safeNumber);
+        if (nums.includes(null)) invalidFilter();
+        return negated
+          ? notInArray(column, nums as number[])
+          : inArray(column, nums as number[]);
+      }
+      return negated ? notInArray(column, values) : inArray(column, values);
+    }
+
+    // Comparison operators. For dates the labels are calendar-relative:
+    // "before X" excludes X's day, "on or before X" includes all of it.
+    case 'lt':
+      if (spec.type === 'date') return lt(column, dayBounds(value).start);
+      return compareNumber(column, value, lt);
+    case 'lte':
+      if (spec.type === 'date') return lt(column, dayBounds(value).next);
+      return compareNumber(column, value, lte);
+    case 'gt':
+      if (spec.type === 'date') return gte(column, dayBounds(value).next);
+      return compareNumber(column, value, gt);
+    case 'gte':
+      if (spec.type === 'date') return gte(column, dayBounds(value).start);
+      return compareNumber(column, value, gte);
+
+    case 'isBetween': {
+      const [rawStart, rawEnd] = value as string[];
+
+      if (spec.type === 'date') {
+        const from = rawStart ? dayBounds(rawStart).start : null;
+        const to = rawEnd ? dayBounds(rawEnd).next : null;
+        if (!from && !to) invalidFilter();
+        return and(
+          from ? gte(column, from) : undefined,
+          to ? lt(column, to) : undefined
+        );
+      }
+
+      const from = rawStart?.trim() ? safeNumber(rawStart) : null;
+      const to = rawEnd?.trim() ? safeNumber(rawEnd) : null;
+      if (from === null && to === null) invalidFilter();
+      return and(
+        from !== null ? gte(column, from) : undefined,
+        to !== null ? lte(column, to) : undefined
+      );
+    }
+
+    // `isEmpty` compares against '' and casts to text, which PostgreSQL
+    // rejects outright on boolean/timestamp/numeric columns ("invalid input
+    // syntax for type boolean: \"\"") — a 500, not a filter. For those types
+    // the only meaningful emptiness is NULL.
+    case 'isEmpty':
+      return isStringLike(spec.type) ? isEmpty(column) : isNull(column);
+    case 'isNotEmpty':
+      return isStringLike(spec.type) ? not(isEmpty(column)) : isNotNull(column);
+
+    default:
+      return invalidFilter();
+  }
+}
+
+function compareNumber(
+  column: AnyColumn,
+  value: unknown,
+  op: typeof lt | typeof lte | typeof gt | typeof gte
+): SQL {
+  const num = safeNumber(value);
+  if (num === null) invalidFilter();
+  return op(column, num);
+}
+
 export function filterColumns<T extends Table>({
   table,
   filters,
   joinOperator,
+  specs,
 }: {
   table: T;
   filters: ExtendedColumnFilter<T>[];
   joinOperator: JoinOperator;
+  /** Server-owned descriptors; a column without one is not filterable. */
+  specs: FilterColumnSpecs;
 }): SQL | undefined {
   const joinFn = joinOperator === 'and' ? and : or;
 
-  const conditions = filters.map((filter) => {
+  const conditions: SQL[] = [];
+  for (const filter of filters) {
+    // `Object.hasOwn`, not `specs[id]`: the column id is attacker-controlled,
+    // and a plain object resolves inherited members. `constructor`,
+    // `toString`, `hasOwnProperty` and `__proto__` all return a truthy value,
+    // slip past the unknown-column check, and then blow up further down as a
+    // 500 — the exact defect this validator exists to remove.
+    const spec = Object.hasOwn(specs, filter.id) ? specs[filter.id] : undefined;
+    if (!spec) invalidFilter();
+
     const column = safeGetColumn(table, filter.id);
-    if (!column) return undefined;
+    // A descriptor without a matching column is a server-side mismatch, not
+    // something the client did — surface it as 500, not 422.
+    if (!column)
+      throw new Error(`Filterable column "${filter.id}" is not on the table`);
 
-    switch (filter.operator) {
-      case 'iLike':
-        return filter.variant === 'text' && typeof filter.value === 'string'
-          ? ilike(column, `%${escapeLike(filter.value)}%`)
-          : undefined;
-      case 'endsWith':
-        return filter.variant === 'text' && typeof filter.value === 'string'
-          ? ilike(column, `%${escapeLike(filter.value)}`)
-          : undefined;
-      case 'startsWith':
-        return filter.variant === 'text' && typeof filter.value === 'string'
-          ? ilike(column, `${escapeLike(filter.value)}%`)
-          : undefined;
-      case 'notILike':
-        return filter.variant === 'text' && typeof filter.value === 'string'
-          ? notIlike(column, `%${escapeLike(filter.value)}%`)
-          : undefined;
+    const decision = assertFilterAllowed(
+      filter as ExtendedColumnFilter<Table>,
+      spec
+    );
+    if (decision === 'skip') continue;
 
-      case 'eq':
-        if (column.dataType === 'boolean' && typeof filter.value === 'string') {
-          return eq(column, filter.value === 'true');
-        }
-        if (filter.variant === 'date') {
-          const date = safeDate(Number(filter.value));
-          if (!date) return undefined;
-          date.setHours(0, 0, 0, 0);
-          const end = new Date(date);
-          end.setHours(23, 59, 59, 999);
-          return and(gte(column, date), lte(column, end));
-        }
-        if (column.dataType === 'number' || column.dataType === 'bigint') {
-          const num = safeNumber(filter.value);
-          if (num === null) return undefined;
-          return eq(column, num);
-        }
-        return eq(column, filter.value);
+    const condition = buildCondition(
+      column,
+      filter as ExtendedColumnFilter<Table>,
+      spec
+    );
+    if (condition) conditions.push(condition);
+  }
 
-      case 'ne':
-        if (column.dataType === 'boolean' && typeof filter.value === 'string') {
-          return ne(column, filter.value === 'true');
-        }
-        if (filter.variant === 'date') {
-          const date = safeDate(Number(filter.value));
-          if (!date) return undefined;
-          date.setHours(0, 0, 0, 0);
-          const end = new Date(date);
-          end.setHours(23, 59, 59, 999);
-          return or(lt(column, date), gt(column, end));
-        }
-        if (column.dataType === 'number' || column.dataType === 'bigint') {
-          const num = safeNumber(filter.value);
-          if (num === null) return undefined;
-          return ne(column, num);
-        }
-        return ne(column, filter.value);
-
-      case 'inArray':
-        if (Array.isArray(filter.value)) {
-          if (column.dataType === 'number' || column.dataType === 'bigint') {
-            const nums = filter.value
-              .map(safeNumber)
-              .filter((n): n is number => n !== null);
-            return nums.length > 0 ? inArray(column, nums) : undefined;
-          }
-          return inArray(column, filter.value);
-        }
-        return undefined;
-
-      case 'notInArray':
-        if (Array.isArray(filter.value)) {
-          if (column.dataType === 'number' || column.dataType === 'bigint') {
-            const nums = filter.value
-              .map(safeNumber)
-              .filter((n): n is number => n !== null);
-            return nums.length > 0 ? notInArray(column, nums) : undefined;
-          }
-          return notInArray(column, filter.value);
-        }
-        return undefined;
-
-      case 'lt': {
-        if (filter.variant === 'number' || filter.variant === 'range') {
-          const num = safeNumber(filter.value);
-          return num !== null ? lt(column, num) : undefined;
-        }
-        if (filter.variant === 'date' && typeof filter.value === 'string') {
-          const date = safeDate(Number(filter.value));
-          if (!date) return undefined;
-          date.setHours(23, 59, 59, 999);
-          return lt(column, date);
-        }
-        return undefined;
-      }
-
-      case 'lte': {
-        if (filter.variant === 'number' || filter.variant === 'range') {
-          const num = safeNumber(filter.value);
-          return num !== null ? lte(column, num) : undefined;
-        }
-        if (filter.variant === 'date' && typeof filter.value === 'string') {
-          const date = safeDate(Number(filter.value));
-          if (!date) return undefined;
-          date.setHours(23, 59, 59, 999);
-          return lte(column, date);
-        }
-        return undefined;
-      }
-
-      case 'gt': {
-        if (filter.variant === 'number' || filter.variant === 'range') {
-          const num = safeNumber(filter.value);
-          return num !== null ? gt(column, num) : undefined;
-        }
-        if (filter.variant === 'date' && typeof filter.value === 'string') {
-          const date = safeDate(Number(filter.value));
-          if (!date) return undefined;
-          date.setHours(0, 0, 0, 0);
-          return gt(column, date);
-        }
-        return undefined;
-      }
-
-      case 'gte': {
-        if (filter.variant === 'number' || filter.variant === 'range') {
-          const num = safeNumber(filter.value);
-          return num !== null ? gte(column, num) : undefined;
-        }
-        if (filter.variant === 'date' && typeof filter.value === 'string') {
-          const date = safeDate(Number(filter.value));
-          if (!date) return undefined;
-          date.setHours(0, 0, 0, 0);
-          return gte(column, date);
-        }
-        return undefined;
-      }
-
-      case 'isBetween':
-        if (
-          filter.variant === 'date' &&
-          Array.isArray(filter.value) &&
-          filter.value.length === 2
-        ) {
-          const start = filter.value[0]
-            ? safeDate(Number(filter.value[0]))
-            : null;
-          const end = filter.value[1]
-            ? safeDate(Number(filter.value[1]))
-            : null;
-
-          if (start) start.setHours(0, 0, 0, 0);
-          if (end) end.setHours(23, 59, 59, 999);
-
-          return and(
-            start ? gte(column, start) : undefined,
-            end ? lte(column, end) : undefined
-          );
-        }
-
-        if (
-          (filter.variant === 'number' || filter.variant === 'range') &&
-          Array.isArray(filter.value) &&
-          filter.value.length === 2
-        ) {
-          const firstValue =
-            filter.value[0] && filter.value[0].trim() !== ''
-              ? Number(filter.value[0])
-              : null;
-          const secondValue =
-            filter.value[1] && filter.value[1].trim() !== ''
-              ? Number(filter.value[1])
-              : null;
-
-          if (firstValue === null && secondValue === null) {
-            return undefined;
-          }
-
-          if (firstValue !== null && secondValue === null) {
-            return eq(column, firstValue);
-          }
-
-          if (firstValue === null && secondValue !== null) {
-            return eq(column, secondValue);
-          }
-
-          return and(
-            firstValue !== null ? gte(column, firstValue) : undefined,
-            secondValue !== null ? lte(column, secondValue) : undefined
-          );
-        }
-        return undefined;
-
-      case 'isEmpty':
-        return isEmpty(column);
-
-      case 'isNotEmpty':
-        return not(isEmpty(column));
-
-      default:
-        return undefined;
-    }
-  });
-
-  const validConditions = conditions.filter(
-    (condition) => condition !== undefined
-  );
-
-  return validConditions.length > 0 ? joinFn(...validConditions) : undefined;
+  return conditions.length > 0 ? joinFn(...conditions) : undefined;
 }
 
 export function getColumn<T extends Table>(
@@ -267,6 +312,8 @@ function safeGetColumn<T extends Table>(
   table: T,
   columnKey: string
 ): AnyColumn | null {
+  // Client-supplied key: a plain lookup resolves inherited members.
+  if (!Object.hasOwn(table, columnKey)) return null;
   const col = table[columnKey as keyof T];
   if (!col || typeof col !== 'object' || !('dataType' in col)) return null;
   return col as unknown as AnyColumn;

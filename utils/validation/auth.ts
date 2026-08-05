@@ -47,13 +47,21 @@ const userRoleSchema = z.object({
 });
 
 /**
- * Enforce PHONE_NUMBER_MODE at the app boundary:
- * - disabled: a phone must not be supplied.
- * - required: a phone must be supplied.
+ * Enforce PHONE_NUMBER_MODE at the app boundary, for all three modes:
+ *
+ * - `disabled`: a non-empty phone is rejected. An explicit `null`/`''` is
+ *   accepted and ignored — the field is inert, not forbidden, so a client that
+ *   always sends the key still works.
+ * - `optional`: anything valid, including none.
+ * - `required`: a phone must be supplied on create. On UPDATE an omitted key
+ *   means "keep the current number" (`allowAbsent`), so requiring it there
+ *   rejected every partial update — the one mode combination that contradicted
+ *   the documented update semantics.
  */
 function validatePhoneByMode(
   data: { phoneNumber?: string | null },
-  ctx: z.RefinementCtx
+  ctx: z.RefinementCtx,
+  { allowAbsent = false }: { allowAbsent?: boolean } = {}
 ) {
   if (!PHONE_ENABLED && data.phoneNumber) {
     ctx.addIssue({
@@ -62,7 +70,10 @@ function validatePhoneByMode(
       path: ['phoneNumber'],
     });
   }
-  if (PHONE_REQUIRED && !data.phoneNumber) {
+  // `undefined` only when the key was absent: optionalPhoneSchema maps '' to
+  // null, so an empty submitted value is still "supplied, and cleared".
+  const absent = data.phoneNumber === undefined;
+  if (PHONE_REQUIRED && !data.phoneNumber && !(allowAbsent && absent)) {
     ctx.addIssue({
       code: z.ZodIssueCode.custom,
       message: 'رقم الهاتف مطلوب',
@@ -76,9 +87,27 @@ function validateCustomRolePermissions(
     roleId: EntityID | typeof CUSTOM_ROLE_VALUE;
     permissions?: unknown[];
   },
-  ctx: z.RefinementCtx
+  ctx: z.RefinementCtx,
+  /**
+   * Updates may OMIT `permissions` to mean "keep the current matrix". The
+   * client only sends it when it actually changed, so requiring it here made
+   * renaming a custom-role user fail with a 422. Creates still require it —
+   * there is no existing matrix to keep.
+   */
+  { permissionsOptional = false }: { permissionsOptional?: boolean } = {}
 ) {
-  if (data.roleId === CUSTOM_ROLE_VALUE && !data.permissions?.length) {
+  // Omitted and empty are different requests. `undefined` alone means "keep";
+  // an explicitly supplied `[]` claims to clear the matrix, and the handler
+  // reads presence off `.length` — so it silently selected "keep" too and
+  // returned 200 for a change that never happened. A custom role with no
+  // permissions is not a product state, so it is rejected in both variants.
+  const suppliedEmpty =
+    Array.isArray(data.permissions) && data.permissions.length === 0;
+  const missing = permissionsOptional
+    ? suppliedEmpty
+    : !data.permissions?.length;
+
+  if (missing && data.roleId === CUSTOM_ROLE_VALUE) {
     ctx.addIssue({
       code: z.ZodIssueCode.custom,
       message: 'يجب تحديد صلاحيات للدور المخصص',
@@ -95,28 +124,62 @@ function validateCustomRolePermissions(
   }
 }
 
-export const createUserSchema = userRoleSchema.superRefine((data, ctx) => {
+type UserPayloadShape = {
+  roleId: EntityID | typeof CUSTOM_ROLE_VALUE;
+  permissions?: unknown[];
+  phoneNumber?: string | null;
+};
+
+function refineUserPayload(data: UserPayloadShape, ctx: z.RefinementCtx) {
   validateCustomRolePermissions(data, ctx);
   validatePhoneByMode(data, ctx);
+}
+
+/** Update variant: an omitted permission matrix or phone means "unchanged". */
+function refineUserUpdatePayload(data: UserPayloadShape, ctx: z.RefinementCtx) {
+  validateCustomRolePermissions(data, ctx, { permissionsOptional: true });
+  validatePhoneByMode(data, ctx, { allowAbsent: true });
+}
+
+/**
+ * Create stays LENIENT on purpose. Unknown keys are stripped, which is the
+ * documented and tested mass-assignment contract for this endpoint: a client
+ * may post server-owned fields (`createdBy`, …) and they must be dropped, not
+ * rejected. Every field the create handler writes is read from the parsed
+ * output, so stripping is safe here — and unlike the update path there is no
+ * "looks like it worked but didn't" failure mode, since every mutable field
+ * except `phoneNumber` is required.
+ */
+export const createUserSchema = userRoleSchema.superRefine(refineUserPayload);
+
+const updateUserObject = userRoleSchema.omit({ password: true }).extend({
+  id: idSchema,
+  isActive: z.boolean(),
+  password: z
+    .preprocess(
+      (e) => (typeof e === 'string' && e.trim().length ? e : null),
+      passwordSchema.optional().nullish()
+    )
+    .optional()
+    .nullish(),
 });
 
-export const updateUserSchema = userRoleSchema
-  .omit({ password: true })
-  .extend({
-    id: idSchema,
-    isActive: z.boolean(),
-    password: z
-      .preprocess(
-        (e) => (typeof e === 'string' && e.trim().length ? e : null),
-        passwordSchema.optional().nullish()
-      )
-      .optional()
-      .nullish(),
-  })
-  .superRefine((data, ctx) => {
-    validateCustomRolePermissions(data, ctx);
-    validatePhoneByMode(data, ctx);
-  });
+export const updateUserSchema =
+  updateUserObject.superRefine(refineUserUpdatePayload);
+
+/**
+ * Server-side admin update contract.
+ *
+ * `phoneNumber` is genuinely optional here — omitted (`undefined`) means "keep
+ * the current number" and an explicit `null`/`''` means "clear it". The
+ * handler derives presence from the PARSED value; reading it off the raw body
+ * let a stripped typo look like "not supplied" and return 200 without
+ * performing the update.
+ */
+export const adminUpdateUserSchema = updateUserObject
+  .extend({ phoneNumber: optionalPhoneSchema.optional() })
+  .strict()
+  .superRefine(refineUserUpdatePayload);
 
 // Reject unknown keys with .strict() so a client sending email/roleId/password/
 // isActive gets a 4xx instead of a misleading 200 with the fields silently stripped.

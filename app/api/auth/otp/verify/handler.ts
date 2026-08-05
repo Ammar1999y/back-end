@@ -4,7 +4,11 @@ import { db } from '@/db';
 import { users } from '@/db/schema';
 import { getAuditMeta } from '@/lib/audit';
 import { verifyTurnstileRequest } from '@/lib/captcha';
-import { enforceRateLimit, ipIdentifier, otpVerifyScope } from '@/lib/rate-limit';
+import {
+  enforceOtpVerifyQuota,
+  enforceRateLimit,
+  ipIdentifier,
+} from '@/lib/rate-limit';
 import { sanitizeForLog } from '@/utils';
 
 import type { Handler } from '@/lib/http/contract';
@@ -58,13 +62,7 @@ export const POST: Handler = async (ctx) => {
     const identifier =
       channel === 'email' ? parsed.data.email : parsed.data.phoneNumber;
 
-    await enforceRateLimit({
-      scope: otpVerifyScope(channel),
-      identifier: identifier.toLowerCase(),
-      limit: 10,
-      window: 600,
-      failClosed: true,
-    });
+    await enforceOtpVerifyQuota({ channel, identifier });
 
     const whereClause =
       channel === 'email'

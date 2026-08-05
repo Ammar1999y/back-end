@@ -7,6 +7,7 @@ import type {
 } from '@tanstack/react-table';
 import type { RefObject } from 'react';
 
+import { useRouter } from 'next/router';
 import { useEffect, useMemo } from 'react';
 
 import {
@@ -70,6 +71,7 @@ export function useDataTable<TData>(props: UseDataTableProps<TData>) {
     ...tableProps
   } = props;
 
+  const { pathname } = useRouter();
   const columnVisibility = useColumnVisibility((s) => s.columnVisibility);
   const columnPinning = useColumnPinning((s) => s.columnPinning);
   const columnOrder = useColumnOrder((s) => s.columnOrder);
@@ -94,6 +96,14 @@ export function useDataTable<TData>(props: UseDataTableProps<TData>) {
       sort: s.sort,
     }))
   );
+
+  // Same singleton, same leak: a client-side table would otherwise open on the
+  // page number and sort of whichever table was visited before it. Keyed by
+  // route, identical to the key `useServerDataTable` passes, so the two calls
+  // are idempotent rather than resetting each other.
+  useIsomorphicLayoutEffect(() => {
+    useDataTableStore.getState().actions.initTable(pathname);
+  }, [pathname]);
 
   useEffect(() => {
     setTimeout(() => {

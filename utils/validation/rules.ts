@@ -43,6 +43,19 @@ export const safeStringRegex =
 export const idRequired =
   'رقم المعرف غير صحيح، اعد تحميل الصفحة ثم حاول مرة اخرى';
 
+/**
+ * First-issue message for a failed `safeParse`, with a localized message for
+ * `.strict()` rejections. Zod's built-in unknown-key message is English and
+ * would be the only non-Arabic string a client ever sees; naming the offending
+ * keys is also what turns a silently-stripped typo into an actionable 422.
+ */
+export function zodIssueMessage(error: z.ZodError): string {
+  const issue = error.issues[0];
+  if (issue?.code === 'unrecognized_keys')
+    return `حقول غير معروفة في الطلب: ${issue.keys.join('، ')}`;
+  return issue?.message ?? 'قم بالتحقق من البيانات المدخله';
+}
+
 export function getIDSchema(
   props: {
     optional?: boolean;
@@ -143,20 +156,35 @@ export const emailSchema = z.preprocess(
     )
 );
 
-export const passwordSchema = z
-  .string('كلمة المرور مطلوبة')
-  .min(PASSWORD_MIN, `كلمة المرور يجب أن تكون ${PASSWORD_MIN} أحرف على الأقل`)
-  .max(PASSWORD_MAX, `كلمة المرور يجب أن لا تتجاوز ${PASSWORD_MAX} حرفاً`)
-  .refine(
-    (val) =>
-      /[a-z]/.test(val) &&
-      /[A-Z]/.test(val) &&
-      /[0-9]/.test(val) &&
-      /[^a-zA-Z0-9]/.test(val),
-    {
-      error: 'تحقق من صحة كلمة المرور',
-    }
-  );
+/**
+ * Canonical password form. `hashPassword` / `verifyPassword` NFKC-normalize
+ * before hashing, so every other check has to see the SAME string: policy
+ * validation, old-vs-new comparison and the HIBP breach lookup all run on the
+ * schema output. Normalizing only at the storage layer let a
+ * compatibility-equivalent input (e.g. U+FB01 "ﬁ" → "fi") pass a breach check
+ * and then normalize into a breached credential. NFKC is idempotent, so the
+ * storage-layer normalization stays as defense in depth for non-schema callers.
+ */
+export const normalizePasswordInput = (v: string) =>
+  typeof v === 'string' ? v.normalize('NFKC') : v;
+
+export const passwordSchema = z.preprocess(
+  normalizePasswordInput,
+  z
+    .string('كلمة المرور مطلوبة')
+    .min(PASSWORD_MIN, `كلمة المرور يجب أن تكون ${PASSWORD_MIN} أحرف على الأقل`)
+    .max(PASSWORD_MAX, `كلمة المرور يجب أن لا تتجاوز ${PASSWORD_MAX} حرفاً`)
+    .refine(
+      (val) =>
+        /[a-z]/.test(val) &&
+        /[A-Z]/.test(val) &&
+        /[0-9]/.test(val) &&
+        /[^a-zA-Z0-9]/.test(val),
+      {
+        error: 'تحقق من صحة كلمة المرور',
+      }
+    )
+);
 
 const itemOrderError = 'ترتيب العنصر يجب ان يكون رقم صحيحاً';
 

@@ -6,12 +6,15 @@ import { otpMsg } from '@/app/api/auth/otp/messages';
 import { db } from '@/db';
 import { users } from '@/db/schema';
 import { withTransaction } from '@/db/ws';
-import { isUniqueViolation } from '@/utils';
 import { getAuditMeta } from '@/lib/audit';
 import { LoginRejected, verifyLoginAttempt } from '@/lib/auth/login-guard';
 import { verifyTurnstileRequest } from '@/lib/captcha';
 import { requireSession } from '@/lib/http/session';
-import { enforceRateLimit, otpSendScope, userIdentifier } from '@/lib/rate-limit';
+import {
+  enforceOtpSendQuota,
+  enforceRateLimit,
+  userIdentifier,
+} from '@/lib/rate-limit';
 
 import {
   HTTP_STATUS,
@@ -21,10 +24,9 @@ import {
 } from '@/utils/api-messages';
 import {
   apiSuccess,
-  getErrorHeaders,
   handleApiError,
   requireJsonBody,
-  resolveUserUniqueViolation,
+  handleUserUniqueViolation,
 } from '@/utils/api-response';
 import { OTP_AUTO_VERIFY } from '@/utils/config';
 import { CustomError } from '@/utils/error-class';
@@ -143,14 +145,12 @@ export const POST: Handler = async (ctx) => {
       });
     }
 
-    // Per-destination cap (shared with the public OTP send budget) so the same
-    // address can't be targeted repeatedly across actors/endpoints.
-    await enforceRateLimit({
-      scope: otpSendScope('email'),
-      identifier: newEmail.toLowerCase(),
-      limit: 5,
-      window: 3600,
-      failClosed: true,
+    // Aggregate per-destination cap (shared with every other send surface) so
+    // the same address can't be targeted repeatedly across actors/endpoints.
+    await enforceOtpSendQuota({
+      channel: 'email',
+      destination: newEmail,
+      surface: 'contact_change',
     });
 
     // Normal flow: send the code to the NEW address bound to change_email.
@@ -169,16 +169,10 @@ export const POST: Handler = async (ctx) => {
       data: { otpSent: true },
     });
   } catch (error) {
-    if (isUniqueViolation(error)) {
-      return handleApiError(
-        new CustomError(
-          resolveUserUniqueViolation(error),
-          HTTP_STATUS.CONFLICT
-        ),
-        undefined,
-        getErrorHeaders(error)
-      );
-    }
+    // Only a KNOWN constraint becomes a 409; an unrecognized one falls
+    // through to the 500 path so the schema/code mismatch is visible.
+    const conflict = handleUserUniqueViolation(error);
+    if (conflict) return conflict;
     return handleApiError(error, MSG_UPDATE_ERROR);
   }
 };

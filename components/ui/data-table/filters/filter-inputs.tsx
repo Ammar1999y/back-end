@@ -2,6 +2,7 @@ import type { ExtendedColumnFilter } from '@/types/data-table';
 import type { Column, ColumnMeta } from '@tanstack/react-table';
 
 import { cn } from '@/lib/utils';
+import { calendarDayInZone, safeDate } from '@/utils/time';
 
 import { DateRangePicker } from '@/components/ui/date/rang';
 import { SingleDatePicker } from '@/components/ui/date/single';
@@ -192,20 +193,75 @@ function FilterFacetedSelect<TData>({
   );
 }
 
+/**
+ * Date filters travel as a plain `YYYY-MM-DD` calendar day, not as an instant.
+ * Sending `getTime()` meant sending *local* midnight, which the server then
+ * re-bounded in its own timezone — so a picked day could query the previous or
+ * next one. The server resolves the calendar day in the configured business
+ * timezone (see `BUSINESS_TIMEZONE`).
+ */
+function toCalendarDateValue(date: Date | undefined): string {
+  if (!date) return '';
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
+}
+
+/** Parse a calendar day back into a local Date for the picker's display. */
+function fromCalendarDateValue(value: string | undefined): Date | undefined {
+  if (!value) return undefined;
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value);
+  if (match) {
+    const [year, month, day] = [match[1], match[2], match[3]].map(Number);
+    const parsed = new Date(year, month - 1, day);
+    // Round-trip check: `new Date(2026, 1, 30)` rolls over to Mar 2, so a
+    // malformed bookmarked value rendered as a real (wrong) day while the
+    // server correctly rejected it with 422. Show nothing rather than a date
+    // the server will not accept.
+    return parsed.getFullYear() === year &&
+      parsed.getMonth() === month - 1 &&
+      parsed.getDate() === day
+      ? parsed
+      : undefined;
+  }
+
+  // Legacy epoch-ms value from a bookmarked URL. Resolve it to a calendar day
+  // the SAME way the server does — in the business timezone — so the picker
+  // never shows a different day from the one being filtered on.
+  //
+  // `safeDate`, not `Number.isFinite`: a finite-but-out-of-range epoch (1e20)
+  // yields an Invalid Date, and formatting one throws a RangeError that takes
+  // the whole filter UI down during render.
+  const parsed = safeDate(Number(value));
+  if (!parsed) return undefined;
+  const [year, month, day] = calendarDayInZone(parsed).split('-').map(Number);
+  return new Date(year, month - 1, day);
+}
+
 function FilterDateInput<TData>({
   filter,
   onFilterUpdate,
 }: FilterInputProps<TData>) {
+  // Positions are preserved here for the same reason the parser preserves
+  // them: `isBetween` is a [lower, upper] tuple, so compacting turned
+  // ["", "2026-08-05"] — "up to Aug 5" — into a lower bound of Aug 5.
   const dateValue = Array.isArray(filter.value)
-    ? filter.value.filter(Boolean)
-    : [filter.value, filter.value].filter(Boolean);
+    ? filter.value
+    : [filter.value, filter.value];
 
   if (filter.operator === 'isBetween') {
-    const startDate = dateValue[0] ? new Date(Number(dateValue[0])) : undefined;
-    const endDate = dateValue[1] ? new Date(Number(dateValue[1])) : undefined;
+    const startDate = fromCalendarDateValue(dateValue[0]);
+    const endDate = fromCalendarDateValue(dateValue[1]);
 
     return (
       <DateRangePicker
+        // Keyed on the column. Both date pickers read `initialDate*` only in
+        // their `useState` initialiser and never resync, and switching a
+        // filter's column keeps the same row (same `filterId`) while resetting
+        // its value — so the previous column's date stayed visible in the
+        // picker and could be re-applied to the new column. Remounting is the
+        // safe fix here: syncing inside the hooks risks clobbering an edit
+        // that is in progress while the popover is open.
+        key={filter.id}
         initialDateFrom={startDate}
         initialDateTo={endDate}
         align='start'
@@ -216,22 +272,28 @@ function FilterDateInput<TData>({
         )}
         onChange={(range) => {
           onFilterUpdate(filter.filterId, {
-            value: range.from
-              ? [
-                  (range.from.getTime() ?? '').toString(),
-                  (range.to?.getTime() ?? '').toString(),
-                ]
-              : [],
+            // Gated on EITHER bound. Checking only `range.from` discarded an
+            // upper-only range entirely on save, so reading the tuple
+            // correctly wasn't enough — it was thrown away on the way out.
+            value:
+              range.from || range.to
+                ? [
+                    toCalendarDateValue(range.from),
+                    toCalendarDateValue(range.to),
+                  ]
+                : [],
           });
         }}
       />
     );
   }
 
-  const startDate = dateValue[0] ? new Date(Number(dateValue[0])) : undefined;
+  const startDate = fromCalendarDateValue(dateValue[0]);
 
   return (
     <SingleDatePicker
+      // See the range picker above — same stale-initial-prop remount.
+      key={filter.id}
       initialDate={startDate}
       align='start'
       placeholder='اختر تاريخ'
@@ -241,7 +303,7 @@ function FilterDateInput<TData>({
       )}
       onChange={(date) => {
         onFilterUpdate(filter.filterId, {
-          value: (date?.getTime() ?? '').toString(),
+          value: toCalendarDateValue(date),
         });
       }}
     />

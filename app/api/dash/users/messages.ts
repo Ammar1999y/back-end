@@ -5,6 +5,7 @@ export const userMsg = {
   cannotModifyOwnPermissions: 'لا يمكنك تعديل صلاحياتك الخاصة',
   cannotDeleteSelf: 'لا يمكنك حذف حسابك الخاص',
   roleNotFound: 'الدور غير موجود أو غير متاح',
+  customRoleNeedsPermissions: 'يجب تحديد صلاحيات للدور المخصص',
   currentPasswordIncorrect: 'كلمة المرور الحالية غير صحيحة',
   passwordChanged: 'تم تغيير كلمة المرور بنجاح',
   emailChanged: 'تم تغيير البريد الإلكتروني بنجاح',

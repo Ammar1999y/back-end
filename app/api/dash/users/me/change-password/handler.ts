@@ -1,15 +1,16 @@
 import type { VerifiedPasswordProof } from '@/lib/auth/login-guard';
 import type { Handler } from '@/lib/http/contract';
 
-import { and, eq, isNull, ne } from 'drizzle-orm';
+import { and, eq, isNull } from 'drizzle-orm';
 
 import { otpMsg } from '@/app/api/auth/otp/messages';
-import { accounts, sessions, users } from '@/db/schema';
+import { accounts, users } from '@/db/schema';
 import { withTransaction } from '@/db/ws';
 import { auditLog, getAuditMeta } from '@/lib/audit';
 import { checkPasswordCompromise } from '@/lib/auth/check-password';
 import { LoginRejected, verifyLoginAttempt } from '@/lib/auth/login-guard';
 import { hashPassword } from '@/lib/auth/password';
+import { revokeOtherSessions, revokePendingProofs } from '@/lib/auth/rotation';
 import { verifyTurnstileRequest } from '@/lib/captcha';
 import { requireSession } from '@/lib/http/session';
 import { enforceRateLimit, userIdentifier } from '@/lib/rate-limit';
@@ -126,11 +127,12 @@ export const POST: Handler = async (ctx) => {
         .set({ password: hashedPassword })
         .where(eq(accounts.id, account.id));
 
-      if (sessionId) {
-        await tx
-          .delete(sessions)
-          .where(and(eq(sessions.userId, userId), ne(sessions.id, sessionId)));
-      }
+      if (sessionId) await revokeOtherSessions(tx, userId, sessionId);
+
+      // Revoking sessions alone is not enough: an unconsumed forgot-password
+      // or passwordless proof issued before this change would still reset the
+      // NEW password. Rotation invalidates every pending proof.
+      await revokePendingProofs(tx, userId);
 
       await auditLog(tx, {
         userId,

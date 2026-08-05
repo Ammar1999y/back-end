@@ -33,7 +33,24 @@ interface DataTableState {
   search: string;
 }
 
+interface DataTableIdentity {
+  /** Which table the current state belongs to (`null` before the first mount). */
+  tableKey: string | null;
+}
+
 interface DataTableActions {
+  /**
+   * Bind the store to one table and (re)load its state from the URL.
+   *
+   * The store is a module singleton, so it is created once per page LOAD, not
+   * once per table. Client-side navigation from one table page to another kept
+   * the previous table's filters, page and search: a users-only `email` filter
+   * was then sent to the permissions endpoint (422 with the new strict column
+   * specs), and a shared id like `isActive`/`createdAt` silently filtered the
+   * next table instead. Called on mount with the table's identity; a different
+   * identity resets to that URL's state.
+   */
+  initTable: (tableKey: string) => void;
   setPage: (page: number) => void;
   setPerPage: (perPage: number) => void;
   setSorting: (sort: ExtendedColumnSort<any>[]) => void;
@@ -47,7 +64,7 @@ interface DataTableActions {
   setSearch: (search: string) => void;
 }
 
-export interface DataTableStore extends DataTableState {
+export interface DataTableStore extends DataTableState, DataTableIdentity {
   actions: DataTableActions;
 }
 
@@ -80,10 +97,25 @@ function parseUrlParams(): DataTableState {
   return { page, perPage, sort, filters, joinOperator, search };
 }
 
+/**
+ * This table page's own URL state. Exported so a consumer can use it on the
+ * first render after a client-side navigation, while the singleton still holds
+ * the previous table's state — without that, the first request of the new table
+ * carries the old table's filters.
+ */
+export function readUrlDataTableState(): DataTableState {
+  return parseUrlParams();
+}
+
 export const useDataTableStore = create<DataTableStore>((set, get) => ({
   ...parseUrlParams(),
+  tableKey: null,
 
   actions: {
+    initTable: (tableKey) => {
+      if (get().tableKey === tableKey) return;
+      set({ ...parseUrlParams(), tableKey });
+    },
     setPage: (page) => set({ page }),
     setPerPage: (perPage) => set({ perPage }),
     setSorting: (sort) => set({ sort }),

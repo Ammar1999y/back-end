@@ -34,6 +34,9 @@ export const DateRangeTrigger = memo<DateRangeTriggerProps>(
         return fromText === toText ? fromText : `${fromText} - ${toText}`;
       }
       if (range.from) return formatDate(range.from, locale);
+      // An upper-only range is still an active filter. Falling through to the
+      // placeholder made the control look empty while rows were being filtered.
+      if (range.to) return formatDate(range.to, locale);
       return placeholder || title || 'اختر التاريخ';
     };
 

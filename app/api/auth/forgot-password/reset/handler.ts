@@ -3,17 +3,17 @@ import type { Handler } from '@/lib/http/contract';
 import { and, eq, isNull } from 'drizzle-orm';
 
 import { db } from '@/db';
-import {
-  accounts,
-  sessions,
-  users,
-  verificationSessions,
-} from '@/db/schema';
+import { accounts, users } from '@/db/schema';
 import { auditLog, getAuditMeta } from '@/lib/audit';
 import { checkPasswordCompromise } from '@/lib/auth/check-password';
 import { hashPassword } from '@/lib/auth/password';
+import { revokeOtherSessions, revokePendingProofs } from '@/lib/auth/rotation';
 import { verifyTurnstileRequest } from '@/lib/captcha';
-import { enforceRateLimit, ipIdentifier, otpVerifyScope } from '@/lib/rate-limit';
+import {
+  enforceOtpVerifyQuota,
+  enforceRateLimit,
+  ipIdentifier,
+} from '@/lib/rate-limit';
 
 import {
   CREDENTIAL_PROVIDER_ID,
@@ -64,13 +64,7 @@ export const POST: Handler = async (ctx) => {
     const identifier =
       channel === 'email' ? parsed.data.email : parsed.data.phoneNumber;
 
-    await enforceRateLimit({
-      scope: otpVerifyScope(channel),
-      identifier: identifier.toLowerCase(),
-      limit: 10,
-      window: 600,
-      failClosed: true,
-    });
+    await enforceOtpVerifyQuota({ channel, identifier });
 
     // Breach screen + hash BEFORE the transaction (account-independent, so it
     // leaks nothing about whether the identifier exists) and so we never hold a
@@ -111,7 +105,7 @@ export const POST: Handler = async (ctx) => {
       identifier,
       code,
       auditMeta,
-      onVerified: async (tx) => {
+      onVerified: async (tx, matched) => {
         const [account] = await tx
           .select({ id: accounts.id })
           .from(accounts)
@@ -134,12 +128,12 @@ export const POST: Handler = async (ctx) => {
           .set({ password: hashedPassword })
           .where(eq(accounts.id, account.id));
 
-        // Credential rotation — revoke every auth session and drop any pending
-        // verification sessions (stale change_* proofs / consumed rows).
-        await tx.delete(sessions).where(eq(sessions.userId, userData.id));
-        await tx
-          .delete(verificationSessions)
-          .where(eq(verificationSessions.userId, userData.id));
+        // Credential rotation — same policy as every other rotation path:
+        // revoke every auth session (no session to keep here) and drop the
+        // user's other pending proofs, keeping only the one being consumed so
+        // it survives as an auditable single-use record.
+        await revokeOtherSessions(tx, userData.id);
+        await revokePendingProofs(tx, userData.id, matched.verificationSessionId);
 
         await auditLog(tx, {
           userId: userData.id,

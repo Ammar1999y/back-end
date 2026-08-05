@@ -39,22 +39,15 @@ const DeleteAction = memo(({ user }: { user: User }) => {
         href: `/api/dash/users/${user.id}`,
         method: 'DELETE',
         onSuccess: () => {
-          // Update users list cache
-          const existingList = queryClient.getQueryData<User[]>(
-            USERS_QUERY_KEYS.list
-          );
-
-          if (existingList) {
-            queryClient.setQueryData(
-              USERS_QUERY_KEYS.list,
-              existingList.filter((item) => item.id !== user.id)
-            );
-          }
-
-          // Remove detail cache
           queryClient.removeQueries({
             queryKey: USERS_QUERY_KEYS.detail(user.id),
           });
+          // The paginated list is keyed by page/sort/filters/search with a
+          // `{ data, meta }` value, so filtering `getQueryData(list)` matched
+          // nothing and the deleted row stayed on screen. Invalidating the
+          // prefix refetches whichever page is actually mounted — which also
+          // pulls in the row that moved up from the next page.
+          queryClient.invalidateQueries({ queryKey: USERS_QUERY_KEYS.list });
         },
       });
 

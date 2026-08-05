@@ -5,12 +5,13 @@ import type {
   PermissionAction,
 } from './constants';
 
-import { and, eq, isNull } from 'drizzle-orm';
+import { and, eq, gt, isNull, sql } from 'drizzle-orm';
 
 import { db } from '@/db';
-import { rolePermissions, roles, users } from '@/db/schema';
+import { rolePermissions, roles, sessions, users } from '@/db/schema';
 import { validID } from '@/utils';
 import { auth } from '@/lib/auth';
+import { assertLiveSession } from '@/lib/auth/live-session';
 
 import {
   HTTP_STATUS,
@@ -28,13 +29,21 @@ const SCOPED_ACTIONS = new Set<PermissionAction>(
 );
 const READ_ACTIONS = new Set<PermissionAction>(['view', 'viewOwn']);
 
+/** Own-scoped action → the all-scoped action that supersedes it. */
+const SUPERSEDING_ACTION = Object.fromEntries(
+  Object.entries(OWN_ACTION_MAP).map(([all, own]) => [own, all])
+) as Record<string, AllScopedAction | undefined>;
+
 /**
- * Resolve allowed/scope for a given action against a permissions matrix:
- * - For scoped actions (`view`/`edit`/`delete`): tries the unrestricted
- *   action first, then falls back to the `Own` variant.
- * - For all other actions: only the exact action is considered.
+ * Resolve allowed/scope for a given action against a permissions matrix.
+ *
+ * - An all-scoped action (`view`/`edit`/`delete`): the unrestricted grant first,
+ *   then the `Own` variant with `scope: 'own'`.
+ * - An own-scoped action (`viewOwn`/`editOwn`/`deleteOwn`): the superseding
+ *   unrestricted grant first, then the own grant itself.
+ * - Anything else: exact match only.
  */
-function resolveActionScope(
+export function resolveActionScope(
   permissions: Record<string, Record<string, boolean>> | Partial<
     Record<DashboardPage, Record<PermissionAction, boolean>>
   >,
@@ -42,6 +51,22 @@ function resolveActionScope(
   action: PermissionAction
 ): { allowed: boolean; scope: AccessScope | null } {
   const pagePerms = permissions?.[resource];
+
+  // An own-scoped action asked for DIRECTLY. Handled first because the generic
+  // path below would answer both of its cases wrongly: holding `edit` while
+  // requesting `editOwn` was denied outright, and holding only `editOwn` while
+  // requesting `editOwn` was answered `scope: 'all'` — an own-scoped grant
+  // reported as unrestricted access. No route asks for an own variant today, so
+  // neither is currently reachable; the function is exported to every future
+  // call site, which is exactly how a latent trap becomes a live one.
+  const superseding = SUPERSEDING_ACTION[action];
+  if (superseding) {
+    if (pagePerms?.[superseding] === true)
+      return { allowed: true, scope: 'all' };
+    if (pagePerms?.[action] === true) return { allowed: true, scope: 'own' };
+    return { allowed: false, scope: null };
+  }
+
   if (pagePerms?.[action] === true) return { allowed: true, scope: 'all' };
   if (SCOPED_ACTIONS.has(action)) {
     const ownAction = OWN_ACTION_MAP[action as AllScopedAction];
@@ -75,7 +100,21 @@ export async function checkUserPermission(params: {
   const shouldForceDB = forceDB || !READ_ACTIONS.has(action);
 
   if (shouldForceDB) {
-    // Single query: fetch user + role + permissions in one round-trip
+    // The session ROW is verified here, not just the user and role.
+    //
+    // `getSession` is served from Better Auth's cookie cache for up to
+    // `cookieCache.maxAge`, and that cached copy stays valid after the row
+    // behind it is deleted. Credential rotation (password/email/phone change,
+    // admin edit) revokes sessions by deleting rows — so without this join a
+    // revoked session kept performing writes for the rest of the cache window,
+    // which is precisely what revocation is supposed to prevent. Reloading the
+    // user and permissions was not enough: an active user with an active role
+    // passed every other check.
+    const sessionId = validID(session?.session.id);
+    if (!sessionId)
+      throw new CustomError(MSG_LOGIN_REQUIRED, HTTP_STATUS.UNAUTHORIZED);
+
+    // Single query: session + user + role + permissions in one round-trip.
     const rows = await db
       .select({
         roleId: users.roleId,
@@ -85,17 +124,21 @@ export async function checkUserPermission(params: {
         pageName: rolePermissions.pageName,
         pagePermissions: rolePermissions.permissions,
       })
-      .from(users)
+      .from(sessions)
+      .innerJoin(users, eq(sessions.userId, users.id))
       .leftJoin(roles, eq(users.roleId, roles.id))
       .leftJoin(rolePermissions, eq(roles.id, rolePermissions.roleId))
       .where(
         and(
-          eq(users.id, userId),
+          eq(sessions.id, sessionId),
+          eq(sessions.userId, userId),
+          gt(sessions.expiresAt, sql`now()`),
           isNull(users.deletedAt),
           eq(users.isActive, true)
         )
       );
 
+    // Covers both "user is gone/inactive" and "this session was revoked".
     if (!rows.length)
       throw new CustomError(MSG_LOGIN_REQUIRED, HTTP_STATUS.UNAUTHORIZED);
 
@@ -199,6 +242,10 @@ export async function checkMultiplePermissions(params: {
   let roleId: EntityID | null = validID(session?.user.roleId) ?? null;
 
   if (shouldForceDB) {
+    // Same revocation check as `checkUserPermission` — this path authorizes
+    // writes too, so a revoked session must not survive here either.
+    await assertLiveSession(session?.session.id, userId);
+
     const [userData] = await db
       .select({
         roleId: users.roleId,

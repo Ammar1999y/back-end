@@ -150,10 +150,14 @@ export async function verifyLoginAttempt(
       }
 
       // Lock expired — reset within the same transaction before proceeding
-      await tx
+      const [reset] = await tx
         .update(users)
         .set({ failedLoginAttempts: 0, lockedUntil: null })
-        .where(eq(users.id, user.id));
+        .where(eq(users.id, user.id))
+        .returning({
+          failedLoginAttempts: users.failedLoginAttempts,
+          lockedUntil: users.lockedUntil,
+        });
 
       if (auditMeta) {
         await auditLog(tx, {
@@ -174,6 +178,14 @@ export async function verifyLoginAttempt(
           meta: auditMeta,
         });
       }
+
+      // Adopt the post-reset row as the authoritative state. The branches
+      // below derive `willLock` and both audit payloads from these values;
+      // keeping the pre-reset counter made the next failed attempt report
+      // "attempt 6, accountLocked: true" while the DB actually stored
+      // attempt 1 and no lock.
+      user.failedLoginAttempts = reset?.failedLoginAttempts ?? 0;
+      user.lockedUntil = reset?.lockedUntil ?? null;
     }
 
     const [account] = await tx
@@ -359,6 +371,10 @@ async function upgradePasswordHash({
         passwordPepperId: upgrade.activePepperId,
         passwordHashUpgraded: true,
       },
+      // The pepper's VERSION id, not the pepper. Declared because the generic
+      // denylist matches the substring `password` and would otherwise strip the
+      // only fields this event exists to record.
+      safeFields: ['passwordPepperId'],
       meta: auditMeta ?? PASSWORD_UPGRADE_AUDIT_META,
     });
   });

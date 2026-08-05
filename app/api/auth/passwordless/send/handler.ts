@@ -5,7 +5,11 @@ import { and, eq, isNull } from 'drizzle-orm';
 import { db } from '@/db';
 import { users } from '@/db/schema';
 import { verifyTurnstileRequest } from '@/lib/captcha';
-import { enforceRateLimit, ipIdentifier, otpSendScope } from '@/lib/rate-limit';
+import {
+  enforceOtpSendQuota,
+  enforceRateLimit,
+  ipIdentifier,
+} from '@/lib/rate-limit';
 import { sanitizeForLog } from '@/utils';
 
 import { HTTP_STATUS, MSG_PAGE_NOT_FOUND } from '@/utils/api-messages';
@@ -57,12 +61,10 @@ export const POST: Handler = async (ctx) => {
       channel === 'email' ? parsed.data.email : parsed.data.phoneNumber;
     const entityName = channel === 'email' ? 'البريد الإلكتروني' : 'رقم الهاتف';
 
-    await enforceRateLimit({
-      scope: otpSendScope(channel),
-      identifier: identifier.toLowerCase(),
-      limit: 5,
-      window: 3600,
-      failClosed: true,
+    await enforceOtpSendQuota({
+      channel,
+      destination: identifier,
+      surface: 'passwordless',
     });
 
     const genericResponse = () =>

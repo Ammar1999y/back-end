@@ -28,14 +28,39 @@ import {
   PHONE_OTP_AVAILABLE,
 } from '@/utils/validation/otp';
 
-import { API_PATH_MAX, getClientIp, USER_AGENT_MAX } from './audit';
+import {
+  API_PATH_MAX,
+  getClientIp,
+  TRUSTED_IP_HEADERS,
+  USER_AGENT_MAX,
+} from './audit';
+import { toAuthApiError } from './auth/api-error';
 import { BASE_ERROR_CODES } from './auth/code-errors';
 import { LoginRejected, verifyLoginAttempt } from './auth/login-guard';
 import { hashPassword } from './auth/password';
 import { passwordless } from './auth/passwordless';
 import { REQUIRE_ROLE_FOR_LOGIN } from './permissions/constants';
 import { sanitizePermissions } from './permissions/utils';
+import { enforceRateLimit, ipIdentifier } from './rate-limit';
 import { authRateLimitStorage } from './rate-limit/auth-storage';
+import { CustomError } from '@/utils/error-class';
+
+/**
+ * Per-IP sign-in budget. Generous enough that an office behind one NAT egress
+ * isn't punished, tight enough that credential stuffing across many accounts
+ * is throttled (per-account lockout only covers repeated attempts on ONE
+ * account). Applied to an IPv6 /64 bucket, not a single address.
+ */
+const SIGN_IN_IP_LIMIT_PER_MINUTE = 20;
+
+/**
+ * Read-only session lookups are hit on every dashboard navigation and
+ * permission check. They must not share the sign-in-grade bucket: behind one
+ * NAT egress the default 10/min turns ordinary browsing into deterministic
+ * 429s.
+ */
+const GET_SESSION_LIMIT_PER_MINUTE = 300;
+const SIGN_OUT_LIMIT_PER_MINUTE = 30;
 
 // ⚠️ WARNING: password.verify below always returns true because the before
 // hook already verifies credentials via verifyLoginAttempt(). If you add a new
@@ -97,6 +122,35 @@ export const auth = betterAuth({
           (ctx as { headers?: Headers }).headers ??
           (ctx as { request?: Request }).request?.headers ??
           new Headers();
+
+        // Authoritative per-IP admission, consumed BEFORE any credential work.
+        // Two reasons this replaces Better Auth's own /sign-in/email rule
+        // (disabled in `rateLimit.customRules` below):
+        //  1. Atomicity — Better Auth admits on a separate read then write, so
+        //     parallel requests at the boundary can all observe the same
+        //     remaining quota and pass. Redis' sliding window increments
+        //     atomically.
+        //  2. Trust — `ipIdentifier` resolves only the edge headers
+        //     (lib/audit.ts) and buckets IPv6 by /64, so the limit can't be
+        //     bypassed by forging or rotating `x-forwarded-for`. It throws 503
+        //     when no trusted IP is present, which fails sign-in closed rather
+        //     than skipping the limit.
+        // Per-account lockout does not cover this: spraying one password
+        // across many accounts never trips it.
+        try {
+          await enforceRateLimit({
+            scope: 'auth.sign-in.ip',
+            identifier: ipIdentifier(reqHeaders),
+            limit: SIGN_IN_IP_LIMIT_PER_MINUTE,
+            window: 60,
+            failClosed: true,
+          });
+        } catch (e) {
+          if (e instanceof CustomError)
+            throw toAuthApiError(e, MSG_INVALID_CREDENTIALS);
+          throw e;
+        }
+
         const auditMeta = {
           ip: getClientIp(reqHeaders),
           userAgent:
@@ -135,15 +189,20 @@ export const auth = betterAuth({
     after: createAuthMiddleware(async (ctx) => {
       const errorCode = (ctx.context?.returned as any)?.body?.code;
 
-      if (
-        errorCode &&
-        errorCode !== CUSTOM_CODE &&
-        BASE_ERROR_CODES[errorCode]
-      ) {
+      // `Object.hasOwn` + an own-property read, not `BASE_ERROR_CODES[code]`:
+      // the code is framework-supplied text, and a plain object resolves
+      // inherited members — `constructor` or `toString` would look like a
+      // mapped code and put a function where the message belongs.
+      const mappedMessage =
+        typeof errorCode === 'string' && Object.hasOwn(BASE_ERROR_CODES, errorCode)
+          ? BASE_ERROR_CODES[errorCode]
+          : undefined;
+
+      if (errorCode && errorCode !== CUSTOM_CODE && mappedMessage) {
         throw new APIError(
           (ctx.context?.returned as any)?.statusCode || HTTP_STATUS.BAD_REQUEST,
           {
-            message: BASE_ERROR_CODES[errorCode],
+            message: mappedMessage,
             code: CUSTOM_CODE,
           }
         );
@@ -160,6 +219,15 @@ export const auth = betterAuth({
   advanced: {
     database: {
       generateId: false,
+    },
+    // Better Auth otherwise resolves the client IP from `x-forwarded-for`,
+    // which is client-controllable whenever the origin is directly reachable.
+    // Pin it to the same trusted edge headers the rest of the app uses so the
+    // IP written into session metadata — and any Better Auth limiter — can't
+    // be forged. IPv6 is bucketed by /64, matching `ipBucket`.
+    ipAddress: {
+      ipAddressHeaders: [...TRUSTED_IP_HEADERS],
+      ipv6Subnet: 64,
     },
   },
 
@@ -310,8 +378,18 @@ export const auth = betterAuth({
     window: 60,
     max: 10,
     customStorage: authRateLimitStorage,
+    // Explicit per-path budgets. The default 10/min bucket is sized for
+    // credential endpoints; leaving unrelated traffic in it means one surface
+    // throttles another.
     customRules: {
-      '/sign-in/email': { window: 60, max: 5 },
+      '/get-session': { window: 60, max: GET_SESSION_LIMIT_PER_MINUTE },
+      '/sign-out': { window: 60, max: SIGN_OUT_LIMIT_PER_MINUTE },
+      // Owned by the atomic, trusted-IP limiter in the before hook. Keeping a
+      // second quota here would only add a weaker, non-atomic duplicate of a
+      // limit we already enforce — not a second layer.
+      '/sign-in/email': false,
+      // The passwordless plugin runs its own fail-closed per-IP limiter.
+      '/passwordless/verify': false,
     },
   },
 
