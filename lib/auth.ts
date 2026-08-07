@@ -207,7 +207,8 @@ export const auth = betterAuth({
             code: CUSTOM_CODE,
           }
         );
-      } else if (
+      }
+      if (
         errorCode &&
         errorCode !== CUSTOM_CODE &&
         errorCode !== EMAIL_NOT_VERIFIED_CODE &&

@@ -156,16 +156,6 @@ red on arrival gets bypassed within a week.
 
 ## 5. Phase 3 — Maintainability
 
-### 5.1 eslint-plugin-drizzle
-
-Catches `.delete()` / `.update()` calls with no `.where()`. With soft-deletes
-and audit logs in this schema, one missing `where` is a table wipe. Two rules,
-near-zero false positives.
-
-```bash
-bun add -D eslint-plugin-drizzle
-```
-
 ### 5.2 knip
 
 Finds unused files, **plus** unused exports, dependencies, and devDependencies.
@@ -187,7 +177,6 @@ bun add -D dependency-cruiser && bunx depcruise --init
 
 ### 5.4 Additional TS hardening
 
-`noImplicitAny` is already enabled. The remaining high-value flag:
 
 ```jsonc
 "noUncheckedIndexedAccess": true   // array/record access yields `T | undefined`
@@ -195,80 +184,3 @@ bun add -D dependency-cruiser && bunx depcruise --init
 
 Expect real errors — each one is a latent runtime crash. Enable it when there is
 time to work through the fallout, not mid-feature.
-
-### 5.5 ESLint debt
-
-`eslint.config.mjs` disables ~35 rules, two of them under an explicit
-`TODO: should remove it and fix the issues`. Re-enable in small batches once
-tests exist to catch regressions — starting with `react-hooks/exhaustive-deps`
-and `react-hooks/set-state-in-effect`.
-
----
-
-## 6. Phase 4 — Runtime Observability
-
-Static analysis cannot see production. This phase addresses `TODO.md` item 9
-(alerting when errors spike).
-
-- **Sentry** — error grouping, spike alerts to email/Slack, plus performance
-  tracing. First-class Next.js SDK; free tier covers 5k errors/month. This is
-  the direct answer to TODO #9.
-- **Neon query insights** — built in, no setup. Use it to find slow SQL.
-- **Checkly** or **Better Stack** — synthetic uptime checks on the auth
-  endpoints after deployment.
-
-For performance work specifically: Sentry tracing identifies _which_ of the 21
-routes is slow; Neon insights identify _which query_ inside it. Guessing without
-both is wasted effort.
-
----
-
-## 7. Checklist
-
-Work top to bottom. Each item is independently shippable.
-
-**Phase 0 — Foundation**
-
-- [ ] Push to a private GitHub repo
-- [ ] Add `lefthook` + `lefthook.yml`, run `bunx lefthook install`
-- [ ] Add `.github/workflows/ci.yml`
-- [ ] Enable branch protection on `main` requiring CI to pass
-
-**Phase 1 — Tests**
-
-- [ ] Install vitest, add `test` scripts
-- [ ] Unit tests: `lib/permissions/checker.ts`
-- [ ] Unit tests: `lib/auth/*`
-- [ ] Unit tests: `utils/validation/*`
-- [ ] Unit tests: `lib/rate-limit/*`
-- [ ] Integration tests on API routes via testcontainers + Postgres
-
-**Phase 2 — Security**
-
-- [ ] `bun audit --audit-level=high` in CI
-- [ ] One-time `gitleaks detect` history sweep
-- [ ] `gitleaks protect` in pre-commit
-- [ ] Semgrep in CI with `--baseline-commit`
-- [ ] Enable Renovate
-
-**Phase 3 — Maintainability**
-
-- [ ] `eslint-plugin-drizzle`
-- [ ] Replace `scripts/find-unused-files.ts` with `knip`
-- [ ] `dependency-cruiser` layering rules
-- [ ] `noUncheckedIndexedAccess: true`
-- [ ] Re-enable disabled ESLint rules in batches
-
-**Phase 4 — Observability**
-
-- [ ] Sentry (closes TODO #9)
-- [ ] Review Neon query insights
-- [ ] Uptime monitoring on auth endpoints
-
----
-
-## 8. Caveats
-
-- The snapshot in section 1 was verified directly against the repository.
-- Pricing figures and free-tier limits are from training knowledge and change
-  frequently — confirm before committing budget.

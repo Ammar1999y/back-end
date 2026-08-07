@@ -232,10 +232,10 @@ export function permissionsEqual(
     const normalized = normalizeFullPermissions(rows);
     return JSON.stringify(
       Object.entries(normalized)
-        .sort(([x], [y]) => x.localeCompare(y))
+        .toSorted(([x], [y]) => x.localeCompare(y))
         .map(([pageName, permissions]) => [
           pageName,
-          Object.entries(permissions).sort(([x], [y]) => x.localeCompare(y)),
+          Object.entries(permissions).toSorted(([x], [y]) => x.localeCompare(y)),
         ])
     );
   };

@@ -44,9 +44,8 @@ function getZoneFormatter(timeZone: string): Intl.DateTimeFormat {
 function zoneParts(instant: Date, timeZone: string): Record<string, number> {
   const parts = getZoneFormatter(timeZone).formatToParts(instant);
   const out: Record<string, number> = {};
-  for (const part of parts) {
+  for (const part of parts) 
     if (part.type !== 'literal') out[part.type] = Number(part.value);
-  }
   // Some ICU versions render midnight as hour "24".
   if (out.hour === 24) out.hour = 0;
   return out;

@@ -86,7 +86,7 @@ function parsePepperMaterial(
   const generation = entry.generation;
   if (
     typeof generation !== 'number' ||
-    !Number.isInteger(generation) ||
+    !Number.isSafeInteger(generation) ||
     generation < 1 ||
     generation > MAX_POLICY_GENERATION
   ) {

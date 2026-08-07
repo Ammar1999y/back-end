@@ -70,7 +70,7 @@ function parseBoolean(value: unknown): boolean | null {
 
 /** Escape SQL LIKE/ILIKE wildcards to prevent wildcard injection */
 export function escapeLike(value: string): string {
-  return value.replace(/[%_\\]/g, '\\$&');
+  return value.replaceAll(/[%_\\]/g, String.raw`\$&`);
 }
 
 /** Half-open UTC bounds for one calendar day in the business timezone. */
@@ -135,14 +135,18 @@ function buildCondition(
   const value = filter.value;
 
   switch (filter.operator) {
-    case 'iLike':
+    case 'iLike': {
       return ilike(column, `%${escapeLike(value as string)}%`);
-    case 'notILike':
+    }
+    case 'notILike': {
       return notIlike(column, `%${escapeLike(value as string)}%`);
-    case 'startsWith':
+    }
+    case 'startsWith': {
       return ilike(column, `${escapeLike(value as string)}%`);
-    case 'endsWith':
+    }
+    case 'endsWith': {
       return ilike(column, `%${escapeLike(value as string)}`);
+    }
 
     case 'eq':
     case 'ne': {
@@ -193,18 +197,22 @@ function buildCondition(
 
     // Comparison operators. For dates the labels are calendar-relative:
     // "before X" excludes X's day, "on or before X" includes all of it.
-    case 'lt':
+    case 'lt': {
       if (spec.type === 'date') return lt(column, dayBounds(value).start);
       return compareNumber(column, value, lt);
-    case 'lte':
+    }
+    case 'lte': {
       if (spec.type === 'date') return lt(column, dayBounds(value).next);
       return compareNumber(column, value, lte);
-    case 'gt':
+    }
+    case 'gt': {
       if (spec.type === 'date') return gte(column, dayBounds(value).next);
       return compareNumber(column, value, gt);
-    case 'gte':
+    }
+    case 'gte': {
       if (spec.type === 'date') return gte(column, dayBounds(value).start);
       return compareNumber(column, value, gte);
+    }
 
     case 'isBetween': {
       const [rawStart, rawEnd] = value as string[];
@@ -223,8 +231,8 @@ function buildCondition(
       const to = rawEnd?.trim() ? safeNumber(rawEnd) : null;
       if (from === null && to === null) invalidFilter();
       return and(
-        from !== null ? gte(column, from) : undefined,
-        to !== null ? lte(column, to) : undefined
+        from === null ? undefined : gte(column, from),
+        to === null ? undefined : lte(column, to)
       );
     }
 
@@ -232,13 +240,16 @@ function buildCondition(
     // rejects outright on boolean/timestamp/numeric columns ("invalid input
     // syntax for type boolean: \"\"") — a 500, not a filter. For those types
     // the only meaningful emptiness is NULL.
-    case 'isEmpty':
+    case 'isEmpty': {
       return isStringLike(spec.type) ? isEmpty(column) : isNull(column);
-    case 'isNotEmpty':
+    }
+    case 'isNotEmpty': {
       return isStringLike(spec.type) ? not(isEmpty(column)) : isNotNull(column);
+    }
 
-    default:
+    default: {
       return invalidFilter();
+    }
   }
 }
 

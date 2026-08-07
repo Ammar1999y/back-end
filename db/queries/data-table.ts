@@ -59,10 +59,7 @@ export function parseDataTableParams<T extends Table>(
 ): DataTableQueryResult<T> {
   const { searchParams } = new URL(url);
 
-  const params: Record<string, string | undefined> = {};
-  for (const [key, value] of searchParams.entries()) {
-    params[key] = value;
-  }
+  const params: Record<string, string | undefined> = Object.fromEntries(searchParams.entries());
 
   // A filter the parser could not read is a client error, not a filter to
   // ignore: dropping it silently broadens an `and` query and narrows an `or`

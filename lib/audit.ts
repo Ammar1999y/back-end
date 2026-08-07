@@ -20,6 +20,7 @@ export { API_PATH_MAX, USER_AGENT_MAX } from './audit/constants';
  * (`advanced.ipAddress.ipAddressHeaders`) so every IP-derived decision in the
  * app — our limiters, Better Auth's limiter, and session IP metadata — reads
  * the same source instead of Better Auth defaulting to `x-forwarded-for`.
+ * TODO: set the right header to get the IP when deplay the app
  */
 export const TRUSTED_IP_HEADERS = [
   'cf-connecting-ip',
@@ -37,7 +38,7 @@ export const TRUSTED_IP_HEADERS = [
 export function getClientIp(headers: Headers): string | null {
   const raw =
     headers.get(TRUSTED_IP_HEADERS[0]) ??
-    headers.get(TRUSTED_IP_HEADERS[1])?.split(',')[0]?.trim() ??
+    headers.get(TRUSTED_IP_HEADERS[1])?.split(',', 1)[0]?.trim() ??
     null;
 
   if (!raw || raw.length > MAX_IP_LENGTH) return null;
@@ -118,7 +119,7 @@ function isSensitiveAuditKey(
 ): boolean {
   if (typeof value === 'boolean') return false;
   if (safeFields?.has(key)) return false;
-  const normalized = key.toLowerCase().replace(/[^a-z0-9]/g, '');
+  const normalized = key.toLowerCase().replaceAll(/[^a-z0-9]/g, '');
   return SENSITIVE_KEY_FRAGMENTS.some((fragment) =>
     normalized.includes(fragment)
   );

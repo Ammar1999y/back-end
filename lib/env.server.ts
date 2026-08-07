@@ -1,5 +1,3 @@
-import 'server-only';
-
 import { validatePasswordPepperConfiguration } from '@/lib/auth/password-pepper';
 
 /**
@@ -26,21 +24,17 @@ const REQUIRED_IN_PRODUCTION = ['TURNSTILE_SECRET_KEY'] as const;
 function assertEnv(): void {
   const missing: string[] = [];
 
-  for (const key of REQUIRED_SERVER_ENV) {
+  for (const key of REQUIRED_SERVER_ENV)
     if (!process.env[key]) missing.push(key);
-  }
 
-  if (process.env.NODE_ENV === 'production') {
-    for (const key of REQUIRED_IN_PRODUCTION) {
+  if (process.env.NODE_ENV === 'production')
+    for (const key of REQUIRED_IN_PRODUCTION)
       if (!process.env[key]) missing.push(key);
-    }
-  }
 
-  if (missing.length) {
+  if (missing.length)
     throw new Error(
       `Missing required server env var${missing.length > 1 ? 's' : ''}: ${missing.join(', ')}`
     );
-  }
 }
 
 assertEnv();

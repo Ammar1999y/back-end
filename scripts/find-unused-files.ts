@@ -1,5 +1,3 @@
-/* eslint-disable security/detect-non-literal-fs-filename -- dev script: walking the repo with dynamic paths is the whole point */
-
 /**
  * Reports code files that the app can never reach.
  *

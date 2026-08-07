@@ -207,9 +207,9 @@ export const PUT: Handler = async (ctx) => {
           existingRole.createdBy === actorUserId);
 
       if (
+        !canDeactivate &&
         existingRole.isActive &&
-        validatedData.isActive === false &&
-        !canDeactivate
+        validatedData.isActive === false
       ) {
         throw new CustomError(
           MSG_INSUFFICIENT_PERMISSIONS,
@@ -346,8 +346,8 @@ export const PUT: Handler = async (ctx) => {
           )
         );
       } else if (
-        validatedData.roleName !== existingRole.roleName ||
-        permissionsChanged
+        permissionsChanged ||
+        validatedData.roleName !== existingRole.roleName
       ) {
         const precomputed = validatedData?.permissions?.length
           ? {

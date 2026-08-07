@@ -84,7 +84,7 @@ function stripLogControlChars(value: string): string {
 function clampLogString(value: string): string {
   const clean = stripLogControlChars(value);
   return clean.length > LOG_MAX_STRING
-    ? clean.slice(0, LOG_MAX_STRING - 1) + '\u2026'
+    ? clean.slice(0, LOG_MAX_STRING - 1) + '\u{2026}'
     : clean;
 }
 
@@ -357,13 +357,13 @@ export function sanitizeForLog(input: any, maxLength = 1024) {
 
 export const returnNumber = (value: string | undefined | number | null) => {
   const num = Number(value);
-  return !Number.isNaN(num) ? num : 0;
+  return Number.isNaN(num) ? 0 : num;
 };
 export const returnNumberOrNull = (
   value: string | undefined | number | null
 ) => {
   const num = Number(value);
-  return !Number.isNaN(num) ? num : null;
+  return Number.isNaN(num) ? null : num;
 };
 
 export const positiveInt = (val: any, maxValue = MAX_ID) => {

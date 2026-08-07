@@ -237,9 +237,7 @@ export const GET: Handler = async (ctx) => {
         createdAt: userData.createdAt,
         updatedAt: userData.updatedAt,
         permissions,
-        ...(userSessions
-          ? { sessions: userSessions, sessionsHasMore, sessionsNextCursor }
-          : {}),
+        ...(userSessions && { sessions: userSessions, sessionsHasMore, sessionsNextCursor }),
       },
     });
   } catch (error) {

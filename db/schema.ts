@@ -285,22 +285,6 @@ export const accounts = pgTable(
 // User Tracking Fields (after users is defined)
 // ================================
 
-const userTracking = {
-  createdBy: uuid('created_by').references(() => users.id, {
-    onDelete: 'set null',
-  }),
-  updatedBy: uuid('updated_by').references(() => users.id, {
-    onDelete: 'set null',
-  }),
-};
-
-/* eslint-disable @typescript-eslint/no-unused-vars */
-// @ts-ignore
-const auditFields = {
-  ...timestamps,
-  ...userTracking,
-};
-
 // ================================
 // Files Table
 // ================================

@@ -19,9 +19,8 @@ const HIBP_ATTEMPT_TIMEOUT_MS = 1000;
  * doesn't block users on an external dependency.
  */
 export async function checkPasswordCompromise(password: string): Promise<void> {
-  const sha1Hash = (
-    await createHash('SHA-1', 'hex').digest(password)
-  ).toUpperCase();
+  const digest = await createHash('SHA-1', 'hex').digest(password);
+  const sha1Hash = digest.toUpperCase();
   const prefix = sha1Hash.slice(0, 5);
   const suffix = sha1Hash.slice(5);
 

@@ -148,7 +148,7 @@ export function sanitizeSvg(
         }
       });
 
-      Array.from(element.attributes).forEach((attr) => {
+      [...element.attributes].forEach((attr) => {
         const name = attr.name;
         const value = attr.value;
 
@@ -170,16 +170,14 @@ export function sanitizeSvg(
     const shouldConvertColor = (value: string | null | undefined): boolean => {
       if (!value || !convertColor) return false;
       const normalized = value.toLowerCase().trim();
-      if (
+      return !(
         !normalized ||
-        normalized.startsWith('url(') ||
-        normalized === 'currentcolor' ||
         normalized === 'inherit' ||
         normalized === 'transparent' ||
-        normalized === 'none'
-      )
-        return false;
-      return true;
+        normalized === 'none' ||
+        normalized === 'currentcolor' ||
+        normalized.startsWith('url(')
+      );
     };
 
     const styleElements = doc.querySelectorAll('style');
@@ -189,8 +187,7 @@ export function sanitizeSvg(
       const decodedCSS = safeDecodeURI(cssContent);
 
       const hasDangerousCSS =
-        DANGEROUS_CSS_PATTERNS.some((pattern) => pattern.test(cssContent)) ||
-        DANGEROUS_CSS_PATTERNS.some((pattern) => pattern.test(decodedCSS));
+        DANGEROUS_CSS_PATTERNS.some(pattern => pattern.test(cssContent) || pattern.test(decodedCSS));
 
       if (hasDangerousCSS) {
         errors.push('تم إزالة style يحتوي على كود خطير');

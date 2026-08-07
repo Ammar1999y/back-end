@@ -183,6 +183,7 @@ const nextConfig = {
       fullUrl: true,
     },
   },
+  // TODO: test the behavior of the scroll when navigate in the dash
   // experimental: {
   //   scrollRestoration: false,
   // },
