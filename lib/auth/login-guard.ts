@@ -109,9 +109,16 @@ export async function verifyLoginAttempt(
   } = options;
 
   const executor = async (tx: WsTx): Promise<AttemptResult> => {
-    const whereClause = userId
-      ? and(eq(users.id, userId), isNull(users.deletedAt))
-      : and(eq(users.email, email!), isNull(users.deletedAt));
+    const identityFilter = userId
+      ? eq(users.id, userId)
+      : email
+        ? eq(users.email, email)
+        : undefined;
+
+    if (!identityFilter)
+      throw new Error('verifyLoginAttempt requires either email or userId');
+
+    const whereClause = and(identityFilter, isNull(users.deletedAt));
 
     const [user] = await tx
       .select({
@@ -308,7 +315,7 @@ export async function verifyLoginAttempt(
   if (result.outcome === 'success') {
     if (returnPasswordProof) return result.passwordProof;
 
-    if (result.passwordUpgrade && !externalTx) {
+    if (!externalTx && result.passwordUpgrade) {
       try {
         await upgradePasswordHash({
           password,
@@ -327,7 +334,7 @@ export async function verifyLoginAttempt(
 
   // Any branch that did not verify a PHC hash pays the active Argon2 cost after
   // the transaction commits, including missing or unsupported credentials.
-  if (!result.passwordCostPaid && !skipTimingGuard) {
+  if (!skipTimingGuard && !result.passwordCostPaid) {
     await runPasswordTimingGuard(password);
   }
   throw new LoginRejected();

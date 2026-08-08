@@ -92,7 +92,7 @@ export async function checkUserPermission(params: {
 
   const session = await auth.api.getSession({ headers });
   const userId = validID(session?.user.id);
-  if (!userId)
+  if (!session || !userId)
     throw new CustomError(MSG_LOGIN_REQUIRED, HTTP_STATUS.UNAUTHORIZED);
 
   // Write/mutation actions always verify from DB; read actions use cache
@@ -109,7 +109,7 @@ export async function checkUserPermission(params: {
     // which is precisely what revocation is supposed to prevent. Reloading the
     // user and permissions was not enough: an active user with an active role
     // passed every other check.
-    const sessionId = validID(session?.session.id);
+    const sessionId = validID(session.session.id);
     if (!sessionId)
       throw new CustomError(MSG_LOGIN_REQUIRED, HTTP_STATUS.UNAUTHORIZED);
 
@@ -138,28 +138,28 @@ export async function checkUserPermission(params: {
       );
 
     // Covers both "user is gone/inactive" and "this session was revoked".
-    if (!rows.length)
+    const [sessionRow] = rows;
+    if (!sessionRow)
       throw new CustomError(MSG_LOGIN_REQUIRED, HTTP_STATUS.UNAUTHORIZED);
 
-    const roleId = rows[0].roleId;
+    const roleId = sessionRow.roleId;
     if (!roleId)
       throw new CustomError(
         MSG_INSUFFICIENT_PERMISSIONS,
         HTTP_STATUS.FORBIDDEN
       );
 
-    if (rows[0].roleIsActive === false)
+    if (sessionRow.roleIsActive === false)
       throw new CustomError(
         MSG_INSUFFICIENT_PERMISSIONS,
         HTTP_STATUS.FORBIDDEN
       );
 
-    const rolePerms = rows
-      .filter((r) => r.pageName != null)
-      .map((r) => ({
-        pageName: r.pageName!,
-        permissions: r.pagePermissions,
-      }));
+    const rolePerms = rows.flatMap((r) =>
+      r.pageName == null
+        ? []
+        : [{ pageName: r.pageName, permissions: r.pagePermissions }]
+    );
 
     const permissions = sanitizePermissions(rolePerms);
 
@@ -178,9 +178,9 @@ export async function checkUserPermission(params: {
       allowed,
       scope,
       source: 'database' as const,
-      session: session!,
+      session,
       userId,
-      sessionId: validID(session!.session.id),
+      sessionId: validID(session.session.id),
       roleId,
       permissions,
     };
@@ -206,9 +206,9 @@ export async function checkUserPermission(params: {
     allowed,
     scope,
     source: 'cache' as const,
-    session: session!,
+    session,
     userId,
-    sessionId: validID(session!.session.id)!,
+    sessionId: validID(session.session.id),
     roleId,
     permissions,
   };
@@ -232,7 +232,7 @@ export async function checkMultiplePermissions(params: {
 
   const session = await auth.api.getSession({ headers });
   const userId = validID(session?.user.id);
-  if (!userId)
+  if (!session || !userId)
     throw new CustomError(MSG_LOGIN_REQUIRED, HTTP_STATUS.UNAUTHORIZED);
 
   const hasWriteAction = checks.some((c) => !READ_ACTIONS.has(c.action));
@@ -302,8 +302,8 @@ export async function checkMultiplePermissions(params: {
 
   return {
     permissions,
-    session: session!,
+    session,
     userId,
-    sessionId: validID(session!.session.id),
+    sessionId: validID(session.session.id),
   };
 }

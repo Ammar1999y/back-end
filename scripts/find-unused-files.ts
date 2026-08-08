@@ -114,6 +114,7 @@ for (const key of codeFiles) {
   const targets = new Set<string>();
 
   for (const [, specifier] of source.matchAll(SPECIFIER_PATTERN)) {
+    if (!specifier) continue;
     const resolved = resolveSpecifier(specifier, key, allFiles);
     if (resolved && resolved !== key) targets.add(resolved);
   }

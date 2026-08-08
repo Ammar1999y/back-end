@@ -157,7 +157,7 @@ const updateUserObject = userRoleSchema.omit({ password: true }).extend({
   isActive: z.boolean(),
   password: z
     .preprocess(
-      (e) => (typeof e === 'string' && e.trim().length ? e : null),
+      (e) => (typeof e === 'string' && e.trim().length > 0 ? e : null),
       passwordSchema.optional().nullish()
     )
     .optional()

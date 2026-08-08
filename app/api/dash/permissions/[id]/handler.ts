@@ -57,7 +57,7 @@ import {
 } from '@/utils/api-response';
 import { CustomError } from '@/utils/error-class';
 import { adminUpdatePermissionSchema } from '@/utils/validation/permissions';
-import { idRequired } from '@/utils/validation/rules';
+import { idRequired, zodIssueMessage } from '@/utils/validation/rules';
 
 import { permissionMsg } from '../messages';
 
@@ -150,7 +150,7 @@ export const PUT: Handler = async (ctx) => {
 
     if (!validatedDataParsed.success)
       throw new CustomError(
-        validatedDataParsed.error.issues[0].message,
+        zodIssueMessage(validatedDataParsed.error),
         HTTP_STATUS.UNPROCESSABLE
       );
 
@@ -178,7 +178,6 @@ export const PUT: Handler = async (ctx) => {
     const auditMeta = getAuditMeta(ctx);
 
     const updated = await withTransaction(async (tx) => {
-      let permissionsChanged = false;
       const [existingRole] = await tx
         .select({
           id: roles.id,
@@ -239,6 +238,7 @@ export const PUT: Handler = async (ctx) => {
         permissions: unknown;
       }> = [];
 
+      let permissionsChanged = false;
       if (validatedData?.permissions?.length) {
         const permissionsData = validatedData.permissions.map((p) => ({
           roleId: roleId,

@@ -34,7 +34,7 @@ function preAuthScope(pathname: string): string {
     .filter((segment) => segment !== 'api')
     .slice(0, PRE_AUTH_SURFACE_SEGMENTS)
     .map((segment) => segment.slice(0, PRE_AUTH_SEGMENT_MAX));
-  return segments.length ? `preauth.${segments.join('.')}` : 'preauth.root';
+  return segments.length > 0 ? `preauth.${segments.join('.')}` : 'preauth.root';
 }
 
 /**
@@ -146,8 +146,8 @@ function toNextResponse(output: HandlerOutput): NextResponse {
       if (extraFlags?.length || (extra && Object.keys(extra).length > 0)) {
         const setCookieValues = response.headers.getSetCookie();
         const lastIdx = setCookieValues.length - 1;
-        if (lastIdx >= 0) {
-          let line = setCookieValues[lastIdx];
+        let line = setCookieValues[lastIdx];
+        if (line !== undefined) {
           for (const flag of extraFlags ?? []) line += `; ${flag}`;
           for (const [k, v] of Object.entries(extra ?? {}))
             line += `; ${k}=${v}`;

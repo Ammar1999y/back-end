@@ -87,7 +87,7 @@ export const GET: Handler = async (ctx) => {
       where
     );
 
-    const [dashboardUsers, [{ total }]] = await Promise.all([
+    const [dashboardUsers, [totalRow]] = await Promise.all([
       db
         .select({
           id: users.id,
@@ -115,6 +115,8 @@ export const GET: Handler = async (ctx) => {
         .innerJoin(roles, eq(users.roleId, roles.id))
         .where(baseFilter),
     ]);
+
+    const total = totalRow?.total ?? 0;
 
     return apiSuccess({
       message: MSG_FETCHED,
@@ -207,11 +209,15 @@ export const POST: Handler = async (ctx) => {
           createdBy: actorUserId,
           // Admin-set number is unproven → phoneNumberVerified stays false
           // (the DB default). Only persisted when phone is enabled.
-          ...(PHONE_ENABLED && validatedData.phoneNumber
-            ? { phoneNumber: validatedData.phoneNumber }
-            : {}),
+          ...(PHONE_ENABLED &&
+            validatedData.phoneNumber && {
+              phoneNumber: validatedData.phoneNumber,
+            }),
         })
         .returning({ id: users.id });
+
+      if (!newUser)
+        throw new CustomError(MSG_CREATE_ERROR, HTTP_STATUS.INTERNAL_ERROR);
 
       const userId = newUser.id;
 
@@ -233,9 +239,10 @@ export const POST: Handler = async (ctx) => {
           email: validatedData.email,
           roleId: assignedRoleId,
           isActive: validatedData.isActive,
-          ...(PHONE_ENABLED && validatedData.phoneNumber
-            ? { phoneNumber: validatedData.phoneNumber }
-            : {}),
+          ...(PHONE_ENABLED &&
+            validatedData.phoneNumber && {
+              phoneNumber: validatedData.phoneNumber,
+            }),
         },
         meta: auditMeta,
       });

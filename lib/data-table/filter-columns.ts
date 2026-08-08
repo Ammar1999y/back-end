@@ -51,9 +51,15 @@ function invalidFilter(message = MSG_INVALID_FILTER): never {
   throw new CustomError(message, HTTP_STATUS.UNPROCESSABLE);
 }
 
+const STRING_LIKE_TYPES: ReadonlySet<FilterColumnSpec['type']> = new Set([
+  'text',
+  'select',
+  'multiSelect',
+]);
+
 /** Types whose column can actually hold an empty string. */
 function isStringLike(type: FilterColumnSpec['type']): boolean {
-  return type === 'text' || type === 'select' || type === 'multiSelect';
+  return STRING_LIKE_TYPES.has(type);
 }
 
 function safeNumber(value: unknown): number | null {

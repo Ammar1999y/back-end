@@ -31,7 +31,11 @@ import {
 } from '@/utils/api-response';
 import { CustomError } from '@/utils/error-class';
 import { IDS_ARRAY_MAX } from '@/utils/validation/constants';
-import { idRequired, idSchema } from '@/utils/validation/rules';
+import {
+  idRequired,
+  idSchema,
+  zodIssueMessage,
+} from '@/utils/validation/rules';
 
 import { assertTargetUserVisible } from '../target-user';
 import { formatCursor, parseCursor, parseLimit } from './pagination';
@@ -247,7 +251,7 @@ export const DELETE: Handler = async (ctx) => {
     const parsed = deleteSessionsSchema.safeParse(body);
     if (!parsed.success)
       throw new CustomError(
-        parsed.error.issues[0].message,
+        zodIssueMessage(parsed.error),
         HTTP_STATUS.UNPROCESSABLE
       );
 
@@ -295,7 +299,7 @@ export const DELETE: Handler = async (ctx) => {
           oldData: {
             sessionIds: deleted.map((s) => s.id),
             count: deleted.length,
-            ...(revokeAll ? { revokedAll: true } : {}),
+            ...(revokeAll && { revokedAll: true }),
           },
           newData: {},
           meta: auditMeta,

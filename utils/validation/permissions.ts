@@ -103,8 +103,6 @@ export const pagePermissionSchema = rawPagePermissionSchema
     // `editOwn`/`deleteOwn` require `view` OR `viewOwn`.
     const hasAllWrite =
       permissions.edit === true || permissions.delete === true;
-    const hasOwnWrite =
-      permissions.editOwn === true || permissions.deleteOwn === true;
 
     if (hasAllWrite && permissions.view !== true) {
       ctx.addIssue({
@@ -116,7 +114,7 @@ export const pagePermissionSchema = rawPagePermissionSchema
     }
 
     if (
-      hasOwnWrite &&
+      (permissions.editOwn === true || permissions.deleteOwn === true) &&
       permissions.view !== true &&
       permissions.viewOwn !== true
     ) {

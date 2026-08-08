@@ -18,6 +18,7 @@ import { OTP_AUTO_VERIFY } from '@/utils/config';
 import { CustomError } from '@/utils/error-class';
 import { processOtpVerify } from '@/utils/otp';
 import { changeEmailVerifySchema } from '@/utils/validation/auth';
+import { zodIssueMessage } from '@/utils/validation/rules';
 
 import { userMsg } from '../../../messages';
 import { commitEmailChange, refreshSessionCookies } from '../../contact-change';
@@ -47,7 +48,7 @@ export const POST: Handler = async (ctx) => {
     const parsed = changeEmailVerifySchema.safeParse(body);
     if (!parsed.success)
       throw new CustomError(
-        parsed.error.issues[0].message,
+        zodIssueMessage(parsed.error),
         HTTP_STATUS.UNPROCESSABLE
       );
 

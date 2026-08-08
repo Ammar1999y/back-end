@@ -16,6 +16,7 @@
 import { readdirSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+
 import ts from 'typescript';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -129,7 +130,8 @@ const findSilencersInFile = (filePath: string): MatchLocation[] => {
 
   // 3. Optional: Search for TS suppression comments (@ts-ignore, @ts-expect-error, @ts-nocheck)
   if (INCLUDE_COMMENTS) {
-    const commentRegex = /\/\/\s*@ts-(ignore|expect-error|nocheck)|\/\*\s*@ts-(ignore|expect-error|nocheck)/g;
+    const commentRegex =
+      /\/\/\s*@ts-(ignore|expect-error|nocheck)|\/\*\s*@ts-(ignore|expect-error|nocheck)/g;
     const lines = content.split(/\r?\n/);
     lines.forEach((lineText, idx) => {
       if (commentRegex.test(lineText)) {
@@ -171,10 +173,14 @@ const main = () => {
   const gray = '\x1b[90m';
   const green = '\x1b[32m';
 
-  console.log(`\n${bold}🔍 Searching for TypeScript silencers (!)...${reset}\n`);
+  console.log(
+    `\n${bold}🔍 Searching for TypeScript silencers (!)...${reset}\n`
+  );
 
   if (allMatches.length === 0) {
-    console.log(`${green}✨ Great job! No TypeScript silencers (! operator) found across ${files.length} scanned files.${reset}\n`);
+    console.log(
+      `${green}✨ Great job! No TypeScript silencers (! operator) found across ${files.length} scanned files.${reset}\n`
+    );
     process.exit(0);
   }
 
@@ -191,7 +197,9 @@ const main = () => {
   let commentCount = 0;
 
   grouped.forEach((matches, file) => {
-    console.log(`${cyan}${bold}${file}${reset} ${gray}(${matches.length} occurrence${matches.length > 1 ? 's' : ''})${reset}`);
+    console.log(
+      `${cyan}${bold}${file}${reset} ${gray}(${matches.length} occurrence${matches.length > 1 ? 's' : ''})${reset}`
+    );
     for (const m of matches) {
       if (m.type === 'non-null-assertion') nonNullCount++;
       else if (m.type === 'definite-assignment') definiteCount++;
@@ -201,8 +209,8 @@ const main = () => {
         m.type === 'non-null-assertion'
           ? `${red}Non-Null Assertion (!)${reset}`
           : m.type === 'definite-assignment'
-          ? `${yellow}Definite Assignment (!:)${reset}`
-          : `${yellow}TS Directive Comment${reset}`;
+            ? `${yellow}Definite Assignment (!:)${reset}`
+            : `${yellow}TS Directive Comment${reset}`;
 
       console.log(`  ${gray}Line ${m.line}:${m.column}${reset} [${typeLabel}]`);
       console.log(`    ${gray}└─>${reset} ${m.snippet}`);
@@ -218,10 +226,14 @@ const main = () => {
   if (INCLUDE_COMMENTS) {
     console.log(`TS Suppression Comments:    ${yellow}${commentCount}${reset}`);
   }
-  console.log(`Total occurrences:          ${bold}${allMatches.length}${reset}\n`);
+  console.log(
+    `Total occurrences:          ${bold}${allMatches.length}${reset}\n`
+  );
 
   if (FAIL_ON_FOUND) {
-    console.error(`${red}❌ Failure: TypeScript silencers found and --fail flag was supplied.${reset}`);
+    console.error(
+      `${red}❌ Failure: TypeScript silencers found and --fail flag was supplied.${reset}`
+    );
     process.exit(1);
   }
 };

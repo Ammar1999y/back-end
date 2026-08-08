@@ -1,12 +1,13 @@
 /* eslint-disable unicorn/prefer-math-trunc */
+import type { NeonDbError } from '@neondatabase/serverless';
+
 import { MAX_ID } from '@/constants';
 import { EntityID } from '@/types';
 import { v7 as uuidv7 } from 'uuid';
 
-export function normalizeArabicDigits(input: any): any {
-  if (typeof input !== 'string') return input;
+export function normalizeArabicDigits(input: string): string {
   const ARNums = ['٠', '١', '٢', '٣', '٤', '٥', '٦', '٧', '٨', '٩'];
-  return input.replace(/[٠-٩]/g, (n) => String(ARNums.indexOf(n)));
+  return input.replaceAll(/[٠-٩]/g, (n) => String(ARNums.indexOf(n)));
 }
 
 export const humanReadableNumber = (
@@ -67,7 +68,7 @@ const SENSITIVE_LOG_FRAGMENTS = [
 const ERROR_DETAIL_KEYS = ['code', 'constraint', 'status', 'statusCode'];
 
 function isSensitiveLogKey(key: string): boolean {
-  const normalized = key.toLowerCase().replace(/[^a-z0-9]/g, '');
+  const normalized = key.toLowerCase().replaceAll(/[^a-z0-9]/g, '');
   return SENSITIVE_LOG_FRAGMENTS.some((fragment) =>
     normalized.includes(fragment)
   );
@@ -232,19 +233,25 @@ function serializeLogValue(
   if (value === null) return null;
 
   switch (typeof value) {
-    case 'undefined':
+    case 'undefined': {
       return undefined;
-    case 'boolean':
+    }
+    case 'boolean': {
       return value;
-    case 'number':
+    }
+    case 'number': {
       return Number.isFinite(value) ? value : String(value);
-    case 'bigint':
+    }
+    case 'bigint': {
       return `${value}n`;
-    case 'string':
+    }
+    case 'string': {
       return clampLogString(value);
+    }
     case 'function':
-    case 'symbol':
+    case 'symbol': {
       return `[${typeof value}]`;
+    }
   }
 
   const obj = value as object;
@@ -334,7 +341,7 @@ export function serializeForLog(input: unknown, maxLength = 1024): string {
     : out.slice(0, maxLength - 3) + '...';
 }
 
-export function sanitizeForLog(input: any, maxLength = 1024) {
+export function sanitizeForLog(input: unknown, maxLength = 1024) {
   // Development still gets an expandable structure rather than a JSON string —
   // but a REDACTED one. Returning the raw value meant local, preview, and
   // accidentally development-configured deployments printed whatever the value
@@ -366,17 +373,30 @@ export const returnNumberOrNull = (
   return Number.isNaN(num) ? null : num;
 };
 
-export const positiveInt = (val: any, maxValue = MAX_ID) => {
+export const positiveInt = (val: unknown, maxValue = MAX_ID) => {
   const num = Number(val);
   if (!Number.isFinite(num) || num <= 0 || num > maxValue) return 0;
   return num | 0;
 };
 
+/**
+ * Drizzle wraps the driver error, so the PostgreSQL fields sit either on the
+ * thrown value or one `cause` level down. Read structurally, not with
+ * `instanceof`: the import stays type-only so this module — which
+ * `lib/data-table/parsers.ts` reaches from the browser — pulls in no db layer.
+ */
+type PgErrorFields = Pick<NeonDbError, 'code' | 'constraint'>;
+type ThrownDbError = Partial<PgErrorFields> & {
+  cause?: Partial<PgErrorFields>;
+};
+
+const asDbError = (e: unknown) => e as ThrownDbError | null | undefined;
+
 export function isUniqueViolation(e: unknown): boolean {
-  const anyErr = e as any;
+  const err = asDbError(e);
   // TODO: test this
   return (
-    anyErr?.code === '23505' || anyErr?.cause?.code === '23505' /* ||
+    err?.code === '23505' || err?.cause?.code === '23505' /* ||
     /duplicate|unique/i.test(anyErr?.message ?? '') ||
     /duplicate|unique/i.test(anyErr?.cause?.message ?? '') */
   );
@@ -384,13 +404,13 @@ export function isUniqueViolation(e: unknown): boolean {
 
 // PostgreSQL FK violation code: 23503
 export function isForeignKeyViolation(e: unknown): boolean {
-  const anyErr = e as any;
-  return anyErr?.code === '23503' || anyErr?.cause?.code === '23503';
+  const err = asDbError(e);
+  return err?.code === '23503' || err?.cause?.code === '23503';
 }
 
 export function getConstraintName(e: unknown): string {
-  const anyErr = e as any;
-  return anyErr?.constraint ?? anyErr?.cause?.constraint ?? '';
+  const err = asDbError(e);
+  return err?.constraint ?? err?.cause?.constraint ?? '';
 }
 
 export const formatDate = (date: string) =>
@@ -410,7 +430,7 @@ const UUID_V7_REGEX =
  * @param val - Value to validate
  * @returns The valid UUID v7 string, or empty string if invalid
  */
-export const validID = (val: any): string => {
+export const validID = (val: unknown): string => {
   if (typeof val !== 'string') return '';
   const trimmed = val.trim();
   return UUID_V7_REGEX.test(trimmed) ? trimmed : '';
@@ -433,7 +453,7 @@ export const generateUUIDv7 = (): EntityID => {
 export const extractIdFromUrl = (url: string): string | null => {
   // Match UUID v7 (36 chars with hyphens) or numeric ID at the end
   const match = url.match(/\/([0-9a-f-]{36}|\d+)$/i);
-  return match ? match[1] : null;
+  return match?.[1] ?? null;
 };
 
 // export const validID = positiveInt;

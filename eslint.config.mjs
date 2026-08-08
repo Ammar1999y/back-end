@@ -9,13 +9,7 @@ const compat = new FlatCompat({
 
 const eslintConfig = [
   {
-    ignores: [
-      '.next/**',
-      'out/**',
-      'build/**',
-      'next-env.d.ts',
-      'scripts/**',
-    ],
+    ignores: ['.next/**', 'out/**', 'build/**', 'next-env.d.ts', 'scripts/**'],
   },
   ...nextVitals,
   ...nextTs,
@@ -69,22 +63,16 @@ const eslintConfig = [
       // 'import/no-unresolved': 'off',
       // 'import/named': 'off',
       // 'unicorn/prevent-abbreviations': 'off',
+      // 'security/detect-object-injection': 'off',
 
-      '@typescript-eslint/no-explicit-any': 'off',
-      'unicorn/no-null': 'off',
       'unicorn/prefer-minimal-ternary': 'off',
-
       'unicorn/no-top-level-assignment-in-function': 'off',
       'unicorn/no-unreadable-for-of-expression': 'off',
       'unicorn/no-unsafe-buffer-conversion': 'off',
-      'security/detect-object-injection': 'off',
-
-      'unicorn/prefer-string-replace-all': 'off',
-      'unicorn/no-declarations-before-early-exit': 'off',
-      'unicorn/prefer-simple-condition-first': 'off',
       'unicorn/max-nested-calls': 'off',
 
       '@typescript-eslint/no-require-imports': 'off',
+      'unicorn/no-null': 'off',
       'unicorn/no-array-callback-reference': 'off',
       'unicorn/prefer-module': 'off',
       'unicorn/consistent-function-scoping': 'off',

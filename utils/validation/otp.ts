@@ -60,7 +60,9 @@ const bypassChannels: OtpChannel[] = OTP_AUTO_VERIFY
 
 // Enabled channels — exposed to the client via NEXT_PUBLIC_ so the UI adapts.
 // Empty array means OTP is completely disabled.
-export const ENABLED_OTP_CHANNELS: readonly OtpChannel[] = [...new Set([...envChannels, ...bypassChannels])];
+export const ENABLED_OTP_CHANNELS: readonly OtpChannel[] = [
+  ...new Set([...envChannels, ...bypassChannels]),
+];
 
 export const OTP_ENABLED = ENABLED_OTP_CHANNELS.length > 0;
 

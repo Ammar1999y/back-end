@@ -356,8 +356,8 @@ async function sendOtp(
     const message = readErrorField(error, 'message');
 
     if (
-      isCustomError(error) &&
       message &&
+      isCustomError(error) &&
       SAFE_DELIVERY_MESSAGES.has(message)
     ) {
       // A FRESH error, not the original. Rethrowing carried whatever `code`,
@@ -567,6 +567,9 @@ export async function processOtpSend({
         id: verificationSessions.id,
         attemptNumber: verificationSessions.attemptNumber,
       });
+
+    if (!updatedSession)
+      throw new CustomError(MSG_OTP_SEND_FAILED, HTTP_STATUS.INTERNAL_ERROR);
 
     // ── Invalidate old codes by upserting the latest into the
     //    one-row-per-session slot guarded by `ux_verification_codes_session`.

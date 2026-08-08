@@ -177,7 +177,6 @@ bun add -D dependency-cruiser && bunx depcruise --init
 
 ### 5.4 Additional TS hardening
 
-
 ```jsonc
 "noUncheckedIndexedAccess": true   // array/record access yields `T | undefined`
 ```

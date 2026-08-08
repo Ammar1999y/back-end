@@ -173,7 +173,12 @@ export function validatePasswordPepperConfiguration(): void {
 
 export function getActivePasswordPepper(): PasswordPepper {
   const configuration = getConfiguration();
-  const material = configuration.keys.get(configuration.activeId)!;
+  const material = configuration.keys.get(configuration.activeId);
+  if (!material) {
+    configurationError(
+      `${ACTIVE_ID_ENV} must identify a key present in ${KEYRING_ENV}`
+    );
+  }
   return {
     id: configuration.activeId,
     ...material,

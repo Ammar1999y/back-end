@@ -17,9 +17,9 @@ export function sanitizeFilename(filename: string, maxLength = 50): string {
   const nameWithoutExt = lastDot > 0 ? filename.slice(0, lastDot) : filename;
 
   const sanitized = nameWithoutExt
-    .replace(/\.\./g, '')
-    .replace(/[^\p{L}\p{N}\p{Zs}_\-()]/gu, '')
-    .replace(/\s+/g, ' ')
+    .replaceAll('..', '')
+    .replaceAll(/[^\p{L}\p{N}\p{Zs}_\-()]/gu, '')
+    .replaceAll(/\s+/g, ' ')
     .trim()
     .slice(0, maxLength);
 

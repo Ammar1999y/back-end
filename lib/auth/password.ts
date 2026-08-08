@@ -59,7 +59,12 @@ function parsePasswordHash(hash: string): ParsedPasswordHash | null {
   }
 
   const [, pepperId, phc] = parts;
-  if (!PEPPER_ID_PATTERN.test(pepperId) || !phc.startsWith(ARGON2ID_PREFIX)) {
+  if (
+    pepperId === undefined ||
+    phc === undefined ||
+    !PEPPER_ID_PATTERN.test(pepperId) ||
+    !phc.startsWith(ARGON2ID_PREFIX)
+  ) {
     throw new PasswordHashFormatError(
       'Stored password hash has an invalid envelope'
     );

@@ -287,7 +287,7 @@ export function parseFiltersState<TData>(
 export const MAX_PAGE = 10_000;
 export const MAX_PER_PAGE = 100;
 
-export interface GetDataSchema<T = any> {
+export interface GetDataSchema<T = Record<string, unknown>> {
   page: number;
   perPage: number;
   sort: ExtendedColumnSort<T>[];
@@ -301,7 +301,7 @@ function safeParam(value: string | string[] | undefined): string | null {
   return typeof value === 'string' ? value : null;
 }
 
-export function parseSearchParams<T = any>(
+export function parseSearchParams<T = Record<string, unknown>>(
   params: Record<string, string | string[] | undefined>,
   defaultSort?: ExtendedColumnSort<T>,
   onFilterDropped?: () => void

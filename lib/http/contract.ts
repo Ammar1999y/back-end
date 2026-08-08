@@ -110,8 +110,8 @@ export function parseSetCookieHeaders(values: string[]): HandlerCookie[] {
       .split(';')
       .map((s) => s.trim())
       .filter(Boolean);
-    if (!segments.length) continue;
     const [nameValue, ...attrs] = segments;
+    if (!nameValue) continue;
     const eqIdx = nameValue.indexOf('=');
     if (eqIdx === -1) continue;
     const name = nameValue.slice(0, eqIdx);
@@ -132,6 +132,7 @@ export function parseSetCookieHeaders(values: string[]): HandlerCookie[] {
       else if (key === 'secure') options.secure = true;
       else if (key === 'samesite') {
         const s = v?.toLowerCase();
+        // eslint-disable-next-line unicorn/prefer-includes-over-repeated-comparisons
         if (s === 'strict' || s === 'lax' || s === 'none') options.sameSite = s;
       } else if (eq === -1) {
         extraFlags.push(k);
@@ -139,8 +140,8 @@ export function parseSetCookieHeaders(values: string[]): HandlerCookie[] {
         extra[k] = v;
       }
     }
-    if (extraFlags.length) options.extraFlags = extraFlags;
-    if (Object.keys(extra).length) options.extra = extra;
+    if (extraFlags.length > 0) options.extraFlags = extraFlags;
+    if (Object.keys(extra).length > 0) options.extra = extra;
     parsed.push({ name, value, options });
   }
   return parsed;

@@ -141,7 +141,7 @@ export const GET: Handler = async (ctx) => {
 
     // Shared with the sessions subresource so parent and child can't drift:
     // protected-system, role presence, and ownership are one predicate.
-    assertTargetUserVisible({
+    const targetRoleId = assertTargetUserVisible({
       isSelf,
       roleId: userData.roleId,
       createdBy: userData.createdBy,
@@ -156,11 +156,7 @@ export const GET: Handler = async (ctx) => {
     const showSessions =
       (isSelf || editAll || (editOwn && userData.createdBy === userId)) &&
       (isSelf ||
-        (await actorCoversTargetRole(
-          actorViewPermissions,
-          userData.roleId!,
-          db
-        )));
+        (await actorCoversTargetRole(actorViewPermissions, targetRoleId, db)));
 
     const permissions =
       userData.role?.rolePermissions?.map((p) => ({
@@ -237,7 +233,11 @@ export const GET: Handler = async (ctx) => {
         createdAt: userData.createdAt,
         updatedAt: userData.updatedAt,
         permissions,
-        ...(userSessions && { sessions: userSessions, sessionsHasMore, sessionsNextCursor }),
+        ...(userSessions && {
+          sessions: userSessions,
+          sessionsHasMore,
+          sessionsNextCursor,
+        }),
       },
     });
   } catch (error) {
@@ -544,14 +544,15 @@ async function handleAdminEdit(
         // address. The address changes by admin authority, but
         // the verified flag resets to false so nothing trusts it until the
         // owner re-proves it via OTP. emailVerified is never set true here.
-        ...(emailChanged ? { emailVerified: false } : {}),
-        ...(phoneChanged
-          ? { phoneNumber: newPhoneNumber, phoneNumberVerified: false }
-          : {}),
+        ...(emailChanged && { emailVerified: false }),
+        ...(phoneChanged && {
+          phoneNumber: newPhoneNumber,
+          phoneNumberVerified: false,
+        }),
         // Admin-issued password reset is the supported recovery path for a
         // locked-out user; clear the brute-force counters atomically with the
         // password change so the user can sign in immediately.
-        ...(password ? { failedLoginAttempts: 0, lockedUntil: null } : {}),
+        ...(password && { failedLoginAttempts: 0, lockedUntil: null }),
       })
       .where(and(eq(users.id, userId), isNull(users.deletedAt)))
       .returning({ id: users.id, updatedAt: users.updatedAt });
@@ -643,24 +644,23 @@ async function handleAdminEdit(
         email: lockedUser.email,
         roleId: lockedUser.roleId,
         isActive: lockedUser.isActive,
-        ...(emailChanged ? { emailVerified: lockedUser.emailVerified } : {}),
-        ...(phoneChanged
-          ? {
-              phoneNumber: lockedUser.phoneNumber,
-              phoneNumberVerified: lockedUser.phoneNumberVerified,
-            }
-          : {}),
+        ...(emailChanged && { emailVerified: lockedUser.emailVerified }),
+        ...(phoneChanged && {
+          phoneNumber: lockedUser.phoneNumber,
+          phoneNumberVerified: lockedUser.phoneNumberVerified,
+        }),
       },
       newData: {
         name: validatedData.name,
         email: validatedData.email,
         roleId: assignedRoleId,
         isActive: validatedData.isActive,
-        ...(emailChanged ? { emailVerified: false } : {}),
-        ...(phoneChanged
-          ? { phoneNumber: newPhoneNumber, phoneNumberVerified: false }
-          : {}),
-        ...(password ? { passwordChanged: true } : {}),
+        ...(emailChanged && { emailVerified: false }),
+        ...(phoneChanged && {
+          phoneNumber: newPhoneNumber,
+          phoneNumberVerified: false,
+        }),
+        ...(password && { passwordChanged: true }),
       },
       // A custom-permissions-only edit changes nothing on the user row: the real
       // change is the roles event below. Without this the pair was a users

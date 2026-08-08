@@ -50,17 +50,17 @@ export function sanitizeSvg(
   }
 
   if (trimmed.includes('<!--')) {
-    trimmed = trimmed.replace(/<!--[\s\S]*?-->/g, '');
+    trimmed = trimmed.replaceAll(/<!--[\s\S]*?-->/g, '');
     errors.push('تم إزالة XML comments');
   }
 
   if (trimmed.includes('<![CDATA[')) {
-    trimmed = trimmed.replace(/<!\[CDATA\[[\s\S]*?\]\]>/g, '');
+    trimmed = trimmed.replaceAll(/<!\[CDATA\[[\s\S]*?\]\]>/g, '');
     errors.push('تم إزالة CDATA sections');
   }
 
   if (trimmed.includes('<?')) {
-    trimmed = trimmed.replace(/<\?[\s\S]*?\?>/g, '');
+    trimmed = trimmed.replaceAll(/<\?[\s\S]*?\?>/g, '');
     errors.push('تم إزالة Processing Instructions');
   }
 
@@ -142,10 +142,12 @@ export function sanitizeSvg(
     const allElements = doc.querySelectorAll('*');
     allElements.forEach((element) => {
       DANGEROUS_ATTRIBUTES.forEach((attr) => {
-        if (element.hasAttribute(attr)) {
-          errors.push(`تم إزالة خاصية خطيرة: ${attr}`);
-          element.removeAttribute(attr);
+        if (!element.hasAttribute(attr)) {
+          return;
         }
+
+        errors.push(`تم إزالة خاصية خطيرة: ${attr}`);
+        element.removeAttribute(attr);
       });
 
       [...element.attributes].forEach((attr) => {
@@ -186,8 +188,9 @@ export function sanitizeSvg(
 
       const decodedCSS = safeDecodeURI(cssContent);
 
-      const hasDangerousCSS =
-        DANGEROUS_CSS_PATTERNS.some(pattern => pattern.test(cssContent) || pattern.test(decodedCSS));
+      const hasDangerousCSS = DANGEROUS_CSS_PATTERNS.some(
+        (pattern) => pattern.test(cssContent) || pattern.test(decodedCSS)
+      );
 
       if (hasDangerousCSS) {
         errors.push('تم إزالة style يحتوي على كود خطير');
@@ -195,7 +198,7 @@ export function sanitizeSvg(
         return;
       }
 
-      cssContent = cssContent.replace(
+      cssContent = cssContent.replaceAll(
         /(fill|stroke)\s*:\s*([^;}]+?)(?=\s*[;}])/gi,
         (_match, property, value) => {
           if (!shouldConvertColor(value)) {
@@ -211,21 +214,25 @@ export function sanitizeSvg(
     const allElementsWithColors = svgElement.querySelectorAll('*');
     allElementsWithColors.forEach((element) => {
       ['fill', 'stroke'].forEach((attr) => {
-        if (element.hasAttribute(attr)) {
-          const value = element.getAttribute(attr);
-          if (shouldConvertColor(value)) {
-            element.setAttribute(attr, 'currentColor');
-          }
+        if (!element.hasAttribute(attr)) {
+          return;
+        }
+
+        const value = element.getAttribute(attr);
+        if (shouldConvertColor(value)) {
+          element.setAttribute(attr, 'currentColor');
         }
       });
     });
 
     ['fill', 'stroke'].forEach((attr) => {
-      if (svgElement.hasAttribute(attr)) {
-        const value = svgElement.getAttribute(attr);
-        if (shouldConvertColor(value)) {
-          svgElement.setAttribute(attr, 'currentColor');
-        }
+      if (!svgElement.hasAttribute(attr)) {
+        return;
+      }
+
+      const value = svgElement.getAttribute(attr);
+      if (shouldConvertColor(value)) {
+        svgElement.setAttribute(attr, 'currentColor');
       }
     });
 

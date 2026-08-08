@@ -47,7 +47,7 @@ export async function checkPasswordCompromise(password: string): Promise<void> {
       if (
         data
           .split('\n')
-          .some((line) => line.split(':')[0].toUpperCase() === suffix)
+          .some((line) => line.split(':', 1)[0]?.toUpperCase() === suffix)
       ) {
         throw new CustomError(
           MSG_PASSWORD_COMPROMISED,

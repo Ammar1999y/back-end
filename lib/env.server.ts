@@ -1,3 +1,4 @@
+/* eslint-disable unicorn/no-top-level-side-effects -- the load-time crash IS this module's contract */
 import { validatePasswordPepperConfiguration } from '@/lib/auth/password-pepper';
 
 /**
@@ -31,7 +32,7 @@ function assertEnv(): void {
     for (const key of REQUIRED_IN_PRODUCTION)
       if (!process.env[key]) missing.push(key);
 
-  if (missing.length)
+  if (missing.length > 0)
     throw new Error(
       `Missing required server env var${missing.length > 1 ? 's' : ''}: ${missing.join(', ')}`
     );
@@ -39,3 +40,18 @@ function assertEnv(): void {
 
 assertEnv();
 validatePasswordPepperConfiguration();
+
+/**
+ * Re-reads a variable `assertEnv` has already proven present. The throw is
+ * unreachable once this module has evaluated; it is what makes the `string`
+ * return type honest, so consumers need no non-null assertion.
+ */
+function requireEnv(key: (typeof REQUIRED_SERVER_ENV)[number]): string {
+  const value = process.env[key];
+  if (!value) throw new Error(`Missing required server env var: ${key}`);
+  return value;
+}
+
+export const DATABASE_URL = requireEnv('DATABASE_URL');
+export const UPSTASH_REDIS_REST_URL = requireEnv('UPSTASH_REDIS_REST_URL');
+export const UPSTASH_REDIS_REST_TOKEN = requireEnv('UPSTASH_REDIS_REST_TOKEN');

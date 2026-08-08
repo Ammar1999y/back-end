@@ -28,6 +28,7 @@ import {
 } from '@/utils/api-response';
 import { CustomError } from '@/utils/error-class';
 import { changePasswordSchema } from '@/utils/validation/auth';
+import { zodIssueMessage } from '@/utils/validation/rules';
 
 import { userMsg } from '../../messages';
 
@@ -50,7 +51,7 @@ export const POST: Handler = async (ctx) => {
     const parsed = changePasswordSchema.safeParse(body);
     if (!parsed.success)
       throw new CustomError(
-        parsed.error.issues[0].message,
+        zodIssueMessage(parsed.error),
         HTTP_STATUS.UNPROCESSABLE
       );
 

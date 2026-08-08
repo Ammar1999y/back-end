@@ -17,7 +17,7 @@ export const DIST_MAX = 100;
 export const sanitizeStrict = (v: string) =>
   typeof v === 'string'
     ? v
-        .replace(
+        .replaceAll(
           /[^\p{L}\p{M}\p{N}\p{Zs}\n\.,!?:/\\;\-+=\(\)\[\]''"؟،؛@#_&%]/gu,
           ''
         )
@@ -27,11 +27,11 @@ export const sanitizeStrict = (v: string) =>
 export const sanitizeStrictSingleLine = (v: string) =>
   typeof v === 'string'
     ? v
-        .replace(
+        .replaceAll(
           /[^\p{L}\p{M}\p{N}\p{Zs}\n\.,!?:/\\;\-+=\(\)\[\]''"؟،؛@#_&%]/gu,
           ''
         )
-        .replace(/\s+/g, ' ')
+        .replaceAll(/\s+/g, ' ')
         .trim()
     : '';
 
@@ -82,8 +82,10 @@ export const idSchema = getIDSchema({ optional: false }) as z.ZodPipe<
 
 export const richTextSchema = z.any();
 
-export const datePreprocess = (val: any) => {
-  const date = safeDate(val);
+export const datePreprocess = (val: unknown) => {
+  const accepted =
+    typeof val === 'string' || typeof val === 'number' || val instanceof Date;
+  const date = accepted ? safeDate(val) : null;
   return date ? date.toISOString() : null;
 };
 
@@ -117,7 +119,7 @@ export const getColorSchema = (
   return z.preprocess(
     (v: string | null | undefined) =>
       typeof v === 'string'
-        ? v.replace(/\s+/g, '').toUpperCase() || (optional ? null : '')
+        ? v.replaceAll(/\s+/g, '').toUpperCase() || (optional ? null : '')
         : optional
           ? null
           : '',
@@ -131,9 +133,9 @@ export const slugPreprocess = (v: string) => {
   return v
     .toLowerCase()
     .trim()
-    .replace(/\s+/g, '-')
-    .replace(/-+/g, '-')
-    .replace(/^-+|-+$/g, '');
+    .replaceAll(/\s+/g, '-')
+    .replaceAll(/-+/g, '-')
+    .replaceAll(/^-+|-+$/g, '');
 };
 
 export const slugSchema = z.preprocess(
@@ -153,7 +155,7 @@ export const slugSchema = z.preprocess(
 
 export const emailSchema = z.preprocess(
   (v: string) =>
-    typeof v === 'string' ? v.replace(/\s+/g, ' ').trim().toLowerCase() : '',
+    typeof v === 'string' ? v.replaceAll(/\s+/g, ' ').trim().toLowerCase() : '',
   z
     .email('يرجى إدخال بريد إلكتروني صحيح')
     .max(EMAIL_MAX, `يجب أن لا يتجاوز البريد الإلكتروني ${EMAIL_MAX} حرفاً`)
@@ -217,7 +219,7 @@ export const phoneSchema = z.preprocess(
   (v) => {
     if (typeof v === 'number') v = String(v);
     if (typeof v !== 'string') return v;
-    return normalizeArabicDigits(v).replace(phoneCleanupRegex, '');
+    return normalizeArabicDigits(v).replaceAll(phoneCleanupRegex, '');
   },
   z
     .string(saudiPhoneEmptyError)

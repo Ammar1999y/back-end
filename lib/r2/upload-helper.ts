@@ -74,9 +74,10 @@ export function validateMagicBytes(
   if (!primaryMatch) return { valid: false };
 
   // Check secondary signature if exists (WebP needs RIFF + WEBP)
-  if ('secondary' in signature && signature.secondary) {
-    const secondaryMatch = signature.secondary.bytes.every(
-      (byte, i) => buffer[signature.secondary!.offset + i] === byte
+  const secondary = 'secondary' in signature ? signature.secondary : undefined;
+  if (secondary) {
+    const secondaryMatch = secondary.bytes.every(
+      (byte, i) => buffer[secondary.offset + i] === byte
     );
     if (!secondaryMatch) return { valid: false };
   }
@@ -239,14 +240,15 @@ export async function uploadImagesToR2(params: {
             isPublic: bucketType === 'public',
           }),
           contentDisposition: getContentDisposition({
-            filename: img.r2Key.split('/').pop()!,
+            filename: img.r2Key.slice(img.r2Key.lastIndexOf('/') + 1),
             inline: true,
           }),
           metadata: {
-            ...(img.originalMimeType && {
-              originalMimeType: img.originalMimeType,
-              originalSize: img.originalSize!.toString(),
-            }),
+            ...(img.originalMimeType &&
+              img.originalSize !== undefined && {
+                originalMimeType: img.originalMimeType,
+                originalSize: img.originalSize.toString(),
+              }),
           },
         })
       )

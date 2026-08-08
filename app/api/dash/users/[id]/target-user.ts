@@ -24,6 +24,10 @@ export type RolePolicyShape = {
  * endpoints checked only ownership — so an actor blocked from *reading* a
  * protected account could still list and revoke its sessions. A subresource
  * must never be reachable when its parent is not.
+ *
+ * Returns the target's role id, which a caller that needs it would otherwise
+ * have to re-narrow from `EntityID | null` after this function already proved
+ * it present.
  */
 export function assertTargetUserVisible(opts: {
   isSelf: boolean;
@@ -32,7 +36,7 @@ export function assertTargetUserVisible(opts: {
   role: RolePolicyShape;
   actorUserId: EntityID;
   scope: 'all' | 'own' | null;
-}): void {
+}): EntityID {
   if (!opts.roleId) throw new CustomError(MSG_NOT_FOUND, HTTP_STATUS.NOT_FOUND);
 
   // Self is exempt: a system-role owner can still read their own account.
@@ -45,6 +49,8 @@ export function assertTargetUserVisible(opts: {
     opts.createdBy !== opts.actorUserId
   )
     throw new CustomError(MSG_NOT_FOUND, HTTP_STATUS.NOT_FOUND);
+
+  return opts.roleId;
 }
 
 /**

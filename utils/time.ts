@@ -41,14 +41,33 @@ function getZoneFormatter(timeZone: string): Intl.DateTimeFormat {
   return formatter;
 }
 
-function zoneParts(instant: Date, timeZone: string): Record<string, number> {
+interface ZoneParts {
+  year: number;
+  month: number;
+  day: number;
+  hour: number;
+  minute: number;
+  second: number;
+}
+
+// `NaN` rather than 0 for an absent field: it propagates as the invalid date
+// every caller already rejects, instead of a plausible year 0 / January / day 0.
+function zoneParts(instant: Date, timeZone: string): ZoneParts {
   const parts = getZoneFormatter(timeZone).formatToParts(instant);
-  const out: Record<string, number> = {};
-  for (const part of parts) 
-    if (part.type !== 'literal') out[part.type] = Number(part.value);
-  // Some ICU versions render midnight as hour "24".
-  if (out.hour === 24) out.hour = 0;
-  return out;
+  const found = new Map<string, number>();
+  for (const part of parts)
+    if (part.type !== 'literal') found.set(part.type, Number(part.value));
+  const read = (type: string) => found.get(type) ?? NaN;
+  const hour = read('hour');
+  return {
+    year: read('year'),
+    month: read('month'),
+    day: read('day'),
+    // Some ICU versions render midnight as hour "24".
+    hour: hour === 24 ? 0 : hour,
+    minute: read('minute'),
+    second: read('second'),
+  };
 }
 
 /** Offset of `timeZone` from UTC at `instant`, in milliseconds. */
@@ -103,6 +122,21 @@ function resolveZonedWallClock(utcNaive: number, timeZone: string): Date {
  */
 const MIDNIGHT_JUMP_PROBE_HOURS = 3;
 
+interface CalendarDateParts {
+  year: number;
+  month: number;
+  day: number;
+}
+
+/** Split a `YYYY-MM-DD` string into numeric components, or null if malformed. */
+function splitCalendarDate(calendarDate: string): CalendarDateParts | null {
+  if (!CALENDAR_DATE_PATTERN.test(calendarDate)) return null;
+  const [year, month, day] = calendarDate.split('-').map(Number);
+  if (year === undefined || month === undefined || day === undefined)
+    return null;
+  return { year, month, day };
+}
+
 /** First instant belonging to `calendarDate` in `timeZone`, or null. */
 function firstInstantOfDay(
   year: number,
@@ -128,8 +162,9 @@ export function zonedDayStart(
   calendarDate: string,
   timeZone: string = BUSINESS_TIMEZONE
 ): Date | null {
-  if (!CALENDAR_DATE_PATTERN.test(calendarDate)) return null;
-  const [year, month, day] = calendarDate.split('-').map(Number);
+  const parts = splitCalendarDate(calendarDate);
+  if (!parts) return null;
+  const { year, month, day } = parts;
   if (Number.isNaN(Date.UTC(year, month - 1, day))) return null;
 
   return firstInstantOfDay(year, month, day, calendarDate, timeZone);
@@ -147,7 +182,9 @@ export function zonedNextDayStart(
   // Validates the input day, including the real-date round trip.
   if (!zonedDayStart(calendarDate, timeZone)) return null;
 
-  const [year, month, day] = calendarDate.split('-').map(Number);
+  const parts = splitCalendarDate(calendarDate);
+  if (!parts) return null;
+  const { year, month, day } = parts;
   // The next day's identity is derived from `Date`, not from re-parsing a
   // YYYY-MM-DD string through `CALENDAR_DATE_PATTERN`: the day after
   // 9999-12-31 is year 10000, whose five digits the four-digit pattern
@@ -177,7 +214,7 @@ export function toCalendarDate(
   if (typeof raw === 'string' && CALENDAR_DATE_PATTERN.test(raw)) return raw;
 
   const numeric = Number(raw);
-  if (!Number.isFinite(numeric) || numeric === 0) return null;
+  if (numeric === 0 || !Number.isFinite(numeric)) return null;
   const instant = safeDate(numeric);
   return instant ? calendarDayInZone(instant, timeZone) : null;
 }

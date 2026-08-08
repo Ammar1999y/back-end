@@ -231,11 +231,11 @@ function computeChangedFields(
 ): string[] {
   const skip = new Set(metadataFields);
   const changed: string[] = [];
-  for (const key of Object.keys(newData)) {
-    if (skip.has(key) || isSensitiveAuditKey(key, newData[key], safeFields))
+  for (const [key, newValue] of Object.entries(newData)) {
+    if (skip.has(key) || isSensitiveAuditKey(key, newValue, safeFields))
       continue;
     const oldVal = JSON.stringify(oldData[key] ?? null);
-    const newVal = JSON.stringify(newData[key] ?? null);
+    const newVal = JSON.stringify(newValue ?? null);
     if (oldVal !== newVal) changed.push(key);
   }
   return changed;

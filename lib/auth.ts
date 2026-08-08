@@ -3,7 +3,7 @@ import * as schema from '@/db/schema';
 import { sanitizeForLog, validID } from '@/utils';
 import { betterAuth } from 'better-auth';
 import { drizzleAdapter } from 'better-auth/adapters/drizzle';
-import { APIError, createAuthMiddleware } from 'better-auth/api';
+import { APIError, createAuthMiddleware, isAPIError } from 'better-auth/api';
 import { captcha, haveIBeenPwned } from 'better-auth/plugins';
 
 import {
@@ -77,7 +77,7 @@ const ALLOWED_PATHS = new Set([
 const CUSTOM_CODE = CUSTOM_AUTH_CODE;
 
 export const auth = betterAuth({
-  baseURL: process.env.NEXT_PUBLIC_URL!,
+  baseURL: process.env.NEXT_PUBLIC_URL,
   database: drizzleAdapter(db, { provider: 'pg', schema: schema }),
   emailAndPassword: {
     enabled: true,
@@ -187,7 +187,12 @@ export const auth = betterAuth({
       }
     }),
     after: createAuthMiddleware(async (ctx) => {
-      const errorCode = (ctx.context?.returned as any)?.body?.code;
+      // Better Auth's own predicate, not `instanceof`: it also accepts an
+      // APIError that crossed a module-instance boundary, which is the same
+      // value the dispatcher itself treats as the failure.
+      const returned = ctx.context?.returned;
+      const failure = isAPIError(returned) ? returned : undefined;
+      const errorCode = failure?.body?.code;
 
       // `Object.hasOwn` + an own-property read, not `BASE_ERROR_CODES[code]`:
       // the code is framework-supplied text, and a plain object resolves
@@ -201,7 +206,7 @@ export const auth = betterAuth({
 
       if (errorCode && errorCode !== CUSTOM_CODE && mappedMessage) {
         throw new APIError(
-          (ctx.context?.returned as any)?.statusCode || HTTP_STATUS.BAD_REQUEST,
+          failure?.status || failure?.statusCode || HTTP_STATUS.BAD_REQUEST,
           {
             message: mappedMessage,
             code: CUSTOM_CODE,
@@ -428,7 +433,7 @@ export const auth = betterAuth({
       secretKey:
         process.env.NODE_ENV === 'development'
           ? '1x0000000000000000000000000000000AA'
-          : process.env.TURNSTILE_SECRET_KEY!,
+          : (process.env.TURNSTILE_SECRET_KEY ?? ''),
       endpoints: ['/sign-in/email'], // TODO: add the proper endpoints
     }),
     // Passwordless sign-in (OTP → session). Verifies its own captcha/OTP.

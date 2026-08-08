@@ -34,6 +34,7 @@ import { CustomError } from '@/utils/error-class';
 import { processOtpSend } from '@/utils/otp';
 import { changePhoneSchema } from '@/utils/validation/auth';
 import { ENABLED_OTP_CHANNELS } from '@/utils/validation/otp';
+import { zodIssueMessage } from '@/utils/validation/rules';
 
 import { userMsg } from '../../messages';
 import { commitPhoneChange } from '../contact-change';
@@ -66,12 +67,11 @@ export const POST: Handler = async (ctx) => {
     const parsed = changePhoneSchema.safeParse(body);
     if (!parsed.success)
       throw new CustomError(
-        parsed.error.issues[0].message,
+        zodIssueMessage(parsed.error),
         HTTP_STATUS.UNPROCESSABLE
       );
 
     const { newPhoneNumber, channel } = parsed.data;
-    const auditMeta = getAuditMeta(ctx);
 
     if (
       !OTP_AUTO_VERIFY &&
@@ -82,6 +82,7 @@ export const POST: Handler = async (ctx) => {
         HTTP_STATUS.SERVICE_UNAVAILABLE
       );
 
+    const auditMeta = getAuditMeta(ctx);
     try {
       await verifyLoginAttempt({
         userId,

@@ -24,7 +24,11 @@ import {
 } from '@/utils/api-response';
 import { CustomError } from '@/utils/error-class';
 import { NAME_MAX } from '@/utils/validation/constants';
-import { emailSchema, passwordSchema } from '@/utils/validation/rules';
+import {
+  emailSchema,
+  passwordSchema,
+  zodIssueMessage,
+} from '@/utils/validation/rules';
 
 const devSignUpSchema = z.object({
   name: z
@@ -49,7 +53,7 @@ export const POST: Handler = async (ctx) => {
     const parsed = devSignUpSchema.safeParse(body);
     if (!parsed.success)
       throw new CustomError(
-        parsed.error.issues[0].message,
+        zodIssueMessage(parsed.error),
         HTTP_STATUS.UNPROCESSABLE
       );
 
@@ -65,6 +69,9 @@ export const POST: Handler = async (ctx) => {
           isActive: true,
         })
         .returning({ id: roles.id });
+
+      if (!systemRole)
+        throw new CustomError(MSG_CREATE_ERROR, HTTP_STATUS.INTERNAL_ERROR);
 
       const allPermissions = DEFAULT_PAGE_PERMISSIONS.map((page) => ({
         roleId: systemRole.id,
@@ -86,6 +93,9 @@ export const POST: Handler = async (ctx) => {
           isActive: true,
         })
         .returning({ id: users.id });
+
+      if (!newUser)
+        throw new CustomError(MSG_CREATE_ERROR, HTTP_STATUS.INTERNAL_ERROR);
 
       await tx.insert(accounts).values({
         accountId: newUser.id,

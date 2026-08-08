@@ -17,6 +17,7 @@ import { auditLog } from '@/lib/audit';
 import {
   HTTP_STATUS,
   MSG_CANNOT_GRANT_UNOWNED_PERMISSIONS,
+  MSG_CREATE_ERROR,
   MSG_NOT_FOUND,
 } from '@/utils/api-messages';
 import { CustomError } from '@/utils/error-class';
@@ -99,6 +100,10 @@ export async function createCustomRole(
         createdBy: createdBy ?? null,
       })
       .returning({ id: roles.id });
+
+    if (!customRole)
+      throw new CustomError(MSG_CREATE_ERROR, HTTP_STATUS.INTERNAL_ERROR);
+
     roleId = customRole.id;
   }
 
@@ -235,7 +240,9 @@ export function permissionsEqual(
         .toSorted(([x], [y]) => x.localeCompare(y))
         .map(([pageName, permissions]) => [
           pageName,
-          Object.entries(permissions).toSorted(([x], [y]) => x.localeCompare(y)),
+          Object.entries(permissions).toSorted(([x], [y]) =>
+            x.localeCompare(y)
+          ),
         ])
     );
   };
@@ -469,7 +476,7 @@ export async function validateRolePermissionScope(
     .where(eq(rolePermissions.roleId, roleId))
     .for('share');
 
-  if (!perms.length) return;
+  if (perms.length === 0) return;
 
   const targetPerms = perms.map((p) => ({
     name: p.pageName as DashboardPage,

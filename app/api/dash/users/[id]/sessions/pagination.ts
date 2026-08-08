@@ -63,9 +63,10 @@ function parseCursorTimestamp(raw: string): Date | null {
   const [, y, mo, d, h, mi, sec] = match;
   const year = Number(y);
   const month = Number(mo);
-  const day = Number(d);
 
   if (month < 1 || month > 12) return null;
+
+  const day = Number(d);
   if (day < 1 || day > daysInMonth(year, month)) return null;
   if (Number(h) > 23 || Number(mi) > 59 || Number(sec) > 59) return null;
 

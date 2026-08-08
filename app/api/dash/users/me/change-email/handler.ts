@@ -33,6 +33,7 @@ import { CustomError } from '@/utils/error-class';
 import { processOtpSend } from '@/utils/otp';
 import { changeEmailSchema } from '@/utils/validation/auth';
 import { EMAIL_OTP_AVAILABLE } from '@/utils/validation/otp';
+import { zodIssueMessage } from '@/utils/validation/rules';
 
 import { userMsg } from '../../messages';
 import { commitEmailChange, refreshSessionCookies } from '../contact-change';
@@ -66,12 +67,9 @@ export const POST: Handler = async (ctx) => {
     const parsed = changeEmailSchema.safeParse(body);
     if (!parsed.success)
       throw new CustomError(
-        parsed.error.issues[0].message,
+        zodIssueMessage(parsed.error),
         HTTP_STATUS.UNPROCESSABLE
       );
-
-    const newEmail = parsed.data.newEmail;
-    const auditMeta = getAuditMeta(ctx);
 
     // Verification must be possible before we accept the request — otherwise we
     // would either send to a dead channel or strand the change forever.
@@ -81,6 +79,7 @@ export const POST: Handler = async (ctx) => {
         HTTP_STATUS.SERVICE_UNAVAILABLE
       );
 
+    const auditMeta = getAuditMeta(ctx);
     // Re-auth in its own short tx so the later mutation doesn't hold a row lock
     // across argon2.
     try {
@@ -120,6 +119,9 @@ export const POST: Handler = async (ctx) => {
         MSG_INSUFFICIENT_PERMISSIONS,
         HTTP_STATUS.FORBIDDEN
       );
+
+    const newEmail = parsed.data.newEmail;
+
     if (currentUser.email === newEmail)
       throw new CustomError(
         userMsg.newEmailSameAsCurrent,

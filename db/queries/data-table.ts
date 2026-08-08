@@ -20,7 +20,7 @@ import {
 import { HTTP_STATUS } from '@/utils/api-messages';
 import { CustomError } from '@/utils/error-class';
 
-interface DataTableQueryParams {
+interface DataTableQueryParams<T extends Table> {
   /**
    * Server-owned descriptors for every filterable/sortable column. Its keys
    * ARE the allowlist — a column with no descriptor can be neither filtered
@@ -30,7 +30,7 @@ interface DataTableQueryParams {
   filterableColumns: FilterColumnSpecs;
   /** Columns to match against for quick search (?search=) */
   searchableColumns?: string[];
-  defaultSort?: ExtendedColumnSort<any>;
+  defaultSort?: ExtendedColumnSort<T>;
 }
 
 interface DataTableQueryResult<T extends Table> {
@@ -55,16 +55,18 @@ export function parseDataTableParams<T extends Table>(
     filterableColumns,
     searchableColumns,
     defaultSort,
-  }: DataTableQueryParams
+  }: DataTableQueryParams<T>
 ): DataTableQueryResult<T> {
   const { searchParams } = new URL(url);
 
-  const params: Record<string, string | undefined> = Object.fromEntries(searchParams.entries());
+  const params: Record<string, string | undefined> = Object.fromEntries(
+    searchParams.entries()
+  );
 
   // A filter the parser could not read is a client error, not a filter to
   // ignore: dropping it silently broadens an `and` query and narrows an `or`
   // one, so the caller gets rows they never asked for with a 200.
-  const parsed = parseSearchParams(params, defaultSort, () => {
+  const parsed = parseSearchParams<T>(params, defaultSort, () => {
     throw new CustomError(MSG_INVALID_FILTER, HTTP_STATUS.UNPROCESSABLE);
   });
 

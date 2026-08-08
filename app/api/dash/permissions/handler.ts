@@ -36,6 +36,7 @@ import {
 } from '@/utils/api-response';
 import { CustomError } from '@/utils/error-class';
 import { adminCreatePermissionSchema } from '@/utils/validation/permissions';
+import { zodIssueMessage } from '@/utils/validation/rules';
 
 import { permissionMsg } from './messages';
 
@@ -75,7 +76,7 @@ export const GET: Handler = async (ctx) => {
       where
     );
 
-    const [rolesWithCounts, [{ total }]] = await Promise.all([
+    const [rolesWithCounts, [totalRow]] = await Promise.all([
       db
         .select({
           id: roles.id,
@@ -96,6 +97,8 @@ export const GET: Handler = async (ctx) => {
         .offset(offset),
       db.select({ total: count() }).from(roles).where(baseFilter),
     ]);
+
+    const total = totalRow?.total ?? 0;
 
     return apiSuccess({
       message: MSG_FETCHED,
@@ -136,7 +139,7 @@ export const POST: Handler = async (ctx) => {
     const validatedDataParsed = adminCreatePermissionSchema.safeParse(body);
     if (!validatedDataParsed.success)
       throw new CustomError(
-        validatedDataParsed.error.issues[0].message,
+        zodIssueMessage(validatedDataParsed.error),
         HTTP_STATUS.UNPROCESSABLE
       );
 
@@ -166,6 +169,9 @@ export const POST: Handler = async (ctx) => {
           createdBy: actorUserId,
         })
         .returning({ id: roles.id });
+
+      if (!newRole)
+        throw new CustomError(MSG_CREATE_ERROR, HTTP_STATUS.INTERNAL_ERROR);
 
       const newPermissionsForAudit: Array<{
         pageName: string;
@@ -201,7 +207,7 @@ export const POST: Handler = async (ctx) => {
           // Same `{ pageName, permissions }` shape and `changedPermissions`
           // summary the update and custom-role events use. The request payload
           // keys pages as `name`, so it is mapped rather than stored verbatim.
-          ...(newPermissionsForAudit.length && {
+          ...(newPermissionsForAudit.length > 0 && {
             permissions: newPermissionsForAudit,
             changedPermissions: diffPermissionMatrices(
               [],
