@@ -4,6 +4,7 @@ import { and, eq, isNull } from 'drizzle-orm';
 
 import { ensureMinDelay, otpMsg } from '@/app/api/auth/otp/messages';
 import { db } from '@/db';
+import { userContactColumn } from '@/db/queries';
 import { users } from '@/db/schema';
 import { withTransaction } from '@/db/ws';
 import { sanitizeForLog } from '@/utils';
@@ -107,9 +108,7 @@ export const passwordless = () =>
               .from(users)
               .where(
                 and(
-                  channel === 'email'
-                    ? eq(users.email, identifier)
-                    : eq(users.phoneNumber, identifier),
+                  eq(userContactColumn(channel), identifier),
                   isNull(users.deletedAt),
                   eq(users.isActive, true)
                 )

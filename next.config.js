@@ -156,7 +156,9 @@ const headers = isDev
 /** @type {import('next').NextConfig} */
 const nextConfig = {
   reactStrictMode: true,
-  reactCompiler: true,
+  serverExternalPackages: ['jsdom', 'css-tree'],
+  // TODO: active it for front-end
+  // reactCompiler: true,
   poweredByHeader: false,
   images: {
     unoptimized: true,

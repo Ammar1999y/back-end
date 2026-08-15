@@ -5,12 +5,12 @@ import type {
   SessionMetadata,
 } from './constants';
 import type { WsTx } from '@/db/ws';
+import type { EntityID } from '@/types';
 
 import { and, eq, isNull, ne, notInArray, sql } from 'drizzle-orm';
 
 import { db } from '@/db';
 import { rolePermissions, roles, users } from '@/db/schema';
-import { EntityID } from '@/types';
 import { v7 as uuidv7 } from 'uuid';
 import { auditLog } from '@/lib/audit';
 
@@ -26,9 +26,9 @@ import {
   CUSTOM_ROLE_VALUE,
   DASHBOARD_PAGES,
   DEFAULT_PAGE_PERMISSIONS,
-  OWN_ACTION_MAP,
   PERMISSION_ACTIONS,
   ROLE_SCOPE,
+  SUPERSEDING_ACTION,
 } from './constants';
 
 type DbOrTx = typeof db | WsTx;
@@ -409,15 +409,6 @@ export async function getUserPermissions({
  * Compares each `true` permission in `targetPermissions` against the acting user's own permissions.
  * Throws if any granted permission is not held by the acting user.
  */
-/**
- * Own-scoped action → the all-scoped action that supersedes it.
- *
- * The inverse of `OWN_ACTION_MAP`, derived from it so the two can't drift.
- */
-const SUPERSEDING_ACTION = Object.fromEntries(
-  Object.entries(OWN_ACTION_MAP).map(([all, own]) => [own, all])
-) as Record<string, PermissionAction | undefined>;
-
 /**
  * Does the actor hold `action`, directly or through supersession?
  *

@@ -56,7 +56,7 @@ export const POST: Handler = async (ctx) => {
     const auditMeta = getAuditMeta(ctx);
 
     // OTP_AUTO_VERIFY commits directly (idempotent if initiate already did).
-    // Otherwise the session lookup keyed by (userId, channel, purpose,
+    // Otherwise the session lookup keyed by (userId, contactKind, purpose,
     // identifier) means the code can only commit the address it was issued for.
     await (OTP_AUTO_VERIFY
       ? withTransaction((tx) =>

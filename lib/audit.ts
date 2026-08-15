@@ -1,9 +1,9 @@
 import type { AuditAction } from '@/db/schema';
 import type { WsTx } from '@/db/ws';
 import type { HandlerInput } from '@/lib/http/contract';
+import type { EntityID } from '@/types';
 
 import { auditLogs } from '@/db/schema';
-import { EntityID } from '@/types';
 import * as z from 'zod';
 
 import { API_PATH_MAX, USER_AGENT_MAX } from './audit/constants';

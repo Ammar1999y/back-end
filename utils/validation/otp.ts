@@ -10,10 +10,20 @@ import {
 } from './rules';
 
 // ── Channel Configuration ──
-// All supported channels — any change here requires a DB migration
-// (update the CHECK constraint chk_verification_channel on verification_sessions)
-export const OTP_CHANNELS = ['email', 'sms', 'whatsapp'] as const;
+// The email/phone split is declared HERE and nowhere else: `isPhoneChannel`,
+// the per-contact quota grouping, the phone-only schemas and the availability
+// flags all derive from these two lists. `OTP_CHANNELS` is the concatenation,
+// so its order — which the `otp_channel` pgEnum depends on — stays stable.
+// ⚠️ Changing these requires a DB migration (otp_channel pgEnum).
+export const EMAIL_OTP_CHANNELS = ['email'] as const;
+export const PHONE_OTP_CHANNELS = ['sms', 'whatsapp'] as const;
+export const OTP_CHANNELS = [
+  ...EMAIL_OTP_CHANNELS,
+  ...PHONE_OTP_CHANNELS,
+] as const;
+
 export type OtpChannel = (typeof OTP_CHANNELS)[number];
+export type PhoneOtpChannel = (typeof PHONE_OTP_CHANNELS)[number];
 
 // ── OTP Purpose ──
 // Every verification session is bound to exactly one purpose so an OTP proven
@@ -32,7 +42,14 @@ export const OTP_PURPOSES = [
 ] as const;
 export type OtpPurpose = (typeof OTP_PURPOSES)[number];
 
-const isPhoneChannel = (c: OtpChannel) => c === 'sms' || c === 'whatsapp';
+const PHONE_CHANNEL_SET = new Set<OtpChannel>(PHONE_OTP_CHANNELS);
+
+/**
+ * sms and whatsapp reach the same destination and cost the same, so every
+ * per-contact quota and block must treat them as one.
+ */
+export const isPhoneChannel = (c: OtpChannel): c is PhoneOtpChannel =>
+  PHONE_CHANNEL_SET.has(c);
 
 // Channels listed in the env, filtered to real ones and — when phone is
 // disabled (PHONE_NUMBER_MODE) — with the phone channels stripped so the
@@ -51,11 +68,8 @@ const envChannels: OtpChannel[] = (
 // verification UI still needs channels to offer and the flag-flip endpoints
 // must stay reachable. Email is always available; phone channels only when
 // phone is enabled.
-const bypassChannels: OtpChannel[] = OTP_AUTO_VERIFY
-  ? ([
-      'email',
-      ...(PHONE_ENABLED ? (['sms', 'whatsapp'] as const) : []),
-    ] as OtpChannel[])
+const bypassChannels: readonly OtpChannel[] = OTP_AUTO_VERIFY
+  ? [...EMAIL_OTP_CHANNELS, ...(PHONE_ENABLED ? PHONE_OTP_CHANNELS : [])]
   : [];
 
 // Enabled channels — exposed to the client via NEXT_PUBLIC_ so the UI adapts.
@@ -66,13 +80,14 @@ export const ENABLED_OTP_CHANNELS: readonly OtpChannel[] = [
 
 export const OTP_ENABLED = ENABLED_OTP_CHANNELS.length > 0;
 
-/** A channel capable of verifying the email is enabled. */
-export const EMAIL_OTP_AVAILABLE = (
-  ENABLED_OTP_CHANNELS as readonly string[]
-).includes('email');
+/** Narrows unvalidated input to a channel that is enabled right now. */
+export function isChannelEnabled(channel: string): channel is OtpChannel {
+  return (ENABLED_OTP_CHANNELS as readonly string[]).includes(channel);
+}
 
-/** A channel capable of verifying the phone (sms/whatsapp) is enabled. */
-export const PHONE_OTP_AVAILABLE = ENABLED_OTP_CHANNELS.some(isPhoneChannel);
+/** A channel capable of verifying the email / the phone is enabled. */
+export const EMAIL_OTP_AVAILABLE = EMAIL_OTP_CHANNELS.some(isChannelEnabled);
+export const PHONE_OTP_AVAILABLE = PHONE_OTP_CHANNELS.some(isChannelEnabled);
 
 const MSG_CHANNEL_DISABLED = 'طريقة الإرسال غير مسموحة حالياً';
 
@@ -81,7 +96,7 @@ export function channelEnabledRefine(
   data: { channel: string },
   ctx: z.RefinementCtx
 ) {
-  if (!(ENABLED_OTP_CHANNELS as readonly string[]).includes(data.channel)) {
+  if (!isChannelEnabled(data.channel)) {
     ctx.addIssue({
       code: z.ZodIssueCode.custom,
       message: MSG_CHANNEL_DISABLED,
@@ -91,9 +106,7 @@ export function channelEnabledRefine(
 
 export const channelSchema = z
   .enum(OTP_CHANNELS)
-  .refine((ch) => (ENABLED_OTP_CHANNELS as readonly string[]).includes(ch), {
-    message: MSG_CHANNEL_DISABLED,
-  });
+  .refine(isChannelEnabled, { message: MSG_CHANNEL_DISABLED });
 
 export const otpCodeSchema = z.preprocess(
   sanitizeStrictSingleLine,

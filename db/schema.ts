@@ -5,6 +5,11 @@
 // data-table UI, you MUST also add a corresponding trigram (GIN) index in:
 //   db/migrations/001_add_trgm_indexes.sql
 // Without a trgm index, ILIKE '%text%' queries will cause full table scans.
+import type {
+  DashboardPage,
+  PermissionAction,
+  SessionMetadata,
+} from '@/lib/permissions/constants';
 import type { AnyPgColumn } from 'drizzle-orm/pg-core';
 
 import { relations, sql } from 'drizzle-orm';
@@ -16,6 +21,7 @@ import {
   jsonb,
   pgEnum,
   pgTable,
+  text,
   timestamp,
   uniqueIndex,
   uuid,
@@ -27,11 +33,8 @@ import { API_PATH_MAX, USER_AGENT_MAX } from '@/lib/audit/constants';
 import {
   CUSTOM_ROLE_VALUE,
   DASHBOARD_PAGES,
-  DashboardPage,
-  PermissionAction,
   REQUIRE_ROLE_FOR_LOGIN,
   ROLE_SCOPE,
-  SessionMetadata,
 } from '@/lib/permissions/constants';
 
 import { PHONE_NUMBER_MODE, PHONE_REQUIRED } from '@/utils/config';
@@ -427,7 +430,20 @@ export const verificationSessions = pgTable(
     userId: uuid('user_id')
       .notNull()
       .references(() => users.id, { onDelete: 'cascade' }),
+    // Delivery transport of the most recent code. Informational after the fact:
+    // nothing reads it to decide behaviour, and it is NOT part of the key.
     channel: otpChannel('channel').notNull(),
+    // What is actually being proven, derived from the transport so the two can
+    // never disagree. sms and whatsapp reach the same phone number, so keying
+    // sessions on the transport gave each one its own send cycle, its own
+    // 5-guess budget and its own 6-hour block — switching transport reset all
+    // three. Generated rather than written by the app: an INSERT cannot set it,
+    // so no code path can produce a row whose kind contradicts its channel.
+    contactKind: text('contact_kind')
+      .notNull()
+      .generatedAlwaysAs(
+        sql`CASE WHEN channel = 'email' THEN 'email' ELSE 'phone' END`
+      ),
     identifier: varchar('identifier', { length: OTP_IDENTIFIER_MAX }).notNull(),
     // Binds the session to a single reason so a code proven for one purpose can
     // never authorize a different sensitive action.
@@ -440,8 +456,12 @@ export const verificationSessions = pgTable(
     }),
     attemptNumber: integer('attempt_number').notNull().default(0),
     verifyAttemptNumber: integer('verify_attempt_number').notNull().default(0),
-    // Rolling 24h counter of failed verifies. Unlike verifyAttemptNumber,
-    // this is NOT reset on resend — it closes the send-cycle-reset bypass.
+    // Failed verifies in a 24h window ANCHORED at verifyAttemptWindowStart —
+    // a fixed window, not a rolling one: every failure on this row ages out
+    // together when the anchor passes 24h. Unlike verifyAttemptNumber it is
+    // NOT reset on resend, which closes the send-cycle-reset bypass. It lives
+    // on the proof row, so it is also lost when the row is deleted (a
+    // verify_contact success, or a credential rotation).
     verifyAttemptDaily: integer('verify_attempt_daily').notNull().default(0),
     verifyAttemptWindowStart: timestamp('verify_attempt_window_start', {
       withTimezone: true,
@@ -483,12 +503,14 @@ export const verificationSessions = pgTable(
     ...timestamps,
   },
   (t) => [
-    // Widened to include `purpose`: one in-flight session per (user, channel,
-    // purpose). The send upsert's onConflict target MUST match this key, or a
-    // change_email send would clobber an in-flight verify_contact code.
-    uniqueIndex('ux_verification_sessions_user_channel_purpose').on(
+    // One in-flight session per (user, CONTACT KIND, purpose). Keyed on the
+    // contact kind, not the transport, so sms and whatsapp for one phone share
+    // a single cycle, block and verify budget. `purpose` stays in the key or a
+    // change_email send would clobber an in-flight verify_contact code. The
+    // send upsert's onConflict target MUST match this key.
+    uniqueIndex('ux_verification_sessions_user_contact_purpose').on(
       t.userId,
-      t.channel,
+      t.contactKind,
       t.purpose
     ),
     check('chk_attempt_number_non_negative', sql`attempt_number >= 0`),

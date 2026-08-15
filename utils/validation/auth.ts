@@ -1,11 +1,12 @@
-import { EntityID } from '@/types';
+import type { EntityID } from '@/types';
+
 import * as z from 'zod';
 import { CUSTOM_ROLE_VALUE } from '@/lib/permissions/constants';
 
 import { PHONE_ENABLED, PHONE_REQUIRED } from '@/utils/config';
 
 import { NAME_MAX } from './constants';
-import { channelEnabledRefine, otpCodeSchema } from './otp';
+import { channelEnabledRefine, otpCodeSchema, PHONE_OTP_CHANNELS } from './otp';
 import { permissionsArraySchema } from './permissions';
 import {
   emailSchema,
@@ -210,7 +211,7 @@ export const changeEmailVerifySchema = z.object({
 });
 
 // Phone OTP delivery channel (email is never a phone channel).
-const phoneOtpChannelSchema = z.enum(['sms', 'whatsapp']);
+const phoneOtpChannelSchema = z.enum(PHONE_OTP_CHANNELS);
 
 // Self-service: change own phone — step 1 (initiate).
 export const changePhoneSchema = z.object({

@@ -87,22 +87,19 @@ export function parseDataTableParams<T extends Table>(
         })
       : undefined;
 
-  // --- Quick search (mutually exclusive with filters on the client) ---
-  // An explicitly supplied term outside the accepted length is REJECTED, not
-  // ignored. The debounce that makes 1–2 characters a normal in-progress state
-  // lives on the client, which already omits the parameter below the trigram
-  // floor (`utils/query.ts`) — so a short term arriving here is not a user
-  // mid-keystroke, it is a request whose search this endpoint cannot honour.
-  // Answering it with unfiltered rows and a 200 is the same fail-open the filter
-  // path rejects.
+  // --- Quick search ---
+  // Out-of-range terms are IGNORED, not rejected — the opposite of the filter
+  // contract above, deliberately. The trigram floor is an index policy, not a
+  // statement about malformed input: a dropped structured predicate widens an
+  // `and` query to rows the caller never asked for, whereas dropping a
+  // standalone search term returns the caller's ordinary authorized list. A
+  // bookmarked 1-2 character URL is a compatibility case, not an attack.
   const rawSearch = searchParams.get('search')?.trim() ?? '';
-  if (
-    rawSearch.length > 0 &&
-    (rawSearch.length < MIN_SEARCH_LENGTH ||
-      rawSearch.length > MAX_SEARCH_LENGTH)
-  )
-    throw new CustomError(MSG_INVALID_FILTER, HTTP_STATUS.UNPROCESSABLE);
-  const search = rawSearch;
+  const search =
+    rawSearch.length >= MIN_SEARCH_LENGTH &&
+    rawSearch.length <= MAX_SEARCH_LENGTH
+      ? rawSearch
+      : '';
 
   let searchWhere: SQL | undefined;
   if (search && searchableColumns?.length) {

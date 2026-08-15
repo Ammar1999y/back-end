@@ -1,10 +1,10 @@
 import type { WsTx } from '@/db/ws';
+import type { EntityID } from '@/types';
 
 import { and, eq, isNull, sql } from 'drizzle-orm';
 
 import { accounts, users } from '@/db/schema';
 import { withTransaction } from '@/db/ws';
-import { EntityID } from '@/types';
 import { auditLog } from '@/lib/audit';
 
 import { CREDENTIAL_PROVIDER_ID } from '@/utils/api-messages';

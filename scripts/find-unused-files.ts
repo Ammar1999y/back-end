@@ -27,13 +27,14 @@ const SKIP_DIRECTORIES = new Set([
   'out',
   'patches',
   'public',
+  'scripts',
 ]);
 
 const CODE_EXTENSIONS = ['.ts', '.tsx', '.mts', '.js', '.jsx', '.mjs', '.cjs'];
 const RESOLVE_EXTENSIONS = [...CODE_EXTENSIONS, '.json', '.css'];
 
 /** Loaded by Next.js / tooling, not by an import — always a root. */
-const ENTRY_DIRECTORIES = ['app/', 'tests/', 'scripts/'];
+const ENTRY_DIRECTORIES = ['app/', 'tests/'];
 const ENTRY_FILE_PATTERN =
   /^(middleware|instrumentation|next\.config|drizzle\.config|eslint\.config|prettier\.config|postcss\.config|tailwind\.config)\.[a-z]+$/;
 
@@ -44,7 +45,9 @@ const toKey = (absolutePath: string) =>
   path.relative(ROOT, absolutePath).split(path.sep).join('/');
 
 const walk = (directory: string, found: string[] = []) => {
-  for (const entry of readdirSync(directory, { withFileTypes: true })) {
+  // eslint-disable-next-line security/detect-non-literal-fs-filename -- `directory` is reached by recursive descent from ROOT, never from input
+  const entries = readdirSync(directory, { withFileTypes: true });
+  for (const entry of entries) {
     const full = path.join(directory, entry.name);
     if (entry.isDirectory()) {
       if (!SKIP_DIRECTORIES.has(entry.name)) walk(full, found);
@@ -101,6 +104,25 @@ const resolveSpecifier = (
   );
 };
 
+/**
+ * Every in-repo file a source imports. Extracted from the scan loop so its
+ * `continue` is not inside a nested loop — see `enqueueUnreached` below for the
+ * same reasoning.
+ */
+const resolveImports = (
+  source: string,
+  fromKey: string,
+  files: Set<string>
+): string[] => {
+  const resolved: string[] = [];
+  for (const [, specifier] of source.matchAll(SPECIFIER_PATTERN)) {
+    if (!specifier) continue;
+    const target = resolveSpecifier(specifier, fromKey, files);
+    if (target && target !== fromKey) resolved.push(target);
+  }
+  return resolved;
+};
+
 const allFiles = new Set(walk(ROOT));
 const codeFiles = [...allFiles].filter(
   (key) => hasExtension(key, CODE_EXTENSIONS) && !key.endsWith('.d.ts')
@@ -110,14 +132,9 @@ const importsOf = new Map<string, string[]>();
 const importersOf = new Map<string, string[]>();
 
 for (const key of codeFiles) {
+  // eslint-disable-next-line security/detect-non-literal-fs-filename -- `key` is a repo-relative path produced by the walk above
   const source = readFileSync(path.join(ROOT, key), 'utf8');
-  const targets = new Set<string>();
-
-  for (const [, specifier] of source.matchAll(SPECIFIER_PATTERN)) {
-    if (!specifier) continue;
-    const resolved = resolveSpecifier(specifier, key, allFiles);
-    if (resolved && resolved !== key) targets.add(resolved);
-  }
+  const targets = new Set(resolveImports(source, key, allFiles));
 
   importsOf.set(key, [...targets]);
   for (const target of targets) {
@@ -129,17 +146,27 @@ const reachable = new Set<string>();
 const queue = codeFiles.filter((key) => isEntry(key));
 for (const key of queue) reachable.add(key);
 
+/**
+ * Extracted so its `continue` sits in a single loop, not a nested one:
+ * `prefer-continue` wants the early continue and `no-break-in-nested-loop` wants
+ * it out of the nest, and a function is the shape both rules accept.
+ */
+const enqueueUnreached = (targets: readonly string[]) => {
+  for (const target of targets) {
+    if (reachable.has(target)) continue;
+    reachable.add(target);
+    queue.push(target);
+  }
+};
+
 while (queue.length > 0) {
   const current = queue.pop() as string;
-  for (const target of importsOf.get(current) ?? []) {
-    if (!reachable.has(target)) {
-      reachable.add(target);
-      queue.push(target);
-    }
-  }
+  enqueueUnreached(importsOf.get(current) ?? []);
 }
 
-const unused = codeFiles.filter((key) => !reachable.has(key)).sort();
+const unused = codeFiles
+  .filter((key) => !reachable.has(key))
+  .toSorted((a, b) => (a === b ? 0 : a < b ? -1 : 1));
 
 if (unused.length === 0) {
   console.log(

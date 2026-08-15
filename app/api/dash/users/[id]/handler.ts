@@ -1,12 +1,12 @@
 import type { Handler } from '@/lib/http/contract';
 import type { checkUserPermission } from '@/lib/permissions/checker';
+import type { EntityID } from '@/types';
 
 import { and, desc, eq, gt, isNull, sql } from 'drizzle-orm';
 
 import { db } from '@/db';
 import { accounts, rolePermissions, roles, sessions, users } from '@/db/schema';
 import { withTransaction } from '@/db/ws';
-import { EntityID } from '@/types';
 import { validID } from '@/utils';
 import { auditLog, getAuditMeta } from '@/lib/audit';
 import { checkPasswordCompromise } from '@/lib/auth/check-password';

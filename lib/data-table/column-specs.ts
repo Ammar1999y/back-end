@@ -13,6 +13,10 @@ import { dataTableConfig } from './config';
  *
  * These descriptors bind column -> DB type -> allowed operators -> value rules
  * in one place, on the server, where the client can't influence them.
+ *
+ * `variant` is deliberately NOT bound here: it describes how the CLIENT renders
+ * a control, is validated for membership in `parsers.ts` and then never read,
+ * so it reaches no SQL. `type` below is the only authority.
  */
 
 export type FilterColumnType =

@@ -1,10 +1,10 @@
 import type { WsTx } from '@/db/ws';
 import type { HandlerCookie } from '@/lib/http/contract';
+import type { EntityID } from '@/types';
 
 import { and, eq, isNull } from 'drizzle-orm';
 
 import { users } from '@/db/schema';
-import { EntityID } from '@/types';
 import { sanitizeForLog } from '@/utils';
 import { auditLog, getAuditMeta } from '@/lib/audit';
 import { auth } from '@/lib/auth';
@@ -17,6 +17,7 @@ import {
   MSG_NOT_FOUND,
 } from '@/utils/api-messages';
 import { CustomError } from '@/utils/error-class';
+import { markContactVerified } from '@/utils/otp';
 
 type AuditMeta = ReturnType<typeof getAuditMeta>;
 
@@ -45,10 +46,14 @@ export async function refreshSessionCookies(
 /**
  * Atomically commit a verified contact change. Called either from inside
  * `processOtpVerify`'s transaction (real OTP path) or from a fresh transaction
- * when OTP_AUTO_VERIFY bypasses code entry. The verified flag is only ever set
- * here — i.e. as the direct result of a proven (or explicitly bypassed)
- * verification — so `email`/`phone_number` can never carry a stale verified
- * state onto an unproven address.
+ * when OTP_AUTO_VERIFY bypasses code entry.
+ *
+ * Where the verified flag may be set true (the earlier "single writer" wording
+ * was never what the code did): alongside a NEW address, only in the one
+ * `UPDATE` below that writes the address — splitting them would leave the row
+ * carrying a new address with the old flag; on an UNCHANGED address, only via
+ * `markContactVerified`. Clearing it is unrestricted; only granting needs a
+ * boundary.
  *
  * A unique-constraint violation (address already taken) propagates to the
  * caller, which maps it to 409.
@@ -102,14 +107,18 @@ export async function commitEmailChange({
   if (!current.roleId)
     throw new CustomError(MSG_INSUFFICIENT_PERMISSIONS, HTTP_STATUS.FORBIDDEN);
 
-  // Idempotent: the address is already committed (e.g. a duplicate verify call
-  // after an auto-verify). Just ensure the verified flag is set.
+  // Idempotent: the address is already committed (e.g. a duplicate verify after
+  // an auto-verify), so only the flag can be missing. Writing it inline here
+  // skipped the audit row every other verified-flag transition produces.
   if (current.email === newEmail) {
-    if (!current.emailVerified)
-      await tx
-        .update(users)
-        .set({ emailVerified: true })
-        .where(eq(users.id, userId));
+    await markContactVerified(tx, {
+      userId,
+      channel: 'email',
+      auditMeta,
+      onMissing: () => {
+        throw new CustomError(MSG_NOT_FOUND, HTTP_STATUS.NOT_FOUND);
+      },
+    });
     return;
   }
 
@@ -169,12 +178,19 @@ export async function commitPhoneChange({
   if (!current.roleId)
     throw new CustomError(MSG_INSUFFICIENT_PERMISSIONS, HTTP_STATUS.FORBIDDEN);
 
+  // Same idempotent branch as the email flow — see `commitEmailChange`.
   if (current.phoneNumber === newPhoneNumber) {
-    if (!current.phoneNumberVerified)
-      await tx
-        .update(users)
-        .set({ phoneNumberVerified: true })
-        .where(eq(users.id, userId));
+    await markContactVerified(tx, {
+      userId,
+      // The helper only distinguishes email from phone; `sms` and `whatsapp`
+      // both name the same `phone_number_verified` flag, and the transport used
+      // to prove it is not recorded on the user row.
+      channel: 'sms',
+      auditMeta,
+      onMissing: () => {
+        throw new CustomError(MSG_NOT_FOUND, HTTP_STATUS.NOT_FOUND);
+      },
+    });
     return;
   }
 

@@ -1,5 +1,6 @@
 import type { FilterColumnSpecs } from '@/lib/data-table/column-specs';
 import type { Handler } from '@/lib/http/contract';
+import type { PermissionAction } from '@/lib/permissions/constants';
 
 import { and, count, eq, sql } from 'drizzle-orm';
 
@@ -9,11 +10,7 @@ import { rolePermissions, roles } from '@/db/schema';
 import { withTransaction } from '@/db/ws';
 import { auditLog, getAuditMeta } from '@/lib/audit';
 import { requirePermission } from '@/lib/http/session';
-import {
-  CUSTOM_ROLE_VALUE,
-  PermissionAction,
-  ROLE_SCOPE,
-} from '@/lib/permissions/constants';
+import { CUSTOM_ROLE_VALUE, ROLE_SCOPE } from '@/lib/permissions/constants';
 import {
   diffPermissionMatrices,
   PERMISSION_AUDIT_VERSION,
@@ -35,7 +32,7 @@ import {
   requireJsonBody,
 } from '@/utils/api-response';
 import { CustomError } from '@/utils/error-class';
-import { adminCreatePermissionSchema } from '@/utils/validation/permissions';
+import { createPermissionSchema } from '@/utils/validation/permissions';
 import { zodIssueMessage } from '@/utils/validation/rules';
 
 import { permissionMsg } from './messages';
@@ -135,8 +132,12 @@ export const POST: Handler = async (ctx) => {
 
     const body = requireJsonBody(ctx.body);
 
-    // Strict server contract: unknown keys are rejected rather than stripped.
-    const validatedDataParsed = adminCreatePermissionSchema.safeParse(body);
+    // Lenient on unknown TOP-LEVEL keys, matching the users collection POST: a
+    // client may post back a response object carrying server-owned fields and
+    // have them stripped. Nested page/action objects stay strict, and every
+    // field this handler writes is required — so a misspelled key fails as a
+    // missing field, not as a silent no-op. PUT is strict.
+    const validatedDataParsed = createPermissionSchema.safeParse(body);
     if (!validatedDataParsed.success)
       throw new CustomError(
         zodIssueMessage(validatedDataParsed.error),

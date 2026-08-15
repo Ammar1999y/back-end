@@ -31,12 +31,9 @@ const ERROR_MESSAGES = {
   viewRequiredForWrite:
     'يجب تفعيل صلاحية العرض عند تفعيل أي صلاحية كتابة (إنشاء، تعديل، حذف)',
 };
-// `.strict()`: an action key that is not a real action is a client error, not
-// something to drop. The preprocess below removes actions a page does not offer
-// (the UI submits the full matrix for every page, so that part is normalisation)
-// but leaves anything unrecognised in place for this schema to reject — a
-// misspelled `dleete` used to be stripped and answered with 200, so the operator
-// believed they had granted a permission that was never written.
+// `.strict()`: a misspelled `dleete` used to be stripped and answered with 200,
+// so the operator believed they had granted something that was never written.
+// Real-but-unavailable actions are handled by value in `normalizeActionsForPage`.
 const permissionSchema = z
   .object(
     Object.keys(PERMISSION_ACTIONS).reduce(
@@ -71,32 +68,38 @@ const rawPagePermissionSchema = z
   .strict();
 
 /**
- * An action the page does not offer is REJECTED, not dropped.
- *
- * It used to be normalised away, which meant `{name: 'home', permissions:
- * {edit: true}}` returned 200 while granting nothing — the API confirming a
- * change it had silently discarded. `home` has no `edit` column, so no client
- * produces that payload: the UI builds each page's matrix from that page's own
- * available actions, so there is no compatibility case to preserve and nothing
- * to normalise.
+ * An action the page does not offer: 422 when granted, dropped when not.
+ * Rejecting `edit: false` would fail a uniform matrix over a no-op, and
+ * `sanitizePermissions` forces unavailable actions to false on read anyway.
  */
-function assertActionsAvailableForPage(
-  { name, permissions }: z.output<typeof rawPagePermissionSchema>,
+function normalizeActionsForPage(
+  value: z.output<typeof rawPagePermissionSchema>,
   ctx: z.RefinementCtx
-) {
+): z.output<typeof rawPagePermissionSchema> {
+  const { name, permissions } = value;
   const available = getAvailablePermissions(name);
-  for (const action of Object.keys(permissions)) {
-    if (available.includes(action as PermissionAction)) continue;
+  // Safe to write by key: `permissionSchema` is `.strict()` over
+  // `PERMISSION_ACTIONS`, so every surviving key is one of ours.
+  const kept: Partial<Record<PermissionAction, boolean>> = {};
+
+  for (const [action, granted] of Object.entries(permissions)) {
+    if (available.includes(action as PermissionAction)) {
+      kept[action as PermissionAction] = granted;
+      continue;
+    }
+    if (granted !== true) continue;
     ctx.addIssue({
       code: z.ZodIssueCode.custom,
       path: ['permissions', action],
       message: `الصلاحية "${action}" غير متاحة لصفحة "${name}"`,
     });
   }
+
+  return { name, permissions: kept };
 }
 
 export const pagePermissionSchema = rawPagePermissionSchema
-  .superRefine(assertActionsAvailableForPage)
+  .transform(normalizeActionsForPage)
   .superRefine(({ permissions }, ctx) => {
     // `create` alone needs no read access (per product spec).
     // `edit`/`delete` (all-scope) require `view`.
@@ -181,17 +184,20 @@ export const updatePermissionSchema = createPermissionSchema
   .partial({ permissions: true }); // Make permissions optional for updates
 
 /**
- * Server wire contracts. Same fields, but unknown keys are REJECTED instead of
- * stripped: a misspelled `permissionz` or `descriptionn` used to be dropped and
- * answered with 200, so the client believed a change had been applied that was
- * never written.
+ * UPDATE rejects unknown top-level keys instead of stripping them: a misspelled
+ * `descriptionn` was dropped and answered with 200, so the client believed a
+ * change had been applied that was never written.
  *
- * Separate from the schemas above rather than `.strict()` on them, because those
- * two double as react-hook-form resolvers, whose state legitimately carries
- * response-only fields (`createdAt`, `usersCount`) that would then fail
- * client-side validation before a request was ever made.
+ * CREATE stays lenient, matching `createUserSchema` — every field it writes is
+ * required, so a misspelled key fails as a MISSING field rather than as a silent
+ * no-op, and the endpoint's documented contract is that a client may post back a
+ * response object carrying server-owned extras (`createdAt`, `usersCount`) and
+ * have them stripped. Nested page/action objects are strict in both.
+ *
+ * Kept separate from the schemas above rather than `.strict()` on them, because
+ * those double as react-hook-form resolvers whose state legitimately carries
+ * those response-only fields.
  */
-export const adminCreatePermissionSchema = createPermissionSchema.strict();
 export const adminUpdatePermissionSchema = updatePermissionSchema.strict();
 
 // Type inference

@@ -1,6 +1,18 @@
+import type { OtpChannel } from '@/utils/validation/otp';
 import type { AnyColumn } from 'drizzle-orm';
 
 import { sql } from 'drizzle-orm';
+
+import { users } from '@/db/schema';
+
+/**
+ * The `users` column an OTP channel's identifier is stored in. Six auth flows
+ * had inlined the channel→column mapping, which hid how many places resolve a
+ * user by contact.
+ */
+export function userContactColumn(channel: OtpChannel) {
+  return channel === 'email' ? users.email : users.phoneNumber;
+}
 
 /**
  * ⚠️ TEXT-LIKE COLUMNS ONLY. `= ''` is a hard PostgreSQL error on

@@ -29,8 +29,10 @@ export const OTP_MAX_ATTEMPTS = 5;
 // ⚠️ Baked into DB CHECK constraint `chk_verify_attempt_number_max` (db/schema.ts).
 // Changing this value requires generating a new migration to keep the DB in sync.
 export const OTP_MAX_VERIFY_ATTEMPTS = 5;
-// Rolling 24h cap on failed verifies per (userId, channel). Survives resend
-// cycles so an attacker cannot reset the counter by requesting a new code.
+// Cap on failed verifies per (userId, contactKind), summed across every
+// purpose. NOT a rolling window: each proof row anchors its own 24h period, so
+// the bound is the sum of independently-anchored counters. Survives resend
+// cycles so an attacker cannot reset it by requesting a new code.
 export const OTP_MAX_DAILY_VERIFY_ATTEMPTS = 15;
 export const OTP_EXPIRY_MINUTES = 10;
 export const OTP_BLOCK_DURATION_HOURS = 6;

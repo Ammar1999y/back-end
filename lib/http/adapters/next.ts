@@ -143,14 +143,15 @@ function toNextResponse(output: HandlerOutput): NextResponse {
 
       // NextResponse.cookies has no slot for unmodelled attributes; append them
       // to the existing Set-Cookie line so Partitioned / Priority / etc. survive.
-      if (extraFlags?.length || (extra && Object.keys(extra).length > 0)) {
+      const flags = extraFlags ?? [];
+      const extraAttributes = Object.entries(extra ?? {});
+      if (flags.length > 0 || extraAttributes.length > 0) {
         const setCookieValues = response.headers.getSetCookie();
         const lastIdx = setCookieValues.length - 1;
         let line = setCookieValues[lastIdx];
         if (line !== undefined) {
-          for (const flag of extraFlags ?? []) line += `; ${flag}`;
-          for (const [k, v] of Object.entries(extra ?? {}))
-            line += `; ${k}=${v}`;
+          for (const flag of flags) line += `; ${flag}`;
+          for (const [k, v] of extraAttributes) line += `; ${k}=${v}`;
           setCookieValues[lastIdx] = line;
           response.headers.delete('set-cookie');
           for (const v of setCookieValues)

@@ -168,7 +168,10 @@ async function processImage(
   else if (shouldOptimizeImage(file.type)) {
     const optimized = await optimizeImage(buffer, { targetSize });
 
-    buffer = Buffer.from(optimized.buffer);
+    // `optimized.buffer` is the result object's Buffer field, not a view's
+    // `.buffer`, so `Buffer.from` here was a redundant copy — not the unsafe
+    // conversion `unicorn/no-unsafe-buffer-conversion` reports.
+    buffer = optimized.buffer;
     finalMimeType = 'image/webp';
     finalSize = optimized.size;
     width = optimized.width;

@@ -1,7 +1,11 @@
 import { FlatCompat } from '@eslint/eslintrc';
 import nextVitals from 'eslint-config-next/core-web-vitals';
 import nextTs from 'eslint-config-next/typescript';
+import eslintPluginDrizzle from 'eslint-plugin-drizzle';
+import eslintPluginPrettier from 'eslint-plugin-prettier';
 import eslintPluginUnicorn from 'eslint-plugin-unicorn';
+
+const drizzleObjectName = ['db', 'tx'];
 
 const compat = new FlatCompat({
   baseDirectory: import.meta.dirname,
@@ -9,7 +13,7 @@ const compat = new FlatCompat({
 
 const eslintConfig = [
   {
-    ignores: ['.next/**', 'out/**', 'build/**', 'next-env.d.ts', 'scripts/**'],
+    ignores: ['.next/**', 'out/**', 'build/**', 'next-env.d.ts'],
   },
   ...nextVitals,
   ...nextTs,
@@ -63,12 +67,8 @@ const eslintConfig = [
       // 'import/no-unresolved': 'off',
       // 'import/named': 'off',
       // 'unicorn/prevent-abbreviations': 'off',
-      // 'security/detect-object-injection': 'off',
+      'security/detect-object-injection': 'off',
 
-      'unicorn/prefer-minimal-ternary': 'off',
-      'unicorn/no-top-level-assignment-in-function': 'off',
-      'unicorn/no-unreadable-for-of-expression': 'off',
-      'unicorn/no-unsafe-buffer-conversion': 'off',
       'unicorn/max-nested-calls': 'off',
 
       '@typescript-eslint/no-require-imports': 'off',
@@ -85,6 +85,27 @@ const eslintConfig = [
       'unicorn/no-for-each': 'off',
       'unicorn/no-negated-array-predicate': 'off',
       'unicorn/no-computed-property-existence-check': 'off',
+    },
+  },
+  {
+    files: ['**/*.{ts,tsx,js,mjs}'],
+    plugins: {
+      drizzle: eslintPluginDrizzle,
+    },
+    rules: {
+      'drizzle/enforce-delete-with-where': ['error', { drizzleObjectName }],
+      'drizzle/enforce-update-with-where': ['error', { drizzleObjectName }],
+    },
+  },
+  {
+    plugins: {
+      prettier: eslintPluginPrettier,
+    },
+    rules: {
+      'prettier/prettier': 'warn',
+      // Prettier reformats both of these, so ESLint's opinion on them conflicts.
+      'arrow-body-style': 'off',
+      'prefer-arrow-callback': 'off',
     },
   },
 ];

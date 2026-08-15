@@ -57,7 +57,12 @@ const STRING_LIKE_TYPES: ReadonlySet<FilterColumnSpec['type']> = new Set([
   'multiSelect',
 ]);
 
-/** Types whose column can actually hold an empty string. */
+/**
+ * Types whose column can actually hold an empty string. ⚠️ `select` /
+ * `multiSelect` name a value set, not a storage type — every registered one is
+ * text today. Backing one with a PostgreSQL enum makes `isEmpty` generate
+ * `enum_column = ''`, a cast error; carry the DB type on the descriptor first.
+ */
 function isStringLike(type: FilterColumnSpec['type']): boolean {
   return STRING_LIKE_TYPES.has(type);
 }
@@ -119,6 +124,9 @@ function assertFilterAllowed(
   // array case differently would 422 the whole list on a half-filled chip.
   // Checked on content, not length: positional slots mean a cleared range
   // arrives as ['', ''] rather than [].
+  //
+  // Not the dropped-predicate case elsewhere in this file: there a real
+  // condition vanished; an empty set was never a condition.
   if (valueIsArray && !(filter.value as string[]).some(Boolean)) return 'skip';
 
   if (isScanOnlyOperator(filter.operator) && !spec.allowScanOnly)

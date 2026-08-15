@@ -114,7 +114,7 @@ migrations.
 
 ```bash
 # Semgrep
-semgrep --config=p/typescript --config=p/nextjs --config=p/secrets
+semgrep --config=p/typescript --config=p/nextjs --config=p/secrets --baseline-commit=<sha> # only findings introduced by the PR
 
 # Secret history sweep (one-time, then rely on the pre-commit hook)
 gitleaks detect --source . --redact --verbose
@@ -130,56 +130,5 @@ Recorded so these are not re-evaluated later:
 - **CodeQL** — free only for _public_ repos. Private repos require GitHub Code
   Security (~$30/active committer/month; verify current pricing). Deep
   interprocedural taint analysis is overkill at 16.6k LOC.
-- **Trivy** — its dependency scanning duplicates `bun audit`, and its
-  container/IaC scanning has no target here (no Dockerfile, no Kubernetes, no
-  Terraform).
 - **Snyk Code / SonarQube** — overlap Semgrep and the existing ESLint security
   plugins without adding a distinct signal at this size.
-
-### Noise control — the part that decides whether any of this survives
-
-The standard criticism of SAST is real: too many findings, too many false
-positives, a backlog nobody triages. A tool producing 400 ignored alerts equals
-zero protection.
-
-**Rule: baseline everything, then fail CI only on _new_ findings.**
-
-```bash
-semgrep --baseline-commit=<sha>       # only findings introduced by the PR
-bun audit --audit-level=high          # gate on high/critical; ignore low/moderate
-```
-
-Existing findings go to a tracked backlog, never a blocking gate. A gate that is
-red on arrival gets bypassed within a week.
-
----
-
-## 5. Phase 3 — Maintainability
-
-### 5.2 knip
-
-Finds unused files, **plus** unused exports, dependencies, and devDependencies.
-Directly replaces the homegrown `scripts/find-unused-files.ts`.
-
-```bash
-bun add -D knip && bunx knip
-```
-
-### 5.3 dependency-cruiser
-
-Encode the intended architecture as an enforced rule — e.g. `app/api/**` may not
-import `db/schema.ts` directly, only through `db/queries/**`. This is how
-layering survives a deadline.
-
-```bash
-bun add -D dependency-cruiser && bunx depcruise --init
-```
-
-### 5.4 Additional TS hardening
-
-```jsonc
-"noUncheckedIndexedAccess": true   // array/record access yields `T | undefined`
-```
-
-Expect real errors — each one is a latent runtime crash. Enable it when there is
-time to work through the fallout, not mid-feature.

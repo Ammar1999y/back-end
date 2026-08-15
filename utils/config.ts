@@ -16,8 +16,31 @@
  * Without this the client sent local midnight and the server re-derived
  * start/end-of-day in its own zone, shifting the selected day by the offset
  * between them.
+ *
+ * `NEXT_PUBLIC_` so both bundles resolve the same value: a server-only variable
+ * is inlined as `undefined` in the client, which reintroduces the divergence
+ * this constant exists to remove. A calendar zone is not a secret.
  */
-export const BUSINESS_TIMEZONE = 'Asia/Riyadh';
+const DEFAULT_BUSINESS_TIMEZONE = 'Asia/Riyadh';
+
+function resolveBusinessTimezone(): string {
+  const configured = process.env.NEXT_PUBLIC_BUSINESS_TIMEZONE?.trim();
+  if (!configured) return DEFAULT_BUSINESS_TIMEZONE;
+
+  try {
+    // Throws RangeError on an unknown zone. Failing beats falling back: a typo
+    // that silently resolves to Riyadh is how "off by one day" reaches production.
+    new Intl.DateTimeFormat('en-US', { timeZone: configured });
+  } catch {
+    throw new Error(
+      `Invalid NEXT_PUBLIC_BUSINESS_TIMEZONE: "${configured}" is not a recognized IANA time zone`
+    );
+  }
+
+  return configured;
+}
+
+export const BUSINESS_TIMEZONE = resolveBusinessTimezone();
 
 export type PhoneNumberMode = 'required' | 'optional' | 'disabled';
 

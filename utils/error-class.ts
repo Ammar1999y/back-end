@@ -3,7 +3,12 @@ class CustomError extends Error {
   public responseHeaders?: Record<string, string>;
 
   constructor(
-    public message: string,
+    // `override` rather than dropping the parameter property: `super(message)`
+    // alone would leave `message` a NON-enumerable own property (as `Error`
+    // defines it), while a parameter property makes it enumerable. Keeping the
+    // declaration preserves that, so anything spreading or enumerating a
+    // CustomError sees the same shape it always has.
+    public override message: string,
     public status?: number,
     public code?: string
   ) {

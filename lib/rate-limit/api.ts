@@ -1,4 +1,6 @@
-import { EntityID } from '@/types';
+import type { EntityID } from '@/types';
+import type { OtpChannel } from '@/utils/validation/otp';
+
 import { sanitizeForLog } from '@/utils';
 import { getClientIp } from '@/lib/audit';
 
@@ -8,8 +10,9 @@ import {
   MSG_TOO_MANY_REQUESTS,
 } from '@/utils/api-messages';
 import { CustomError } from '@/utils/error-class';
+import { isPhoneChannel } from '@/utils/validation/otp';
 
-import { rateLimit, refundRateLimit } from './index';
+import { rateLimit } from './index';
 
 // The app runs on Vercel, or on a VPS behind Cloudflare — both always inject
 // a trusted IP header (`cf-connecting-ip` / `x-vercel-forwarded-for`). A null
@@ -105,8 +108,8 @@ export type OtpContactKind = 'email' | 'phone';
  * share one destination budget. Keying quotas on the channel let a caller
  * double both the delivery cap and the block budget by switching transport.
  */
-export const otpContactKind = (channel: string): OtpContactKind =>
-  channel === 'email' ? 'email' : 'phone';
+export const otpContactKind = (channel: OtpChannel): OtpContactKind =>
+  isPhoneChannel(channel) ? 'phone' : 'email';
 
 /** Independent send budgets so one surface can't starve another. */
 export type OtpSendSurface =
@@ -137,23 +140,16 @@ const ONE_HOUR_S = 3600;
 const ONE_DAY_S = 86_400;
 
 /**
- * Send-side quota chain. Fails closed at every layer: losing the limiter on a
- * paid-delivery path is a cost/abuse event, not something to shrug through.
+ * Pre-lookup send quotas: per surface, then per destination. Fails closed —
+ * losing the limiter on a paid-delivery path is a cost/abuse event.
  *
- * Order matters. Every layer is consume-on-check, so a request rejected by a
- * later layer has already spent the earlier ones. Narrowest first, global
- * last, means a request rejected by the surface or destination cap no longer
- * charges the global breaker.
- *
- * It is NOT true that only delivered messages charge it. The whole chain runs
- * before the account lookup, on purpose: applying it afterwards would cap real
- * accounts and not fake ones, which is an account-existence oracle. So a send
- * to a non-existent address, or one whose provider call later fails, still
- * spends global budget. That is the accepted price of the privacy property —
- * the breaker bounds *attempted* outbound work, not confirmed deliveries.
+ * Runs BEFORE the account lookup on purpose: applying it afterwards would cap
+ * real accounts and not fake ones, which is an existence oracle. Both layers
+ * are keyed by destination, so naming addresses nobody owns only exhausts
+ * budget for those addresses. The app-wide breaker is deliberately NOT here.
  */
 export async function enforceOtpSendQuota(opts: {
-  channel: string;
+  channel: OtpChannel;
   /** Normalized destination (email address / phone number). */
   destination: string;
   surface: OtpSendSurface;
@@ -181,10 +177,26 @@ export async function enforceOtpSendQuota(opts: {
     window: ONE_HOUR_S,
     failClosed: true,
   });
+}
 
+/**
+ * App-wide delivery breaker, charged by `processOtpSend` immediately before
+ * dispatch. This is the ONE quota every user shares, so what may charge it
+ * decides who can deny OTP to everyone else: charged pre-lookup with the rest
+ * of the chain, ~2000 requests naming nonexistent addresses exhausted a full
+ * day of delivery for the whole application at zero cost to the attacker.
+ *
+ * Privacy is unaffected — the per-destination caps still run pre-lookup, and a
+ * rejection here surfaces as the same generic success the handlers already
+ * return. Charged before dispatch, not after: a provider that is timing out is
+ * exactly when the breaker has to trip.
+ */
+export async function enforceOtpGlobalSendBudget(opts: {
+  channel: OtpChannel;
+}): Promise<void> {
   await enforceRateLimit({
     scope: 'otp.send.global',
-    identifier: kind,
+    identifier: otpContactKind(opts.channel),
     limit: OTP_GLOBAL_SEND_CAP_PER_DAY,
     window: ONE_DAY_S,
     failClosed: true,
@@ -196,7 +208,7 @@ export async function enforceOtpSendQuota(opts: {
  * rotating the purpose can't multiply the per-identifier attempt budget.
  */
 export async function enforceOtpVerifyQuota(opts: {
-  channel: string;
+  channel: OtpChannel;
   identifier: string;
 }): Promise<void> {
   await enforceRateLimit({
@@ -209,58 +221,14 @@ export async function enforceOtpVerifyQuota(opts: {
 }
 
 /**
- * Rolling 24h verify-FAILURE budget per (user, contact kind).
- *
- * The DB counter that enforces this lives on the proof row, which is unique
- * per (user, channel, PURPOSE), so the documented daily budget was silently
- * multiplied by the number of reachable purposes. This is the one counter
- * that spans them.
- *
- * Charged for FAILURES only, but admitted ATOMICALLY: consume a token on the
- * way in, then refund the attempts that turn out not to be chargeable (a
- * correct code, or a request against an already-locked row where no code was
- * even read). Charging unconditionally would count successful verifications
- * and let ordinary passwordless use lock an account out of every OTP flow;
- * admitting on a non-consuming read would let N concurrent failures all pass
- * the same stale reading. The refund path (`rate: -1`) makes both properties
- * available at once.
- *
- * Over-limit requests do not consume — the limiter's Lua script returns before
- * its INCRBY — so a rejected attempt cannot extend its own lockout.
+ * The 24h verify-FAILURE budget deliberately does NOT live here. It was
+ * enforced twice — Redis and the proof row — which cost a consume-then-refund
+ * protocol, a hand-rebuilt refund key, and a failure mode where a Redis blip
+ * locked a user out of every OTP flow for 24h. The surviving authority is
+ * `verification_sessions.verifyAttemptDaily`, enforced transactionally in
+ * `processOtpVerify`. Verify attempts are still bounded in Redis per
+ * destination (`enforceOtpVerifyQuota`) and per user (endpoint limiters).
  */
-const OTP_VERIFY_DAILY_SCOPE = 'otp.verify.daily';
-
-function otpVerifyDailyKey(channel: string, userId: EntityID) {
-  return {
-    identifier: `${OTP_VERIFY_DAILY_SCOPE}.${otpContactKind(channel)}:${userId}`,
-    window: ONE_DAY_S,
-  };
-}
-
-/** Consume one token, rejecting (429/503) when the shared budget is spent. */
-export async function enforceOtpVerifyDailyBudget(opts: {
-  channel: string;
-  userId: EntityID;
-  limit: number;
-}): Promise<void> {
-  await enforceRateLimit({
-    scope: `${OTP_VERIFY_DAILY_SCOPE}.${otpContactKind(opts.channel)}`,
-    identifier: opts.userId,
-    limit: opts.limit,
-    window: ONE_DAY_S,
-    failClosed: true,
-  });
-}
-
-/** Return the token taken at admission when the attempt was not a failure. */
-export async function refundOtpVerifyAttempt(opts: {
-  channel: string;
-  userId: EntityID;
-  limit: number;
-}): Promise<void> {
-  const key = otpVerifyDailyKey(opts.channel, opts.userId);
-  await refundRateLimit({ ...key, limit: opts.limit });
-}
 
 /**
  * Check a sliding-window rate limit for the current request.

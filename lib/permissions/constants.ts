@@ -70,6 +70,16 @@ export type AllScopedAction = keyof typeof OWN_ACTION_MAP;
 export type OwnScopedAction = (typeof OWN_ACTION_MAP)[AllScopedAction];
 
 /**
+ * Own-scoped action → the all-scoped action that supersedes it. Derived from
+ * `OWN_ACTION_MAP` and declared beside it: the permission checker and the
+ * grant-scope validator both need this rule, and two copies would be one edit
+ * away from disagreeing about who may grant what.
+ */
+export const SUPERSEDING_ACTION = Object.fromEntries(
+  Object.entries(OWN_ACTION_MAP).map(([all, own]) => [own, all])
+) as Record<string, AllScopedAction | undefined>;
+
+/**
  * Access scope resolved from a user's permissions for a given action:
  * - 'all': user has the unrestricted action (e.g. `view`).
  * - 'own': user has only the own-scoped variant (e.g. `viewOwn`) — must filter by created_by.

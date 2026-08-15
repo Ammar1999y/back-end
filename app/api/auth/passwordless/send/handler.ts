@@ -3,6 +3,7 @@ import type { Handler } from '@/lib/http/contract';
 import { and, eq, isNull } from 'drizzle-orm';
 
 import { db } from '@/db';
+import { userContactColumn } from '@/db/queries';
 import { users } from '@/db/schema';
 import { sanitizeForLog } from '@/utils';
 import { verifyTurnstileRequest } from '@/lib/captcha';
@@ -79,9 +80,7 @@ export const POST: Handler = async (ctx) => {
       .from(users)
       .where(
         and(
-          channel === 'email'
-            ? eq(users.email, identifier)
-            : eq(users.phoneNumber, identifier),
+          eq(userContactColumn(channel), identifier),
           isNull(users.deletedAt),
           eq(users.isActive, true)
         )

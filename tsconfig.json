@@ -1,13 +1,14 @@
 {
   "compilerOptions": {
-    "target": "ES2017",
+    // "target": "ES2017", TODO: if the app support front-end
+    "target": "ESNext",
+    "module": "Preserve",
     "lib": ["dom", "dom.iterable", "esnext"],
     "allowJs": true,
     "skipLibCheck": true,
     "strict": true,
     "noEmit": true,
     "esModuleInterop": true,
-    "module": "esnext",
     "moduleResolution": "bundler",
     "resolveJsonModule": true,
     "isolatedModules": true,
@@ -21,6 +22,9 @@
     "noUnusedParameters": true,
     "noFallthroughCasesInSwitch": true,
     "noUncheckedIndexedAccess": true,
+    "verbatimModuleSyntax": true,
+    "noImplicitOverride": true,
+
     "paths": {
       "@/*": ["./*"]
     },
@@ -28,7 +32,8 @@
       {
         "name": "next"
       }
-    ]
+    ],
+    "types": ["bun"]
   },
   "include": [
     "next-env.d.ts",

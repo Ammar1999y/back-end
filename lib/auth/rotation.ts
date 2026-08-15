@@ -1,9 +1,9 @@
 import type { WsTx } from '@/db/ws';
+import type { EntityID } from '@/types';
 
 import { and, eq, ne } from 'drizzle-orm';
 
 import { sessions, verificationSessions } from '@/db/schema';
-import { EntityID } from '@/types';
 
 /**
  * Single policy for what a credential / identity rotation invalidates.

@@ -1,0 +1,3 @@
+DROP INDEX "ux_verification_sessions_user_channel_purpose";--> statement-breakpoint
+ALTER TABLE "verification_sessions" ADD COLUMN "contact_kind" text GENERATED ALWAYS AS (CASE WHEN channel = 'email' THEN 'email' ELSE 'phone' END) STORED NOT NULL;--> statement-breakpoint
+CREATE UNIQUE INDEX "ux_verification_sessions_user_contact_purpose" ON "verification_sessions" USING btree ("user_id","contact_kind","purpose");

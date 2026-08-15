@@ -3,6 +3,7 @@ import type { Handler } from '@/lib/http/contract';
 import { and, eq, isNull } from 'drizzle-orm';
 
 import { db } from '@/db';
+import { userContactColumn } from '@/db/queries';
 import { users } from '@/db/schema';
 import { withTransaction } from '@/db/ws';
 import { sanitizeForLog } from '@/utils';
@@ -92,10 +93,7 @@ export const POST: Handler = async (ctx) => {
         data: GENERIC_SEND_DATA,
       });
 
-    const whereClause =
-      channel === 'email'
-        ? eq(users.email, identifier)
-        : eq(users.phoneNumber, identifier);
+    const whereClause = eq(userContactColumn(channel), identifier);
 
     const [userData] = await db
       .select({

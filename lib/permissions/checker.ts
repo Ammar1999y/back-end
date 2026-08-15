@@ -4,12 +4,12 @@ import type {
   DashboardPage,
   PermissionAction,
 } from './constants';
+import type { EntityID } from '@/types';
 
 import { and, eq, gt, isNull, sql } from 'drizzle-orm';
 
 import { db } from '@/db';
 import { rolePermissions, roles, sessions, users } from '@/db/schema';
-import { EntityID } from '@/types';
 import { validID } from '@/utils';
 import { auth } from '@/lib/auth';
 import { assertLiveSession } from '@/lib/auth/live-session';
@@ -21,18 +21,13 @@ import {
 } from '@/utils/api-messages';
 import { CustomError } from '@/utils/error-class';
 
-import { OWN_ACTION_MAP } from './constants';
+import { OWN_ACTION_MAP, SUPERSEDING_ACTION } from './constants';
 import { getUserPermissions, sanitizePermissions } from './utils';
 
 const SCOPED_ACTIONS = new Set<PermissionAction>(
   Object.keys(OWN_ACTION_MAP) as PermissionAction[]
 );
 const READ_ACTIONS = new Set<PermissionAction>(['view', 'viewOwn']);
-
-/** Own-scoped action → the all-scoped action that supersedes it. */
-const SUPERSEDING_ACTION = Object.fromEntries(
-  Object.entries(OWN_ACTION_MAP).map(([all, own]) => [own, all])
-) as Record<string, AllScopedAction | undefined>;
 
 /**
  * Resolve allowed/scope for a given action against a permissions matrix.

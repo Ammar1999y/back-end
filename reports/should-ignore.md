@@ -131,9 +131,47 @@
     `200 + nextAllowedIn:30` for every case (real / fake / verified / throttled)
     so timing and status leak nothing. Enforced by the test "per-identifier hour
     limit never leaks 429 to client (collapsed to 200)". The client already gets
-    a constant `nextAllowedIn` for its countdown. Surfacing 429 (the original
-    ERR-1 suggestion) would break this contract — not worth the UX gain.
-59. **Custom IPv6 `/64` Bucketing in `ipBucket`** —
+    a constant `nextAllowedIn` for its countdown. Surfacing 429 would break this
+    contract — not worth the UX gain.
+59. **Explicit Empty Filter Array Treated As "No Filter"** —
+    `lib/data-table/filter-columns.ts` — chosen UI semantics, not a SQL
+    identity: `col IN ()` matches nothing, so this is a deliberate reading of an
+    empty selection as "chip not filled in yet" rather than "match nothing". The
+    literal reading shows an empty table for a chip the user has not used, and a
+    422 turns it into an error. Not the dropped-predicate case the strict filter
+    contract exists for — there a real condition vanished; here none was
+    expressed, and the caller's base authorization predicate is untouched either
+    way.
+60. **Filter `variant` Not Bound To The Column Descriptor** —
+    `lib/data-table/column-specs.ts` — `variant` describes how the client
+    renders a control; it is validated for membership then never read, so it
+    reaches no SQL. Binding it would make the server an authority on UI
+    rendering, and a boolean column rendered as a multiSelect is legitimate.
+61. **`OTP_AUTO_VERIFY` Enabled With No Environment Guard** — `utils/config.ts`
+    — documented development bypass while no OTP provider is configured;
+    flipping it is covered by the pre-production `TODO` sweep. Never reaches
+    `passwordless_login` / `forgot_password` (both always issue a real code), so
+    the blast radius is contact-verification and the authenticated
+    contact-change commits.
+62. **Session Pagination Has No Matching Index** — `db/schema.ts`,
+    `app/api/dash/users/[id]/sessions/pagination.ts` — the `(createdAt, id)`
+    keyset cursor is correct; only the index shape is questioned. More than 50
+    live sessions per user is unrealistic for an admin dashboard, and a
+    session-purge cron is already planned. Add `(user_id, created_at, id)` only
+    if a real query plan justifies it.
+63. **Trusted IP Header Is Not Yet Pinned To The Deployment** — `lib/audit.ts`,
+    `lib/rate-limit/api.ts`, `lib/auth.ts` — `TRUSTED_IP_HEADERS` accepts both
+    `cf-connecting-ip` and `x-vercel-forwarded-for`, which has two consequences:
+    on a Vercel-only deployment a client-supplied Cloudflare header wins unless
+    the edge strips it, and when neither header is present `ipIdentifier` throws
+    503 — so local dev, a bare VPS, Docker and `next start` return 503 on every
+    sign-in, since the sign-in hook calls it. The fail-closed 503 is intended
+    and diagnosable (it keeps its own status and message, and the missing
+    headers are logged). Both follow from one unmade decision, and both are
+    settled by the same step: pick exactly ONE header for the target deployment
+    and enforce the matching ingress boundary. Already flagged by the `TODO`
+    above every such site; belongs on the pre-production checklist.
+64. **Custom IPv6 `/64` Bucketing in `ipBucket`** —
     `lib/rate-limit/api.ts:35-63` — manual `::` expansion; verified correct for
     all valid inputs and `getClientIp` blocks malformed ones upstream. The only
     proposed remedy adds the `ip-address` dependency — supply-chain/maintenance
@@ -167,3 +205,22 @@
 54. **External OTP Delivery Inside DB Transaction** — `utils/otp.ts:306` —
     `sendOtp()` runs inside `withTransaction`, holding a DB connection and row
     lock during the full external HTTP call; needs benchmarking before splitting
+55. **OTP Verify Budget Uses Per-Proof Anchored Windows** — `utils/otp.ts`,
+    `db/schema.ts` — the 15-failure budget is the sum of independently anchored
+    counters stored on proof rows, not a literal rolling 24-hour window, so two
+    full budgets can fall inside one moving 24 hours; and deleting a proof row
+    on successful verification or credential rotation forgives its earlier
+    failures. Kept for now — see `TODO.md` item 12. Revisit if a strict
+    identity-wide any-24-hours guarantee is needed, or if the six-hour block is
+    shortened.
+56. **Generic `Error.message` Is Retained in Server Logs** — `utils/index.ts`,
+    `utils/api-response.ts` — the serializer keeps free-text messages so an
+    unexpected library failure stays diagnosable; clients never receive them
+    raw, only a fixed generic 500. Every source demonstrated to embed sensitive
+    data in a message is filtered where it is thrown — Drizzle bound parameters,
+    OTP provider payloads, and both Redis store boundaries — and no
+    project-authored error interpolates a credential. The residual risk is a
+    future dependency doing the same in text nobody has audited yet. Accepted
+    for the development stage with restricted log access and periodic deletion;
+    audit each new integration, and settle access and retention before
+    production hardening.

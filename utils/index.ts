@@ -1,8 +1,8 @@
 /* eslint-disable unicorn/prefer-math-trunc */
+import type { EntityID } from '@/types';
 import type { NeonDbError } from '@neondatabase/serverless';
 
 import { MAX_ID } from '@/constants';
-import { EntityID } from '@/types';
 import { v7 as uuidv7 } from 'uuid';
 
 export function normalizeArabicDigits(input: string): string {
@@ -31,16 +31,14 @@ const LOG_MAX_STRING = 256;
 const LOG_REDACTED = '[redacted]';
 
 /**
- * Key fragments whose values never belong in a log line.
+ * Key fragments whose values never belong in a log line, matched ANYWHERE in
+ * the key.
  *
  * ⚠️ A NET, not a guarantee. It cannot see a secret inside free text (a driver
  * error's message carries its bound parameters; a provider's carries the
  * payload it rejected) and it cannot know a key nobody listed. Those need a
  * boundary at the source — see `serializeQueryError` and `sendOtp`. The rule is
  * still: never hand a secret to a logger.
- *
- * `code` is listed because here a "code" is an OTP; safe diagnostic fields are
- * named otherwise (`smtpClass`, `status`).
  */
 const SENSITIVE_LOG_FRAGMENTS = [
   'password',
@@ -60,15 +58,40 @@ const SENSITIVE_LOG_FRAGMENTS = [
   'salt',
   'passphrase',
   'otp',
-  'code',
-  'hash',
 ];
+
+/**
+ * `hash` and `code` are secrets in one position and diagnostics in another, so
+ * they are matched positionally rather than as substrings: `hash` at the end is
+ * the digest (`passwordHash`), at the start it describes one (`hashUpgraded`);
+ * `code` at the end is a status (`statusCode`), alone it is the OTP. As plain
+ * substrings they redacted every one of those.
+ */
+const SENSITIVE_LOG_SUFFIXES = ['hash'];
+const SENSITIVE_LOG_KEYS: ReadonlySet<string> = new Set([
+  'code',
+  'plaintextcode',
+  'verificationcode',
+  'resetcode',
+]);
 
 /** Extra diagnostic fields worth keeping off Error-like objects (PG codes). */
 const ERROR_DETAIL_KEYS = ['code', 'constraint', 'status', 'statusCode'];
 
-function isSensitiveLogKey(key: string): boolean {
+/**
+ * SQLSTATE (`23505`) or a Node/Nodemailer class (`ECONNRESET`). An Error's
+ * `code` is kept only when it matches this — six plain digits, an OTP, does not.
+ */
+const DRIVER_ERROR_CODE = /^(?:[0-9A-Z]{5}|[A-Z][A-Z0-9_]{1,31})$/;
+
+function isSensitiveLogKey(key: string, value: unknown): boolean {
+  // A boolean cannot carry a credential, so a flag ABOUT one is safe by
+  // construction — same rule as `lib/audit.ts`.
+  if (typeof value === 'boolean') return false;
   const normalized = key.toLowerCase().replaceAll(/[^a-z0-9]/g, '');
+  if (SENSITIVE_LOG_KEYS.has(normalized)) return true;
+  if (SENSITIVE_LOG_SUFFIXES.some((suffix) => normalized.endsWith(suffix)))
+    return true;
   return SENSITIVE_LOG_FRAGMENTS.some((fragment) =>
     normalized.includes(fragment)
   );
@@ -195,6 +218,9 @@ function serializeErrorLike(
 ): Record<string, unknown> {
   if (isParameterBearingQueryError(error)) return serializeQueryError(error);
 
+  // `message` is kept, and a key-based rule cannot see inside it: anything that
+  // builds a message from a secret must be contained where it is thrown (see
+  // `serializeQueryError`, `sendOtp`). This is not a no-secrets guarantee.
   const out: Record<string, unknown> = {
     name: clampLogString(error.name || 'Error'),
     message: clampLogString(error.message || ''),
@@ -202,8 +228,17 @@ function serializeErrorLike(
   const anyErr = error as unknown as Record<string, unknown>;
   for (const key of ERROR_DETAIL_KEYS) {
     const value = anyErr[key];
-    if (typeof value === 'string' || typeof value === 'number')
-      out[key] = typeof value === 'string' ? clampLogString(value) : value;
+    if (typeof value === 'number') {
+      out[key] = value;
+      continue;
+    }
+    if (typeof value !== 'string') continue;
+    // A plain object's `code` is redacted outright; an Error's is kept because
+    // that is where driver metadata lives. The shape test reconciles the two.
+    out[key] =
+      key === 'code' && !DRIVER_ERROR_CODE.test(value)
+        ? LOG_REDACTED
+        : clampLogString(value);
   }
   if (error.cause != null && depth < LOG_MAX_DEPTH)
     out.cause = serializeLogValue(error.cause, depth + 1, seen, budget);
@@ -300,14 +335,10 @@ function serializeLogValue(
       break;
     }
     keyCount += 1;
-    out[key] = isSensitiveLogKey(key)
+    const entry = (obj as Record<string, unknown>)[key];
+    out[key] = isSensitiveLogKey(key, entry)
       ? LOG_REDACTED
-      : serializeLogValue(
-          (obj as Record<string, unknown>)[key],
-          depth + 1,
-          seen,
-          budget
-        );
+      : serializeLogValue(entry, depth + 1, seen, budget);
   }
   return out;
 }

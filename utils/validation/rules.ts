@@ -1,4 +1,5 @@
-import { EntityID } from '@/types';
+import type { EntityID } from '@/types';
+
 import * as z from 'zod';
 
 import { normalizeArabicDigits, positiveInt, validID } from '..';

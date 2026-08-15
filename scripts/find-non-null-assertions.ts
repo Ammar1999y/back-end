@@ -36,11 +36,22 @@ const SKIP_DIRECTORIES = new Set([
 
 const TS_EXTENSIONS = new Set(['.ts', '.tsx', '.mts', '.cts']);
 
+// Terminal ANSI formatting. Module scope: several of these were declared in the
+// middle of `main`, after an early return, so half the palette was unreachable
+// from the JSON path that also wants none of it.
+const reset = '\u{1B}[0m';
+const bold = '\u{1B}[1m';
+const red = '\u{1B}[31m';
+const yellow = '\u{1B}[33m';
+const cyan = '\u{1B}[36m';
+const gray = '\u{1B}[90m';
+const green = '\u{1B}[32m';
+
 // CLI Options
-const args = process.argv.slice(2);
-const FAIL_ON_FOUND = args.includes('--fail');
-const OUTPUT_JSON = args.includes('--json');
-const INCLUDE_COMMENTS = args.includes('--comments') || args.includes('--all');
+const args = new Set(process.argv.slice(2));
+const FAIL_ON_FOUND = args.has('--fail');
+const OUTPUT_JSON = args.has('--json');
+const INCLUDE_COMMENTS = args.has('--comments') || args.has('--all');
 
 interface MatchLocation {
   file: string;
@@ -51,10 +62,12 @@ interface MatchLocation {
 }
 
 const toRelativePath = (absolutePath: string) =>
-  path.relative(ROOT, absolutePath).replace(/\\/g, '/');
+  path.relative(ROOT, absolutePath).replaceAll('\\', '/');
 
 const scanDirectory = (dirPath: string, fileList: string[] = []): string[] => {
-  for (const entry of readdirSync(dirPath, { withFileTypes: true })) {
+  // eslint-disable-next-line security/detect-non-literal-fs-filename -- dirPath is derived from ROOT by recursive descent, never from input
+  const entries = readdirSync(dirPath, { withFileTypes: true });
+  for (const entry of entries) {
     const fullPath = path.join(dirPath, entry.name);
     if (entry.isDirectory()) {
       if (!SKIP_DIRECTORIES.has(entry.name)) {
@@ -71,6 +84,7 @@ const scanDirectory = (dirPath: string, fileList: string[] = []): string[] => {
 };
 
 const findSilencersInFile = (filePath: string): MatchLocation[] => {
+  // eslint-disable-next-line security/detect-non-literal-fs-filename -- filePath comes from scanDirectory's walk of ROOT, never from input
   const content = readFileSync(filePath, 'utf8');
   const relativePath = toRelativePath(filePath);
   const sourceFile = ts.createSourceFile(
@@ -110,17 +124,18 @@ const findSilencersInFile = (filePath: string): MatchLocation[] => {
     }
 
     // 2. Definite assignment assertion: e.g. `class A { name!: string }` or `let x!: string`
-    if (ts.isPropertyDeclaration(node) || ts.isVariableDeclaration(node)) {
-      if (node.exclamationToken) {
-        const { line, column } = getLoc(node.exclamationToken.pos);
-        matches.push({
-          file: relativePath,
-          line,
-          column,
-          type: 'definite-assignment',
-          snippet: getLineSnippet(line),
-        });
-      }
+    if (
+      (ts.isPropertyDeclaration(node) || ts.isVariableDeclaration(node)) &&
+      node.exclamationToken
+    ) {
+      const { line, column } = getLoc(node.exclamationToken.pos);
+      matches.push({
+        file: relativePath,
+        line,
+        column,
+        type: 'definite-assignment',
+        snippet: getLineSnippet(line),
+      });
     }
 
     ts.forEachChild(node, visit);
@@ -160,18 +175,10 @@ const main = () => {
 
   if (OUTPUT_JSON) {
     console.log(JSON.stringify(allMatches, null, 2));
+    // eslint-disable-next-line unicorn/no-process-exit -- CLI entry point: the exit code IS this tool's result contract, the case the rule excepts
     if (FAIL_ON_FOUND && allMatches.length > 0) process.exit(1);
     return;
   }
-
-  // Terminal ANSI Formatting
-  const reset = '\x1b[0m';
-  const bold = '\x1b[1m';
-  const red = '\x1b[31m';
-  const yellow = '\x1b[33m';
-  const cyan = '\x1b[36m';
-  const gray = '\x1b[90m';
-  const green = '\x1b[32m';
 
   console.log(
     `\n${bold}🔍 Searching for TypeScript silencers (!)...${reset}\n`
@@ -181,6 +188,7 @@ const main = () => {
     console.log(
       `${green}✨ Great job! No TypeScript silencers (! operator) found across ${files.length} scanned files.${reset}\n`
     );
+    // eslint-disable-next-line unicorn/no-process-exit -- CLI entry point: the exit code IS this tool's result contract, the case the rule excepts
     process.exit(0);
   }
 
@@ -192,18 +200,21 @@ const main = () => {
     grouped.set(match.file, list);
   }
 
-  let nonNullCount = 0;
-  let definiteCount = 0;
-  let commentCount = 0;
+  // Counted by tallying the discriminant rather than branching on it: an
+  // if/else chain trips `prefer-switch`, and a `switch` inside these nested
+  // loops trips `no-break-in-nested-loop`. A keyed tally needs neither.
+  const counts: Record<MatchLocation['type'], number> = {
+    'non-null-assertion': 0,
+    'definite-assignment': 0,
+    'ts-comment': 0,
+  };
 
   grouped.forEach((matches, file) => {
     console.log(
       `${cyan}${bold}${file}${reset} ${gray}(${matches.length} occurrence${matches.length > 1 ? 's' : ''})${reset}`
     );
     for (const m of matches) {
-      if (m.type === 'non-null-assertion') nonNullCount++;
-      else if (m.type === 'definite-assignment') definiteCount++;
-      else if (m.type === 'ts-comment') commentCount++;
+      counts[m.type]++;
 
       const typeLabel =
         m.type === 'non-null-assertion'
@@ -221,10 +232,16 @@ const main = () => {
   console.log(`${bold}──────── Summary ────────${reset}`);
   console.log(`Files scanned:              ${files.length}`);
   console.log(`Files with silencers:       ${grouped.size}`);
-  console.log(`Non-Null Assertions (!):    ${red}${nonNullCount}${reset}`);
-  console.log(`Definite Assignments (!:):  ${yellow}${definiteCount}${reset}`);
+  console.log(
+    `Non-Null Assertions (!):    ${red}${counts['non-null-assertion']}${reset}`
+  );
+  console.log(
+    `Definite Assignments (!:):  ${yellow}${counts['definite-assignment']}${reset}`
+  );
   if (INCLUDE_COMMENTS) {
-    console.log(`TS Suppression Comments:    ${yellow}${commentCount}${reset}`);
+    console.log(
+      `TS Suppression Comments:    ${yellow}${counts['ts-comment']}${reset}`
+    );
   }
   console.log(
     `Total occurrences:          ${bold}${allMatches.length}${reset}\n`
@@ -234,6 +251,7 @@ const main = () => {
     console.error(
       `${red}❌ Failure: TypeScript silencers found and --fail flag was supplied.${reset}`
     );
+    // eslint-disable-next-line unicorn/no-process-exit -- CLI entry point: the exit code IS this tool's result contract, the case the rule excepts
     process.exit(1);
   }
 };

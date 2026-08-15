@@ -33,7 +33,7 @@ import { OTP_AUTO_VERIFY, PHONE_ENABLED } from '@/utils/config';
 import { CustomError } from '@/utils/error-class';
 import { processOtpSend } from '@/utils/otp';
 import { changePhoneSchema } from '@/utils/validation/auth';
-import { ENABLED_OTP_CHANNELS } from '@/utils/validation/otp';
+import { isChannelEnabled } from '@/utils/validation/otp';
 import { zodIssueMessage } from '@/utils/validation/rules';
 
 import { userMsg } from '../../messages';
@@ -73,10 +73,7 @@ export const POST: Handler = async (ctx) => {
 
     const { newPhoneNumber, channel } = parsed.data;
 
-    if (
-      !OTP_AUTO_VERIFY &&
-      !(ENABLED_OTP_CHANNELS as readonly string[]).includes(channel)
-    )
+    if (!OTP_AUTO_VERIFY && !isChannelEnabled(channel))
       throw new CustomError(
         userMsg.verificationUnavailable,
         HTTP_STATUS.SERVICE_UNAVAILABLE

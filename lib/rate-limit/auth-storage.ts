@@ -3,6 +3,7 @@ import type { BetterAuthRateLimitStorage } from '@better-auth/core';
 import { sanitizeForLog } from '@/utils';
 
 import { redis } from './client';
+import { describeAuthStoreFailure } from './store-failure';
 
 type RateLimitEntry = {
   key: string;
@@ -49,7 +50,9 @@ export const authRateLimitStorage: BetterAuthRateLimitStorage = {
         redis.get<RateLimitEntry>(`${KEY_PREFIX}${key}`)
       );
     } catch (error) {
-      console.error(sanitizeForLog(error));
+      // NOT the raw error: `key` is `${ip}|${path}`, and the Upstash client
+      // quotes the command — including that key — in its message.
+      console.error(sanitizeForLog(describeAuthStoreFailure(error, 'get')));
       throw error;
     }
   },
@@ -59,7 +62,7 @@ export const authRateLimitStorage: BetterAuthRateLimitStorage = {
         redis.set(`${KEY_PREFIX}${key}`, value, { ex: TTL_SECONDS })
       );
     } catch (error) {
-      console.error(sanitizeForLog(error));
+      console.error(sanitizeForLog(describeAuthStoreFailure(error, 'set')));
       throw error;
     }
   },

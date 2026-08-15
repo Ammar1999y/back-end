@@ -2,16 +2,16 @@ import { sanitizeForLog } from '@/utils';
 import { Ratelimit } from '@upstash/ratelimit';
 
 import { redis } from './client';
+import { describeStoreFailure } from './store-failure';
 
 export { authRateLimitStorage } from './auth-storage';
 export {
+  enforceOtpGlobalSendBudget,
   enforceOtpSendQuota,
-  enforceOtpVerifyDailyBudget,
   enforceOtpVerifyQuota,
   enforceRateLimit,
   ipIdentifier,
   otpContactKind,
-  refundOtpVerifyAttempt,
   userIdentifier,
 } from './api';
 export type { OtpContactKind, OtpSendSurface } from './api';
@@ -77,14 +77,7 @@ export async function rateLimit(opts: {
         degraded: false,
       };
     } catch (error) {
-      console.error(
-        sanitizeForLog({
-          msg: 'rate-limit store error',
-          attempt,
-          identifier: opts.identifier,
-          error,
-        })
-      );
+      console.error(sanitizeForLog(describeStoreFailure(error, opts, attempt)));
       if (attempt < RATE_LIMIT_RETRIES) {
         await new Promise((r) =>
           setTimeout(r, RATE_LIMIT_RETRY_BASE_MS * (attempt + 1))
@@ -103,35 +96,9 @@ export async function rateLimit(opts: {
 }
 
 /**
- * Give one token back.
- *
- * This is what lets a budget be charged for a *specific outcome* while still
- * admitting atomically: consume on the way in (so concurrent callers can never
- * all pass a stale reading), then refund the ones that turned out not to be
- * chargeable. `@upstash/ratelimit` implements a negative rate directly in its
- * Lua script — the cap check is skipped when `rate < 0` — so the refund is a
- * single atomic INCRBY, not a read-modify-write.
- *
- * Failure is logged, never thrown: by the time a refund runs the request's
- * outcome is already decided, and turning a Redis blip into a 5xx would be
- * strictly worse than over-counting one entry in a 24h budget.
+ * No refund primitive here, deliberately. `@upstash/ratelimit` supports a
+ * negative rate, but a refund cannot be transactional with the work it refunds,
+ * so every failure to apply one silently over-charges a real user. If a future
+ * budget needs outcome-specific accounting, prefer a counter that commits with
+ * the outcome.
  */
-export async function refundRateLimit(opts: {
-  identifier: string;
-  limit: number;
-  window: number;
-}): Promise<void> {
-  try {
-    await getLimiter(opts.limit, opts.window).limit(opts.identifier, {
-      rate: -1,
-    });
-  } catch (error) {
-    console.error(
-      sanitizeForLog({
-        msg: 'rate-limit refund error',
-        identifier: opts.identifier,
-        error,
-      })
-    );
-  }
-}

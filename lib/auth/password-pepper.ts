@@ -163,6 +163,7 @@ function parseConfiguration(): PasswordPepperConfiguration {
 }
 
 function getConfiguration(): PasswordPepperConfiguration {
+  // eslint-disable-next-line unicorn/no-top-level-assignment-in-function -- memoized lazy singleton; the assignment IS the cache
   cachedConfiguration ??= parseConfiguration();
   return cachedConfiguration;
 }
