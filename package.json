@@ -7,11 +7,16 @@
     "start": "next start",
     "lint": "tsc --noEmit && eslint .",
     "format": "prettier --write .",
-    "probe:local": "bun scripts/probe/local/time-dst.ts && bun scripts/probe/local/log-serializer.ts && bun scripts/probe/local/permission-schema.ts && bun test scripts/probe/local",
-    "probe:db": "bun test ./scripts/probe/dev-live/database/otp-verify-budget.dev-probe.ts",
-    "probe:redis": "bun test ./scripts/probe/dev-live/redis/otp-global-breaker.dev-probe.ts",
-    "find:unused-files": "bun scripts/find-unused-files.ts && bun add -D knip && bunx knip",
+    "format:check": "prettier --check .",
+    "audit": "bun audit",
+    "find:unused-files": "bun scripts/find-unused-files.ts && bunx knip",
     "find:non-null": "bun scripts/find-non-null-assertions.ts",
+    "precommit": "lefthook run fix && lefthook run verify",
+    "verify": "lefthook run verify",
+    "fix": "lefthook run fix",
+    "scan:secrets": "mise exec -- gitleaks git . --redact --verbose --no-banner",
+    "scan:sast": "mise exec -- semgrep scan --config=p/typescript --config=p/nextjs --config=p/secrets --error --metrics=off",
+    "prepare": "lefthook install",
     "db:generate": "drizzle-kit generate",
     "db:migrate": "drizzle-kit migrate",
     "db:migrate:sql": "bun scripts/apply-sql-migrations.ts"
@@ -23,6 +28,10 @@
     "Safari >= 15",
     "defaults and fully supports es6-module and not dead"
   ],
+  "overrides": {
+    "nanoid": "^3.3.18",
+    "esbuild": "^0.28.1"
+  },
   "dependencies": {
     "@aws-sdk/client-s3": "^3",
     "@aws-sdk/s3-request-presigner": "^3",
@@ -66,6 +75,7 @@
     "eslint-plugin-security": "^4",
     "eslint-plugin-unicorn": "^73",
     "knip": "^6.32.2",
+    "lefthook": "^2.1.10",
     "prettier": "^3.6",
     "typescript": "^6"
   },

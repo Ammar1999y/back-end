@@ -1,0 +1,71 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended",
+    ":semanticCommits",
+    ":dependencyDashboard",
+    "security:openssf-scorecard",
+    "security:minimumReleaseAgeNpm",
+    "helpers:pinGitHubActionDigests"
+  ],
+  "timezone": "Asia/Riyadh",
+  "prConcurrentLimit": 5,
+  "prHourlyLimit": 2,
+  "rangeStrategy": "bump",
+  "labels": ["dependencies"],
+  "lockFileMaintenance": {
+    "enabled": true,
+    "schedule": ["before 6am on monday"]
+  },
+  "osvVulnerabilityAlerts": true,
+  "vulnerabilityAlerts": {
+    "enabled": true,
+    "labels": ["security", "urgent"],
+    "schedule": ["at any time"],
+    "minimumReleaseAge": null,
+    "dependencyDashboardApproval": false
+  },
+  "packageRules": [
+    {
+      "description": "Group all non-major dev tooling into a single PR instead of flooding.",
+      "matchDepTypes": ["devDependencies"],
+      "matchUpdateTypes": ["minor", "patch", "pin", "digest"],
+      "groupName": "dev tooling (non-major)"
+    },
+    {
+      "description": "Group non-major runtime deps; majors stay separate for review.",
+      "matchDepTypes": ["dependencies"],
+      "matchUpdateTypes": ["minor", "patch"],
+      "groupName": "runtime dependencies (non-major)"
+    },
+    {
+      "description": "Next.js and its ESLint config must move together.",
+      "matchPackageNames": ["next", "eslint-config-next"],
+      "groupName": "next.js"
+    },
+    {
+      "description": "Better Auth core and plugins must move together.",
+      "matchPackageNames": ["better-auth", "@better-auth/**"],
+      "groupName": "better-auth"
+    },
+    {
+      "description": "Drizzle ORM and its kit must move together.",
+      "matchPackageNames": [
+        "drizzle-orm",
+        "drizzle-kit",
+        "eslint-plugin-drizzle"
+      ],
+      "groupName": "drizzle"
+    },
+    {
+      "description": "GitHub Actions pinned by major only.",
+      "matchManagers": ["github-actions"],
+      "groupName": "github actions"
+    },
+    {
+      "description": "Scanner binaries move together and are never grouped with app deps.",
+      "matchManagers": ["mise"],
+      "groupName": "scanner toolchain"
+    }
+  ]
+}

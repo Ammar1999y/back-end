@@ -1,0 +1,5 @@
+# Pre-existing history only. A keyboard-shortcut literal ('mod+shift+enter')
+# in the since-deleted front-end editor code, matched by the generic-api-key
+# entropy rule — not a credential. Delete this file once the history is
+# restarted; the fingerprint will no longer match any commit.
+e565d517fd031e5a0553d47808e89553dca62f56:components/editor/plugins/exit-break-kit.tsx:generic-api-key:9

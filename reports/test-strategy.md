@@ -1,11 +1,11 @@
 # Test Strategy Review — Probes, Isolation, and the VPS Target
 
-**Date:** 2026-08-14
-**Scope:** `scripts/probe/`, `db/index.ts`, `db/ws.ts`, `lib/rate-limit/client.ts`
-**Question answered:** is the current "tests may freely destroy the dev database
-and Redis" approach the right path to maximum test quality, and does full
-isolation from the application still make sense once the app runs on a VPS with
-a local Postgres and an in-memory store instead of Redis?
+**Date:** 2026-08-14 **Scope:** `scripts/probe/`, `db/index.ts`, `db/ws.ts`,
+`lib/rate-limit/client.ts` **Question answered:** is the current "tests may
+freely destroy the dev database and Redis" approach the right path to maximum
+test quality, and does full isolation from the application still make sense once
+the app runs on a VPS with a local Postgres and an in-memory store instead of
+Redis?
 
 ---
 
@@ -65,10 +65,10 @@ being destroyed **disposable per run**:
 This is what makes the current setup fundamentally flawed relative to the stated
 future.
 
-| Layer      | Tested today                                        | Planned on the VPS               |
-| ---------- | --------------------------------------------------- | -------------------------------- |
+| Layer      | Tested today                                          | Planned on the VPS               |
+| ---------- | ----------------------------------------------------- | -------------------------------- |
 | Database   | `drizzle-orm/neon-http` + `db/ws.ts` (Neon WebSocket) | Local Postgres, different driver |
-| Rate limit | Upstash Redis (`lib/rate-limit/client.ts`)          | `lru-cache` or similar           |
+| Rate limit | Upstash Redis (`lib/rate-limit/client.ts`)            | `lru-cache` or similar           |
 
 Both are provider-specific. Neither survives the move:
 
@@ -133,15 +133,16 @@ fails in production.
 - **Environment:** separate database, separate store, fake providers, its own
   env file. Total isolation. Yes.
 - **Code path:** tests must enter through the same door a request does. The
-  front-end has been removed, so the API surface *is* the product. The
-  highest-value tests call the route handlers through `lib/http/adapters/next.ts`
-  with a real `Request`, asserting status, body shape and headers — not only
-  internal functions.
+  front-end has been removed, so the API surface _is_ the product. The
+  highest-value tests call the route handlers through
+  `lib/http/adapters/next.ts` with a real `Request`, asserting status, body
+  shape and headers — not only internal functions.
 
-The `mock.module('@/lib/rate-limit/index', …)` probes under `scripts/probe/local/`
-are sound as unit probes, but they carry the drift risk: they assert which
-identifiers were *consumed*, which stays green even if the real store stops
-enforcing them. Keep them; they cannot be the only coverage of that path.
+The `mock.module('@/lib/rate-limit/index', …)` probes under
+`scripts/probe/local/` are sound as unit probes, but they carry the drift risk:
+they assert which identifiers were _consumed_, which stays green even if the
+real store stops enforcing them. Keep them; they cannot be the only coverage of
+that path.
 
 ---
 
@@ -158,17 +159,17 @@ scripts/probe/       retire once the above exists
 
 ## 7. Bun tooling worth using
 
-| Tool                                   | Use here                                                                                             |
-| -------------------------------------- | ---------------------------------------------------------------------------------------------------- |
-| `bunfig.toml` `[test] preload`         | Container boot, migrations, global teardown. Replaces per-file setup.                                |
-| `setSystemTime` from `bun:test`        | Directly applicable to the 24h budget anchoring and the DST cases, which are untestable without it.  |
-| `Bun.sql`                              | Built-in Postgres client, zero dependencies, for `CREATE`/`DROP DATABASE` orchestration outside Drizzle. |
-| `Bun.$`                                | Docker lifecycle in preload; avoids a Testcontainers dependency.                                     |
-| `Bun.serve`                            | Fake SMS/email provider as a real HTTP server. Better than mocking nodemailer — exercises timeout and 5xx paths. |
-| `test.each` / `describe.each`          | The contract suite parameterized over implementations.                                               |
-| `bun test --rerun-each=20`             | Flake and order-dependence detection.                                                                |
-| `--coverage`, `--bail`, `expect.extend` | Coverage gates, fast failure, domain-specific matchers.                                              |
-| `bun test --env-file=.env.test`        | Prevents `.env` leaking into a suite that drops databases.                                           |
+| Tool                                    | Use here                                                                                                         |
+| --------------------------------------- | ---------------------------------------------------------------------------------------------------------------- |
+| `bunfig.toml` `[test] preload`          | Container boot, migrations, global teardown. Replaces per-file setup.                                            |
+| `setSystemTime` from `bun:test`         | Directly applicable to the 24h budget anchoring and the DST cases, which are untestable without it.              |
+| `Bun.sql`                               | Built-in Postgres client, zero dependencies, for `CREATE`/`DROP DATABASE` orchestration outside Drizzle.         |
+| `Bun.$`                                 | Docker lifecycle in preload; avoids a Testcontainers dependency.                                                 |
+| `Bun.serve`                             | Fake SMS/email provider as a real HTTP server. Better than mocking nodemailer — exercises timeout and 5xx paths. |
+| `test.each` / `describe.each`           | The contract suite parameterized over implementations.                                                           |
+| `bun test --rerun-each=20`              | Flake and order-dependence detection.                                                                            |
+| `--coverage`, `--bail`, `expect.extend` | Coverage gates, fast failure, domain-specific matchers.                                                          |
+| `bun test --env-file=.env.test`         | Prevents `.env` leaking into a suite that drops databases.                                                       |
 
 ---
 

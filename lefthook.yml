@@ -1,0 +1,58 @@
+# Local gates. GitHub Actions re-runs the same checks, so a skipped hook
+# (`--no-verify`, or a clone that never ran `bun install`) is still caught.
+#
+#   bun run precommit  fix what is auto-fixable, then run every gate
+#   bun run verify     gates only, no writes — same set as pre-push and CI
+#   bun run fix        writes only
+#
+# The scanners run through `mise exec` so they are the exact versions pinned in
+# mise.toml — the same file CI installs from. Run `mise install` once.
+
+pre-commit:
+  parallel: true
+  commands:
+    typecheck:
+      glob: '*.{ts,tsx,mts,cts}'
+      run: bunx tsc --noEmit
+    lint:
+      glob: '*.{ts,tsx,mts,cts,js,mjs,cjs}'
+      run: bunx eslint --max-warnings 0 {staged_files}
+    format:
+      glob: '*.{ts,tsx,mts,cts,js,mjs,cjs,json,jsonc,md,yml,yaml,css}'
+      run: bunx prettier --check {staged_files}
+    secrets:
+      run: mise exec -- gitleaks git --staged --redact --verbose --no-banner
+
+pre-push: &full_verify
+  parallel: true
+  commands:
+    typecheck:
+      run: bunx tsc --noEmit
+    lint:
+      run: bunx eslint . --max-warnings 0
+    format:
+      run: bunx prettier --check .
+    audit:
+      run: bun audit
+    secrets:
+      run: mise exec -- gitleaks git . --redact --verbose --no-banner
+      fail_text: 'leaked secret, or tools not installed (mise install)'
+    sast:
+      run:
+        mise exec -- semgrep scan --config=p/typescript --config=p/nextjs
+        --config=p/secrets --error --metrics=off
+      fail_text: 'semgrep findings, or tools not installed (mise install)'
+    workflows:
+      run: mise exec -- actionlint
+      fail_text: 'workflow errors, or tools not installed (mise install)'
+
+verify: *full_verify
+
+fix:
+  # Sequential: both commands rewrite the same files.
+  piped: true
+  commands:
+    format:
+      run: bunx prettier --write .
+    lint:
+      run: bunx eslint . --fix

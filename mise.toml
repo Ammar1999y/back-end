@@ -1,0 +1,23 @@
+# Single source of truth for the scanner binaries. CI installs from this file
+# and `bun run verify` executes through `mise exec`, so a local scan and a CI
+# scan are provably the same version — a stale local gitleaks cannot report
+# "clean" against rules newer than the binary.
+#
+# bun is deliberately absent: it is pinned by `packageManager` in package.json,
+# which `oven-sh/setup-bun` reads and Renovate's npm manager tracks. Listing it
+# here too would create the second source of truth this file exists to remove.
+#
+# Renovate's `mise` manager updates every entry natively — no custom regex.
+
+[tools]
+gitleaks = "8.30.1"
+actionlint = "1.7.12"
+# actionlint shells out to shellcheck for `run:` blocks and silently skips that
+# analysis when the binary is absent. GitHub's runners ship it, so without this
+# pin the local gate is weaker than CI — which is how an SC2086 reached main.
+shellcheck = "0.11.0"
+# semgrep ships no standalone binary for every platform, so mise resolves it
+# through the pipx backend — which needs a Python installer present. uv is that
+# installer, and pinning it keeps the resolution reproducible too.
+uv = "0.12.5"
+semgrep = "1.173.0"

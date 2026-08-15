@@ -3,5 +3,8 @@
   // Both are loaded by name through `FlatCompat.extends()` in eslint.config.mjs.
   // Knip resolves imports statically, so it cannot see string-addressed plugins.
   // Verified active with `eslint --print-config`.
-  "ignoreDependencies": ["eslint-plugin-no-unsanitized", "eslint-plugin-security"],
+  "ignoreDependencies": [
+    "eslint-plugin-no-unsanitized",
+    "eslint-plugin-security",
+  ],
 }
