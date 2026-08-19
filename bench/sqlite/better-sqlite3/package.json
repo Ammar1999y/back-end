@@ -1,0 +1,15 @@
+{
+  "name": "bench-better-sqlite3",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "correctness": "node run.mjs --mode=correctness --profile=baseline",
+    "suite": "node run.mjs --mode=suite --profile=baseline",
+    "pragmas": "node run.mjs --mode=pragmas --workload=rl_consume",
+    "secure-delete": "node run.mjs --mode=pragmas --workload=cache_sweep --profiles=baseline,secure_delete_fast,secure_delete_on --repeat=3",
+    "concurrent": "node run.mjs --mode=concurrent --workers=4 --durationMs=5000 --workload=rl_consume"
+  },
+  "dependencies": {
+    "better-sqlite3": "13.0.3"
+  }
+}

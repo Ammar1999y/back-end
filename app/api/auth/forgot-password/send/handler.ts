@@ -115,7 +115,7 @@ export const POST: Handler = async (ctx) => {
   } catch (error) {
     await ensureMinDelay(Date.now() - start);
     // 429 is not collapsed: the throttles reaching here are the pre-lookup IP
-    // and per-identifier Redis caps, which leak nothing about account existence.
+    // and per-identifier limiter caps, which leak nothing about account existence.
     if (
       error instanceof CustomError &&
       (error.status === HTTP_STATUS.BAD_REQUEST ||

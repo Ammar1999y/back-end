@@ -13,7 +13,11 @@ const compat = new FlatCompat({
 
 const eslintConfig = [
   {
-    ignores: ['.next/**', 'out/**', 'build/**', 'next-env.d.ts'],
+    // `bench/**` is tracked project code but deliberately outside this config: it
+    // is a standalone harness with no tsconfig, targeting two runtimes (Node and
+    // Bun) with plain `.mjs` and console reporting, so the app's rules do not
+    // apply to it. Prettier still formats it, and `format:check` still gates it.
+    ignores: ['.next/**', 'out/**', 'build/**', 'next-env.d.ts', 'bench/**'],
   },
   ...nextVitals,
   ...nextTs,

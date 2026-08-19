@@ -177,7 +177,7 @@ export const POST: Handler = async (ctx) => {
 
     // Collapse unknown-identifier / already-verified to the generic success so
     // existence can't be probed. 429 is NOT collapsed: the only throttles that
-    // reach here are the pre-lookup IP and per-identifier Redis caps, which are
+    // reach here are the pre-lookup IP and per-identifier limiter caps, which are
     // independent of the user lookup; the existence-revealing OTP block is
     // swallowed in the inner try/catch above. Propagating 429 avoids a fake 200
     // under throttling and returns a real Retry-After.

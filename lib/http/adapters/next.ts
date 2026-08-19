@@ -63,8 +63,10 @@ export function toNextHandler(
       if (opts?.preAuthIpLimit) {
         // Fail-closed: this limiter exists specifically so unauthenticated
         // traffic can't hammer session lookup. Letting requests through on
-        // an Upstash outage would silently strip the protection it exists
-        // for, so a 503 is the correct shape during a degraded store.
+        // a degraded limiter store would silently strip the protection it
+        // exists for, so a 503 is the correct shape. Locally that now means a
+        // broken disk or schema rather than a network outage, which makes
+        // failing closed more clearly right, not less.
         await enforceRateLimit({
           scope: preAuthScope(ctx.apiPath),
           identifier: ipIdentifier(ctx.headers),

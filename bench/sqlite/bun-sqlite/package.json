@@ -1,0 +1,13 @@
+{
+  "name": "bench-bun-sqlite",
+  "private": true,
+  "type": "module",
+  "description": "bun:sqlite benchmark project (no dependencies - the driver is built into Bun)",
+  "scripts": {
+    "correctness": "bun run.mjs --mode=correctness --profile=baseline",
+    "suite": "bun run.mjs --mode=suite --profile=baseline",
+    "pragmas": "bun run.mjs --mode=pragmas --workload=rl_consume",
+    "secure-delete": "bun run.mjs --mode=pragmas --workload=cache_sweep --profiles=baseline,secure_delete_fast,secure_delete_on --repeat=3",
+    "concurrent": "bun run.mjs --mode=concurrent --workers=4 --durationMs=5000 --workload=rl_consume"
+  }
+}

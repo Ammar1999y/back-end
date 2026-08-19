@@ -1,0 +1,4 @@
+# Transient benchmark databases (regenerated on every run, can reach hundreds of MB)
+*/.bench-data/
+node_modules/
+*.log

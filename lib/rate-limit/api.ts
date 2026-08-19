@@ -222,16 +222,17 @@ export async function enforceOtpVerifyQuota(opts: {
 
 /**
  * The 24h verify-FAILURE budget deliberately does NOT live here. It was
- * enforced twice — Redis and the proof row — which cost a consume-then-refund
- * protocol, a hand-rebuilt refund key, and a failure mode where a Redis blip
- * locked a user out of every OTP flow for 24h. The surviving authority is
- * `verification_sessions.verifyAttemptDaily`, enforced transactionally in
- * `processOtpVerify`. Verify attempts are still bounded in Redis per
- * destination (`enforceOtpVerifyQuota`) and per user (endpoint limiters).
+ * enforced twice — in the limiter store and in the proof row — which cost a
+ * consume-then-refund protocol, a hand-rebuilt refund key, and a failure mode
+ * where one store blip locked a user out of every OTP flow for 24h. The
+ * surviving authority is `verification_sessions.verifyAttemptDaily`, enforced
+ * transactionally in `processOtpVerify`. Verify attempts are still bounded by the
+ * limiter per destination (`enforceOtpVerifyQuota`) and per user (endpoint
+ * limiters).
  */
 
 /**
- * Check a sliding-window rate limit for the current request.
+ * Check a fixed-window rate limit for the current request.
  *
  * Throws `CustomError(429)` with `responseHeaders` set (Retry-After +
  * X-RateLimit-*) when the caller is over the limit; the error handler /

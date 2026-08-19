@@ -970,8 +970,8 @@ export async function processOtpVerify({
         //    knowing the code.
         //
         // Accepted tradeoff: a user who can complete verifies never accumulates
-        // the DB-side SEND throttle. Their remaining bound is the Redis
-        // `otp.send.*` chain — the bound moved, it did not disappear.
+        // the DB-side SEND throttle. Their remaining bound is the
+        // `otp.send.*` limiter chain — the bound moved, it did not disappear.
         await tx
           .update(verificationSessions)
           .set({

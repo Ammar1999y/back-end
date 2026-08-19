@@ -1,4 +1,6 @@
 /* eslint-disable unicorn/no-top-level-side-effects -- the load-time crash IS this module's contract */
+import path from 'node:path';
+
 import { validatePasswordPepperConfiguration } from '@/lib/auth/password-pepper';
 
 /**
@@ -13,8 +15,6 @@ const REQUIRED_SERVER_ENV = [
   'DATABASE_URL',
   'PASSWORD_PEPPER_ACTIVE_ID',
   'PASSWORD_PEPPER_KEYRING',
-  'UPSTASH_REDIS_REST_URL',
-  'UPSTASH_REDIS_REST_TOKEN',
 ] as const;
 
 // Vars that are only required outside development. The Turnstile module falls
@@ -117,5 +117,67 @@ function requireEnv(key: (typeof REQUIRED_SERVER_ENV)[number]): string {
 }
 
 export const DATABASE_URL = requireEnv('DATABASE_URL');
-export const UPSTASH_REDIS_REST_URL = requireEnv('UPSTASH_REDIS_REST_URL');
-export const UPSTASH_REDIS_REST_TOKEN = requireEnv('UPSTASH_REDIS_REST_TOKEN');
+/**
+ * Directory holding the local SQLite databases.
+ *
+ * MUST be a Coolify persistent volume on real local disk. A container's writable
+ * layer is not deployment persistence, and SQLite's WAL requires the `-shm` file,
+ * which needs real mmap on a local filesystem. Never NFS or CIFS — file locking
+ * there is unreliable and the failure mode is silent corruption, not an error.
+ *
+ * Required and absolute in production, with no fallback. A default would let a
+ * missing variable or an unmounted volume boot successfully and write to the
+ * container layer, where every redeploy silently resets the auth, API and daily
+ * OTP counters — and the OTP one is a money cap. Failing to boot is the correct
+ * response to that misconfiguration.
+ *
+ * NOTE the limit of this check: it proves the path is configured and absolute, not
+ * that a volume is mounted there. SQLite will happily create the same path inside
+ * the container. Only surviving a real redeploy proves persistence — see the
+ * verification step in reports/coolify-deployment.md.
+ */
+function resolveSqliteDir(): string {
+  const configured = process.env.SQLITE_DIR?.trim();
+
+  if (!configured) {
+    if (process.env.NODE_ENV === 'production')
+      throw new Error(
+        'Missing required server env var: SQLITE_DIR. It must be an absolute path ' +
+          'to a persistent volume; see reports/coolify-deployment.md.'
+      );
+    return './data';
+  }
+
+  if (process.env.NODE_ENV === 'production' && !path.isAbsolute(configured))
+    throw new Error(
+      `SQLITE_DIR must be an absolute path in production, got: ${configured}`
+    );
+
+  return configured;
+}
+
+const SQLITE_DIR = resolveSqliteDir();
+
+/** Rate-limit state: process-crash-safe, must survive deploys (the OTP cap). */
+export const RATE_LIMIT_DB_PATH = path.join(SQLITE_DIR, 'rate-limit.db');
+
+/** Response cache: disposable. Safe to delete, and safe to place on tmpfs. */
+export const CACHE_DB_PATH = path.join(SQLITE_DIR, 'cache.db');
+
+/**
+ * Shared secret for the maintenance endpoints (the expiry sweep and the deep
+ * storage check).
+ *
+ * Deliberately NOT in `REQUIRED_IN_PRODUCTION`. That list is enforced at module
+ * load, and `next build` runs as production — so requiring it there would force
+ * the real secret into the build environment for a value only ever used at
+ * runtime.
+ *
+ * Enforced two other ways instead, which together cover the failure it guards:
+ * the routes reject an unset token rather than treating it as "no auth required"
+ * (so it fails closed), and `/api/health/storage` reports `maintenanceTokenSet`,
+ * which fails readiness in production. A deploy that forgets it is therefore
+ * visible at the health check rather than as a sweep that silently never runs.
+ */
+export const SQLITE_MAINTENANCE_TOKEN =
+  process.env.SQLITE_MAINTENANCE_TOKEN ?? '';

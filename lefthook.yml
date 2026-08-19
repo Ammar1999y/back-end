@@ -16,7 +16,14 @@ pre-commit:
       run: bunx tsc --noEmit
     lint:
       glob: '*.{ts,tsx,mts,cts,js,mjs,cjs}'
-      run: bunx eslint --max-warnings 0 {staged_files}
+      # `--no-warn-ignored` because this hook passes staged files to eslint by
+      # name. `eslint .` skips ignored paths silently, but an explicit argument
+      # that matches an ignore pattern is reported as a warning — and with
+      # `--max-warnings 0` that fails the commit. `bench/**` is eslint-ignored on
+      # purpose (see eslint.config.mjs) while still being tracked, so without
+      # this flag every commit touching the benchmark harness would be blocked
+      # for files eslint was never meant to check.
+      run: bunx eslint --max-warnings 0 --no-warn-ignored {staged_files}
     format:
       glob: '*.{ts,tsx,mts,cts,js,mjs,cjs,json,jsonc,md,yml,yaml,css}'
       run: bunx prettier --check {staged_files}

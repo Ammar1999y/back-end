@@ -5,17 +5,37 @@
  * `mock.module`-ed by a probe and because a containment boundary is easier to
  * trust when it is the only thing in its file.
  *
- * Why a boundary is needed at all: `@upstash/redis` formats an HTTP error
- * response as `` `${body.error}, command was: ${JSON.stringify(req.body)}` ``,
- * and the command body is the Redis key. Both key spaces here embed data worth
- * withholding — the API limiter's key ends in the destination, and Better
- * Auth's ends in `${ip}|${path}`. `sanitizeForLog` keeps free-text messages by
- * policy, so the raw error must never reach it.
+ * ## Why the boundary is kept now that the store is local
+ *
+ * The original justification was specific to `@upstash/redis`, which formatted an
+ * HTTP error as `` `${body.error}, command was: ${JSON.stringify(req.body)}` `` —
+ * the command body being the Redis key. That dependency is gone, and the local
+ * driver was tested against exactly this concern: a UNIQUE violation on a key
+ * containing `ip:203.0.113.77|user:victim@example.com` produced only
+ * `UNIQUE constraint failed: cache.key`, with no key content in the message or
+ * the stack. So the demonstrated leak no longer exists.
+ *
+ * The boundary stays anyway, for reasons that do not depend on the old client:
+ *
+ * 1. Both key spaces still embed data worth withholding — the API limiter's key
+ *    ends in the destination (email address or phone number), and Better Auth's
+ *    is `${ip}|${path}`. The sensitivity of the input is unchanged.
+ * 2. `sanitizeForLog` keeps free-text messages by policy, so any future driver or
+ *    driver version that does interpolate a bound parameter into its message
+ *    would reach the log unfiltered. The store is scheduled to change again — from
+ *    better-sqlite3 to `bun:sqlite` at the framework migration — and that is
+ *    exactly the kind of change that reintroduces such a message.
+ * 3. What an outage actually needs is which operation failed and the error class.
+ *    Neither is derived from the key, so withholding it costs no diagnostic value.
+ *
+ * In other words this is now a precaution rather than a fix for an observed leak,
+ * and the accompanying probes assert the property rather than reproducing a
+ * specific client's message format.
  */
 
 /**
- * `name` on an Error is the class name (`UpstashError`, `TypeError`). Observed
- * values from this dependency are fixed identifiers, not formatted text.
+ * `name` on an Error is the class name (`SqliteError`, `TypeError`). Observed
+ * values are fixed identifiers, not formatted text.
  */
 function errorClassOf(error: unknown): string {
   const name = (error as { name?: unknown } | null)?.name;
@@ -24,7 +44,6 @@ function errorClassOf(error: unknown): string {
 
 export interface StoreFailureLog {
   msg: 'rate-limit store error';
-  attempt: number;
   scope: string;
   errorClass: string;
 }
@@ -41,15 +60,17 @@ export interface StoreFailureLog {
  * `preauth.dash.{permissions,roles,users}`); dynamic path segments never survive
  * its two-segment slice, and no scope contains a colon. There is deliberately no
  * runtime validation here, because no reachable path needs one.
+ *
+ * There is no `attempt` field any more: the retry loop it counted was shaped for
+ * transient HTTP failures. A local store failure means a broken disk or schema,
+ * and `SQLITE_BUSY` — the one transient case — is absorbed by `busy_timeout`.
  */
 export function describeStoreFailure(
   error: unknown,
-  opts: { identifier: string },
-  attempt: number
+  opts: { identifier: string }
 ): StoreFailureLog {
   return {
     msg: 'rate-limit store error',
-    attempt,
     scope: opts.identifier.split(':', 1)[0] ?? '',
     errorClass: errorClassOf(error),
   };
@@ -57,25 +78,23 @@ export function describeStoreFailure(
 
 export interface AuthStoreFailureLog {
   msg: 'auth rate-limit store error';
-  op: 'get' | 'set';
+  op: 'get' | 'set' | 'consume';
   errorClass: string;
 }
 
 /**
  * Summarize a Better Auth limiter-storage failure.
  *
- * No key, deliberately. Better Auth builds it with
- * `createRateLimitKey(ip, path)` = `` `${ip}|${path}` `` (`@better-auth/core`
- * `utils/ip`), so logging the key — or the raw Upstash error that quotes it —
- * puts the requester's IP address in the log on every retry of every failing
- * request. Reproduced against the installed client; see the regression test.
+ * No key, deliberately. Better Auth builds it with `createRateLimitKey(ip, path)`
+ * = `` `${ip}|${path}` `` (`@better-auth/core` `utils/ip`), so logging the key
+ * would put the requester's IP address in the log on every failing request.
  *
  * Which operation failed and the error's class are what an outage actually
  * needs, and neither is derived from the key.
  */
 export function describeAuthStoreFailure(
   error: unknown,
-  op: 'get' | 'set'
+  op: 'get' | 'set' | 'consume'
 ): AuthStoreFailureLog {
   return {
     msg: 'auth rate-limit store error',

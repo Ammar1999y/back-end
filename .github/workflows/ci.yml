@@ -25,6 +25,14 @@ jobs:
         run: bun run lint
       - name: Format check
         run: bun run format:check
+      - name: Probe tests
+        # These cover the SQLite rate-limit and cache invariants. Half of each
+        # SQLite probe runs in a Node child: `better-sqlite3` is built against
+        # the V8 C++ API and cannot load under Bun, which is what runs the tests.
+        # `bun test` exits non-zero on failure, so no extra guard is needed.
+        # `node --version` first so a runner without Node fails here with an
+        # obvious message rather than inside a spawned child.
+        run: node --version && bun run test
       - name: Build
         # lib/env.server.ts hard-fails at module load on a missing var, so the
         # build needs a complete set. These are throwaway values shaped to pass
@@ -36,9 +44,10 @@ jobs:
           NEXT_PUBLIC_TURNSTILE_SITE_KEY: 1x00000000000000000000AA
           TURNSTILE_SECRET_KEY: 1x0000000000000000000000000000000AA
           DATABASE_URL: postgres://ci:ci@db.example.com/ci?sslmode=require
-          UPSTASH_REDIS_REST_URL: https://example.upstash.io
-          UPSTASH_REDIS_REST_TOKEN: ci-placeholder-token
           BETTER_AUTH_SECRET: ci-placeholder-better-auth-secret-000000
+          # SQLITE_DIR has no production default so an unmounted volume cannot
+          # boot silently; the build only needs it to resolve paths.
+          SQLITE_DIR: /tmp/ci-sqlite
           PASSWORD_PEPPER_ACTIVE_ID: ci
           PASSWORD_PEPPER_KEYRING: '{"ci":{"generation":1,"secret":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}}'
         run: bun run build

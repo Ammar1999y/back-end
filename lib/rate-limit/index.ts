@@ -1,7 +1,8 @@
-import { sanitizeForLog } from '@/utils';
-import { Ratelimit } from '@upstash/ratelimit';
+import type { ConsumeRow } from './store';
 
-import { redis } from './client';
+import { sanitizeForLog } from '@/utils';
+
+import { getRateLimitStore } from './store';
 import { describeStoreFailure } from './store-failure';
 
 export { authRateLimitStorage } from './auth-storage';
@@ -26,79 +27,88 @@ export interface RateLimitResult {
   degraded: boolean;
 }
 
-// Ratelimit instances bake (limit, window) into themselves, so we cache per
-// configuration. Per-identifier scoping happens inside .limit(identifier).
-const limiters = new Map<string, Ratelimit>();
-
-function getLimiter(limit: number, window: number): Ratelimit {
-  const cacheKey = `${limit}:${window}`;
-  let limiter = limiters.get(cacheKey);
-  if (!limiter) {
-    limiter = new Ratelimit({
-      redis,
-      limiter: Ratelimit.slidingWindow(limit, `${window} s`),
-      prefix: 'rl',
-      analytics: false,
-    });
-    limiters.set(cacheKey, limiter);
-  }
-  return limiter;
-}
-
-const RATE_LIMIT_RETRIES = 2;
-const RATE_LIMIT_RETRY_BASE_MS = 50;
-
 /**
- * Sliding-window rate limit check.
+ * Fixed-window rate limit check.
  *
- * `identifier` should encode the scope (e.g. `users.create:<ip>`). Retries
- * transient store errors before falling through to fail-open; every failure
- * is logged so degraded mode is observable.
+ * `identifier` should encode the scope (e.g. `users.create:<ip>`).
+ *
+ * Fixed window, not the approximate sliding window this used to inherit from
+ * `@upstash/ratelimit`. The trade is bounded and was taken deliberately: at a
+ * window boundary a caller can fit up to 2x the limit into a short burst, while
+ * the sustained rate is unchanged. In exchange the check is one atomic statement
+ * over one row — verified to lose no updates across four concurrent processes —
+ * and `remaining` is exact rather than an approximation. For the global daily OTP
+ * budget a fixed window is also the more faithful model: it IS a calendar-day
+ * cost cap, not a rolling one.
+ *
+ * There is no retry loop. The former 2-attempt/50ms backoff was shaped for HTTP
+ * against Upstash; a local SQLite failure means the disk or schema is broken, and
+ * retrying twice cannot fix that. The one genuinely transient local failure —
+ * `SQLITE_BUSY` under multi-process contention — is handled by `busy_timeout` in
+ * the driver, which is where it belongs.
  */
 export async function rateLimit(opts: {
   identifier: string;
   limit: number;
   window: number;
 }): Promise<RateLimitResult> {
-  const limiter = getLimiter(opts.limit, opts.window);
+  const windowMs = opts.window * 1000;
 
-  for (let attempt = 0; attempt <= RATE_LIMIT_RETRIES; attempt++) {
-    try {
-      const result = await limiter.limit(opts.identifier);
+  try {
+    const now = Date.now();
+    const windowStart = now - (now % windowMs);
+    const admitted = getRateLimitStore().consume.get<ConsumeRow>(
+      opts.identifier,
+      windowStart,
+      windowStart + windowMs,
+      opts.limit
+    );
+
+    // No row means the admission was refused without writing: the key exists, is
+    // in THIS window, and is already at the limit. `windowStart` below is the
+    // value we just bound, and the statement's WHERE proves the stored row
+    // matched it — so no follow-up read is needed. Reading it back was also a
+    // race: a concurrent process can roll the row into the next window between
+    // the denied UPSERT and the read, which overstated `retryAfter` by a whole
+    // window (measured 61s where 1s was correct).
+    if (!admitted) {
       return {
-        success: result.success,
-        limit: result.limit,
-        remaining: result.remaining,
-        // Floor to 1s so a compliant client doesn't hot-loop when reset
-        // lands within the current second.
-        retryAfter: result.success
-          ? 0
-          : Math.max(1, Math.ceil((result.reset - Date.now()) / 1000)),
+        success: false,
+        limit: opts.limit,
+        remaining: 0,
+        // Floor to 1s so a compliant client doesn't hot-loop when the window
+        // rolls over within the current second.
+        retryAfter: Math.max(
+          1,
+          Math.ceil((windowStart + windowMs - now) / 1000)
+        ),
         degraded: false,
       };
-    } catch (error) {
-      console.error(sanitizeForLog(describeStoreFailure(error, opts, attempt)));
-      if (attempt < RATE_LIMIT_RETRIES) {
-        await new Promise((r) =>
-          setTimeout(r, RATE_LIMIT_RETRY_BASE_MS * (attempt + 1))
-        );
-      }
     }
-  }
 
-  return {
-    success: true,
-    limit: opts.limit,
-    remaining: opts.limit,
-    retryAfter: 0,
-    degraded: true,
-  };
+    const used = Number(admitted.count);
+    return {
+      success: true,
+      limit: opts.limit,
+      remaining: Math.max(0, opts.limit - used),
+      retryAfter: 0,
+      degraded: false,
+    };
+  } catch (error) {
+    console.error(sanitizeForLog(describeStoreFailure(error, opts)));
+    return {
+      success: true,
+      limit: opts.limit,
+      remaining: opts.limit,
+      retryAfter: 0,
+      degraded: true,
+    };
+  }
 }
 
 /**
- * No refund primitive here, deliberately. `@upstash/ratelimit` supports a
- * negative rate, but a refund cannot be transactional with the work it refunds,
- * so every failure to apply one silently over-charges a real user. If a future
- * budget needs outcome-specific accounting, prefer a counter that commits with
- * the outcome.
+ * No refund primitive here, deliberately. A refund cannot be transactional with
+ * the work it refunds, so every failure to apply one silently over-charges a real
+ * user. If a future budget needs outcome-specific accounting, prefer a counter
+ * that commits with the outcome.
  */

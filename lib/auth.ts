@@ -126,10 +126,12 @@ export const auth = betterAuth({
         // Authoritative per-IP admission, consumed BEFORE any credential work.
         // Two reasons this replaces Better Auth's own /sign-in/email rule
         // (disabled in `rateLimit.customRules` below):
-        //  1. Atomicity — Better Auth admits on a separate read then write, so
-        //     parallel requests at the boundary can all observe the same
-        //     remaining quota and pass. Redis' sliding window increments
-        //     atomically.
+        //  1. Atomicity — Better Auth's legacy get/set path admits on a
+        //     separate read then write, so parallel requests at the boundary can
+        //     all observe the same remaining quota and pass. `rateLimit` admits
+        //     in ONE statement instead. (`authRateLimitStorage` now also
+        //     implements Better Auth's atomic `consume`, which closes the same
+        //     gap for the rules it still owns.)
         //  2. Trust — `ipIdentifier` resolves only the edge headers
         //     (lib/audit.ts) and buckets IPv6 by /64, so the limit can't be
         //     bypassed by forging or rotating `x-forwarded-for`. It throws 503
@@ -378,8 +380,9 @@ export const auth = betterAuth({
   },
 
   // https://www.better-auth.com/docs/concepts/rate-limit
-  // Storage is Upstash Redis (see lib/rate-limit/) so the counter is shared
-  // across serverless instances on Vercel.
+  // Storage is a local SQLite database (see lib/rate-limit/), shared by every
+  // process on the host through its WAL. It is NOT shared beyond the host, so
+  // this counter assumes a single-VPS deployment.
   rateLimit: {
     enabled: true,
     window: 60,

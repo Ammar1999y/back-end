@@ -94,22 +94,22 @@ const headers = isDev
           },
         ],
       },
-      // {
-      //   source: '/(pwa|js|images|styles|fonts)/(.*?)',
-      //   headers: [
-      //     {
-      //       key: 'Cache-Control',
-      //       value: 'public, max-age=604800, immutable', // 1 week, change it depend on how often you update the files
-      //     },
-      //   ],
-      // },
+      {
+        source: '/(pwa|js|images|styles|fonts)/(.*?)',
+        headers: [
+          {
+            key: 'Cache-Control',
+            value: 'public, max-age=604800, immutable', // 1 week, change it depend on how often you update the files
+          },
+        ],
+      },
       {
         source: '/public/(.*?)',
         headers: [
-          // {
-          //   key: 'Cache-Control',
-          //   value: 'public, max-age=604800, immutable', // 1 week, change it depend on how often you update the files
-          // },
+          {
+            key: 'Cache-Control',
+            value: 'public, max-age=604800, immutable', // 1 week, change it depend on how often you update the files
+          },
           { key: 'Cross-Origin-Resource-Policy', value: 'cross-origin' },
         ],
       },
@@ -117,10 +117,10 @@ const headers = isDev
         source:
           '/(manifest.json|og.png|favicon.ico|robots.txt|sitemap.xml|.well-known(?:/.*)?)', // the (?:/.*)? should use for folders
         headers: [
-          // {
-          //   key: 'Cache-Control',
-          //   value: 'public, max-age=604800, immutable', // 1 week, change it depend on how often you update the files
-          // },
+          {
+            key: 'Cache-Control',
+            value: 'public, max-age=604800, immutable', // 1 week, change it depend on how often you update the files
+          },
           {
             key: 'Cross-Origin-Resource-Policy',
             value: `cross-origin`,
@@ -132,10 +132,10 @@ const headers = isDev
           '/(manifest.json|og.png|favicon.ico|robots.txt|sitemap.xml|.well-known(?:/.*)?)', // the (?:/.*)? should use for folders
         locale: false,
         headers: [
-          // {
-          //   key: 'Cache-Control',
-          //   value: 'public, max-age=604800, immutable', // 1 week, change it depend on how often you update the files
-          // },
+          {
+            key: 'Cache-Control',
+            value: 'public, max-age=604800, immutable', // 1 week, change it depend on how often you update the files
+          },
           {
             key: 'Cross-Origin-Resource-Policy',
             value: `cross-origin`,
@@ -156,7 +156,9 @@ const headers = isDev
 /** @type {import('next').NextConfig} */
 const nextConfig = {
   reactStrictMode: true,
-  serverExternalPackages: ['jsdom', 'css-tree'],
+  // better-sqlite3 is a native addon; bundling it breaks the .node load.
+  // Remove it here when the driver becomes bun:sqlite (see lib/sqlite/driver.ts).
+  serverExternalPackages: ['jsdom', 'css-tree', 'better-sqlite3'],
   // TODO: active it for front-end
   // reactCompiler: true,
   poweredByHeader: false,
