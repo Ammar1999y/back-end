@@ -14,9 +14,8 @@ import {
   sql,
 } from 'drizzle-orm';
 
-import { db } from '@/db';
+import { db, withTransaction } from '@/db';
 import { rolePermissions, roles, sessions, users } from '@/db/schema';
-import { withTransaction } from '@/db/ws';
 import { validID } from '@/utils';
 import { auditLog, getAuditMeta } from '@/lib/audit';
 import { requirePermission } from '@/lib/http/session';
@@ -476,7 +475,7 @@ export const DELETE: Handler = async (ctx) => {
         RETURNING r.id
       `);
 
-      if (deleted.rows.length === 0)
+      if (deleted.length === 0)
         throw new CustomError(permissionMsg.hasUsers, HTTP_STATUS.BAD_REQUEST);
 
       await auditLog(tx, {

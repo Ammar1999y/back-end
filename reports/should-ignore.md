@@ -181,9 +181,12 @@
 
 42. **Unauthenticated Upload** — `app/api/upload/image/route.ts` — No auth or
     rate limiting on upload endpoint
-43. **Pool-Per-Transaction** — `db/ws.ts` — Creates and destroys a DB connection
-    pool on every write call
-44. **Swallowed Pool Cleanup Errors** — `db/ws.ts`
+43. ~~**Pool-Per-Transaction**~~ — **FIXED 2026-08-20.** `db/ws.ts` is deleted
+    with the Neon drivers; `withTransaction` runs on the one pooled `bun:sql`
+    client in `db/index.ts`. See `TODO.md` item 2.
+44. ~~**Swallowed Pool Cleanup Errors**~~ — **FIXED 2026-08-20.** No
+    per-transaction pool is created, so there is none to tear down.
+
 45. **No Request Size Limit** — All POST/PUT handlers
 46. **No Session, Audit Log, Deleted Users, Temp Files Cleanup** — No cron jobs
     for stale data

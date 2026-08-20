@@ -1,4 +1,4 @@
-import type { WsTx } from '@/db/ws';
+import type { Tx } from '@/db';
 import type { EntityID } from '@/types';
 
 import { and, eq, ne } from 'drizzle-orm';
@@ -21,7 +21,7 @@ import { sessions, verificationSessions } from '@/db/schema';
 
 /** Revoke every auth session for the user except the one making the request. */
 export async function revokeOtherSessions(
-  tx: WsTx,
+  tx: Tx,
   userId: EntityID,
   keepSessionId?: string | null
 ): Promise<void> {
@@ -56,7 +56,7 @@ export async function revokeOtherSessions(
  * verification-session TTL item in TODO.md for the periodic sweep.
  */
 export async function revokePendingProofs(
-  tx: WsTx,
+  tx: Tx,
   userId: EntityID,
   keepVerificationSessionId?: string | null
 ): Promise<void> {

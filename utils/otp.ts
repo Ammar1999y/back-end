@@ -1,12 +1,12 @@
 import crypto from 'node:crypto';
-import type { WsTx } from '@/db/ws';
+import type { Tx } from '@/db';
 import type { EntityID } from '@/types';
 import type { OtpChannel, OtpPurpose } from '@/utils/validation/otp';
 
 import { and, eq, gt, isNull, sql } from 'drizzle-orm';
 
+import { withTransaction } from '@/db';
 import { users, verificationCodes, verificationSessions } from '@/db/schema';
-import { withTransaction } from '@/db/ws';
 import { sanitizeForLog } from '@/utils';
 import nodemailer from 'nodemailer';
 import { auditLog } from '@/lib/audit';
@@ -598,7 +598,7 @@ export async function processOtpSend({
  * address with the old flag.
  */
 export async function markContactVerified(
-  tx: WsTx,
+  tx: Tx,
   opts: {
     userId: EntityID;
     channel: OtpChannel;
@@ -693,7 +693,7 @@ interface ProcessOtpVerifyOptions {
    * pending proofs while preserving the one being consumed here.
    */
   onVerified?: (
-    tx: WsTx,
+    tx: Tx,
     matched: { targetIdentifier: string | null; verificationSessionId: string }
   ) => Promise<void>;
 }

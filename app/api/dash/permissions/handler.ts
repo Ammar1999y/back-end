@@ -4,10 +4,9 @@ import type { PermissionAction } from '@/lib/permissions/constants';
 
 import { and, count, eq, sql } from 'drizzle-orm';
 
-import { db } from '@/db';
+import { db, withTransaction } from '@/db';
 import { parseDataTableParams } from '@/db/queries/data-table';
 import { rolePermissions, roles } from '@/db/schema';
-import { withTransaction } from '@/db/ws';
 import { auditLog, getAuditMeta } from '@/lib/audit';
 import { requirePermission } from '@/lib/http/session';
 import { CUSTOM_ROLE_VALUE, ROLE_SCOPE } from '@/lib/permissions/constants';

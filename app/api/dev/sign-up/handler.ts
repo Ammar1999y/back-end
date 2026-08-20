@@ -1,7 +1,7 @@
 import type { Handler } from '@/lib/http/contract';
 
+import { withTransaction } from '@/db';
 import { accounts, rolePermissions, roles, users } from '@/db/schema';
-import { withTransaction } from '@/db/ws';
 import * as z from 'zod';
 import { hashPassword } from '@/lib/auth/password';
 import {

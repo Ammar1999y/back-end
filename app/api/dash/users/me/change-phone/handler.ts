@@ -3,9 +3,8 @@ import type { Handler } from '@/lib/http/contract';
 import { and, eq, isNull } from 'drizzle-orm';
 
 import { otpMsg } from '@/app/api/auth/otp/messages';
-import { db } from '@/db';
+import { db, withTransaction } from '@/db';
 import { users } from '@/db/schema';
-import { withTransaction } from '@/db/ws';
 import { getAuditMeta } from '@/lib/audit';
 import { LoginRejected, verifyLoginAttempt } from '@/lib/auth/login-guard';
 import { verifyTurnstileRequest } from '@/lib/captcha';

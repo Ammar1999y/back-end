@@ -3,10 +3,9 @@ import type { BetterAuthPlugin } from 'better-auth';
 import { and, eq, isNull } from 'drizzle-orm';
 
 import { ensureMinDelay, otpMsg } from '@/app/api/auth/otp/messages';
-import { db } from '@/db';
+import { db, withTransaction } from '@/db';
 import { userContactColumn } from '@/db/queries';
 import { users } from '@/db/schema';
-import { withTransaction } from '@/db/ws';
 import { sanitizeForLog } from '@/utils';
 import { APIError, createAuthEndpoint } from 'better-auth/api';
 import { setSessionCookie } from 'better-auth/cookies';

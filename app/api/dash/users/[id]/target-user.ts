@@ -1,4 +1,4 @@
-import type { WsTx } from '@/db/ws';
+import type { Tx } from '@/db';
 import type { PermissionObject } from '@/lib/permissions/constants';
 import type { EntityID } from '@/types';
 
@@ -61,7 +61,7 @@ export function assertTargetUserVisible(opts: {
 export async function actorCoversTargetRole(
   actorPermissions: Partial<PermissionObject> | undefined,
   roleId: EntityID,
-  executor: WsTx | typeof db
+  executor: Tx | typeof db
 ): Promise<boolean> {
   if (!actorPermissions) return true;
   try {

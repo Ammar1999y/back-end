@@ -13,7 +13,9 @@
  *     - For `number`: import `integer` from 'drizzle-orm/pg-core'
  *       and remove the `uuid` import and `generateId` import.
  *     - For `UUID`: enable `uuid` from 'drizzle-orm/pg-core'
- *       and `import { v7 as generateId } from 'uuid'`.
+ *       and `import { generateUuidV7 as generateId } from '@/lib/id'`
+ *       (the `uuid` package is no longer imported anywhere — `lib/id.ts` is
+ *       the only generator seam).
  *
  *  b) Primary Key columns in every table:
  *     - number → `id: integer('id').primaryKey().generatedAlwaysAsIdentity()`

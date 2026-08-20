@@ -1,22 +1,10 @@
-import type { AuthConsumeRow, AuthEntryRow } from './store';
+import type { AuthConsumeRow } from './store';
 import type { BetterAuthRateLimitStorage } from '@better-auth/core';
 
 import { sanitizeForLog } from '@/utils';
 
 import { getRateLimitStore } from './store';
 import { describeAuthStoreFailure } from './store-failure';
-
-/**
- * Better Auth's row shape. Declared locally rather than imported: the exported
- * `RateLimit` type is generic over plugin and option inference, and assigning
- * this object to `BetterAuthRateLimitStorage` below is what actually proves
- * compatibility — the compiler rejects a mismatch either way.
- */
-type RateLimitEntry = {
-  key: string;
-  count: number;
-  lastRequest: number;
-};
 
 /**
  * TTL is a cleanup boundary, not a correctness one: expiry is filtered on read
@@ -78,46 +66,6 @@ export const authRateLimitStorage: BetterAuthRateLimitStorage = {
       // treating the attempt as "no prior record". Losing the limiter on
       // /sign-in/email would let an attacker burn unlimited credential-stuffing
       // attempts during an outage.
-      throw error;
-    }
-  },
-
-  /**
-   * Retained because `get`/`set` are still required members of the interface in
-   * 1.6, and any version that does not call `consume` falls back to them. This
-   * path is non-atomic by construction — that is the gap `consume` closes — so it
-   * must not become the primary path again.
-   */
-  async get(key: string) {
-    try {
-      const row = getRateLimitStore().authGet.get<AuthEntryRow>(
-        key,
-        Date.now()
-      );
-      if (!row) return null;
-      return {
-        key: row.key,
-        count: Number(row.count),
-        lastRequest: Number(row.last_request),
-      } satisfies RateLimitEntry;
-    } catch (error) {
-      console.error(sanitizeForLog(describeAuthStoreFailure(error, 'get')));
-      throw error;
-    }
-  },
-
-  async set(key: string, value: RateLimitEntry) {
-    try {
-      const now = Date.now();
-      getRateLimitStore().authSet.run(
-        key,
-        value.count,
-        value.lastRequest,
-        value.lastRequest,
-        now + TTL_MS
-      );
-    } catch (error) {
-      console.error(sanitizeForLog(describeAuthStoreFailure(error, 'set')));
       throw error;
     }
   },

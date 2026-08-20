@@ -47,7 +47,17 @@ jobs:
         # what forces the module graph to evaluate — lib/env.server.ts throws at
         # load on a missing var, and the SQLite stores open lazily. It boots the
         # real server and asserts readiness, headers, routing and the maintenance
-        # guard. No PostgreSQL or network access is required.
+        # guard.
+        #
+        # No PostgreSQL or network access is required — but that is now a
+        # property of the driver rather than a free consequence of it. The old
+        # `neon-http` client was a `fetch` wrapper that could not connect until
+        # a query ran. `bun:sql` is a real TCP pool, and this step works only
+        # because Bun opens it LAZILY: `new SQL(url)` against the unreachable
+        # host below constructs without a connection attempt, and `close()` on a
+        # never-connected pool resolves immediately. If a startup ping or an
+        # eager connect is ever added, this step fails and the failure will look
+        # like a network problem. See reports/test-strategy.md §7.4e.
         #
         # These are throwaway values shaped to pass validation only — no real
         # credential belongs in this file.

@@ -1,7 +1,7 @@
 import type { Handler } from '@/lib/http/contract';
 
 import { otpMsg } from '@/app/api/auth/otp/messages';
-import { withTransaction } from '@/db/ws';
+import { withTransaction } from '@/db';
 import { getAuditMeta } from '@/lib/audit';
 import { verifyTurnstileRequest } from '@/lib/captcha';
 import { requireSession } from '@/lib/http/session';

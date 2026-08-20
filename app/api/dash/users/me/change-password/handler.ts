@@ -4,8 +4,8 @@ import type { Handler } from '@/lib/http/contract';
 import { and, eq, isNull } from 'drizzle-orm';
 
 import { otpMsg } from '@/app/api/auth/otp/messages';
+import { withTransaction } from '@/db';
 import { accounts, users } from '@/db/schema';
-import { withTransaction } from '@/db/ws';
 import { auditLog, getAuditMeta } from '@/lib/audit';
 import { checkPasswordCompromise } from '@/lib/auth/check-password';
 import { LoginRejected, verifyLoginAttempt } from '@/lib/auth/login-guard';

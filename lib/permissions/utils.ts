@@ -4,7 +4,7 @@ import type {
   PermissionObject,
   SessionMetadata,
 } from './constants';
-import type { WsTx } from '@/db/ws';
+import type { Tx } from '@/db';
 import type { EntityID } from '@/types';
 
 import { and, eq, isNull, ne, notInArray, sql } from 'drizzle-orm';
@@ -31,7 +31,7 @@ import {
   SUPERSEDING_ACTION,
 } from './constants';
 
-type DbOrTx = typeof db | WsTx;
+type DbOrTx = typeof db | Tx;
 type RolePolicyTarget =
   { roleName?: string | null; scope?: string | null } | null | undefined;
 
@@ -65,7 +65,7 @@ export function standardRoleFilter(roleId: EntityID) {
  * Otherwise creates a new role with scope='custom' stamped with `createdBy`.
  */
 export async function createCustomRole(
-  tx: WsTx,
+  tx: Tx,
   permissions: Array<{
     name: DashboardPage;
     permissions: Record<string, boolean>;
@@ -149,7 +149,7 @@ export async function createCustomRole(
  */
 export async function validateAssignableRole(
   roleId: EntityID,
-  tx: WsTx
+  tx: Tx
 ): Promise<void> {
   // FOR SHARE prevents role deactivation/deletion between validation and assignment
   const [role] = await tx
@@ -312,7 +312,7 @@ export const PERMISSION_AUDIT_METADATA_FIELDS = [
  * one contract.
  */
 export async function auditCustomRolePermissions(
-  tx: WsTx,
+  tx: Tx,
   params: {
     actorUserId: EntityID;
     actorEmail: string;
@@ -484,7 +484,7 @@ export async function validateRolePermissionScope(
  */
 export async function refreshRoleSessions(
   roleId: EntityID,
-  tx: WsTx,
+  tx: Tx,
   precomputed?: {
     roleName: string;
     roleScope: string;
@@ -517,12 +517,15 @@ export async function refreshRoleSessions(
     permissions = sanitizePermissions(roleData.rolePermissions);
   }
 
-  const metadataPatch = JSON.stringify({
-    roleName,
-    roleScope,
-    permissions,
-    roleId,
-  });
+  /**
+   * The OBJECT, not `JSON.stringify` of it. `bun:sql` encodes whatever JS value
+   * it is handed for a jsonb parameter, so a pre-serialised string is encoded
+   * twice and arrives as a jsonb string scalar — on which `||` concatenates into
+   * an array instead of merging, silently discarding this patch. Reproduced; see
+   * the `jsonb` helper in `db/schema.ts`, which is the same fix at the column
+   * boundary. One rule: never pre-stringify JSON for this driver.
+   */
+  const metadataPatch = { roleName, roleScope, permissions, roleId };
 
   await tx.execute(sql`
     UPDATE sessions
@@ -541,7 +544,7 @@ export async function refreshRoleSessions(
  */
 export async function refreshUserSessions(
   userId: EntityID,
-  tx?: WsTx
+  tx?: Tx
 ): Promise<void> {
   const executor: DbOrTx = tx ?? db;
 
@@ -564,12 +567,13 @@ export async function refreshUserSessions(
 
   const permissions = sanitizePermissions(userData.role.rolePermissions);
 
-  const metadataPatch = JSON.stringify({
+  // The object, not its JSON text — see `refreshRoleSessions` above.
+  const metadataPatch = {
     roleId: userData.roleId,
     roleName: userData.role.roleName,
     roleScope: userData.role.scope,
     permissions,
-  });
+  };
 
   await executor.execute(sql`
     UPDATE sessions

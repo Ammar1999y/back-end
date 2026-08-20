@@ -6,6 +6,7 @@
  * free-text limitation.
  */
 import { serializeForLog } from '@/utils';
+import { SQL } from 'bun';
 import { expect, test } from 'bun:test';
 
 /**
@@ -111,6 +112,76 @@ check(
   'OTP-shaped code redacted on Error',
   !has(otpShapedErr, '123456'),
   otpShapedErr
+);
+
+// ── `errno`, which is where bun:sql actually puts the SQLSTATE ─────────
+// The block above pins `code`, and `code` is NOT the spelling this driver
+// produces: `bun:sql` reports `code: 'ERR_POSTGRES_SERVER_ERROR'` for every
+// server error and the five-character SQLSTATE in `errno`. So the `code` cases
+// exercise a compatibility fallback while the field the serializer actually
+// receives went uncovered — the same circularity `reports/test-strategy.md`
+// makes a standing rule of: never assert against a hand-authored fixture where
+// a real one is reachable (§5.1 records the concrete case, a manufactured
+// SQLite error name).
+//
+// Built with Bun's OWN `SQL.PostgresError` rather than `Object.assign` on an
+// Error: the constructor is typed, so this fixture cannot drift from the shape
+// the driver really throws, and it needs no database to run in CI. What it does
+// NOT prove is that Bun populates `errno` from the wire — that needs a live
+// server and lives in scripts/probe/dev-live/.
+const driverPgError = new SQL.PostgresError(
+  'duplicate key value violates unique constraint "ux_users_email"',
+  {
+    code: 'ERR_POSTGRES_SERVER_ERROR',
+    errno: '23505',
+    constraint: 'ux_users_email',
+  }
+);
+const pgErr = serializeForLog(driverPgError);
+check(
+  'SQLSTATE in errno kept on a real PostgresError',
+  has(pgErr, '23505'),
+  pgErr
+);
+check('constraint name kept alongside it', has(pgErr, 'ux_users_email'), pgErr);
+
+// `errno` joined the shape-checked set, so it must be gated exactly like `code`:
+// a six-digit OTP smuggled in under that key is still redacted.
+const otpShapedErrno = serializeForLog(
+  Object.assign(new Error('boom'), { errno: '123456' })
+);
+check(
+  'OTP-shaped errno redacted on Error',
+  !has(otpShapedErrno, '123456'),
+  otpShapedErrno
+);
+
+// Node spells the same key as a negative integer; the numeric branch keeps it.
+const nodeErrno = serializeForLog(
+  Object.assign(new Error('ENOENT'), { code: 'ENOENT', errno: -4058 })
+);
+check('numeric Node errno kept', has(nodeErrno, '-4058'), nodeErrno);
+
+// A parameter-bearing query error is reduced to allowlisted fields only, and
+// `errno` had to be added to that allowlist too — otherwise a wrapped driver
+// error logged a constraint with no code at all.
+const wrappedDriverError = serializeForLog(
+  new Error(
+    'Failed query: insert into users (email) values ($1)\nparams: victim@example.com',
+    {
+      cause: driverPgError,
+    }
+  )
+);
+check(
+  'SQLSTATE survives the query-error reduction',
+  has(wrappedDriverError, '23505'),
+  wrappedDriverError
+);
+check(
+  'bound parameter still withheld from the wrapped driver error',
+  !has(wrappedDriverError, 'victim@example.com'),
+  wrappedDriverError
 );
 
 // ── Drizzle parameter-bearing error still withheld ────────────────────

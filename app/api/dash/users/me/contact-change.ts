@@ -1,4 +1,4 @@
-import type { WsTx } from '@/db/ws';
+import type { Tx } from '@/db';
 import type { HandlerCookie } from '@/lib/http/contract';
 import type { EntityID } from '@/types';
 
@@ -60,7 +60,7 @@ export async function refreshSessionCookies(
  */
 
 interface CommitContactChangeOpts {
-  tx: WsTx;
+  tx: Tx;
   userId: EntityID;
   /** Auth session to preserve; all the user's other sessions are revoked. */
   keepSessionId?: string | null;

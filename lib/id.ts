@@ -10,16 +10,26 @@
  * `db/schema.ts` can use it without the import cycle that reaching into
  * `utils/index.ts` would create.
  *
- * On the implementation: `Bun.randomUUIDv7()` produces the same string format
- * and is a candidate replacement. It is NOT adopted on the strength of existing
- * — see `bench/uuid/` for the measurement and `TODO.md` for the decision. This
- * module is the seam that makes the swap a one-line change either way.
+ * On the implementation: this was `v7()` from the `uuid` package until Bun
+ * 1.4.0. `Bun.randomUUIDv7()` was held off specifically because its 12-bit
+ * sub-millisecond counter WRAPPED at 4096 ids inside one millisecond and broke
+ * strict ordering there — measured, every trial — and these ids are time-ordered
+ * primary keys that a keyset cursor sorts on. 1.4.0 exhausts the counter and
+ * then advances the embedded timestamp instead of wrapping, so ordering now
+ * holds even at the rate that used to break it. Re-measured on 1.4.0:
+ * `bench/uuid/`, and `TODO.md` EM-5 for the decision.
+ *
+ * The one behaviour the swap does introduce: sustaining more than ~4096
+ * generations per millisecond makes the timestamp INSIDE the id run ahead of
+ * the wall clock (measured ~330 ms ahead in a tight loop, repaid only as real
+ * time passes). Harmless here because nothing decodes that timestamp — callers
+ * treat the id as an opaque sortable string — so do not start reading a creation
+ * time out of an id without revisiting this.
  */
-import { v7 } from 'uuid';
 
 /** A UUIDv7 string: time-ordered, and lexicographically sortable by creation. */
 export type UuidV7 = string;
 
 export function generateUuidV7(): UuidV7 {
-  return v7();
+  return Bun.randomUUIDv7();
 }

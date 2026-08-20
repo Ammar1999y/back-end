@@ -40,6 +40,9 @@ yarn-error.log*
 # env files (can opt-in for committing if needed)
 .env
 .env.local
+# Loaded by `bun test` under NODE_ENV=test and holds the test database URL, so
+# it carries a credential even though nothing in it is production.
+.env.test
 
 # vercel
 .vercel

@@ -77,41 +77,89 @@ export function printThroughputTable(rows, title) {
   }
 }
 
-/** implementation-name -> aggregated row, for the share-of-realistic-op table. */
-function byGenerator(rows) {
-  return new Map(rows.map((r) => [r.generator, r]));
-}
-
 /**
- * "Share of a realistic operation": tight-loop ns/op as a percentage of
- * interleaved ns/op, per implementation. Answers what fraction of a row-insert
- * shaped operation the id call itself accounts for, rather than only the
- * isolated-call difference.
+ * "Share of a realistic operation": the id call's ns/op as a percentage of a
+ * whole row-build-and-serialize operation's ns/op — what fraction of realistic
+ * per-row work the generator itself accounts for, rather than the isolated-call
+ * difference. The min–max column is the spread of the per-repeat ratios, and it
+ * is printed rather than hidden because it is the only honest indicator of how
+ * much of the headline is measurement noise (see run.mjs `runPerfScenarios`).
  */
-export function printShareTable(throughputRows, interleavedRows) {
-  const throughputByGen = byGenerator(throughputRows);
-  const interleavedByGen = byGenerator(interleavedRows);
+export function printShareTable(shareRows) {
   console.log('\n### id-generation share of a realistic per-row operation');
   const columns = [
     { label: 'implementation', width: 18, align: 'left' },
     { label: 'tight-loop ns/op', width: 17 },
     { label: 'interleaved ns/op', width: 18 },
-    { label: 'share of realistic op', width: 22 },
+    { label: 'share (median)', width: 15 },
+    { label: 'share min-max', width: 16 },
   ];
   const header = columns.map((c) => pad(c.label, c.width, c.align)).join('  ');
   console.log(header);
   console.log('-'.repeat(header.length));
-  for (const [name, throughput] of throughputByGen) {
-    const interleaved = interleavedByGen.get(name);
-    if (!interleaved) continue;
-    const share = (throughput.nsPerOpMedian / interleaved.nsPerOpMedian) * 100;
-    const cells = [
-      pad(name, columns[0].width, 'left'),
-      pad(fmtNs(throughput.nsPerOpMedian), columns[1].width),
-      pad(fmtNs(interleaved.nsPerOpMedian), columns[2].width),
-      pad(`${share.toFixed(1)}%`, columns[3].width),
-    ];
-    console.log(cells.join('  '));
+  for (const row of shareRows) {
+    console.log(
+      [
+        pad(row.generator, columns[0].width, 'left'),
+        pad(fmtNs(row.tightNsPerOpMedian), columns[1].width),
+        pad(fmtNs(row.interleavedNsPerOpMedian), columns[2].width),
+        pad(`${row.sharePctMedian.toFixed(1)}%`, columns[3].width),
+        pad(
+          `${row.sharePctMin.toFixed(1)}-${row.sharePctMax.toFixed(1)}%`,
+          columns[4].width
+        ),
+      ].join('  ')
+    );
+  }
+}
+
+/**
+ * Timestamp-fidelity table. Every column is a measurement rather than a
+ * verdict — the one pass/fail the scenario owns ("never behind the wall clock")
+ * is a check and prints with the others; see shared/checks.mjs for why the two
+ * drift directions are not treated alike.
+ */
+export function printClockTable(summaries) {
+  console.log('\n### embedded timestamp vs the wall clock');
+  const columns = [
+    { label: 'implementation', width: 18, align: 'left' },
+    { label: 'ids/phase', width: 11, render: (s) => fmtOps(s.size) },
+    {
+      label: 'max ms behind',
+      width: 14,
+      render: (s) => String(Math.max(s.pairedMaxBehindMs, s.burstMaxBehindMs)),
+    },
+    {
+      label: 'paired ms ahead',
+      width: 16,
+      render: (s) => String(s.pairedMaxAheadMs),
+    },
+    {
+      label: 'burst ms borrowed',
+      width: 18,
+      render: (s) => `${s.burstBorrowedMs} (peak ${s.burstMaxAheadMs})`,
+    },
+    {
+      label: 'ms ahead after idle',
+      width: 20,
+      render: (s) => `${s.settledDriftMs} (${s.settleMs} ms)`,
+    },
+  ];
+  const header = columns.map((c) => pad(c.label, c.width, c.align)).join('  ');
+  console.log(header);
+  console.log('-'.repeat(header.length));
+  for (const summary of summaries) {
+    console.log(
+      columns
+        .map((c) =>
+          pad(
+            c.render ? c.render(summary) : summary.generator,
+            c.width,
+            c.align
+          )
+        )
+        .join('  ')
+    );
   }
 }
 
@@ -119,7 +167,15 @@ export function printChecks(title, results) {
   console.log(`\n### ${title}`);
   let failedCritical = 0;
   for (const r of results) {
-    const status = r.pass ? 'PASS' : r.critical ? 'FAIL (CRITICAL)' : 'FAIL';
+    // A passing non-critical entry carries no verdict — it is a measurement
+    // printed in check shape — so it says INFO rather than PASS.
+    const status = r.pass
+      ? r.critical
+        ? 'PASS'
+        : 'INFO'
+      : r.critical
+        ? 'FAIL (CRITICAL)'
+        : 'FAIL';
     if (!r.pass && r.critical) failedCritical++;
     console.log(`${status.padEnd(16)} ${r.name.padEnd(58)} ${r.detail}`);
   }

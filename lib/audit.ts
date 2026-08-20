@@ -1,5 +1,5 @@
+import type { Tx } from '@/db';
 import type { AuditAction } from '@/db/schema';
-import type { WsTx } from '@/db/ws';
 import type { HandlerInput } from '@/lib/http/contract';
 import type { EntityID } from '@/types';
 
@@ -309,7 +309,7 @@ interface AuditLogParams {
  * BigQuery, CloudWatch Logs) so an attacker with DB access can't erase their
  * trail. Not urgent — production-maturity item.
  */
-export async function auditLog(tx: WsTx, params: AuditLogParams) {
+export async function auditLog(tx: Tx, params: AuditLogParams) {
   const { userId, userEmail, action, tableName, recordId, meta } = params;
 
   const safeFields = params.safeFields ? new Set(params.safeFields) : undefined;

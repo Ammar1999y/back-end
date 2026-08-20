@@ -33,7 +33,7 @@ import { Database } from 'bun:sqlite';
 const VALID_NODE_ENV = new Set(['development', 'test', 'production']);
 
 /** Bun's own pin, so the expected version has exactly one home. */
-const EXPECTED_BUN_VERSION = '1.3.14';
+const EXPECTED_BUN_VERSION = '1.4.0';
 
 /**
  * The conservative floor for the WAL-reset race — see the SQLite notice linked
@@ -85,12 +85,19 @@ function requirePort(): number {
 /**
  * Refuses a runtime whose Bun minor differs from the tested one.
  *
- * Minor, not patch: `bun:sqlite` is compiled into the binary, so transaction and
- * locking semantics travel with the Bun version rather than with a lockfile
- * entry — and that is a minor-version concern. A patch difference is logged
- * loudly instead of being fatal, because deployment images move on patch
- * releases routinely and refusing to boot for one would trade a real outage for
- * a theoretical drift.
+ * Minor, not patch: BOTH database drivers are compiled into the binary, so their
+ * transaction semantics travel with the Bun version rather than with a lockfile
+ * entry — and that is a minor-version concern. `bun:sqlite` is the older reason.
+ * `bun:sql` is the sharper one: through 1.3.x a simple-protocol query running
+ * concurrently with a not-yet-prepared parameterized query on the same
+ * connection could deliver one query's rows to the other, and the `BEGIN`,
+ * `COMMIT` and `ROLLBACK` that `db.transaction()` issues ARE simple-protocol
+ * queries (Bun #32772, fixed in 1.4.0). Below this pin, every transaction in the
+ * application is exposed to that.
+ *
+ * A patch difference is logged loudly instead of being fatal, because deployment
+ * images move on patch releases routinely and refusing to boot for one would
+ * trade a real outage for a theoretical drift.
  */
 function assertBunVersion(): void {
   if (bunVersion === EXPECTED_BUN_VERSION) return;
@@ -152,6 +159,7 @@ const { drainAfterResponse, pendingAfterResponse } =
   await import('./lib/http/after-response');
 const { closeRateLimitStore } = await import('./lib/rate-limit/store');
 const { closeCacheStore } = await import('./lib/cache');
+const { closeDatabase } = await import('./db');
 
 /**
  * The server-wide request ceiling.
@@ -312,10 +320,15 @@ async function shutdown(signal: string): Promise<void> {
       })
     );
   } finally {
-    // Close only what this process actually opened — neither helper creates a
-    // database file in order to close it.
-    closeStore('rate-limit', closeRateLimitStore);
-    closeStore('cache', closeCacheStore);
+    // PostgreSQL first: it is the only one that can still be waiting on
+    // something, since `close()` lets in-flight queries finish. The SQLite
+    // helpers close only what this process actually opened — neither creates a
+    // database file in order to close it. `@/db` is different and does not need
+    // that guard: its pool is constructed at module load, and the application
+    // cannot have started without loading it.
+    await closeStore('postgres', closeDatabase);
+    await closeStore('rate-limit', closeRateLimitStore);
+    await closeStore('cache', closeCacheStore);
   }
 
   clearTimeout(forced);
@@ -323,9 +336,12 @@ async function shutdown(signal: string): Promise<void> {
   process.exit(0);
 }
 
-function closeStore(name: string, close: () => void): void {
+async function closeStore(
+  name: string,
+  close: () => void | Promise<void>
+): Promise<void> {
   try {
-    close();
+    await close();
   } catch (error) {
     console.error(
       JSON.stringify({

@@ -4,9 +4,8 @@ import type { EntityID } from '@/types';
 
 import { and, desc, eq, gt, isNull, sql } from 'drizzle-orm';
 
-import { db } from '@/db';
+import { db, withTransaction } from '@/db';
 import { accounts, rolePermissions, roles, sessions, users } from '@/db/schema';
-import { withTransaction } from '@/db/ws';
 import { validID } from '@/utils';
 import { auditLog, getAuditMeta } from '@/lib/audit';
 import { checkPasswordCompromise } from '@/lib/auth/check-password';
@@ -283,7 +282,7 @@ async function handleSelfEdit(
       RETURNING prev.name AS old_name, u.updated_at AS updated_at
     `);
 
-    const row = updated.rows[0];
+    const row = updated[0];
     if (!row) throw new CustomError(MSG_NOT_FOUND, HTTP_STATUS.NOT_FOUND);
 
     await auditLog(tx, {
@@ -796,7 +795,7 @@ export const DELETE: Handler = async (ctx) => {
         FOR SHARE OF r
       `);
 
-      const lockedUser = locked.rows[0];
+      const lockedUser = locked[0];
       if (!lockedUser?.role_id)
         throw new CustomError(MSG_NOT_FOUND, HTTP_STATUS.NOT_FOUND);
 

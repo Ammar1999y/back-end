@@ -3,10 +3,9 @@ import type { Handler } from '@/lib/http/contract';
 
 import { and, count, eq, isNull } from 'drizzle-orm';
 
-import { db } from '@/db';
+import { db, withTransaction } from '@/db';
 import { parseDataTableParams } from '@/db/queries/data-table';
 import { accounts, roles, users } from '@/db/schema';
-import { withTransaction } from '@/db/ws';
 import { validID } from '@/utils';
 import { auditLog, getAuditMeta } from '@/lib/audit';
 import { checkPasswordCompromise } from '@/lib/auth/check-password';

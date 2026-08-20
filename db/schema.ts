@@ -16,9 +16,9 @@ import { relations, sql } from 'drizzle-orm';
 import {
   boolean,
   check,
+  customType,
   index,
   integer,
-  jsonb,
   pgEnum,
   pgTable,
   text,
@@ -51,6 +51,64 @@ import {
   URL_MAX,
 } from '@/utils/validation/constants';
 import { OTP_CHANNELS, OTP_PURPOSES } from '@/utils/validation/otp';
+
+/**
+ * `jsonb`, replacing `drizzle-orm/pg-core`'s — which double-encodes under
+ * `bun:sql`.
+ *
+ * Drizzle's own `jsonb` returns `JSON.stringify(value)` from
+ * `mapToDriverValue`, because most PostgreSQL drivers want JSON *text* for a
+ * jsonb parameter. `bun:sql` does not: it JSON-encodes whatever JS value it is
+ * given, so an already-serialised string is encoded a second time and the column
+ * stores a jsonb STRING SCALAR rather than an object. Measured on Bun 1.4.0:
+ * `insert into t (j) values (${'{"a":1}'})` stores `"{\"a\":1}"`, while the
+ * same statement with the object stores `{"a":1}`.
+ *
+ * Drizzle's read path hid it — `mapFromDriverValue` JSON-parses a string, so the
+ * double encode round-tripped invisibly through the ORM. What did not survive
+ * was every SQL-level jsonb operation, because none of them go through that
+ * mapper. `refreshRoleSessions` and `refreshUserSessions`
+ * (`lib/permissions/utils.ts`) merge with `metadata || $1::jsonb`, and `||` on
+ * two jsonb strings CONCATENATES INTO AN ARRAY instead of merging objects:
+ * reproduced, `sessions.metadata` became
+ * `["{\"keepMe\":…}","{\"roleName\":…}"]` and the permission patch was lost.
+ * Anything reading these columns outside Drizzle — `db.execute`, `->`/`->>`,
+ * `@>`, a jsonb index, psql — saw the same.
+ *
+ * So the value is passed through and encoded exactly once, by the driver. This
+ * shadows the drizzle export deliberately: every column here keeps its
+ * declaration, and the broken one is no longer in scope to be used by accident.
+ * `dataType` still reports `jsonb`, so the generated DDL is unchanged.
+ *
+ * NOTE it is `prepare: true` that makes the bug reachable — without a prepared
+ * statement Bun does not know the parameter is jsonb and sends it as text, which
+ * PostgreSQL then parses correctly. Do not read a passing test under
+ * `prepare: false` as evidence that this helper is unnecessary.
+ *
+ * **`fromDriver` is a pass-through, and that is a decision.** Drizzle's builtin
+ * JSON-parses a string on the way out, which is precisely what hid the double
+ * encode above: write twice, read twice, same object back, nothing to see. This
+ * reports what the column actually holds. So these five columns TRUST THEIR
+ * WRITERS — a jsonb string scalar reaching one of them (a `psql` fix-up, a script
+ * that pre-stringifies) reads back as a `string` wearing the column's declared
+ * type, and nothing complains. On the permission path that fails CLOSED (a
+ * lookup on a string yields `undefined`, which denies), but it fails quietly.
+ *
+ * Throwing here instead was considered and rejected. `mapFromDriverValue` runs on
+ * READ, so one bad row would 500 every request that touches it — a role-wide
+ * auth outage to report a write-time mistake — and three of these columns
+ * (`audit_logs`' `old_data`, `new_data`, `changed_fields`) are typed `unknown`,
+ * where jsonb legitimately admits arrays and scalars; `changed_fields` already
+ * stores an array. Refusing a non-object on read would assert an invariant the
+ * type does not carry. The enforcement that belongs to a write-time invariant is
+ * a database CHECK constraint, which needs a migration — tracked in `TODO.md`
+ * PG-4.
+ */
+const jsonb = customType<{ data: unknown; driverData: unknown }>({
+  dataType: () => 'jsonb',
+  toDriver: (value) => value,
+  fromDriver: (value) => value,
+});
 
 export type PermissionActions = Record<PermissionAction, boolean>;
 

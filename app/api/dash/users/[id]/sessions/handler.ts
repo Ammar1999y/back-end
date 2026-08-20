@@ -1,13 +1,12 @@
-import type { WsTx } from '@/db/ws';
+import type { Tx } from '@/db';
 import type { Handler, HandlerInput } from '@/lib/http/contract';
 import type { PermissionObject } from '@/lib/permissions/constants';
 import type { EntityID } from '@/types';
 
 import { and, desc, eq, gt, inArray, isNull, ne, sql } from 'drizzle-orm';
 
-import { db } from '@/db';
+import { db, withTransaction } from '@/db';
 import { roles, sessions, users } from '@/db/schema';
-import { withTransaction } from '@/db/ws';
 import { validID } from '@/utils';
 import * as z from 'zod';
 import { auditLog, getAuditMeta } from '@/lib/audit';
@@ -114,7 +113,7 @@ async function authorizeSessionAccess(
 
 /** Ownership + role-authority check on the target, under a shared lock. */
 async function assertTargetReachable(
-  executor: WsTx | typeof db,
+  executor: Tx | typeof db,
   opts: {
     targetId: EntityID;
     currentUserId: EntityID;

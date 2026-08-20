@@ -1,1085 +1,1409 @@
-# Test Strategy — Decisions, Evidence, and Open Questions
+# Test Strategy — implementation brief
 
-**Date:** 2026-08-15 **Reviewed:** `reports/engineering-hardening-plan.md`
-(current), commit `c583d82`, `scripts/probe/`, `db/index.ts`, `db/ws.ts`,
-`lib/rate-limit/*` **Status:** reasoning and evidence only. Nothing implemented.
+**Updated:** 2026-08-20 · **Toolchain measured against:** Bun `1.4.0`
+(`34cbb9a40`), PostgreSQL `18.6`, `elysia@1.4.29`, `better-auth@1.7.1`,
+`drizzle-orm@0.45.2`, `zod@4.4.3` · **Status:** nothing here is implemented.
 
----
+**How to read this.** §1–§6 are the environment, the harness and the tooling —
+build them first, in that order. §7 is the assertion catalogue: what must be
+proven and why, grouped by area, one entry per property. §8–§10 are the gate,
+the accepted gaps and the sequencing.
 
-## 0. What changed since the previous review
+**Two standing rules for whoever implements this.** They are why several
+entries below look pedantic:
 
-`c583d82` landed lefthook, CI, mise, Renovate, Semgrep and gitleaks. Relevant
-here:
+- **Never assert against a hand-authored fixture where a real one is
+  reachable.** A test that manufactures a driver error and then asserts the
+  reader read it is circular; it passes for any invented spelling. Provoke the
+  real failure.
+- **A property is only proven at the layer it can fail at.** SQL-level
+  behaviour needs a SQL-level assertion, transport-level behaviour needs a
+  socket, signal handling needs a real process. Every entry below names its
+  seam for that reason.
 
-- `.github/workflows/ci.yml` exists with three jobs on `ubuntu-24.04`. There is
-  **no test job** — the plan defers it explicitly: _"A `bun run test` CI step
-  would fail on a missing script. Phase 1 is deferred; add that step together
-  with the tests."_
-- Two open items are gated on tests existing: the branch-protection
-  required-checks list, and the Renovate automerge revisit. Both are already
-  named in the plan.
-
-**Contradiction to flag.** Plan §3 still prescribes
-`bun add -D vitest @vitest/coverage-v8` and `@testcontainers/postgresql`. That
-contradicts the Bun-first rule. `bun test` covers both and `--coverage` is built
-in. The plan needs editing whichever way the decisions below land.
-
----
-
-## 1. "Real services already, so the tests are implementation-independent"
-
-The premise is sound. The inference is not.
-
-The property wanted is _implementation-independence_: the same results
-regardless of which Postgres, which key-value store. A suite run against **one**
-implementation cannot demonstrate independence. It demonstrates that the code
-works on Neon + Upstash. Independence is a minimum-two-point property.
-
-This is not pedantry, because the coupling is not at the SQL layer — where "Neon
-is Postgres" is basically true — but at the **driver**, which is the most
-Neon-specific thing in the repository.
-
-### a. `db/index.ts` — `neon-http`
-
-One HTTP request per query, each its own implicit transaction, zero session
-continuity. Nothing session-scoped works: `SET LOCAL`, session advisory locks,
-`FOR UPDATE` held across statements, temp tables, cursors, `LISTEN`/`NOTIFY`.
-That limitation is _why_ `db/ws.ts` exists. On local Postgres via `postgres-js`
-or `Bun.sql`, queries share a pooled session and none of it is true. There are
-two clients in this repo precisely because the two drivers do not have the same
-semantics.
-
-### b. `db/ws.ts` — the one that actually bites
-
-`withTransaction` creates a **new `Pool` per transaction** and `pool.end()`s it
-in `finally`. On Neon serverless WebSocket that is the normal pattern. On local
-Postgres it means a fresh TCP + TLS handshake and a fresh backend process fork
-**per transaction** — the single most expensive thing that can be done to a
-local server. Every transactional invariant currently under test
-(`processOtpVerify`, `verifyLoginAttempt`, the OTP daily budget) runs through
-it. This function must change on the VPS, so today's tests certify the shape
-that is going to be deleted.
-
-The comment on line 23 already says
-`// To switch to a local DB later, replace the body of this function`. The
-instinct is right; the point is only that the tests validate the pre-swap body.
-
-### c. Latency changes which races are observable
-
-Neon RTT is tens of milliseconds; local Postgres is sub-millisecond. The OTP
-probes run 15+ sequential verify attempts, each a transaction holding a row
-lock, with `300_000` ms timeouts. Race windows scale with RTT. A TOCTOU that
-Neon's latency masks can surface locally, and lock contention that only appears
-at local speed will never appear on Neon. Timing is not an edge case here — the
-budget logic is concurrency-sensitive by design.
-
-### Bottom line
-
-Keep testing against real services; that part is right. But state the claim
-accurately: _these tests prove the invariants hold on the stack they run
-against._ To get the property actually wanted, run them against the target stack
-— which is exactly what the §3 decision achieves.
+Every earlier revision of this document is superseded. Sections that used to
+argue about drivers, stores, Neon branching, `lru-cache`, vitest and
+testcontainers are gone: those questions are closed and the closures are in §1.
 
 ---
 
-## 2. Docker-free Postgres, and what CI actually is
+## 1. Decisions already taken
 
-Verified on this machine: `docker` absent, `psql` absent, `pg_ctl` absent. Bun
-1.3.14, scoop 0.5.3, mise 2026.8.6 present.
+Do not re-litigate these; they are the premises the catalogue is written
+against.
 
-### 2a. The four options
-
-| Option                        | Docker locally | Solves the driver problem | Notes                                                                              |
-| ----------------------------- | -------------- | ------------------------- | ---------------------------------------------------------------------------------- |
-| **CI service container**      | No             | Yes                       | GitHub's runner supplies Docker. Recommended primary. See 2b.                      |
-| **Native Postgres via scoop** | No             | Yes                       | `scoop install postgresql` — verified available, `postgresql 18.6-1`, main bucket. |
-| **Neon branching**            | No             | **No**                    | Works, but entrenches the stack being left.                                        |
-| Docker Desktop / WSL2         | Yes            | Yes                       | Supported on Windows 10 Pro. Declined.                                             |
-
-**On Neon branching.** Neon does support it: `neonctl branches create` or the
-API produces a copy-on-write branch with its own connection string in a couple
-of seconds, deleted after the run. It is a legitimate isolation mechanism, and
-it is the wrong tool here for three reasons:
-
-1. It isolates against infrastructure that is being left. It solves the
-   shared-state problem while entrenching the wrong-stack problem.
-2. Branch creation is seconds, not milliseconds — per-run isolation only, never
-   per-file. `CREATE DATABASE … TEMPLATE` on a local server is the faster
-   primitive.
-3. Plan branch limits and API rate limits apply. **The Neon plan on this account
-   was not inspected**, so the ceiling is unknown — checkable in the console.
-
-Worth it only if the VPS move is 6+ months out and isolation is needed now.
-
-### 2b. What "hosted service" means
-
-**What runs the tests.** GitHub Actions, already wired up. On every push and PR,
-GitHub allocates a **fresh virtual machine** (`ubuntu-24.04`, 4 vCPU / 16 GB on
-the public-repo runner), clones the repo, runs the steps, and **destroys the
-VM**. Nothing persists between runs.
-
-**Where the database comes from.** A `services:` block. The runner VM has Docker
-preinstalled, so it starts a Postgres container alongside the job — Docker is
-needed on _their_ machine, not on this one:
-
-```yaml
-test:
-  runs-on: ubuntu-24.04
-  services:
-    postgres:
-      image: postgres:18-alpine
-      env:
-        POSTGRES_PASSWORD: test
-        POSTGRES_DB: app_test
-      ports: ['5432:5432']
-      options: >-
-        --health-cmd pg_isready --health-interval 5s --health-timeout 5s
-        --health-retries 10
-```
-
-The job connects to `postgres://postgres:test@localhost:5432/app_test`, runs
-`drizzle-kit migrate`, runs `bun test`. When the job ends, container and VM both
-evaporate.
-
-Facts that matter to the decision:
-
-- Service containers are **Linux-runner only**. `ubuntu-24.04` qualifies.
-- The repo is **still public** (plan, "Still open" item 1), so Actions minutes
-  are **free and unlimited**. Going private drops to 2000 min/month free; an
-  integration job is ~2–3 min.
-- **The strategy works there, better than locally.** "Tests fully own the
-  database" is free when the database is destroyed 90 seconds later. No cleanup
-  logic, no `PROBE_STAMP`, no ordering constraints, no risk.
-- Pin the Postgres major in the service container to match the VPS, or one
-  fidelity gap is simply traded for a smaller one.
-- **Cost: the feedback loop.** Integration tests only run on push, ~2 min
-  round-trip. Mitigations: keep unit tests local and fast, and use
-  `bun test --changed` (verified present) locally. Local Postgres via scoop can
-  be added later without touching the harness — only `DATABASE_URL` differs.
-
-**Recommendation.** CI service container as the integration environment. Local
-Postgres as an optional convenience, decided later, not a prerequisite.
+| Decision                                   | Choice                                                                  | Consequence for the suite                                                                                                                                                             |
+| ------------------------------------------ | ----------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Test runner                                | `bun test` only                                                         | No vitest, no `@vitest/coverage-v8`, no external assertion or mocking library. Coverage is built in.                                                                                  |
+| Container orchestration                    | None locally                                                            | No `@testcontainers/postgresql`. It installs and constructs under Bun but `.start()` hangs past 120 s with no Docker daemon. CI's `services:` block is declarative and needs nothing. |
+| PostgreSQL client                          | `bun:sql` + `drizzle-orm/bun-sql`, one pooled client in `db/index.ts`   | Session continuity exists, so `FOR UPDATE`, advisory locks and savepoints are all testable. `db/ws.ts` is deleted.                                                                    |
+| Rate-limit / cache store                   | Local SQLite via `bun:sqlite`, owned fixed-window algorithm             | `now` is client-supplied, so window behaviour is drivable with `setSystemTime`. No Upstash, no Lua, no network.                                                                       |
+| Contract tests between two implementations | Dropped                                                                 | One implementation, tested directly. `tests/contract/` does not exist.                                                                                                                |
+| Per-process rate limiting                  | Accepted, deferred                                                      | Single-process deployment. Multi-process contention is a bench question, not a test one.                                                                                              |
+| Where destructive tests run                | Developer machine and CI only                                           | §3. Production VPS gets a read-only smoke set in a separate harness and nothing else.                                                                                                 |
+| Database ownership                         | Tests own the database **because it is disposable**                     | Not "granted permission on a durable one". Full ownership plus ephemeral is the norm; full ownership plus persistent-and-shared is the anti-pattern.                                  |
+| Honesty about what the suite proves        | These tests prove the invariants hold **on the stack they run against** | Implementation-independence is a minimum-two-point property and is not claimed.                                                                                                       |
 
 ---
 
-## 3. Contract tests — decision accepted, premise corrected
+## 2. Measured facts about the toolchain
 
-The rejection is accepted. Switching to the target implementations now and
-testing those directly is simpler and is the better call. Contract tests exist
-to manage a swap where both sides are kept; that is not the situation.
+Measured on this machine today, not read from documentation. Three of these
+reverse an earlier plan.
 
-The premise about the layer being thin is half right.
-
-**Correct about `lib/rate-limit/auth-storage.ts:50` and `:62`.**
-`redis.get<T>(key)` and `redis.set(key, value, { ex })`. Plain key-value. Ports
-to `lru-cache` in about ten lines.
-
-**Not correct about `lib/rate-limit/index.ts:33-45`.** `getLimiter` constructs
-`new Ratelimit({ redis, limiter: Ratelimit.slidingWindow(limit, window) })`.
-`@upstash/ratelimit` is not a key-value wrapper — it ships **Lua scripts
-executed server-side on Redis**. Verified in
-`node_modules/@upstash/ratelimit/dist/index.mjs`:
-
-```lua
-local requestsInCurrentWindow  = redis.call("GET", currentKey)
-local requestsInPreviousWindow = redis.call("GET", previousKey)
-local percentageInCurrent = ( now % window ) / window
-requestsInPreviousWindow = math.floor(( 1 - percentageInCurrent ) * requestsInPreviousWindow)
-```
-
-Two fixed buckets, the previous one linearly weighted by position within the
-current window, the whole thing atomic under `EVALSHA`. The constructor requires
-an Upstash-compatible client; there is no store-adapter seam.
-
-So this is not a swap — **it is reimplementing the rate-limiting algorithm the
-project currently rents.** Not hard (the script above is the entire algorithm,
-roughly 30 lines of TypeScript), but it is not "point the layer at lru-cache".
-That is the real cost, and it is what made contract tests look attractive.
-
-The conclusion still holds: one implementation, owned and tested directly, beats
-two implementations plus a conformance harness. And owning the algorithm makes
-it _more_ testable than today — `now` is a client-supplied argument, so
-window-boundary behaviour becomes directly drivable with `setSystemTime`, which
-is not meaningfully possible against Upstash today.
-
-Same verdict for the database: pick the driver, test that one.
+| Fact                                              | Result                                                                                                                                                                                                                                                                                                              |
+| ------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Local PostgreSQL                                  | **Present** — 18.6, superuser, `rolcreatedb = true`, `max_connections = 100`. `psql`, `pg_ctl` and `docker` are all absent from `PATH`; the server is reachable only over TCP. An earlier revision concluded there was no local PostgreSQL and planned around CI only.                                              |
+| `CREATE DATABASE` (empty)                         | ~616 ms                                                                                                                                                                                                                                                                                                             |
+| `bun run db:migrate` into a fresh database        | ~1045 ms — both phases, 9 tables, 8 enums, `pg_trgm`, 4 GIN indexes                                                                                                                                                                                                                                                 |
+| `CREATE DATABASE … TEMPLATE <migrated>`           | 455–1347 ms over six runs. An earlier revision quoted ~100 ms as typical; it was never observed.                                                                                                                                                                                                                    |
+| `DROP DATABASE … WITH (FORCE)`                    | ~1.5 s alone, 16.5 s for five in a loop                                                                                                                                                                                                                                                                             |
+| `TRUNCATE <9 tables> RESTART IDENTITY CASCADE`    | 190–272 ms                                                                                                                                                                                                                                                                                                          |
+| `CREATE SCHEMA` / `DROP SCHEMA … CASCADE`         | 21 ms / 2 ms                                                                                                                                                                                                                                                                                                        |
+| Cloning a template with any connection open to it | **Fails** — `source database "…" is being accessed by other users`                                                                                                                                                                                                                                                  |
+| `bun test` and `.env`                             | **`.env` is auto-loaded.** Every test process sees the development `DATABASE_URL` unless something overrides it. `--no-env-file` suppresses it, `--env-file=<path>` replaces it, and under `NODE_ENV=test` a `.env.test` wins over `.env`.                                                                          |
+| `--preload` ordering                              | Top-level `await` in a preload completes before the first test module is imported, so a preload can rewrite `process.env` and the application's module-load-time reads will see it.                                                                                                                                 |
+| Worker identity                                   | `BUN_TEST_WORKER_ID` and `JEST_WORKER_ID` are set (1-based) under `--parallel` and **undefined** without it. Handle both.                                                                                                                                                                                           |
+| Fake timers                                       | `jest.useFakeTimers`, `setSystemTime`, `advanceTimersByTime`, `advanceTimersToNextTimer`, `runAllTimers`, `runOnlyPendingTimers`, `getTimerCount`, `clearAllTimers`, `useRealTimers` — all present, driving both `setTimeout` and `Date`. `jest.unstable_mockModule` does **not** exist; `mock.module` is the seam. |
+| `test.failing`                                    | Present and inverting: a failing body reports as a pass, a body that **starts** passing fails with `this test is marked as failing but it passed`. The right tool for a known-open gate.                                                                                                                            |
+| `coverageThreshold` in `bunfig.toml`              | Honoured. **Trap:** plural keys `lines` / `functions` / `statements` gate; the singular `line` / `function` are **silently ignored** — 33 % function coverage passed `{ function = 0.99 }` with exit 0.                                                                                                             |
+| File parallelism                                  | Sequential in one process by default; `--parallel=N` gives worker processes with distinct pids and overlapping execution.                                                                                                                                                                                           |
 
 ---
 
-## 4. Per-process rate limiting
+## 3. Where the tests run
 
-Accepted as deferred. One item carries forward into §5 rather than being
-re-argued: the deferral is safe against _concurrency_, not against _eviction and
-restart_. Both apply at single-process scale.
+| Environment           | Runs                        | Database it touches                                                                                    |
+| --------------------- | --------------------------- | ------------------------------------------------------------------------------------------------------ |
+| **Developer machine** | Everything                  | Local PostgreSQL, in databases whose names end `_test` and which the harness created. **Never `app`.** |
+| **GitHub Actions**    | Everything, sharded         | A `postgres:18-alpine` `services:` container, destroyed with the runner VM                             |
+| **Production VPS**    | **Nothing from this suite** | Production, read-only, from a separate smoke harness                                                   |
 
----
+**CI has no persistent database, which is better than having one.** The runner
+VM ships with Docker, so a `services:` block starts PostgreSQL beside the job;
+the job migrates it, runs the suite, and container and VM both evaporate.
+Nothing persists, so a destructive suite has nothing to damage and needs no
+cleanup logic. Docker is required on GitHub's machine, not on this one. Pin the
+container's PostgreSQL major to the VPS's, or one fidelity gap is traded for a
+smaller one rather than closed. Actions minutes are free while the repository is
+public; an integration job is 2–3 minutes.
 
-## 5. What actually changes underneath, and the VPS test database
+**The production VPS must not run this suite, and the guarantee has to be
+structural.** The suite truncates tables, creates and drops databases, exhausts
+rate-limit budgets and inserts users and sessions. The only reliable way to keep
+it away from production data is for production credentials never to exist in the
+environment that runs it — so there is no test database on the VPS: not a second
+database on the same instance, not a second instance on the same box. Procedural
+discipline fails eventually; environmental separation does not.
 
-### 5a. Redis → lru-cache: the specifics
+What does belong on the server is a **read-only** post-deploy smoke set —
+health, migration version, `/openapi.json` answering 200, one known-good
+login — in its own harness, kept separate for a specific reason: the day someone
+adds a `DELETE` to a suite that runs against production, the separation stops
+protecting everything else too.
 
-Three of the four differences are minor or favourable. One is not.
-
-**Eviction is not expiry — this is the one.** `lru-cache` evicts by `max` entry
-count in LRU order, independent of TTL. A rate-limit entry can be dropped
-**before its window expires**, silently resetting the counter to zero. Redis
-does not do this on a sized instance with default `noeviction`.
-
-That is an attack, not a quirk. An attacker generates traffic against many
-distinct identifiers — fresh IPs, fresh destinations, fresh addresses — pushing
-their own counter out of the LRU tail, then resumes. The key space is
-attacker-influenced by construction: `otp.send.dest.email:<destination>` embeds
-a value taken from the request body. Sizing `max` high enough to be safe means
-sizing for the attacker's key cardinality, which is unbounded. The honest fix is
-a store that expires by TTL only and fails closed when full — a different data
-structure from an LRU.
-
-**Durability.** A process restart wipes every counter. **Every deploy resets the
-OTP global breaker** (`otp.send.global`, 2000/day), better-auth's login limiter,
-and every per-destination cap. Not attacker-triggerable, but the daily budget
-becomes "per deploy" rather than "per day".
-
-**Atomicity.** Upstash's Lua is atomic server-side. In-process, a purely
-synchronous read-modify-write is atomic in JavaScript, but the store interface
-returns Promises and any `await` between read and write reopens the race.
-Solvable, and easier than it sounds, but it becomes an invariant to maintain.
-
-**Clock — in your favour.** The previous version of this document said Upstash
-uses the Redis server clock. That is wrong: `now` is `ARGV[2]`, supplied by the
-client. Moving in-process changes nothing here, and either way `setSystemTime`
-can drive it.
-
-Net: durability, atomicity and clock are manageable or improvements. **Eviction
-is a genuine new security hole** that has to be designed around rather than
-inherited.
-
-### 5b. "Should tests fully own the database?"
-
-Yes. That is the standard expectation and the correct one. The standard
-formulation has a second half:
-
-> Tests own the database **because the database is disposable** — not because
-> they have been granted permission on a durable one.
-
-The industry answer to "how do I safely let a destructive suite loose" is never
-"carefully". It is "make the target worthless". Full ownership plus ephemeral is
-the norm; full ownership plus persistent-and-shared is the anti-pattern the
-current probes are in. The instinct is right; the shape it should take is
-ephemeral, not permissioned.
-
-### 5c. The options
-
-**A. Separate database, same Postgres instance, same VPS** (`app`, `app_test`).
-Cheapest. Specific risks: a wrong `DATABASE_URL` points a destructive-by-design
-suite at production; shared `shared_buffers`, WAL and connection slots mean a
-test run competes with live traffic; one careless superuser connection crosses
-the boundary. Survivable only with all three of — a dedicated `app_test` role
-holding **zero** privileges on `app`; a boot-time assertion in the harness that
-`current_database()` ends in `_test` and hard-exits otherwise; a separate
-`.env.test`. Without those it is one typo from data loss on the box serving
-users.
-
-**B. Separate Postgres instance on the same VPS** (second port, own data
-directory). Better blast radius, no buffer or WAL contention, ~200 MB extra RAM.
-Still one machine, still one bad env var away — but the separation is enforced
-by the server rather than by grants.
-
-**C. Separate staging VPS.** What teams with budget do. Costs another box, and
-gives somewhere to rehearse migrations.
-
-**D. No test database on the VPS at all — CI is the integration environment.** ←
-recommended. Production VPS runs production only. Integration tests run in CI
-against a throwaway service container (§2b). Nothing can point at production by
-accident because production credentials never exist in the environment that runs
-destructive tests. Requirement: pin the same Postgres major in CI and on the
-VPS.
-
-**E. Post-deploy smoke tests against production.** A small, strictly
-**read-only** set: health endpoint, auth reachable, migrations at the expected
-version, one known-good login. A different category from integration tests.
-Serious teams run both D and E, and keep them in separate harnesses — the day
-someone adds a `DELETE` to the smoke suite is the day D's guarantees stop
-applying.
-
-**How this is done at larger scale:** an ephemeral database per CI job; a
-per-developer local database via docker-compose; one long-lived staging
-environment refreshed from anonymised production dumps for manual and e2e
-testing; production touched only by migrations and read-only smoke checks.
-Nobody points a destructive suite at a machine serving traffic. The separation
-is environmental, not procedural — precisely because procedural discipline fails
-eventually.
-
-**Verdict: D, plus E later. Do not create a test database on the production
-VPS.** A local loop belongs on the developer machine, not the server.
+The cost of CI-as-the-integration-environment is the feedback loop: integration
+tests only run on push. `--changed` locally is the mitigation, and now that a
+local PostgreSQL exists the same suite runs locally against the same harness —
+only `TEST_DATABASE_URL` differs.
 
 ---
 
-## 6. Target structure
+## 4. The harness
 
-Unchanged, with one amendment from §3: `tests/contract/` is dropped. With a
-single implementation, its tests are simply `tests/unit/` (the algorithm, driven
-by `setSystemTime`) and `tests/integration/`.
+### 4.1 PostgreSQL
+
+One file, `tests/helpers/database.ts`, imported by the integration preload and
+by nothing else.
+
+**a. The variable is `TEST_DATABASE_URL`; `DATABASE_URL` is derived from it.**
+The harness reads `TEST_DATABASE_URL`, computes the per-worker database name and
+writes the result into `process.env.DATABASE_URL` **inside the preload**, before
+`db/index.ts` is imported. The pool is constructed at module load from
+`DATABASE_URL`, so the rewrite must happen earlier than any application import,
+and `--preload` is the only hook that reliably is.
+
+**b. Four guards, because `.env` auto-loads.** This is the sharpest hazard in
+the plan. `bun test` reads `.env`, so the development `DATABASE_URL` — pointing
+at `app`, with the developer's real data — is in every test process by default.
+A harness that merely _prefers_ `TEST_DATABASE_URL` and falls back is one
+missing variable away from truncating the dev database. Assert and hard-exit,
+never skip:
+
+1. `TEST_DATABASE_URL` is set. Absent is a failure, not a fallback.
+2. `current_database()` ends with `_test` — asked of the server after
+   connecting, not parsed out of the URL, because the URL is what would be
+   wrong.
+3. The resolved test URL and the `.env` `DATABASE_URL` differ in database name.
+4. `NODE_ENV !== 'production'`.
+
+Separately, run the suite with `NODE_ENV=test` so `.env.test` takes precedence
+over `.env`. `.env.test` holds `TEST_DATABASE_URL` and a `DATABASE_URL` pointing
+at the same test server, so even a harness bug cannot reach `app`. **Add
+`.env.test` to `.gitignore`** — it currently lists `.env` and `.env.local` only,
+and this file will hold a database password.
+
+**c. One migrated template, one database per worker, `TRUNCATE` between files.**
+The numbers in §2 decide this against a database per test _file_: per-file clone
+is ~0.5–1.3 s to create plus ~1.5 s to drop, which across ~30 integration files
+is over a minute of pure provisioning; `TRUNCATE` of all nine tables is ~200 ms
+and provisions nothing.
+
+- `app_test_template` — created once, migrated once with the real
+  `scripts/migrate.ts` (~1.6 s total).
+- `app_test_w<N>` — cloned from the template per worker, `N` from
+  `BUN_TEST_WORKER_ID` defaulting to `0` when serial.
+- Each integration file resets its own worker's database with one
+  `TRUNCATE … RESTART IDENTITY CASCADE` in `beforeAll`; a file needing a clean
+  slate between tests repeats it in `beforeEach`.
+
+**d. Nothing is dropped at the end.** Drop is the expensive operation and a
+crashed run has to self-heal, so the harness reconciles at **start**: reuse
+`app_test_w<N>` if its recorded schema fingerprint matches, otherwise drop and
+re-clone. The fingerprint is a hash of `db/drizzle/meta/_journal.json` plus every
+file in `db/migrations/`, stored in a `_harness_schema` table the migrations do
+not create — which doubles as the ownership marker, since a database without it
+is not one the harness made and must not be touched. `bun run test:db:reset` is
+the explicit teardown.
+
+**e. Close the template pool before cloning.** Measured: PostgreSQL refuses the
+clone while any connection to the template is open. Easy to get wrong because
+`Bun.SQL` connects lazily — the blocking connection may have been opened by a
+fingerprint read three lines earlier.
+
+**f. The connection budget is a real ceiling.** `MAX_POOL_CONNECTIONS` is 10 per
+process, so `--parallel=N` can demand 10 N backends against a local
+`max_connections` of 100, before the developer's own `app` connections and a
+migration run. Assert `workers × MAX_POOL_CONNECTIONS + headroom ≤
+max_connections` (read from `pg_settings`) and fail with that sentence, rather
+than letting it surface as Bun's 30-second `connectionTimeout`, which looks like
+an unrelated hang.
+
+**g. Session fixtures go through the real sign-in path, once per file.** An
+authenticated request needs a cookie Better Auth will accept, and hand-forging
+one means reimplementing its signing. Call the real sign-in endpoint through
+`app.handle(...)`, keep the `Set-Cookie`, reuse it for the whole file. The
+password KDF is Argon2id at 64 MiB, which is exactly why this belongs in
+`beforeAll` and not `beforeEach`.
+
+### 4.2 SQLite
+
+`rate-limit.db` is **shared mutable state with windows up to 24 hours**. Two
+files that both exhaust an OTP budget will fight, and a row left by yesterday's
+run denies today's first assertion with no error — just an unexpected 429.
+
+- `SQLITE_DIR` points at a per-worker temporary directory, never the
+  repository's `data/`. The same preload that rewrites `DATABASE_URL` sets it.
+- Files asserting limiter behaviour **delete the database file** in
+  `beforeEach`. Sweeping is not a reset: the sweep removes only _expired_ rows,
+  and a fixed-window counter inside its window is not expired.
+- The multi-process assertions (§7.2a) need a directory per case — contention
+  over one file is the property.
+- `--isolate` is not a substitute. It resets the JavaScript global, not the
+  filesystem.
+
+### 4.3 Fakes: one egress boundary
+
+Every outbound HTTP call is a hardcoded absolute URL —
+`challenges.cloudflare.com` (Turnstile), `apis.deewan.sa` (SMS),
+`services.rmz.one` (WhatsApp), `api.pwnedpasswords.com` (HIBP) — plus SMTP
+through `nodemailer`. There is no injected base URL to redirect.
+
+**Install one egress guard for the whole suite rather than per-test stubs.** A
+helper replaces `globalThis.fetch` with a router keyed on hostname, returning a
+scripted response per known host and **failing the test** on any unexpected
+host. One mechanism, two properties: the fakes, and the assertion that a code
+path makes no outbound call it should not — which is exactly the defect where an
+unreachable `/api/auth/*` path would have spent Turnstile quota. Where a real
+socket is wanted (timeouts, 5xx, a slow provider), point the router at a
+`Bun.serve` instance instead of returning a synthetic `Response`.
+
+SMTP is the exception: not HTTP, so `mock.module('nodemailer', …)` returning a
+transport that records `sendMail` calls.
+
+**Rule on `mock.module`:** third-party modules at the process boundary only.
+Mocking a first-party module means the test proves the mock. `--isolate` clears
+the module registry between files so a mock cannot leak across files; it can
+still leak across tests within a file, so restore in `afterEach`.
+---
+
+## 5. Layout, scripts, CI
+
+### 5.1 Layout
 
 ```
-tests/unit/          pure, no IO, milliseconds     — run on every save
-tests/integration/   real Postgres + real handlers + fake providers
-scripts/probe/       retire once the above exists
+tests/
+  unit/          pure logic, no IO, milliseconds          — runs on every save
+  integration/   real PostgreSQL + real handlers via app.handle + fake providers
+  process/       spawned children: boot, signals, raw sockets, multi-process SQLite
+  helpers/       database harness, session fixtures, egress guard, preloads
+  fixtures/      _-prefixed child scripts and data (never matched by the test glob)
 ```
+
+`scripts/probe/local/` becomes `tests/unit` and `tests/process`; its
+`_`-prefixed children move to `tests/fixtures/`. The move is not cosmetic: it is
+what lets `bunfig.toml` give the three tiers different preloads, which is the
+only clean way to keep a unit test from paying for a database connection.
+
+Two hygiene items the move must fix, both of which have already bitten:
+
+- **The manufactured error spelling.** `auth-storage-log-boundary.test.ts:49`
+  and `rate-limit-log-boundary.test.ts:42` hand-author
+  `class LeakyDriverError extends Error { override name = 'SqliteError' }`.
+  Measured: `bun:sqlite` throws a plain `Error` with `.name` reassigned to
+  `'SQLiteError'` — different capitalisation — and `.constructor.name` of
+  `'Error'`, not a subclass at all. `errorClassOf` reads only `.name`, so every
+  `expect(d.errorClass).toBe('SqliteError')` passes because the fixture set that
+  exact string and would pass for any invented spelling. Fix both fixtures and
+  add at least one assertion per file whose error comes from a **real**
+  `bun:sqlite` failure.
+- **CLI-style probes.** `log-serializer`, `permission-schema` and `time-dst` were
+  CLI probes without the `.test.ts` suffix and had never executed in CI. They
+  are converted, not renamed — a bare rename would be worse, because an explicit
+  `exit()` inside a test file ends the whole run and silently skips every file
+  after it. Add the guard: every file under `tests/` either matches the test glob
+  or is `_`-prefixed.
+
+### 5.2 Scripts
+
+| Script             | Command                                               | Needs       |
+| ------------------ | ----------------------------------------------------- | ----------- |
+| `test`             | `bun test tests/unit`                                 | nothing     |
+| `test:integration` | `NODE_ENV=test bun test tests/integration --parallel` | PostgreSQL  |
+| `test:process`     | `NODE_ENV=test bun test tests/process`                | a free port |
+| `test:all`         | the three in sequence                                 | PostgreSQL  |
+| `test:db:reset`    | `bun tests/helpers/reset.ts`                          | PostgreSQL  |
+
+`test` stays the cheap one deliberately: it is what `lefthook` runs pre-commit,
+and a pre-commit hook that needs a database is a pre-commit hook that gets
+disabled.
+
+Do **not** use `--concurrent` or `--max-concurrency`. Tests inside one file share
+a database and a rate-limit file; running them concurrently makes every counter
+assertion order-dependent. Parallelism belongs at the file level, where the
+harness has given each worker its own state.
+
+### 5.3 CI
+
+Add the `test` job to `.github/workflows/ci.yml` with a `postgres:18-alpine`
+service container, `pg_isready` health options, and `TEST_DATABASE_URL` pointing
+at it. Service containers are Linux-runner only; `ubuntu-24.04` qualifies.
+
+- `bun install --frozen-lockfile` as its own first step. `package.json` was once
+  edited without regenerating `bun.lock`, so every CI install would have failed
+  while every local command passed — `node_modules` was already populated. No
+  test that assumes an installed tree can detect this.
+- `bun run db:migrate` against the container, then `bun run test:all`.
+- `--shard=${{ matrix.shard }}/3` with `--timings`, uploading the timings file so
+  the next run balances. Integration files are 200 ms to seconds apart, so
+  file-count sharding leaves one job doing most of the work. Empty shards exit 0.
+- `--reporter=junit --reporter-outfile=…` for check annotations (merges across
+  `--parallel` workers) and `--coverage-reporter=text,lcov`.
+- `--bail` on CI only; locally the second failure is usually the informative one.
+- **Keep the existing `Boot smoke test` step exactly as it is**, including its
+  `DATABASE_URL: postgres://ci:ci@db.example.com/ci`. It is the only thing
+  proving the pool still connects lazily (§7.4e); giving it a real database
+  silently deletes that assertion.
+- Group the spawned-process tier as its own step. Those tests each own a real
+  socket, a real child process or a real signal, for the same reason
+  `scripts/smoke.ts` is already separate.
+
+Once the job exists, the two items the hardening plan lists as blocked on it —
+the branch-protection required-checks list and the Renovate automerge revisit —
+are unblocked.
 
 ---
 
-## 7. Bun-first rule, applied
+## 6. Bun facilities, mapped to needs
 
-The rule: if Bun already provides something needed, use Bun's version instead of
-adding a dependency. Applied only to what is actually needed:
+All present in the installed 1.4.0. Where a facility looks right for something
+it is wrong for, that is said too.
 
-| Need                            | Bun provides                        | Verdict                                                                                                                          |
-| ------------------------------- | ----------------------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
-| Test runner                     | `bun test`                          | Use it. **Drop vitest from the plan.**                                                                                           |
-| Coverage                        | `--coverage`, `--coverage-reporter` | Built in. `@vitest/coverage-v8` unnecessary.                                                                                     |
-| Time control                    | `setSystemTime`                     | Verified working. Needed for OTP windows and DST.                                                                                |
-| Postgres client for the harness | `Bun.sql`                           | Verified present. `CREATE`/`DROP DATABASE` without `pg`.                                                                         |
-| Container orchestration         | `Bun.$`                             | Only if going local-Docker. On the CI path **neither `Bun.$` nor testcontainers is needed** — `services:` does it declaratively. |
-| Fake SMS / email provider       | `Bun.serve`                         | Use it — real HTTP, exercises timeout and 5xx paths.                                                                             |
-
-**One item relevant to step 6 of the ordering.** `drizzle-orm/bun-sql` exists in
-the installed drizzle 0.45.2 (verified, alongside `node-postgres/` and
-`postgres-js/`). If the VPS runs Bun, `Bun.sql` + `drizzle-orm/bun-sql` is a
-zero-dependency driver that replaces `@neondatabase/serverless` entirely,
-supports pooled sessions and interactive transactions, and collapses
-`db/index.ts` and `db/ws.ts` into one client. **Not verified:** whether that
-adapter is production-mature or supports everything `withTransaction` needs.
-That is a concrete spike to run before committing. `postgres-js` is the
-conservative alternative.
-
----
-
-## 8. Empirical results — measured, not assumed
-
-### Bun test-file parallelism — resolved
-
-Default is **sequential in a single process**. Two files, 1.5 s sleep each:
-
-```
-b.test.ts: B start …099317  pid 11580
-a.test.ts: A start …100842  pid 11580     ← same pid, strictly after B
-Ran 2 tests across 2 files. [3.46s]        ← ≈ sum
-```
-
-But Bun 1.3.14 **does** ship `--parallel=N` (worker processes, implies
-`--isolate`). Verified:
-
-```
-bun test --parallel=4     →  4x PARALLEL
-A pid 6684   start …132079
-B pid 10764  start …132239                 ← distinct pids, overlapping
-Ran 2 tests across 2 files. [2.23s]        ← ≈ max
-```
-
-Flags missed in the previous document, all present in 1.3.14:
-
-- `--randomize` + `--seed=N` — **the right tool for the order-dependence problem
-  in the probes.** The previous document recommended `--rerun-each` for that,
-  which was wrong: `--rerun-each` catches flakiness, `--randomize` catches
-  ordering. Both are useful, for different things.
-- `--shard=1/3` — split integration tests across parallel CI jobs.
-- `--changed[=ref]` — only test files affected by the git diff. This is the
-  local feedback-loop mitigation for §2b.
-- `--isolate` — fresh global object per file; leaked handles cannot cross files.
-- `--max-concurrency` (default 20), `--concurrent`, `--retry`.
-
-### `setSystemTime` — verified
-
-`setSystemTime(new Date('2030-01-01'))` → `new Date()` returns
-`2030-01-01T00:00:00.000Z`; bare `setSystemTime()` restores. `Bun.sql`,
-`Bun.SQL` and `Bun.$` are all present as functions.
-
-### Testcontainers under Bun — partially resolved
-
-`@testcontainers/postgresql@12.1.0` installs, imports and constructs cleanly
-under Bun 1.3.14. `.start()` **could not be tested — no Docker.** A finding in
-itself: with no Docker daemon it **hung past 120 s** rather than failing fast,
-which is poor DX on a machine that does not have it. Moot on the CI path.
-
-### `CREATE DATABASE … TEMPLATE` cost — not measured
-
-Requires a Postgres server; there is none on this machine. Measuring against
-Neon would produce a meaningless number — network RTT dominates, and Neon's
-copy-on-write storage layer has entirely different characteristics from a local
-data directory. The ~100 ms figure in the previous document was typical, not
-observed, and remains unverified. It becomes a one-job measurement the moment CI
-or a local install exists.
+| Need                          | Facility                                                                             | Note                                                                                                                                                                                        |
+| ----------------------------- | ------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Fast local loop               | `--changed[=ref]`                                                                    | Walks the import graph backward from the diff. The mitigation for integration tests being slower than unit ones.                                                                            |
+| Wall-clock                    | `--parallel[=N]`                                                                     | Worker processes, implies `--isolate`. This is what makes per-worker databases the right isolation unit. Cap `N` by §4.1f, not by CPU count.                                                |
+| Cross-file leakage            | `--isolate`                                                                          | Fresh `globalThis`, cleared module registry, cancelled timers, module-scope subprocesses killed between files. It is what makes `mock.module` safe to use at all.                           |
+| CI fan-out                    | `--shard=M/N` + `--timings` / `--update-timings`                                     | Balances by recorded duration instead of file count.                                                                                                                                        |
+| Ordering bugs                 | `--randomize` + `--seed=N`                                                           | The right tool for order dependence. `--rerun-each` catches flakiness, which is a different thing; both are useful.                                                                         |
+| Genuine externality flakiness | `--retry=<N>`, `{ retry: n }`                                                        | Only where the flakiness is a property of the world. A retry on a race assertion hides the race.                                                                                            |
+| Race assertions               | `{ repeats: n }`                                                                     | Runs n times, fails if any iteration fails — the inverse of `retry`, and the correct one for every concurrency invariant below.                                                             |
+| Time-dependent logic          | `jest.useFakeTimers` + `setSystemTime` + `advanceTimersByTime`                       | Window rollover, the UTC-midnight OTP cap, DST, the six-hour block, cookie-cache staleness. Restore with `useRealTimers()` in `afterEach`; 1.4 also stops fake timers leaking across files. |
+| Known-open gate               | `test.failing`                                                                       | Keeps CI green while a defect stands and turns red the moment it is fixed and the marker is stale. `test.skip` just goes quiet.                                                             |
+| Table-driven walks            | `test.each` / `describe.each`                                                        | The manifest conformance walk and the validation matrix are both natural `each` tables.                                                                                                     |
+| Platform-conditional          | `test.if` / `test.skipIf`                                                            | Only for the cases §9 names. Anything else makes coverage a function of who ran it.                                                                                                         |
+| Fakes                         | `mock`, `spyOn`, `mock.module`                                                       | §4.3. `jest.unstable_mockModule` does not exist here.                                                                                                                                       |
+| Fake HTTP provider            | `Bun.serve`                                                                          | Real sockets, so timeout and 5xx paths are genuinely exercised.                                                                                                                             |
+| Real processes and signals    | `Bun.spawn`                                                                          | The whole process tier.                                                                                                                                                                     |
+| Transport-level status        | `Bun.connect`                                                                        | The only way to observe the 413; `fetch` surfaces it as a closed socket.                                                                                                                    |
+| Harness SQL                   | `Bun.SQL`                                                                            | `CREATE DATABASE`, `TEMPLATE`, `TRUNCATE`, `pg_settings`. No `pg` dependency and no `psql` binary, neither of which exists here.                                                            |
+| Shape assertions              | `toMatchInlineSnapshot`                                                              | For the OpenAPI document and the error envelope, where the assertion _is_ the shape. Inline, not file-based: a snapshot the reviewer sees in the diff.                                      |
+| Assertions                    | `toBeOneOf`, `toContainKey`, `toSatisfy`, `toBeWithin`, `expect.objectContaining`    | All present. Prefer them to hand-rolled booleans, which report `false !== true` and tell the reader nothing.                                                                                |
+| Coverage                      | `--coverage --coverage-reporter=text,lcov`, `bunfig.toml` `[test] coverageThreshold` | §8, including the plural-key trap.                                                                                                                                                          |
 
 ---
 
-## 9. Updated ordering, with dependencies
+## 7. Assertion catalogue
 
-### Decided already — nothing blocks these
+Every entry states what to assert, the concrete failure it catches, and the
+seam. Entries marked **shipped** are defects that were live in this repository;
+they are required assertions because each one already happened once.
 
-1. **Edit `reports/engineering-hardening-plan.md` §3** — replace
-   vitest/coverage-v8 with `bun test`, and drop `@testcontainers/postgresql`
-   pending the §2 decision. It currently contradicts the Bun-first rule and
-   would be followed by anyone reading it.
-2. **Add `tests/unit/`** — pure logic, no IO, no infrastructure decision
-   required. `lib/permissions/checker.ts` first, per the plan's own priority
-   order: a bug there is a full auth bypass, and it needs no database. Unblocked
-   today, and the highest-value work on the list.
+Seams used below: **in-process** = `app.handle(new Request(...))` against the
+real route table, no socket; **unit** = a direct call on an exported function;
+**integration** = in-process plus a real database; **process** = a spawned child
+with a real socket, signal or file lock.
 
-### Blocked on §2 — where integration tests run
+### 7.1 HTTP layer
 
-3. Add the `test` job to `.github/workflows/ci.yml` with a Postgres service
-   container. This in turn unblocks the branch-protection required-checks list
-   and the Renovate automerge revisit, both already open in the plan.
-4. Build the harness: `Bun.sql` for `CREATE DATABASE … TEMPLATE`, drizzle
-   migrations into the template, a database per test file. Identical code local
-   or CI; only `DATABASE_URL` differs.
-5. Measure the `TEMPLATE` cost. Falls out of step 4 for free.
+#### a. CORS preflight
 
-### Blocked on §3 + §5 — which driver, which store
-
-6. **Swap the database driver** to the one the VPS will run. `Bun.sql` +
-   `drizzle-orm/bun-sql` versus `postgres-js`; needs the spike from §7.
-7. **Rewrite `withTransaction`.** The per-transaction `Pool` creation must go.
-   Cannot be validated before 6.
-8. **Replace `@upstash/ratelimit`** with an owned sliding window over an
-   in-process store, with the eviction problem from §5a designed for rather than
-   inherited from `lru-cache` defaults.
-9. **Port the two `dev-live` probes** onto the harness. They become real tests,
-   intent unchanged. Only meaningful after 4 and 6 — porting them onto
-   Neon-shaped infrastructure means porting them twice.
-10. Handler-level integration tests through `lib/http/adapters/next.ts`.
-
-### Critical path
-
-**1 → 2 → (§2 decision) → 3 → 4.** Steps 6–9 need the §5 answer, but §5 does not
-have to be settled now: nothing before step 6 depends on it, and step 2 is a
-week of useful work that no decision blocks.
-
-The one thing worth resolving soon is **§2**, because step 3 unblocks two items
-the plan already lists as open, and the answer looks like "GitHub Actions
-service container" at essentially zero cost while the repo is public.
-
----
-
-## 10. Test work routed out of the Elysia-migration review
-
-Everything below is new working-tree state, uncommitted and unreachable from
-`git log` — `app.ts`, `routes.ts`, `server.ts`,
-`lib/http/{request,response-policy,route-manifest,after-response}.ts` did not
-exist when §0–§9 were written, and none of those sections name Elysia, the route
-table, or the SQLite driver. Nothing here duplicates them.
-
-For each item: what to assert, the concrete failure it catches, and the seam —
-in-process via `app.handle(new Request(...))` (no socket), a direct unit call
-against an exported function, the existing boot smoke suite
-(`scripts/smoke.ts`), or a spawned-process test that needs a real `Bun.serve`
-socket or a real OS signal. No test code below; a separate pass implements it.
-
-### 10.1 CORS preflight regression
-
-**Assert.** An `OPTIONS` request against a registered path, carrying
+**Assert.** `OPTIONS` on a registered path carrying
 `Access-Control-Request-Method` and
-`Access-Control-Request-Headers: X-Captcha-Response`, gets back
-`Access-Control-Allow-Headers` containing `X-Captcha-Response` (case-insensitive
-membership in the comma-separated value). Also assert `Access-Control-Max-Age`
-equals `600`.
+`Access-Control-Request-Headers: X-Captcha-Response` answers with
+`Access-Control-Allow-Headers` containing `X-Captcha-Response`
+(case-insensitive membership in the comma-separated value), and
+`Access-Control-Max-Age` equal to `600`.
 
-**Why.** `@elysia/cors` (`node_modules/@elysia/cors/dist/cjs/index.js`) joins
-`CORS_POLICY.allowedHeaders` into a fixed string once, at plugin construction,
-and publishes it as a default header on every response via `app.headers(...)` —
-it only mirrors the browser's own `Access-Control-Request-Headers` back when
-`allowedHeaders` is left at its permissive `true` default, which this app does
-not do. So the advertised list is exactly, and only, what `CORS_POLICY` names in
-`app.ts`. A future edit that trims the array — as already happened once, per
-`CORS_POLICY`'s own comment recording that the captcha header was missing from
-both this file and `lib/http/adapters/hono.ts.disabled` — drops browser support
-for that endpoint while every status-code check keeps passing, because the
-preflight still answers `204` either way; only reading the header value catches
-it. `maxAge` guards the same class of silent drift against the plugin's own
-default (`maxAge = 5` in its source) — losing the override means the browser
-re-preflights nearly every cross-origin request instead of caching for the
-intended 10 minutes.
+**Why.** `@elysia/cors` joins `CORS_POLICY.allowedHeaders` into a fixed string
+once at plugin construction and publishes it as a default header; it mirrors the
+browser's own request headers back only when `allowedHeaders` is left at its
+permissive `true` default, which this app does not do. So the advertised list is
+exactly what `CORS_POLICY` names — and an edit that trims the array drops
+browser support for that endpoint while every status check still passes, because
+the preflight answers `204` either way. This already happened once: the captcha
+header was missing from both `app.ts` and the Hono example. `maxAge` guards the
+same drift against the plugin's own default of `5`, where losing the override
+means re-preflighting nearly every cross-origin request.
 
-**Seam.** In-process via `app.handle(new Request(...))` against a real
-`ROUTE_MANIFEST` path. The plugin answers `OPTIONS` from its own `onRequest`
-hook unconditionally; no socket is needed.
+**Seam.** In-process. The plugin answers `OPTIONS` from its own `onRequest`
+hook.
 
-### 10.2 Admission precedes body parsing
+#### b. Admission precedes body parsing — four properties, three seams
 
-Three distinct properties; do not test them all the same way or through the same
-seam.
+**b1. Oversized body rejected before buffering.** A JSON POST and a multipart
+POST past `MAX_REQUEST_BODY_BYTES` (8 MiB, exported from `app.ts`) both return
+`413`. The limit is `maxRequestBodySize`, a `Bun.serve` socket option, and its
+purpose is to stop Bun's 128 MiB default from buffering an oversized body before
+any per-route logic runs. Proving "before buffering" needs the client to still
+be sending when the rejection lands: pace the write (chunked body, or a raw
+socket with a delay between chunks) and assert the rejection arrives mid-write.
+Measured: the reply arrives after roughly 64 KiB of a declared 12 MiB body, so
+the rejection genuinely precedes buffering.
 
-**A. Oversized body rejected before buffering.** Assert a JSON POST and a
-multipart POST, both past `MAX_REQUEST_BODY_BYTES` (8 MiB, exported from
-`app.ts`), both return `413`. The limit is `maxRequestBodySize`, a `Bun.serve`
-socket option (`app.ts`'s `serve: {...}`), not an Elysia route check — its
-purpose is to stop Bun's own 128 MiB default from buffering an oversized body
-before any per-route logic runs. Proving "before buffering," not merely
-"eventually 413," requires the client to still be sending when the rejection
-happens: a single `fetch` that awaits a fully-built oversized buffer and then
-checks `status === 413` only proves the ceiling exists eventually. The stronger
-version paces the write — a streaming/chunked request body, or a raw socket
-write with a delay between chunks — and asserts the `413` (or a closed
-connection) arrives while the client is still mid-write. Flag for the
-implementer: confirm this Bun pin's `fetch` can pace an outgoing body before
-committing to that shape; a raw `Bun.connect` socket is the fallback if not.
-**Seam: spawned-process only.** `app.handle(new Request(...))` cannot observe
-this at all — the `Request` handed to `.handle()` is already fully materialised
-with no socket underneath, so the transport-level limit is never in the loop.
+**The 413 is a bare transport reply** — `HTTP/1.1 413 Request Entity Too Large`,
+no body, no security headers, no API envelope, no access-log line — and Bun's own
+`fetch` surfaces it as a closed socket rather than as a status. A `fetch`-based
+`status === 413` assertion **cannot** pass. **Seam: process, with `Bun.connect`.**
+`app.handle()` cannot observe this at all: the `Request` it receives is already
+materialised with no socket underneath.
 
-**B. A JSON-policy route sent `multipart/form-data` parses nothing.** Assert
-that for a route declared `body: 'json'` in `routes.ts`, a POST with
-`Content-Type: multipart/form-data` and a real multipart body yields
-`await ctx.readJson() === null`, and that `await ctx.readFormData()` also
-resolves `null` without the multipart parser ever running. This is
-`withBodyPolicy`'s routing logic (`lib/http/request.ts`): each reader is gated
-on `policy === … && essence === …`, and a forbidden reader is
-`() => Promise.resolve(null)`, which never touches the request stream. Before
-the reordering, the client's own `Content-Type` picked the parser — a JSON-only
-dashboard route parsing attacker-chosen multipart data is exactly the defect
-that closed. **Seam:** in-process via `app.handle(new Request(...))` against a
-real `body: 'json'` route, or a direct unit call against the exported
-`withBodyPolicy` — equally valid for this property, and cheaper.
+**b2. A JSON-policy route sent `multipart/form-data` parses nothing.** For a
+route declared `body: 'json'`, a POST with `Content-Type: multipart/form-data`
+and a real multipart body yields `await ctx.readJson() === null` **and**
+`await ctx.readFormData() === null`, with the multipart parser never running.
+Each reader in `withBodyPolicy` is gated on `policy === … && essence === …` and a
+forbidden reader is `() => Promise.resolve(null)`, which never touches the
+stream. Before the reordering the client's own `Content-Type` picked the parser —
+a JSON-only dashboard route parsing attacker-chosen multipart data. **Seam:**
+unit on `withBodyPolicy`, or in-process; both are valid, unit is cheaper.
 
-**B2. Nothing is parsed before the handler runs.** This is the property that
-distinguishes the current design from the first fix, which only reordered the
-ADAPTER's own admission check. Both readers are lazy and `withBodyPolicy` is
-synchronous, so a route whose only admission check lives inside its handler —
-the OTP endpoints, `preAuth: 'none'` with their own per-identifier budgets —
-also rejects before a byte is parsed. Assert it where it is observable: a
-request to `POST /api/auth/otp/send` that the handler's own limiter rejects must
-not have consumed the request body. **Seam:** a spy or an instrumented `Request`
-whose `text()` records that it was called, driven through `app.handle(...)`.
-Asserting this only against `withBodyPolicy` proves the reader is lazy, not that
-the handler ordered its checks correctly — assert both.
+**b3. Nothing is parsed before the handler runs.** This is what distinguishes the
+current design from the first fix, which only reordered the adapter's own
+admission check. Both readers are lazy and `withBodyPolicy` is synchronous, so a
+route whose only admission check is inside its handler — the OTP endpoints,
+`preAuth: 'none'`, with their own per-identifier budgets — also rejects before a
+byte is parsed. Assert it where it is observable: a `POST /api/auth/otp/send`
+that the handler's own limiter rejects must not have consumed the body. **Seam:**
+an instrumented `Request` whose `text()` records that it was called, driven
+through `app.handle`. Asserting only against `withBodyPolicy` proves the reader
+is lazy, not that the handler ordered its checks correctly — assert both.
 
-**C. Both readers are memoised.** Assert that calling `readFormData` twice on a
-`multipart` route, and `readJson` twice on a `json` route, returns the same
-result both times (same `FormData` / same parsed value, or both `null` for a
-malformed body) rather than throwing `Body has already been used` on the second
-call — the guard is `memoise`'s `pending ??= read()`. **Seam:** direct unit call
-against `withBodyPolicy` (`lib/http/request.ts`) with a real `Request` — no app
-or route table needed.
+**b4. Both readers are memoised.** `readFormData` twice on a multipart route and
+`readJson` twice on a JSON route return the same result both times (same
+`FormData`, same parsed value, or both `null` for a malformed body) rather than
+throwing `Body has already been used` on the second call. The guard is
+`memoise`'s `pending ??= read()`. **Seam:** unit, with a real `Request`.
 
-### 10.3 Production launch smoke
+#### c. Route-table conformance — table-driven over `ROUTE_MANIFEST`
 
-**Assert**, booting the real production command with throwaway production-shaped
-values (mirror `_env-secret-child.ts`'s `REQUIRED` map, plus
-`NODE_ENV=production`):
-
-- `Strict-Transport-Security` is present on a real response (value from
-  `SECURITY_HEADERS`, `lib/http/security-headers.ts` — production-only).
-- A relative `SQLITE_DIR` under `NODE_ENV=production` refuses to boot: no port
-  ever binds, non-zero exit.
-- A weak or absent `BETTER_AUTH_SECRET` refuses to boot: non-zero exit.
-- `NODE_ENV=prodution` (misspelt) refuses to boot: non-zero exit.
-
-**Why.** CI's "Boot smoke test" step (`.github/workflows/ci.yml`) sets
-`NODE_ENV: development` explicitly, so none of the above four run today — the
-whole production posture is unexercised by CI. The fourth case is the sharpest:
-`lib/env.server.ts` only ever compares `NODE_ENV === 'production'`, so a
-misspelling is silently treated as not-production and every guard it gates goes
-slack. The rejection for an invalid `NODE_ENV` value lives only in `server.ts`'s
-`requireNodeEnv()`, which runs _before_ `lib/env.server.ts` is even imported
-(the dynamic `await import('./app')` happens after the checks). `server.ts`'s
-own comment records this as a reproduced defect: a misspelt value "silently
-disabled all four [guards] at once while the server still booted and served
-traffic." A subprocess test that imports `lib/env.server.ts` directly — which is
-all `scripts/probe/local/env-secret.test.ts` does — never goes through
-`server.ts`'s gate and so cannot see this regression at all.
-
-**Cross-reference, not a duplicate.** `env-secret.test.ts` already exhaustively
-covers what makes a `BETTER_AUTH_SECRET` valid (length floor, whitespace, the
-library default, `AUTH_SECRET`/`BETTER_AUTH_SECRETS` aliasing) via subprocess
-against `lib/env.server.ts` directly. This item's job is narrower: confirm the
-same floor still holds when reached through the real `bun run start` boot
-sequence — one weak-secret case is enough here, not a re-derivation of the
-individual rejection rules.
-
-**Also assert** maintenance-token readiness: with a real
-`SQLITE_MAINTENANCE_TOKEN` configured, `/api/health/storage`'s
-`maintenanceTokenSet` field reports `true` — proving the production config
-actually wired a token, which the development-mode smoke run has no reason to
-exercise (a missing token 401s the sweep route regardless of environment, so
-today's check is blind to whether a token was ever configured at all).
-
-**Seam.** A second, sibling smoke run — spawned-process, same shape as
-`scripts/smoke.ts` (spawn, poll, assert, kill) but spawning the real
-`bun run start` command with production-shaped env, wired as a second CI step
-alongside the existing one. The negative cases invert the existing suite's pass
-condition — success means the process exits non-zero and a health fetch never
-succeeds — flag that polarity difference so it isn't copied from
-`scripts/smoke.ts` unchanged.
-
-### 10.4 In-process conformance suite
-
-Table-driven over `ROUTE_MANIFEST` (exported from `app.ts`), four assertions per
-entry:
+`ROUTE_MANIFEST` is exported from `app.ts` for exactly this. Four assertions per
+entry, plus five that the manifest walk cannot reach on its own.
 
 **Reachable.** A request satisfying the route's own `body`/`preAuth` policy
 reaches the handler — the response is neither `404` nor `405`. "Reachable" means
-the router dispatched to the intended handler, not that the handler succeeds.
-This is the direct replacement for hand-verifying that every `routes.ts` entry
-is actually wired into `app.ts`'s registration loop.
+the router dispatched to the intended handler, not that the handler succeeded.
+This replaces hand-verifying that every `routes.ts` entry is wired into `app.ts`'s
+registration loop.
 
-**Wrong method → `405` with a correct `Allow`.** A method not registered for the
-path returns `405`, and `Allow` matches `allowHeader()`'s computed set
-(`lib/http/route-manifest.ts` — `GET` implies `HEAD`, `OPTIONS` always
-included). Elysia reports both "no such path" and "wrong method on a real path"
-as the same `NOT_FOUND` (measured, per `app.ts`'s comment on `routeMiss`) —
-nothing but the manifest can tell them apart.
+**Wrong method → `405` with a correct `Allow`.** `Allow` matches `allowHeader()`'s
+computed set (`GET` implies `HEAD`, `OPTIONS` always included). Elysia reports
+"no such path" and "wrong method on a real path" as the same `NOT_FOUND`
+(measured), so nothing but the manifest can tell them apart.
 
-**Trailing slash → `308`.** The same path with a trailing `/` returns `308` with
-`Location` pointing at the canonical path. `strictPath: true` makes Elysia treat
-the two as different resources; wrong canonicalisation here silently splits a
-cache key and a security-rule match across two URLs for one resource.
+**Trailing slash → `308`.** With `Location` pointing at the canonical path.
+`strictPath: true` makes the two URLs different resources; wrong canonicalisation
+splits a cache key and a security-rule match across two URLs for one resource.
 
-**A case the manifest walk cannot reach on its own.** `ROUTE_MANIFEST` is
-`toManifest(ROUTES)` — it does not include `ROUTE_PREFIXES` (Better Auth's
-`/api/auth` prefix), even though `createRouteLookup(ROUTES, ROUTE_PREFIXES)`
-folds prefixes in at runtime for the 405 boundary. The wrong-method-on-
-`/api/auth/*` case (only `GET`/`POST` registered; `PUT`/`DELETE` must `405`)
-needs one hand-written assertion against `ROUTE_PREFIXES`, not something
-derivable from iterating the manifest.
+**`Cache-Control: no-store`** on every answer, including the `404`, `405` and
+`308` paths — these fall out of the walk for free.
+
+Then, the five hand-written cases:
+
+- **`/api/auth/*` wrong method.** `ROUTE_MANIFEST` is `toManifest(ROUTES)` and
+  does not include `ROUTE_PREFIXES`, even though `createRouteLookup` folds
+  prefixes in at runtime. Only `GET`/`POST` are registered, so `PUT`/`DELETE`
+  must `405` — one assertion against `ROUTE_PREFIXES`, not derivable from
+  iterating the manifest.
+- **`Allow` must never name a method the path answers 404 for** (shipped).
+  Generic assertion: for every manifest path, each method in `Allow` returns
+  something other than 404. The specific case it was written for is `HEAD` —
+  Elysia derives it from a `GET` route in the table but **not** from the Better
+  Auth wildcard, so `Allow: GET, POST, HEAD, OPTIONS` on `/api/auth/*` named a
+  method answering 404. `Allow` for those paths is now `GET, POST, OPTIONS`.
+- **The 405 boundary must not claim paths that do not exist** (shipped).
+  `ROUTE_PREFIXES` matched the whole `/api/auth` prefix, so
+  `PUT /api/auth/does-not-exist` answered `405 Allow: GET, POST` while `GET` on
+  the same path answered `404`. For a path outside `BETTER_AUTH_ALLOWED_PATHS`:
+  every method must be `404`, and `OPTIONS` must not be `204`.
+- **One URL shape, one answer, on every method** (shipped). For a real path,
+  every method on the trailing-slash form returns `308` with the same
+  `Location` — **including `OPTIONS`**, which answered `404` while every other
+  method redirected, because the route-aware OPTIONS gate runs before the router
+  and did not canonicalise. For an unknown path, every method on the slash form
+  returns `404` and none returns `308`, so the redirect never becomes a path
+  oracle.
+- **Every route must be IN the route table** (shipped). `/openapi.json` was
+  registered directly on the framework instance, so it silently had no 405
+  boundary, no trailing-slash redirect and no route-aware `OPTIONS` — the
+  manifest could not see it. Assert that the set of paths the server answers
+  equals the set the manifest declares.
 
 **Manifest completeness.** Every `handler.ts` under `app/api/**` is imported by
-`routes.ts`, and every `ROUTES` entry declares both `preAuth` and `body`. On the
-first half: `scripts/find-unused-files.ts`'s `assertHandlersRegistered` already
-performs exactly this check, but it is a standalone script
-(`bun run find:unused-files`) wired into neither `.github/workflows/ci.yml` nor
-`lefthook.yml` — today it only runs if invoked by hand. Folding the same
-assertion into this suite is what actually makes it CI-enforced, since this
-suite runs under `bun run test`. On the second half, stated honestly:
-`preAuth`/`body` are required fields on `RouteDefinition` — omitting either is
-already a compile error, so a runtime assertion here is cheap insurance against
-a future loosening of the type (an optional field, an `as RouteDefinition` cast)
-rather than something that catches anything reachable today. Keep it for the
-price; don't oversell it.
+`routes.ts` — `scripts/find-unused-files.ts`'s `assertHandlersRegistered`
+already performs this check, but folding it into a suite that `bun run test`
+executes is what makes it enforced rather than hand-invoked. Also assert every
+`ROUTES` entry declares both `preAuth` and `body`; stated honestly, both are
+required fields on `RouteDefinition` so omitting either is already a compile
+error — this is cheap insurance against a future optional field or an
+`as RouteDefinition` cast, not something reachable today.
 
-**Seam.** Entirely in-process via `app.handle(new Request(...))` — the reason
-`app.ts` was split from `server.ts` in the first place.
+**Seam.** In-process throughout, which is the reason `app.ts` was split from
+`server.ts`.
 
-### 10.5 Response policy
+#### d. Better Auth path allowlist — a security fix, not tidiness
 
-**A. A route's own conflicting header loses.** Assert that a handler returning a
-native `Response` carrying its own `Content-Security-Policy` still shows the
-application's CSP (`SECURITY_HEADERS`, `lib/http/security-headers.ts`) on the
-wire. Measured on the pinned `elysia@1.4.29` (`lib/http/response-policy.ts`'s
-own comment): a header on a native `Response` a route returns wins over the same
-key set into `set.headers`, so a route's own CSP silently replaced the global
-one before `mapResponse` existed to overwrite it back. **A wrinkle for the
-implementer:** no handler under `app/api/**` currently sets a custom CSP or any
-`HandlerOutput.headers` at all (checked), so there is no existing route to
-exercise this end-to-end. A direct unit call against `applyResponsePolicy` with
-a `Response` carrying a conflicting header proves the function's own overwrite
-logic, but says nothing about whether `app.ts`'s hook _registration order_ still
-puts `mapResponse` where it needs to be — that needs a route dispatched through
-the real pipeline. Do not mutate the shared `app` singleton exported from
-`app.ts` to add a throwaway route for this: `bun test` runs test files
-sequentially in one process by default (§8), so a route added to the shared
-instance in one file leaks into every other file's `app.handle()` calls for the
-rest of the run. Build a second, minimal Elysia instance in the test file, wired
-with the same hook chain (`onRequest` → `cors` → `mapResponse` → `onError`), and
-one throwaway route on that instead.
+**Assert.** `POST /api/auth/zz/sign-in/email/zz` — an arbitrary nonexistent path
+that merely _contains_ `sign-in/email` — answers `404` with this API's envelope
+and makes **no outbound call**. Assert the second half with the egress guard
+(§4.3), not by reading the response.
 
-**B. `Cache-Control: no-store` on every response, including error paths.** The
-`404`/`405` cases fall out of §10.4's manifest walk for free. For a genuine
-`500`: composing `toWebResponse(handleApiError(new Error(...)))` through
-`applyResponsePolicy` — the exact pipeline `app.ts` runs for an
-application-level throw — is enough to prove the default holds, without needing
-to provoke Elysia's own framework-level `onError` branch (which `handleApiError`
-already intercepts almost everything before it reaches, by design).
+**Why** (shipped). Better Auth runs plugin `onRequest` handlers ahead of its own
+hooks, and the captcha plugin matches its endpoint list with
+`pathname.includes(...)`. Measured before the fix: that path answered
+`400 Missing CAPTCHA response`, and with an `x-captcha-response` header it would
+have performed an outbound Turnstile siteverify for a path this server does not
+serve — unauthenticated, attacker-triggerable spend against the Turnstile quota
+from any URL shaped that way. `app.ts` now checks
+`BETTER_AUTH_ALLOWED_PATHS` before calling `auth.handler`.
 
-**Seam.** In-process via `app.handle(new Request(...))` for the routing-level
-cases; a direct unit call against `applyResponsePolicy` for the
-header-precedence function itself; a purpose-built second Elysia instance (never
-the shared `app`) for the end-to-end registration-order proof.
+**Also assert** `auth.options.baseURL === PUBLIC_ORIGIN` (shipped) under an
+environment that sets **only** `PUBLIC_URL`. The canonical-origin parse was added
+to `lib/env.js` and `lib/auth.ts` was not switched over, so Better Auth kept
+reading `process.env.NEXT_PUBLIC_URL`; once CI moved to the new name, `baseURL`
+was `undefined` — and session cookies are signed against that value. Asserting
+under an environment that sets both names hides exactly this bug.
 
-### 10.6 Cookie forwarding
+#### e. Response policy and cookies
 
-**Assert.** A `HandlerOutput` with two or more cookies (at least one carrying
-`extraFlags: ['Partitioned']`) survives `toWebResponse` → `applyResponsePolicy`
-with every `Set-Cookie` value intact and distinct —
-`response.headers.getSetCookie()` returns N separate values, not one
-comma-joined line, and `Partitioned` (or any other `extraFlags`/`extra`
-attribute) is still present on the value that carried it.
+**A route's own conflicting header loses.** A handler returning a native
+`Response` carrying its own `Content-Security-Policy` still shows the
+application's CSP on the wire. Measured on `elysia@1.4.29`: a header on a native
+`Response` a route returns wins over the same key set into `set.headers`, so a
+route's own CSP silently replaced the global one before `mapResponse` existed to
+overwrite it back.
 
-**Why.** `serializeSetCookie` (`lib/http/contract.ts`) is the one place that
-renders a `HandlerCookie` back to a header line, including attributes neither
-Next's nor Elysia's own cookie API models. `applyResponsePolicy`'s fallback path
-— triggered when `response.headers.set(...)` throws on an immutable header bag —
-rebuilds the `Headers` object and separately has to re-append every `Set-Cookie`
-value via `getSetCookie()`, specifically because `new Headers(headers)` folds
-repeated values into one comma-joined line, which browsers reject as a cookie
-header. Two independent places two cookies can be silently merged into one
-broken line; prove both survive.
+_A wrinkle:_ no handler under `app/api/**` currently sets a custom CSP or any
+`HandlerOutput.headers`, so no existing route exercises this end to end. A unit
+call on `applyResponsePolicy` proves the function's overwrite logic but says
+nothing about whether `app.ts`'s hook registration order still puts `mapResponse`
+where it needs to be. **Do not add a throwaway route to the shared `app`
+singleton** — files run sequentially in one process by default, so the route
+leaks into every other file's `app.handle()` calls for the rest of the run. Build
+a second minimal Elysia instance in the test file with the same hook chain
+(`onRequest` → `cors` → `mapResponse` → `onError`) and one throwaway route on
+that.
+
+**`Cache-Control: no-store` on a genuine 500.** Compose
+`toWebResponse(handleApiError(new Error(...)))` through `applyResponsePolicy` —
+the exact pipeline `app.ts` runs for an application-level throw. No need to
+provoke Elysia's framework-level `onError`, which `handleApiError` intercepts
+almost everything before by design.
+
+**Cookies survive intact and distinct.** A `HandlerOutput` with two or more
+cookies, at least one carrying `extraFlags: ['Partitioned']`, survives
+`toWebResponse` → `applyResponsePolicy` with `response.headers.getSetCookie()`
+returning N separate values — not one comma-joined line — and `Partitioned`
+still present on the value that carried it. Two independent places can merge
+them: `serializeSetCookie` is the only place a `HandlerCookie` is rendered
+(including attributes neither Next's nor Elysia's cookie API models), and
+`applyResponsePolicy`'s fallback path rebuilds the `Headers` object when
+`headers.set(...)` throws on an immutable bag, re-appending every `Set-Cookie`
+via `getSetCookie()` precisely because `new Headers(headers)` folds repeats into
+one comma-joined line that browsers reject.
 
 **Two seams for two properties.** `serializeSetCookie` is the unit — feed it a
-`HandlerCookie` with `extraFlags`/`extra` set and assert the rendered string
-contains them; no app needed. The wire is the integration — the multi-cookie,
-comma-join-proof property needs an actual `Response` to run `getSetCookie()`
-against. The immutable-headers fallback branch specifically has no current
-caller in this codebase that constructs an immutable-header `Response`
-(`app.ts`'s own redirect deliberately avoids `Response.redirect()` for exactly
-this reason) — exercise it with a direct unit call against `applyResponsePolicy`
-fed a `Response.redirect(...)`-built response, since nothing in the live route
-table produces one to catch this through `app.handle()`.
+cookie with `extraFlags`/`extra` set and assert the rendered string. The
+comma-join property needs a real `Response` to call `getSetCookie()` on. The
+immutable-headers fallback has no caller in this codebase that constructs an
+immutable-header `Response` (`app.ts`'s redirect deliberately avoids
+`Response.redirect()` for this reason), so exercise it with a unit call on
+`applyResponsePolicy` fed a `Response.redirect(...)`.
 
-### 10.7 SQLite invariants — replacing what the current probes do not cover
+#### f. The access log's own claim
 
-**a. The migration "concurrency" test is not concurrent, and does not call the
-production code.** `_sqlite-semantics-child.cjs`'s
-`[runMigration(), runMigration(), runMigration()]` are three synchronous
-function calls evaluated in array-literal order, in one process, one after
-another — nothing about that is concurrent. It also builds its own `Database`,
-runs its own PRAGMA sequence and its own `user_version` dance inline, rather
-than calling `openDatabase` (`lib/sqlite/database.ts`) and a real migration list
-— so a regression in `migrate()`'s actual `BEGIN IMMEDIATE` locking strategy
-would not be caught, because the test never calls that function. **What a
-genuine version needs:** real OS processes, not real function calls — spawn N
-(3–8) separate `bun` child processes via `Bun.spawn`, each pointed at the same
-file path through env (mirror the existing children's temp-directory pattern),
-each calling the production path (`getRateLimitStore()` in
-`lib/rate-limit/store.ts`, which calls `openDatabase` with the real
-`MIGRATIONS`), started via `Promise.all` over the spawns rather than awaited one
-at a time so their process starts and connection opens genuinely race. Assert
-every child exits `0` (the historically reproduced failure was a loser process
-throwing `table rate_limit already exists`, per `lib/sqlite/database.ts`'s own
-comment on `migrate`), and that a fresh connection afterward reads
+**Assert.** It is **not** one line per request: `OPTIONS` produces none, because
+both OPTIONS answers short-circuit in an `onRequest` hook (the CORS plugin's 204
+and the route-aware 404) and `onAfterResponse` never fires for them. 404s, 405s
+and 308s **do** appear. Assert exactly that set rather than the slogan, so a
+future change that starts or stops logging preflights is visible.
+
+#### g. OpenAPI document
+
+**A. The consistency check must fire on every drift shape.**
+`openApiConsistencyProblems(manifest)` is exported for this. Assert it returns
+empty for the real table and non-empty for each of: a route declaring
+`body: 'json'` with no `REQUEST_BODIES` entry; a `REQUEST_BODIES` key matching no
+route; a `CREATED_ROUTES` key matching no route; a route that keeps its schema
+after its body policy drops to `none`. Assert **separately** that
+`openApiDocument` _throws_ on each — the CI gate is the 500 that produces, since
+`scripts/smoke.ts` asserts `GET /openapi.json` is 200. Without the throw the
+check is decorative. Two routes shipped with no request body before it existed;
+adding the two schemas fixed the instances and nothing else.
+
+**B. Documented `required` must match runtime optionality** (shipped). For every
+request body in the document, a body omitting each listed-required key is
+**rejected** by the corresponding Zod schema, and a body omitting each
+not-required key is not rejected for that reason. This catches the converter
+defect directly: `z.toJSONSchema(schema, { io: 'input' })` reports
+`required: []` for `createUserSchema` because `emailSchema` and `passwordSchema`
+are `z.preprocess`, while the runtime rejects `{}` with a 422 — so
+`POST /api/dash/users` advertised seven optional properties, all required.
+`io: 'output'` is **not** the fix and must not be substituted: it marks defaulted
+keys (`isActive`, `phoneNumber`) required in a request where they are optional.
+Cover a discriminated union too (`sendOtpSchema`), where every branch listed only
+`channel`.
+
+**C. Statuses the server actually produces must be documented** (shipped). `400`
+and `422` appear on the operations that can return them. Both are derivable from
+the manifest — `400` from a non-`none` body policy via `requireJsonBody`, `422`
+from that or from a path parameter, since every `:id` route validates it — and
+both were absent while `422` is the standard validation failure of every JSON
+route. `401`, `403` and `409` are **not** derivable from the manifest today; if
+they should be documented that needs a new manifest field, which is a design
+change rather than a test.
+
+**D. `operationId` unique across the whole document** (shipped). Four Better Auth
+operations shared one object between `get` and `post`, invalid per OpenAPI 3.1
+§4.8.10 and breaking generators. A one-line uniqueness assertion over every
+operation catches the class.
+
+**E. Every route declaring a body policy appears with a matching request body**
+(shipped) — a cross-check between `ROUTE_MANIFEST` and `openApiDocument(...)`,
+not an inspection of the document alone.
+
+#### h. The registration scanner must fail on each hole that was open
+
+Four cases, each verified to exit non-zero: a `handler: NS.METHOD` reference
+present in `routes.ts` but **outside** the `ROUTES` array (a dead const satisfied
+the gate, because the regex ran over the whole file); an unrouted
+`export function POST`; an unrouted `export { x as POST }`. Plus one case that
+must exit **zero**: `export { GET as legacyGet }` alongside a routed `GET`, since
+the exported name is not a method and a false positive here trains someone to
+disable the gate. **Assert the exit codes, not the message text.**
+
+### 7.2 SQLite storage
+
+Seam for all of this: spawned children against the real `bun:sqlite` driver —
+same shape as the existing `_sqlite-semantics-child.cjs` (a separate process so a
+failed case cannot leak an open file handle), extended to genuinely concurrent
+spawns for (a).
+
+**a. Migration concurrency — the existing test is not concurrent and does not
+call the production code.** `_sqlite-semantics-child.cjs`'s
+`[runMigration(), runMigration(), runMigration()]` are three synchronous calls
+evaluated in array-literal order, in one process, one after another. It also
+builds its own `Database`, its own PRAGMA sequence and its own `user_version`
+dance inline rather than calling `openDatabase` with a real migration list — so a
+regression in `migrate()`'s `BEGIN IMMEDIATE` locking strategy would not be
+caught, because the test never calls that function.
+
+**What a genuine version needs:** real OS processes. Spawn 3–8 separate `bun`
+children via `Bun.spawn`, each pointed at the same file path through env (mirror
+the existing temp-directory pattern), each calling the production path —
+`getRateLimitStore()`, which calls `openDatabase` with the real `MIGRATIONS` —
+started via `Promise.all` over the spawns rather than awaited one at a time, so
+process starts and connection opens genuinely race. Assert every child exits `0`
+(the historically reproduced failure was a loser throwing
+`table rate_limit already exists`) and that a fresh connection afterwards reads
 `user_version === RATE_LIMIT_SCHEMA_VERSION` with the schema applied exactly
 once.
 
-**b. `sqlite-semantics.test.ts` never exercises Better Auth's own statements.**
-The child receives `SQL_CONSUME`, `SQL_SWEEP_RATE_LIMIT` and `SQL_ANY_EXPIRED`
-(extracted from `lib/rate-limit/store.ts`) but never `SQL_AUTH_CONSUME`,
-`SQL_AUTH_GET` or `SQL_AUTH_SET` — the three statements behind Better Auth's
-login-limiter storage contract, against the separate `auth_rate_limit` table.
+**b. Better Auth's own statements are never exercised.** The child receives
+`SQL_CONSUME`, `SQL_SWEEP_RATE_LIMIT` and `SQL_ANY_EXPIRED` but never
+`SQL_AUTH_CONSUME`, `SQL_AUTH_GET` or `SQL_AUTH_SET` — the statements behind the
+login limiter's storage contract, against the separate `auth_rate_limit` table.
 Assert `SQL_AUTH_CONSUME` is max-aware the same way `SQL_CONSUME` is already
 proven to be (admits exactly the limit, zero writes on denial, correct window
-rollover — the same three properties, run the same way, against the auth table).
-Assert `SQL_AUTH_GET` excludes expired rows (`WHERE ... expires_at > ?`). Assert
-`SQL_AUTH_SET` overwrites on conflict
-(count/window_start/last_request/expires_at all replaced) rather than
-accumulating.
+rollover), `SQL_AUTH_GET` excludes expired rows (`expires_at > ?`), and
+`SQL_AUTH_SET` overwrites on conflict — count, window_start, last_request and
+expires_at all replaced — rather than accumulating.
 
-**c. `auth-storage-log-boundary.test.ts` tests the boundary function, not the
-storage.** The file's own header says so: it asserts `describeAuthStoreFailure`
-in isolation because, when it was written, importing the real
-`authRateLimitStorage` under Bun would hard-panic (`better-sqlite3`). That
-blocker is gone — the driver is `bun:sqlite` now — and the file's own `TODO`
-names the fix: force a real failure out of the real storage (an unwritable
-`SQLITE_DIR` is the cheapest reliable way) and prove the same containment
-property — no IP, no key, no path — holds through the actual
-`catch → sanitizeForLog → console.error` wiring in
-`lib/rate-limit/auth-storage.ts`, not just through the extracted function.
+**Blocked on a decision:** `authGet`/`authSet` in `lib/rate-limit/store.ts` now
+have **no caller**, because `better-auth@1.7.1` dropped `get`/`set` from
+`BetterAuthRateLimitStorage` and made `consume` the sole member. Either write
+these tests and keep the statements as a tested seam, or delete both statements
+and drop this half of the entry. Tracked as `TODO.md` PG-3. Do not leave them as
+untested dead code.
 
-**d. The manufactured error name proves nothing, and the codebase already says
-so.** Both `auth-storage-log-boundary.test.ts:49` and
-`rate-limit-log-boundary.test.ts:42` hand-author
-`class LeakyDriverError extends Error { override name = 'SqliteError'; }`.
-Measured: `bun:sqlite` throws a plain `Error` whose `.name` is reassigned to
-`'SQLiteError'` (capital L, capital E — not the fixture's spelling) and whose
-`.constructor.name` is just `'Error'` — not a real subclass at all, unlike the
-fixture. `errorClassOf` (`lib/rate-limit/store-failure.ts`) reads only
-`error.name`, so every assertion of the shape
-`expect(d.errorClass).toBe('SqliteError')` is circular: it passes because the
-fixture set `.name` to that exact string, and would pass identically for any
-invented spelling — it says nothing about what `errorClassOf` reports for a
-_real_ driver error. `store-failure.ts`'s own comment names this precisely: "the
-probe suite still manufactures the Node spelling, which is a test defect
-recorded in reports/test-strategy.md" — this is that record. Fix both fixtures
-to the real spelling, and add at least one assertion per file whose error comes
-from an actual `bun:sqlite` failure (e.g. a real `SQLITE_CONSTRAINT_PRIMARYKEY`
-from a duplicate-key insert against a real table through the production driver)
-rather than a hand-authored class, so containment is proven against what the
-driver actually throws.
+**c. The log-boundary test tests the boundary function, not the storage.**
+`auth-storage-log-boundary.test.ts` asserts `describeAuthStoreFailure` in
+isolation because, when it was written, importing the real
+`authRateLimitStorage` under Bun hard-panicked (`better-sqlite3`). That blocker
+is gone. Force a real failure out of the real storage — an unwritable
+`SQLITE_DIR` is the cheapest reliable way — and prove the same containment
+property (no IP, no key, no path) through the actual
+`catch → sanitizeForLog → console.error` wiring, not just the extracted
+function.
 
-**e. Statement finalisation.** `openConnection` (`lib/sqlite/driver.ts`) now
-tracks every statement it prepares in a `live` set and, on `close()`, finalises
-all of them before calling `db.close(true)`. Assert two things: a connection
-with statements prepared through it (never explicitly finalised by the caller)
-closes without throwing — proving the tracked statements are what get finalised;
-and a statement handle obtained before `close()` genuinely stops working
-afterward — calling `.get()`/`.run()` on it throws rather than silently
-returning rows. The second is the regression proof: the module's own comment
-records that before this fix, a statement prepared from a connection then
-`db.close(false)`'d "still returned rows afterwards" — the handle, its file lock
-and its memory were all still held. A test that only checks `close()` doesn't
-throw would not catch that regression coming back; it has to reuse the pre-close
-statement handle afterward and expect failure.
+**d. Statement finalisation.** `openConnection` tracks every statement it
+prepares in a `live` set and finalises all of them on `close()` before
+`db.close(true)`. Two assertions: a connection with statements prepared through
+it (never explicitly finalised) closes without throwing; and a statement handle
+obtained **before** `close()` genuinely stops working afterwards —
+`.get()`/`.run()` throws rather than silently returning rows. The second is the
+regression proof: before this fix a statement prepared from a connection then
+`db.close(false)`'d still returned rows afterwards, with its file lock and memory
+still held. A test that only checks `close()` doesn't throw would not catch that
+coming back; it has to reuse the pre-close handle.
 
-**f. `busy_timeout` before `journal_mode = WAL`.** `applyPragmas`
-(`lib/sqlite/database.ts`) now sets `busy_timeout` first, specifically because a
-fresh `bun:sqlite` connection reads back `busy_timeout = 0` and
-`journal_mode = WAL` is itself lock-taking. Two separate assertions, not one:
-the read-back value (`describeDatabase(db).busyTimeout === BUSY_TIMEOUT_MS` on a
-fresh connection via the real `openDatabase`) proves the final state; it does
-not prove the _order_. Proving the order needs a real lock to contend with —
-hold a write lock on the same file from a second connection (e.g. an uncommitted
-`BEGIN IMMEDIATE` via `openConnection` directly, bypassing migrations), then
-open a fresh connection against that file through `openDatabase` and assert it
-_waits_ for the lock to clear rather than failing `SQLITE_BUSY` immediately:
-that wait is only possible if `busy_timeout` was already non-zero by the time
-the lock-taking `journal_mode = WAL` pragma ran. Two connections to one file
-within a single Bun process should reproduce SQLite's own locking correctly
-(locking is file-level, not process-level), but this is worth the implementer
-confirming rather than assuming, given this codebase's own standing rule of
-measuring PRAGMA behaviour rather than trusting documentation
-(`lib/sqlite/database.ts`'s header).
+**e. `busy_timeout` before `journal_mode = WAL`.** `applyPragmas` sets
+`busy_timeout` first because a fresh `bun:sqlite` connection reads back
+`busy_timeout = 0` and `journal_mode = WAL` is itself lock-taking. Two separate
+assertions, not one. The read-back value
+(`describeDatabase(db).busyTimeout === BUSY_TIMEOUT_MS` on a fresh connection via
+the real `openDatabase`) proves the final state and says nothing about the order.
+Proving the order needs a real lock: hold a write lock on the same file from a
+second connection (an uncommitted `BEGIN IMMEDIATE` via `openConnection`
+directly, bypassing migrations), then open a fresh connection against that file
+through `openDatabase` and assert it **waits** rather than failing `SQLITE_BUSY`
+immediately — that wait is only possible if `busy_timeout` was already non-zero
+when the lock-taking WAL pragma ran. Two connections to one file within one Bun
+process should reproduce SQLite's file-level locking correctly, but confirm that
+rather than assuming it.
 
-**Seam, all of 10.7.** Spawned child processes against the real `bun:sqlite`
-driver throughout — same shape as the existing `_sqlite-semantics-child.cjs` /
-`_cache-prefix-child.cjs` children (a separate process so a failed case cannot
-leak an open file handle), extended to genuinely concurrent spawns for (a)
-rather than same-process sequential calls.
+**f. Route-level SQLite behaviour still uncovered.** `scripts/smoke.ts` covers
+readiness-ok, the 404 envelope, the security headers and the sweep's
+unauthorized branch. Still uncovered: the readiness route's **degraded**
+branches (each of `journalModeWal`, `schemaVersion`, `busyTimeout`,
+`synchronousNormal`, `maintenanceTokenSet` failing individually → 503 with the
+failing field visible in `checks`), the sweep's `hasMore` under a real backlog,
+and the maintenance-token authorization matrix (absent token → 401, wrong token
+→ 401, correct token → 200, constant-time comparison).
 
-### 10.8 Shutdown
+### 7.3 Boot, shutdown, process lifecycle
+
+#### a. Startup rejection and production posture
+
+`server.ts` validates the runtime **before** importing the application, so none
+of this is reachable by a test that imports `lib/env.server.ts` directly (which
+is all `env-secret.test.ts` does). Spawn the real `bun run start`.
+
+**Assert non-zero exit and a `startup rejected` line for:** `NODE_ENV` absent;
+`NODE_ENV=prodution` (misspelt); `PORT` not a decimal integer in `1..65535`; a
+weak or absent `BETTER_AUTH_SECRET`; a relative `SQLITE_DIR` under
+`NODE_ENV=production`. The misspelling case is the sharpest —
+`lib/env.server.ts` only ever compares `NODE_ENV === 'production'`, so a
+misspelt value was silently treated as not-production and disabled all four
+production guards at once while the server still booted and served traffic
+(reproduced).
+
+**Assert the Bun version guard still bites.** A minor-version mismatch exits
+non-zero; a patch difference logs `bun patch version drift` and continues.
+`Bun.version` cannot be stubbed in a spawned real binary, so split it: assert the
+comparison as a **unit**, and assert the real guard does **not** reject at the
+pinned version by booting the real binary. Say which of the two any given
+assertion proves. The pin is not cosmetic: through Bun 1.3.x a simple-protocol
+query running concurrently with a not-yet-prepared parameterized query on the
+same connection could deliver one query's rows to the other, and the `BEGIN`,
+`COMMIT` and `ROLLBACK` that `db.transaction()` issues **are** simple-protocol
+queries (Bun #32772, fixed in 1.4.0). Below the pin every transaction in the
+application is exposed to it.
+
+**Assert the production posture, positively.** CI's boot smoke step sets
+`NODE_ENV: development` explicitly, so nothing exercises production today. With
+throwaway production-shaped values (mirror `_env-secret-child.ts`'s `REQUIRED`
+map plus `NODE_ENV=production`): `Strict-Transport-Security` is present on a real
+response, and `/api/health/storage` reports `maintenanceTokenSet: true` when a
+real `SQLITE_MAINTENANCE_TOKEN` is configured — proving the production config
+actually wired a token, which a missing-token 401 cannot distinguish from a
+route that is simply guarded.
+
+**Cross-reference, not a duplicate:** `env-secret.test.ts` already covers
+exhaustively what makes a `BETTER_AUTH_SECRET` valid (length floor, whitespace,
+the library default, the `AUTH_SECRET`/`BETTER_AUTH_SECRETS` aliases) via
+subprocess against `lib/env.server.ts`. This item's job is narrower: the same
+floor still holds when reached through the real boot sequence. One weak-secret
+case is enough.
+
+**Seam.** A sibling of `scripts/smoke.ts` — spawn, poll, assert, kill — wired as
+a second CI step. The negative cases invert the existing suite's pass condition:
+success means the process exits non-zero and a health fetch never succeeds. Flag
+that polarity so it is not copied from `scripts/smoke.ts` unchanged.
+
+#### b. Graceful shutdown
 
 **Assert.** A request already in flight when `SIGTERM` arrives completes
-normally — its `fetch()` resolves with the real response, not a connection reset
-— and the process exits within the bounded window (`SHUTDOWN_TIMEOUT_MS`, 15 s,
-plus margin). Separately, sending the signal twice in quick succession (or
-`SIGTERM` then `SIGINT`) runs the shutdown sequence exactly once: one
-`"server stopping"` / `"server stopped"` log line each, no duplicate close
-attempt on the rate-limit or cache store.
+normally — its `fetch()` resolves with the real response, not a connection reset —
+and the process exits within the bounded window. `SIGTERM` twice in quick
+succession, or `SIGTERM` then `SIGINT`, runs the sequence exactly once: one
+`server stopping` and one `server stopped` line, no duplicate close attempt on
+the rate-limit or cache store.
 
-**Why.** `app.stop()` with no argument drains; `app.stop(true)` aborts —
-`server.ts`'s comment records that the previous wiring
-(`process.on('beforeExit')`, not a real signal handler) never fired on Coolify's
-stop-first `SIGTERM` at all, so in-flight mutations, uploads and external calls
-were simply terminated. The idempotency guard (`stopping` boolean) exists
-because a container orchestrator's grace period is not a promise that exactly
-one signal arrives.
+**Why.** The previous wiring was `process.on('beforeExit')`, not a signal
+handler, so it never fired on Coolify's stop-first `SIGTERM` at all and in-flight
+mutations, uploads and external calls were simply terminated. The idempotency
+guard exists because a grace period is not a promise that exactly one signal
+arrives.
 
-**A gap worth naming.** No current route has a deliberate, controllable delay,
-so catching a request reliably "in flight" at the moment the signal is sent is a
-real scheduling problem, not just a matter of firing a request and a signal
-close together. The more robust shape: fire a burst of concurrent requests
-against an already-registered lightweight route, send the signal shortly after
-the burst starts (before all of them can plausibly have finished), and assert
-none of the in-flight ones error out — rather than depending on one request
-timed precisely against the signal.
+**Record and assert the real `app.stop()` semantics** (shipped as four wrong
+comments, and the wrong version argued for a different fix). Measured on
+`elysia@1.4.29`: `stop()` **does** close the listener — a new connection is
+refused as soon as it resolves — and what survives is an already-established
+keep-alive connection, on which a further request is still served. Assert both
+halves.
 
-**Seam.** Spawned-process only — this is real OS signal delivery to a real
-process; `app.handle()` has no process to signal, and the existing boot smoke
-suite neither sends signals nor measures drain timing. A new suite, sibling to
-`scripts/smoke.ts` in shape (spawn, interact over real HTTP, this time also
-signal and measure).
+**The forced-shutdown bound is derived; assert the invariant, not the number.**
+It is `max(IDLE_TIMEOUT_SECONDS, MAX_ROUTE_TIMEOUT_SECONDS) + 15` in
+milliseconds — 135 s with the current table. A flat 15 s bound would have aborted
+at 15 s exactly the 120 s upload the per-route ceiling exists to permit. The
+one-term form (`MAX_ROUTE_TIMEOUT_SECONDS` alone) is also wrong and would have
+passed while the two-term invariant was violated: `reports/coolify-deployment.md`
+§12.2 tells the operator to lower the upload ceiling to 30 s for a shorter deploy
+window, which under the one-term form leaves a 45 s bound against a global
+ceiling that still permits 60 s requests. **Assert the two-term form against a
+route table where the global ceiling is the larger term**, or the test proves
+nothing the one-term version did not.
 
-### 10.9 Bun test-runner features: `--coverage` and `--coverage-threshold`
+**Forced shutdown must actually fire when the drain hangs** (shipped). The timer
+was `unref`'d, so in the one shape it exists for — `app.stop()` resolved,
+listener closed, nothing after it settling, no other ref'd handle — the process
+exited **0** with no `forced shutdown` line and the store closes never ran.
+Assert a non-zero exit and the log line for a hung drain. This needs a hang
+_after_ `stop()` resolves, not during it: a hang during `stop()` leaves a ref'd
+handle and masks the defect.
 
-Short, by design. `--coverage`/`--coverage-reporter` are already named as
-Bun-first in §7; `--coverage-threshold` is the new piece — a CI gate, not just a
-report.
+**A gap worth naming.** No current route has a deliberate, controllable delay, so
+catching a request reliably in flight at the moment the signal is sent is a real
+scheduling problem. The robust shape: fire a burst of concurrent requests against
+an already-registered lightweight route, send the signal shortly after the burst
+starts, and assert none of the in-flight ones error — rather than timing one
+request precisely against the signal.
 
-A blanket, repo-wide threshold would be theatre twice over. Most of the codebase
-(`app/api/**` business logic, permission checking, most of `lib/`) has no tests
-after this pass either, so a repo-wide number is either meaningless-low or an
-immediate, expected failure. Sharper: coverage instrumentation only sees code
-executed _inside_ the `bun test` process. `server.ts`, and every path this
-section's own spawned-process tests exercise (§10.2's oversized-body case,
-§10.3's production boot, §10.7's multi-process migration race, §10.8), run in a
-_child_ process that `bun test --coverage` never instruments — a naive threshold
-would report those lines as uncovered regardless of how thoroughly the
-spawned-process suites actually exercise them, penalising exactly the code this
-pass tests most rigorously.
+**Seam.** Process only, and **Linux only** — see §9.
 
-Where a threshold is meaningful: scoped to what §10.4's conformance suite and
-§10.7's SQL invariant tests exercise completely by construction —
-`lib/http/route-manifest.ts`'s pure functions, `lib/http/request.ts`,
-`lib/http/response-policy.ts`, `lib/http/contract.ts`. A high threshold there is
-a real gate: a drop means a branch of the dispatch or admission logic escaped
-the table-driven walk. Everywhere else, report coverage without gating on it
-until tests exist to make the number mean something.
+### 7.4 PostgreSQL driver
 
-### Seam summary, for sequencing
+Everything here was verified by hand against a real local PostgreSQL 18.6 on Bun
+1.4.0 while making the Neon → `bun:sql` change, by a throwaway suite that was
+then deleted. That deletion is the gap this section closes. Each item either
+shipped broken or was one edit away from it.
 
-In-process (`app.handle`) and direct-unit assertions — §10.1, most of §10.2,
-§10.4, most of §10.5, the unit half of §10.6 — are cheap and belong in the
-existing `bun run test` step with no CI change beyond new files. Spawned-
-process assertions — §10.2's oversized-body case, all of §10.3, §10.7's
-multi-process migration race, §10.8 — are slower and each owns a real socket, a
-real child process, or a real signal; group them into their own step (or extend
-the existing "Boot smoke test" step) rather than folding them into
-`bun run test`, for the same reason `scripts/smoke.ts` is already a separate CI
-step from the probes.
+**Partly closed already, 2026-08-20 — check before treating an item as
+outstanding.** A review pass made the point that a check run once is not a check
+that stays, so two of these are now implemented rather than merely specified:
 
-### 10.10 Regressions this section exists because of
+- `scripts/probe/local/log-serializer.test.ts` gained six assertions covering
+  **b**: the SQLSTATE in `errno` kept, the constraint name beside it, an
+  OTP-shaped `errno` still redacted, a numeric Node `errno` kept, and the
+  SQLSTATE surviving the query-error reduction while the bound parameter does
+  not. They use Bun's own `SQL.PostgresError` constructor instead of
+  `Object.assign` on an `Error`, so the fixture cannot drift from the shape the
+  driver throws — and they need no database, so they run in CI today under
+  `bun run test`.
+- `scripts/probe/dev-live/database/driver-contract.dev-probe.ts` (new) covers the
+  live half — **a**, **b**'s real-error cases, **c**, **d** and **g** — against a
+  real server. 8 assertions, all passing, run with `bun run probe:db`.
 
-Added after an external verification pass found six defects in the
-implementation that the suites above would not have caught. Each is now a
-required assertion, because each shipped once.
+**That is not a gate, and the distinction matters.** `bun run test` runs
+`scripts/probe/local` only and CI has no PostgreSQL service, so the live probe
+runs on demand. Putting it under `local/` would break CI on the first push. §3's
+service-container decision is still what turns these into gates.
 
-**A. `bun install --frozen-lockfile` must succeed.** `package.json` was edited
-without regenerating `bun.lock`, so every CI install job would have failed while
-every local command passed — `node_modules` was already populated. Assert it as
-its own step, before anything else runs: no test that assumes an installed tree
-can detect this.
+Still specification-only: **e** (the pool and lazy connect), **f** (type
+mapping), **h** (the migration runner, which needs a scratch database) and the
+version guard, which belongs with §7.3's production-launch smoke.
 
-**B. `auth.options.baseURL` must equal `PUBLIC_ORIGIN`.** The canonical-origin
-parse was added to `lib/env.js` and `lib/auth.ts` was not switched over, so
-Better Auth kept reading `process.env.NEXT_PUBLIC_URL` — and once CI moved to
-the new `PUBLIC_URL` name, `baseURL` was `undefined`. Session cookies are signed
-against that value. Assert the two are identical under an environment that sets
-ONLY `PUBLIC_URL`; asserting under an environment that sets both hides exactly
-this bug.
+**a. The SQLSTATE moved, and three functions read it** (shipped). `Bun.SQL`'s
+`PostgresError` puts its own identifier in `code` —
+`'ERR_POSTGRES_SERVER_ERROR'` for every constraint violation — and the
+five-character SQLSTATE in **`errno`**, as a string. Measured across unique,
+not-null, check, FK, undefined-table, undefined-column, syntax, bad-cast,
+divide-by-zero, lock-not-available and `RAISE … USING errcode` failures: `errno`
+held the SQLSTATE in all eleven, letters intact (`42P01`, `23P01`), never a
+number. `neon-http` put it in `code`, so `isUniqueViolation`,
+`isForeignKeyViolation` and every caller went silently false the moment the
+driver changed — duplicate-email handling would have returned a generic 500
+instead of a 409.
 
-**C. Every route declaring a body policy must appear in the OpenAPI document
-with a matching request body.** Two routes declared `body: 'json'` and had no
-`requestBody` in the document because their schemas were module-private. Assert
-it as a cross-check between `ROUTE_MANIFEST` and `openApiDocument(...)`, not by
-inspecting the document alone.
+**Assert against errors thrown by the real driver, never a fixture.** A fixture
+setting `.errno = '23505'` proves only that the reader reads `errno`. Provoke
+each: `isUniqueViolation` true for a real duplicate insert through Drizzle, with
+`getConstraintName` returning the actual index name (`ux_users_email`) rather
+than the empty string; `isForeignKeyViolation` true for a real orphan `role_id`;
+`handleUserUniqueViolation` mapping a real `users` unique violation to **409**
+(the assertion that catches this at the contract level rather than the helper
+level); and both helpers **false** for an unrelated failure such as an undefined
+table, so the test cannot pass by matching everything. Also assert the wrapping:
+Drizzle rethrows inside a `DrizzleQueryError` whose `cause` is the driver error,
+so the fields sit one level down — `hasSqlState` checks both levels and both key
+spellings, and a test that only ever sees a top-level error proves half of it.
 
-**D. `operationId` must be unique across the whole document.** Four Better Auth
-operations shared one object between `get` and `post`, which is invalid per
-OpenAPI 3.1 §4.8.10 and breaks generators. A one-line uniqueness assertion over
-every operation catches the whole class.
+**b. The log serializer allowlists field names, so it lost the SQLSTATE too**
+(shipped). `serializeQueryError` reduces a parameter-bearing query error to
+hard-allowlisted fields, and the allowlist named `code` and `constraint`. With
+this driver `code` is `ERR_POSTGRES_SERVER_ERROR`, which fails the
+five-character shape gate and is dropped — so every driver-error log line carried
+a constraint name and no code at all. `errno` is now in both
+`QUERY_ERROR_SAFE_FIELDS` and `ERROR_DETAIL_KEYS`. Assert both directions on a
+**real** error: `sanitizeForLog` of a real `42P01` contains `42P01`;
+`sanitizeForLog` of a real `22P02` (uuid cast of a non-uuid, which PostgreSQL
+echoes the offending value into) contains `22P02` and does **not** contain the
+offending value. Both halves, because widening the allowlist to fix the first is
+exactly how the second gets broken. And a six-digit OTP in a `code` field is
+still redacted — `errno` joining the shape-checked set must not have widened what
+a plain `code` may carry.
 
-**E. Every route must be IN the route table.** `/openapi.json` was registered
-directly on the framework instance, so it silently had no 405 boundary, no
-trailing-slash redirect and no route-aware OPTIONS — the manifest could not see
-it. Assert that the set of paths the server answers equals the set the manifest
-declares; a route registered outside the table is invisible to every check that
-walks the manifest.
+**c. `db.execute()` returns rows, not a result object.** `neon-http` returned
+`{ rows: [...] }`; `bun-sql` returns the array. Three call sites read `.rows`:
+the role `DELETE … RETURNING`, the CTE `UPDATE … RETURNING`, and the
+`SELECT … FOR UPDATE OF u FOR SHARE OF r`. The compiler caught all three, which
+is the only reason this was not a runtime outage — `deleted.rows.length === 0` on
+an array is `undefined === 0`, i.e. false, so the role-delete guard would have
+**silently stopped rejecting deletes of roles that still have users**. Two of the
+three sites are security-relevant and a future `execute` written from memory gets
+no type error if it never touches `.rows`. Assert per site, through the real
+statement, inside a real transaction: the `DELETE … RETURNING` returns one row
+for a deletable role and zero for one already gone; the CTE `UPDATE … RETURNING`
+returns the previous name and a `Date` for `updated_at`; the locking `SELECT`
+returns the locked row.
 
-**F. The 405 boundary must not claim paths that do not exist.** `ROUTE_PREFIXES`
-matched the whole `/api/auth` prefix, so `PUT /api/auth/does-not-exist` answered
-`405 Allow: GET, POST` while `GET` on the same path answered `404`. Assert both
-halves for a path outside `BETTER_AUTH_ALLOWED_PATHS`: every method must be
-`404`, and `OPTIONS` must not be `204`.
+**d. Session continuity — the property the old two-driver split existed to
+buy.** Losing it would break `processOtpSend`'s advisory lock and every
+`FOR UPDATE` in the codebase with no error at all. Assert: two
+`pg_backend_pid()` reads inside one `withTransaction` return the same PID; after
+`pg_advisory_xact_lock(...)` inside a transaction, `pg_locks` shows exactly one
+advisory lock for that backend — using `utils/otp.ts`'s real statement, not a
+stand-in; a throw inside `withTransaction` rolls the writes back and the row
+count is unchanged; and a nested `tx.transaction()` becomes a SAVEPOINT, so an
+inner throw rolls back only the inner write while the outer transaction still
+commits. The last is a real behaviour change from a driver that could not nest
+at all.
 
-**G. The forced-shutdown bound must exceed the longest a request may run — BOTH
-ceilings.** A flat 15 s bound would have aborted the 120 s upload the route
-ceiling exists to permit. It is derived; assert the invariant rather than the
-number, so raising a route's `timeoutSeconds` cannot silently invalidate it
-again.
+**e. The pool, and the one property CI silently depends on.** **Lazy connect is
+load-bearing.** CI's boot smoke step runs with
+`DATABASE_URL: postgres://ci:ci@db.example.com/ci` and asserts that no
+PostgreSQL or network access is required. That was free with a `fetch`-based
+driver; it is now true only because `new SQL(...)` does not connect until the
+first query — measured: construction against an unreachable host takes about
+1 ms, and `close()` on a never-connected pool resolves in under 1 ms.
+**Assert it**, or the next person to add an eager connection or a startup ping
+breaks CI's whole smoke job and the failure will look like a network problem.
 
-**Corrected after this entry shipped:** the invariant is
-`SHUTDOWN_TIMEOUT_MS >= (max(IDLE_TIMEOUT_SECONDS, MAX_ROUTE_TIMEOUT_SECONDS) + 15) * 1000`,
-not `MAX_ROUTE_TIMEOUT_SECONDS` alone. The per-route maximum is only the right
-answer while it happens to be the larger of the two, and it is today (120 > 60)
-purely by coincidence of the current table. Asserting the one-term version would
-have passed while the two-term invariant was violated — which is exactly what
-`reports/coolify-deployment.md` §12.2 tells the operator to do (lower the upload
-ceiling to 30 s for a shorter deploy window), leaving a 45 s bound against a
-global ceiling that still permits 60 s requests. **Assert the two-term form**,
-and assert it against a route table where the global ceiling is the larger term,
-or the test proves nothing that the one-term version did not.
+Also assert: `MAX_POOL_CONNECTIONS` is a real ceiling — 12 concurrent queries
+open exactly 10 backends in `pg_stat_activity` for the current database;
+`closeDatabase()` on a live, actively-used pool resolves, and a query after it
+fails rather than silently reconnecting; and the process exits without a hanging
+handle after `closeDatabase()`, since a pooled connection holding the event loop
+open would turn every deploy into a forced shutdown.
+
+**f. Type mapping, where a wrong assumption is a wrong number.** Unchanged from
+`neon-http` in every case measured, which is the point — assert it so a driver or
+Bun upgrade cannot move it quietly. `count()` from Drizzle is a JS `number` (it
+carries `mapWith(Number)`), and so is the hand-written `usersCount` subquery in
+`app/api/dash/permissions/handler.ts`. **A raw `count(*)` without `mapWith` is a
+`string`** — PostgreSQL `bigint` maps to string by default and `bigint: false` is
+Bun's default. Assert the string case as well as the number case, so the reason
+`mapWith` is required is recorded where whoever writes the next aggregate will
+see it. Also: `numeric` is a `string` (precision preserved), `timestamptz` and
+`timestamp` are `Date`, `jsonb`/`json` are parsed objects, `uuid` is a `string`,
+integer and text arrays are JS arrays. And a guard rather than a fix:
+`'infinity'::timestamp` decodes to the **number** `Infinity`, not a `Date` (Bun
+#35121, changed in 1.4) — nothing in this schema writes it, so assert it only if
+a nullable timestamp ever gains an `infinity` sentinel, and know that `Date`
+methods on it will throw.
+
+**g. `jsonb` was double-encoded — the sharpest defect in the swap** (shipped,
+live, silent, and it reached the permission system).
+
+_Mechanism._ Drizzle's built-in `jsonb` returns `JSON.stringify(value)` from
+`mapToDriverValue`, because most PostgreSQL drivers want JSON _text_ for a jsonb
+parameter. `bun:sql` instead JSON-encodes whatever JS value it is handed for a
+jsonb parameter, so the already-serialised string was encoded a second time and
+the column stored a jsonb **string scalar** rather than an object. Measured on
+Bun 1.4.0: a string parameter into a jsonb column stores `"{\"a\":1}"`
+(`jsonb_typeof` = `string`); the same statement with the object stores `{"a":1}`
+(`jsonb_typeof` = `object`).
+
+_Why nothing noticed._ `mapFromDriverValue` JSON-parses a string, so the double
+encode round-tripped invisibly through the ORM — write twice, read twice, same
+object back. Every read through `db.select()` looked correct. What did **not** go
+through that mapper was every SQL-level jsonb operation.
+
+_What actually broke._ `refreshRoleSessions` and `refreshUserSessions` merge
+session metadata with `metadata || $1::jsonb`, and `||` on two jsonb **strings**
+concatenates into an array instead of merging objects. Reproduced:
+`sessions.metadata` became `["{\"keepMe\":…}","{\"roleName\":…}"]` and the
+permission patch was lost — a role's permission change did not reach the sessions
+it was supposed to refresh.
+
+_Two fix sites, because there are two ways a jsonb value reaches the driver_, and
+a test covering one proves nothing about the other. Column writes: `db/schema.ts`
+defines a local `jsonb` via `customType` with `toDriver: (v) => v`, deliberately
+shadowing the drizzle export, covering `sessions.metadata`,
+`role_permissions.permissions` and `audit_logs`' `old_data` / `new_data` /
+`changed_fields`. Raw parameters: the two `tx.execute(sql\`… || ${patch}::jsonb\`)`sites bypass the column mapper entirely and now bind the **object** instead of`JSON.stringify` of it.
+
+_Assert at the SQL level — not through the ORM read path, which is what hid
+this._ For every jsonb column, after a write through Drizzle,
+`jsonb_typeof(column) = 'object'` — the whole defect in one assertion, and the
+one a `select` through Drizzle cannot make. `refreshUserSessions` and
+`refreshRoleSessions` **merge**: an unrelated pre-existing key survives and the
+patched keys are overwritten; both halves, because a replace passes the second
+and fails the first while a broken merge fails both. The raw merge statement, run
+directly, produces `jsonb_typeof = 'object'` and not an array.
+
+_Fixture rule:_ **reset the row between cases.** Once a row holds an array,
+`array || object` appends and every later assertion in the same test reads
+contaminated state. This happened while writing the check and made a working fix
+look broken.
+
+_Also worth a guard:_ the bug is only reachable with `prepare: true` (the
+default). Without a prepared statement Bun does not learn the parameter is jsonb
+and sends it as text, which PostgreSQL parses correctly — so the same code is
+correct under `prepare: false` and wrong under `prepare: true`. Any future move
+to `prepare: false` (which the runbook prescribes if a transaction pooler is ever
+introduced) must not be read as making the helper unnecessary.
+
+**h. The migration runner.** `bun run db:migrate` is `scripts/migrate.ts` and
+applies both phases: `db/drizzle/` through the ORM's own migrator, then the
+idempotent hand-written SQL in `db/migrations/`. `drizzle-kit migrate` cannot run
+here at all — it supports four drivers and this project deliberately has none of
+them. Assert against a scratch database, never the dev one:
+
+- A fresh database ends with the 9 tables, the 8 enum types, `pg_trgm`, and all
+  four trigram GIN indexes.
+- The ledger is `drizzle.__drizzle_migrations` with one row per journal entry and
+  `created_at` equal to the journal's `when` — this is what makes the script
+  interchangeable with `drizzle-kit migrate`, and it is the claim the script's
+  header makes. A test is what keeps it true across a drizzle upgrade.
+- Running it twice is a no-op: no new ledger rows, no error from the
+  `IF NOT EXISTS` files.
+- Phase order asserted **by consequence**, not by reading the code: on a fresh
+  database the trigram indexes exist, which is only possible if the tables they
+  index were created first.
+- `bun run db:generate` reports "No schema changes" against `db/schema.ts` — the
+  migrations on disk really are the schema. Cheap, and it is the check that
+  answers "are the pending migrations applied, or just rewritten". It is also the
+  guard that the `customType` jsonb fix keeps emitting `jsonb` rather than
+  silently becoming a migration.
+
+### 7.5 Pure logic — the untested majority of the codebase
+
+Everything in this subsection is unit tier: no IO, no database, milliseconds. It
+is where the highest value per line is, and none of it is blocked on anything.
+
+**`lib/permissions/checker.ts` — `resolveActionScope`.** Highest value in the
+repository: a bug here is an authorization bypass and the function is pure.
+Assert the full matrix over `DASHBOARD_PAGES × PERMISSION_ACTIONS` with
+`test.each` — an empty matrix denies; the exact grant allows with `scope: 'all'`;
+the `Own` variant alone allows with `scope: 'own'`. Plus the two cases the
+function's own comment records as previously wrong: holding `edit` while asking
+for `editOwn` must be `allowed: true, scope: 'all'` (it was denied outright), and
+holding only `editOwn` while asking for `editOwn` must report `scope: 'own'` (it
+reported `'all'` — an own-scoped grant reported as unrestricted). No route asks
+for an own variant today, which is exactly how a latent trap becomes a live one.
+Also assert an unknown resource, a `null` matrix, and prototype-polluted keys
+(`__proto__`, `constructor`) all deny — the function indexes a plain object with a
+caller-supplied key.
+
+**`lib/permissions/utils.ts` — `sanitizePermissions`, `normalizeFullPermissions`,
+`permissionsEqual`, `diffPermissionMatrices`, `validatePermissionScope`.**
+`sanitizePermissions` is the boundary between a `jsonb` column and the
+authorization matrix, so assert it against hostile column content: an unknown
+page name, an unknown action, a non-boolean truthy value (`1`, `"true"`), a
+nested object, `null`, an array where an object is expected. Each must be dropped
+rather than passed through — a `"false"` string surviving as truthy is a grant.
+`validatePermissionScope` is the "cannot grant what you do not hold" rule: an
+actor holding a strict subset cannot grant a superset, per page and per action,
+and equality is permitted.
+
+**`lib/rate-limit/api.ts` — `ipBucket`, via `ipIdentifier`.** Hand-rolled IPv6
+parsing, which is where this class of bug lives. Assert: full IPv4 unchanged;
+IPv4-mapped IPv6 (`::ffff:1.2.3.4`) unchanged; an uncompressed IPv6 collapses to
+its first four hextets; **the same address written compressed collapses to the
+same bucket as its expanded form** — two spellings of one address must not be two
+budgets; `::1`; `::`; a `::` mid-string; an address with a zone index. Assert the
+invariant rather than the strings: any two addresses in one /64 map to one key,
+any two in different /64s do not. Also assert `ipIdentifier` throws **503** when
+no trusted header is present in production and resolves the loopback fallback
+under `NODE_ENV=development` — the fail-closed direction is the security
+property, and 400 would let a privacy-collapsing OTP catch mistake it for a
+client error and return a fake success.
+
+**`lib/rate-limit/api.ts` — the quota keys.** Assert the recovery surface uses a
+**different** key from the shared destination budget
+(`otp.send.dest.recovery.*` vs `otp.send.dest.*`): reserved capacity only counts
+as reserved if nothing else can spend it, and a refactor collapsing the two keys
+silently reintroduces a targeted account-recovery denial while every count
+assertion still passes. Assert `otpContactKind` maps both `sms` and `whatsapp` to
+`phone`, since keying on the channel is what let a caller double a paid budget by
+switching transport.
+
+**`lib/http/pre-auth.ts` — `preAuthScope`.** Assert `/api/dash/users/<uuid>` and
+`/api/dash/users/<other-uuid>` produce the **same** scope (ids must not explode
+the keyspace) while `/api/auth/forgot-password/send` and `/api/dash/users`
+produce **different** ones (one surface must not throttle another — the defect the
+function exists for, where anonymous recovery traffic and authenticated dashboard
+traffic from one office NAT drew on a single counter). Also the 40-character
+segment truncation, `/api` alone yielding `preauth.root`, and a path with empty
+`//` segments.
+
+**`lib/rate-limit/index.ts` — `rateLimit`'s arithmetic.** `windowStart` is
+`now - (now % windowMs)`, so this is the natural home for `setSystemTime`: the
+counter resets exactly at the boundary; `retryAfter` is floored to 1 s rather
+than 0 immediately before a rollover (the hot-loop case); a denial reports
+`remaining: 0` **without a follow-up read** — reading it back was a race where a
+concurrent process rolling the row into the next window overstated `retryAfter` by
+a whole window (measured 61 s where 1 s was correct). Then assert the degraded
+path returns `success: true, degraded: true`, and that `enforceRateLimit`
+converts exactly that into a **503 with `Retry-After`** when `failClosed` and
+into nothing when not. That pairing is the fail-closed contract of every OTP and
+auth path.
+
+**`utils/time.ts`.** Partly covered already. Extend to: the Riyadh default (a
+zone with no DST) and a DST zone across both transitions;
+`zonedDayStart`/`zonedNextDayStart` on the skipped and the repeated hour;
+`calendarDayInZone` immediately either side of midnight. Drive with
+`setSystemTime`, not hand-built dates, so the assertion is about the function
+rather than the fixture.
+
+**`utils/index.ts` — `sanitizeForLog` / `serializeForLog`.** The SQLSTATE cases
+are in §7.4b. Add the general containment property: a deeply nested object, a
+cyclic object, a `Headers`, an `Error` with a `cause` chain and a `Buffer` all
+serialize without throwing and without emitting a value from any redacted key.
+Assert the key-**fragment** rule with `test.each` over `password`, `newPassword`,
+`currentPassword`, `token`, `secret`, `otp`, `code` — fragments rather than exact
+names is what the redactor learned the hard way, since an exact set let
+`newPassword` and `currentPassword` through.
+
+**`utils/index.ts` — `validID`, `returnNumber`, `positiveInt`,
+`normalizeArabicDigits`, `extractIdFromUrl`.** `validID` gates every id that
+reaches SQL: assert it rejects a v4 UUID, a non-UUID of exactly 36 characters, an
+uppercase variant and one with surrounding whitespace. `normalizeArabicDigits`
+runs before numeric validation: assert Arabic-Indic and Extended Arabic-Indic
+digits both normalize and that a mixed-script string does not silently
+half-convert.
+
+**`utils/validation/*` — the Zod schemas.** The largest untested surface, and
+pure. Per schema, with `test.each`: the minimal valid input parses; each required
+field's absence is rejected; each length bound rejects at `max + 1` and accepts at
+`max`; and the `z.preprocess` layers (`emailSchema`, `passwordSchema`,
+`phoneSchema`, `otpCodeSchema`, `slugPreprocess`, `datePreprocess`) **normalize**
+rather than merely validate — trimming, case-folding, Arabic-digit conversion.
+Then two properties that are not per-schema: **`.strict()` schemas reject unknown
+keys** (mass assignment is the failure mode), and the documented-required
+cross-check of §7.1g-B, which is the same assertion from the OpenAPI side and
+must agree with this one. `sanitizeStrict` / `safeStringRegex` get their own
+hostile-input table: control characters, RTL overrides, zero-width joiners,
+`<script>`, a null byte.
+
+**`lib/data-table/filter-columns.ts` — `escapeLike`, `filterColumns`,
+`getColumn`.** These build SQL from query parameters. Assert `escapeLike`
+neutralizes `%`, `_` and the escape character itself, and that a value of `100%`
+matches literally rather than as a wildcard. Assert `getColumn` rejects a column
+not in the spec (an allowlist, not a filter) and `operatorAllowedForType` rejects
+an operator the column's type does not support. Assert `filterColumns` **throws**
+`MSG_INVALID_FILTER` on a malformed filter rather than producing a query — the
+failure to prevent is a silently-empty `where`, which reads as "no filter" and
+returns everything.
+
+**`lib/data-table/parsers.ts`.** Assert `MIN_SEARCH_LENGTH`, `MAX_SEARCH_LENGTH`,
+`MAX_PAGE` and `MAX_PER_PAGE` are enforced (an unbounded `perPage` is a denial
+vector), a non-numeric `page` falls back rather than producing `NaN` in SQL, and
+`parseSortingState` rejects a column outside the allowlist.
+
+**`lib/cache/prefix.ts` — `prefixUpperBound`.** Assert directly rather than only
+through `cacheDeletePrefix`: the empty prefix, a prefix ending in `0xFF`, and a
+prefix containing `%`, `_`, `*`, `?` and `[` — the closed key grammar `TODO.md`
+requires before the first cache call site exists.
+
+**`lib/auth/password-pepper.ts` — `validatePasswordPepperConfiguration`.** A
+keyring missing the active id is rejected at load; a secret below the length
+floor is rejected; malformed JSON is rejected; and a keyring still containing a
+**retired** generation is accepted — removing one while codes hashed under it are
+inside their expiry is the HTTP 500 `TODO.md` describes. Configuration parse
+only; no hashing needed.
+
+**`utils/api-response.ts` — `handleApiError` and the violation mappers.** A
+`CustomError` keeps its status, message and `responseHeaders`; an ordinary
+`Error` becomes a fixed generic 500 with no dependency message reaching the
+client; a `ZodError` becomes 422 with field-level detail;
+`handleUserUniqueViolation` maps a **real** driver error to 409 (§7.4a — never a
+fixture). Assert `getErrorHeaders` preserves `Retry-After` and `X-RateLimit-*`:
+the limiter's contract is in the headers, not the body.
+
+**`utils/svg/*` and `utils/images/*` — `sanitizeSvg`, `validateSvgFile`,
+`isDangerousValue`, `safeDecodeURI`.** Security-relevant and pure. One table of
+hostile SVGs, all neutralized: inline `<script>`, `onload`, a `javascript:` href,
+a `data:text/html` href, `<foreignObject>`, an external `xlink:href`, a CSS
+`@import`, a percent-encoded `javascript:` (which is what `safeDecodeURI` exists
+for), an entity-expansion payload, and a document past `SVG_MAX_ELEMENTS`.
+`validateSvgFile` rejects a non-SVG with an `.svg` name. **Run the same table
+against both copies**: `utils/svg/server.ts` and `utils/images/server.ts` are
+divergent duplicates of security code (`TODO.md` EM-11), and running one table
+against both is what makes the divergence visible instead of theoretical.
+
+**`lib/r2/upload-helper.ts` — `validateMagicBytes`, `isAllowedImageType`.** Each
+allowed type's real magic bytes pass; a PNG header under a `.jpg` name is judged
+by bytes not name; a polyglot (valid GIF header followed by `<script>`) is
+rejected; a truncated header is rejected rather than throwing; an empty buffer is
+rejected.
+
+**`lib/r2/client.ts` — `getCacheControlHeader`, `getContentDisposition`,
+`getPublicUrl`, `isAllowedMimeType`, `getR2ConfigStatus`.** Pure.
+`getContentDisposition` decides whether a browser renders or downloads
+attacker-supplied content, so assert quoting and that a filename containing a
+quote, a newline or a non-ASCII character cannot break out of the header value.
+
+**`utils/sanitize-filename.ts`.** Path traversal (`../`, `..\`), an absolute
+path, a Windows device name (`CON`, `NUL`), a trailing dot or space, a null byte,
+an over-long name, and a name that sanitizes to **empty** — which must produce a
+generated id rather than an empty string.
+
+**`lib/id.ts` — `generateUuidV7`.** Format against the application's own
+`UUID_V7_REGEX`, the version nibble, the RFC 9562 variant bits, and strict
+monotonicity across a burst. Load-bearing: these are time-ordered primary keys
+and the session list pages on a `(createdAt, id)` keyset cursor.
+
+The implementation is now `Bun.randomUUIDv7` (`TODO.md` EM-5, switched
+2026-08-20; `uuid` had been kept because 1.3.x wrapped a 12-bit counter and
+inverted at index 4096 of a millisecond bucket, which 1.4.0 fixed by advancing
+the embedded timestamp instead). Two consequences for what must be asserted, and
+both are cheap:
+
+- **The burst has to be big enough to exhaust the counter** — over 4,096 ids
+  inside one millisecond — or the assertion passes without testing the case that
+  used to fail. Assert the bucket size it actually reached, not only the absence
+  of inversions.
+- **Assert the embedded timestamp is never behind `Date.now()`**, and do not
+  assert it is never ahead: counter exhaustion deliberately borrows future
+  milliseconds (measured 333 ms ahead in a 3M-id tight loop). Behind is the
+  ordering defect; ahead is the accepted cost. `bench/uuid/` covers both against
+  the two implementations; the suite's job is the narrower one of keeping the
+  property true for the one that ships.
+
+**`lib/http/security-headers.ts`.** HSTS present under `NODE_ENV=production` and
+absent otherwise; CSP, frame and referrer headers on every response including
+error paths (the wire half is §7.1e).
+
+**`lib/http/route-manifest.ts` — `toManifest`, `createRouteLookup`,
+`allowHeader`.** The pure half of §7.1c: `GET` implies `HEAD`, `OPTIONS` always
+included, prefix folding, and the ordering that makes `/api/dash/users/me/...`
+win over `/api/dash/users/:id`.
+
+### 7.6 Integration behaviour
+
+Seam: in-process handlers plus a real database, per §4.
+
+**`utils/otp.ts` — `processOtpSend` / `processOtpVerify`.** The most
+concurrency-sensitive code in the repository, and local sub-millisecond latency
+will expose races Neon's tens-of-milliseconds RTT masked. Race windows scale with
+RTT, so a TOCTOU the old stack hid can surface here — and lock contention that
+only appears at local speed never appeared on Neon. Use `{ repeats: n }` so a
+single lucky ordering does not read as a proof.
+
+- `OTP_MAX_ATTEMPTS`, `OTP_MAX_VERIFY_ATTEMPTS`,
+  `OTP_MAX_DAILY_VERIFY_ATTEMPTS` and the six-hour block each admit exactly their
+  limit and deny the next — checked by **row state**, not only by response
+  status.
+- Concurrent verifies of the same code consume it **once**: two parallel requests
+  with the correct code produce one success and one failure, not two successes.
+  This is what `pg_advisory_xact_lock` and `FOR UPDATE` are for, and §7.4d proves
+  the driver can now hold them.
+- The advisory lock in `processOtpSend` is actually taken — asserted via
+  `pg_locks` for the transaction's backend PID, using the production statement.
+- Delivery-failure accounting: a provider that throws leaves the row in the state
+  the code claims, and the global breaker is charged at the **delivery boundary**
+  and not by the pre-lookup chain. `otp-global-breaker.test.ts` asserts this with
+  `rateLimit` stubbed; the integration version asserts it against the real store.
+- Anchored-window honesty, with `setSystemTime`: 2000 sends at 23:59 UTC **plus**
+  2000 at 00:01 UTC both succeed. That is the accepted behaviour `TODO.md`
+  records; asserting it keeps it a decision rather than a surprise.
+- `verification_sessions.verify_attempt_daily` is summed across matching
+  `(userId, contactKind)` rows, each with its own anchored 24-hour window, and
+  successful verification, credential rotation and cleanup can delete rows and
+  therefore forgive their failed attempts. Assert the behaviour as an **anchored
+  fixed window**, never as a rolling one — the wording rule in `TODO.md` applies
+  to test names too.
+
+**`lib/auth/login-guard.ts` — `verifyLoginAttempt`.** The lock counter increments
+per failure; the lock engages at the threshold and releases at `locked_until`
+(drive expiry with `setSystemTime`); a correct password mid-lock is still
+refused; a successful login resets the counter. Then the concurrency case: N
+parallel wrong passwords produce exactly N increments, not fewer — a lost update
+here is a brute-force window.
+
+**`lib/permissions/checker.ts` — the DB path.** A deleted session row denies a
+**write** even while the cookie cache would still serve the session; a
+deactivated user denies; an inactive role denies; a user with no role gets 403
+rather than 401. And assert the boundary this deliberately does **not** cross: a
+**read** still succeeds from cache for the cache window, because that is the
+accepted trade — a test that "fixes" it would be asserting a decision nobody
+made. `assertLiveSession` is a pre-transaction check: it proves the row existed
+when it ran, not that it still exists when the mutation commits. Do not write a
+test name or comment claiming it closes the rotation race.
+
+**`lib/permissions/utils.ts` — `refreshRoleSessions` / `refreshUserSessions`.**
+§7.4g, and it is the sharpest item there: assert the merge at the **SQL** level.
+
+**`lib/auth/rotation.ts` — `revokeOtherSessions`, `revokePendingProofs`.** A
+password change deletes every other session and leaves the current one; pending
+proofs for the rotated contact are gone; and the audit row is written in the same
+transaction — a rotation that commits without its audit entry is the one case the
+audit log cannot reconstruct.
+
+**`lib/audit.ts` — `auditLog`.** Against a real insert: `old_data`/`new_data`
+containing `newPassword` stores the key with no value; `jsonb_typeof` is `object`
+(§7.4g — audit's three jsonb columns are in the same class); `apiPath` and
+`userAgent` truncate at their constants rather than erroring.
+
+**Per-route enforcement, table-driven.** §7.1c proves each route is _reachable_;
+this proves each one _enforces_. For every mutating route in `ROUTES`:
+unauthenticated is 401; authenticated-but-unauthorized is 403; a malformed body
+is 422; a valid request produces the documented status **and** an `audit_logs`
+row; the response envelope matches the contract. Routes with
+`preAuth: 'ip-limit'` additionally answer **503** when the limiter store is
+broken — fail-closed is the entire purpose of `enforcePreAuthIpLimit`, and a
+passing 429 test does not prove it.
+
+**`app/api/upload/image/handler.ts`.** The per-file byte ceiling, the magic-byte
+rejection, and that the route is still **unauthenticated** (`TODO.md` item 1).
+Write that last one as the current contract with a comment naming the open
+decision, so changing it is deliberate rather than accidental.
+
+**`app/api/dash/users/[id]/handler.ts` and `.../sessions/handler.ts`.** The
+`editOwn` gate: an actor with `editOwn` viewing a user they did not create is
+refused, and the sessions subresource refuses for the same reason on page one as
+on page two. Session metadata (IP, user-agent) must be gated by the same role
+authority the `/sessions` subresource requires, which needs `createdBy` and
+`roleId` from the user row plus an `actorCoversTargetRole` check — when sessions
+were fetched in parallel with the user query, page one arrived through this
+endpoint while only page two was refused by the child route. Assert both, or the
+fix is only a comment.
+
+**Keyset pagination — `app/api/dash/users/[id]/sessions/pagination.ts` and
+`db/queries/*`.** The cursor is stable across a page boundary when a row is
+inserted between requests, and a forged or garbage cursor is rejected rather than
+scanning from the start.
+
+**Property test worth having, from `TODO.md`:** a concurrent role rename plus a
+user role change (the same user moving off the role as it is renamed) converges
+to a consistent final state — no orphan sessions, no stale `roleName` in
+`session.metadata`.
 
 ---
 
-## 10.11 Assertions from the verification-adjudication pass
+## 8. Coverage gating, scoped
 
-Added after an independent adjudication of
-`reports/elysia-migration-implementation-verification.md` against the response
-to it. Everything here is either a defect that was found and fixed in that pass,
-or a property that was measured by hand and is currently protected by nothing.
-Same rule as §10.10: each one shipped, or could have.
+Report coverage everywhere; gate almost nowhere. A repository-wide threshold
+would be theatre twice over: most of the codebase has no tests even after this
+pass, so a repo-wide number is either meaninglessly low or an immediate expected
+failure — and coverage instrumentation only sees code executed **inside** the
+`bun test` process, so every spawned-process tier (§7.1b1, §7.2, §7.3) reports as
+uncovered no matter how thoroughly it is exercised, penalising exactly the code
+this plan tests most rigorously.
 
-**A. The OpenAPI consistency check must fire on every drift shape.**
-`openApiConsistencyProblems(manifest)` (`lib/http/openapi.ts`) is exported for
-this. Assert it returns empty for the real table, and non-empty for each of: a
-route declaring `body: 'json'` with no `REQUEST_BODIES` entry; a
-`REQUEST_BODIES` key matching no route; a `CREATED_ROUTES` key matching no
-route; a route that keeps its schema after its body policy drops to `none`.
-Assert separately that `openApiDocument` THROWS on each, because the CI gate is
-the 500 that produces — `scripts/smoke.ts` asserts `GET /openapi.json` is 200.
-Without the throw the check is decorative. This is the class of the
-two-routes-with-no-request-body defect; adding the two schemas fixed the
-instances and nothing else.
+Gate only where the suite is exhaustive by construction:
+`lib/http/route-manifest.ts`, `lib/http/request.ts`,
+`lib/http/response-policy.ts`, `lib/http/contract.ts`, `lib/http/pre-auth.ts`,
+`resolveActionScope` in `lib/permissions/checker.ts`, `lib/rate-limit/api.ts`,
+`lib/cache/prefix.ts`, `utils/time.ts`, `utils/sanitize-filename.ts`. A drop
+there means a branch of the dispatch, admission or authorization logic escaped
+the table-driven walk.
 
-**B. Documented `required` must match runtime optionality.** For every request
-body in the generated document, assert that a body omitting each listed-required
-key is REJECTED by the corresponding Zod schema, and that a body omitting each
-NOT-required key is not rejected for that reason. This is the sharpest form and
-it catches the converter defect directly:
-`z.toJSONSchema(schema, { io: 'input' })` reports `required: []` for
-`createUserSchema` because `emailSchema` and `passwordSchema` are
-`z.preprocess`, while the runtime rejects `{}` with a 422 — so
-`POST /api/dash/users` advertised seven optional properties, all of which are
-required. `io: 'output'` is not the fix and must not be substituted: it marks
-defaulted keys (`isActive`, `phoneNumber`) required in a request where they are
-optional. Cover a discriminated union too (`sendOtpSchema`), where every branch
-listed only `channel`.
+Use `coveragePathIgnorePatterns` to exclude everything else while the gate is
+narrow, and **verify the gate fails before trusting it** — set the threshold
+absurdly high once and confirm a non-zero exit. The singular-key trap in §2
+means a misconfigured threshold is indistinguishable from a passing one.
 
-**C. Statuses the server actually produces must be documented.** Assert `400`
-and `422` appear on the operations that can return them. Both are derivable from
-the manifest — `400` from a non-`none` body policy (`requireJsonBody`), `422`
-from that OR a path parameter, since every `:id` route validates it — and both
-were absent while `422` is the standard validation failure of every JSON route.
-`401`, `403` and `409` remain undocumented and are NOT derivable from the
-manifest today; if they should be, that needs a new manifest field, which is a
-design change rather than a test.
+---
 
-**D. The registration scanner must fail on each hole that was open.** Four
-cases, each verified to exit non-zero: a `handler: NS.METHOD` reference present
-in `routes.ts` but OUTSIDE the `ROUTES` array (a dead const satisfied the gate,
-because the regex ran over the whole file); an unrouted `export function POST`;
-an unrouted `export { x as POST }`. Plus one case that must exit ZERO:
-`export { GET as legacyGet }` alongside a routed `GET`, since the exported name
-is not a method and a false positive here would train someone to disable the
-gate. Assert the exit codes, not the message text.
+## 9. Out of scope, deliberately
 
-**E. `Allow` must never name a method the path answers 404 for.** For every path
-the manifest knows, assert that each method in `Allow` returns something other
-than 404. This catches the shape generically; the specific one it was written
-for is `HEAD` — Elysia derives it from a `GET` route in the table but NOT from
-the Better Auth wildcard, so `Allow: GET, POST, HEAD, OPTIONS` on `/api/auth/*`
-named a method answering 404. That is `RoutePrefix.paths`' over-claiming defect
-surviving in the method dimension after it was fixed in the path dimension.
+- **R2 network calls, SMTP delivery, Deewan, WhatsApp, HIBP, Turnstile
+  siteverify.** Faked at the egress boundary (§4.3). Their real behaviour is a
+  deployment check.
+- **Better Auth internals.** Assert the configuration this project owns —
+  `baseURL`, the allowed-path list, the limiter rules — not the library's session
+  machinery.
+- **Argon2 parameters.** Assert the profile constants; benchmarking belongs in
+  `bench/`.
+- **`sharp` output pixels.** Assert the decision (`shouldOptimizeImage`, the size
+  and pixel ceilings), not the bytes.
+- **Anything needing Linux.** The SIGTERM ordering in §7.3b and §7.4e cannot be
+  tested on this machine: Windows `TerminateProcess` is not interceptable, so a
+  spawned server killed with `SIGTERM` exits 143 with no handler output. Mark
+  those `test.skipIf(process.platform === 'win32')` so CI runs them and the local
+  run says so out loud rather than reporting a false pass.
+- **`lib/http/adapters/hono.ts.disabled`.** Unverifiable by construction: it
+  matches no tsconfig include, no lint glob and no test, and it drifted anyway —
+  it called `attachBody`, deleted three changes ago, and nothing caught it. Its
+  CORS policy was extracted into `CORS_POLICY` specifically so it could not
+  drift, and the body contract — the security-relevant half — drifted regardless.
+  Either give it a check that can fail (a static rule asserting every identifier
+  it imports from `lib/http/*` still exists, which is cheap) or accept that it is
+  prose and stop describing it as "the working adapter". Decision, not a test —
+  `TODO.md` EM-17.
 
-**F. One URL shape, one answer, on every method.** For a real path, assert every
-method on its trailing-slash form returns `308` with the same `Location` —
-INCLUDING `OPTIONS`, which answered `404` while every other method redirected,
-because the route-aware OPTIONS gate runs before the router and did not
-canonicalise. For an unknown path, assert every method on the slash form returns
-`404` and none returns `308`, so the redirect never becomes a path oracle.
+**One known-open gate, and it must be visible rather than absent.**
+`utils/config.ts` sets `OTP_AUTO_VERIFY = true`, which is gate 1 of the
+deployment runbook. Write the assertion that it is `false` as `test.failing`: the
+suite stays green while the flag stands, and turns red the moment the flag is
+fixed and the marker is stale. `test.skip` would go quiet, and a plain `test`
+would make CI red forever and get deleted.
 
-**G. Forced shutdown must actually fire when the drain hangs.** The timer was
-`unref`'d, so in the one shape it exists for — `app.stop()` resolved, listener
-closed, nothing after it settling, no other ref'd handle — the process exited
-**0** with no `forced shutdown` line and the store closes never ran. Assert a
-non-zero exit and the log line for a hung drain. Note this needs a hang after
-`stop()` resolves, not during it: a hang during `stop()` leaves a ref'd handle
-and masks the defect.
+---
 
-**H. Record the real `app.stop()` semantics, and assert them.** Measured on
-`elysia@1.4.29`: `stop()` DOES close the listener — a new connection is refused
-as soon as it resolves — and what survives is an already-established keep-alive
-connection, on which a further request is still served. Four in-repo comments
-asserted the opposite, and the wrong version argued for a different fix. Assert
-both halves: a new connection after `stop()` is refused, and a request written
-on a pre-existing connection is answered.
+## 10. Order of work
 
-**I. The access log's own claim.** It is not one line per request: `OPTIONS`
-produces none, because both OPTIONS answers short-circuit in an `onRequest` hook
-(the CORS plugin's 204 and the route-aware 404) and `onAfterResponse` never
-fires for them. 404s, 405s and 308s DO appear. Assert exactly that set rather
-than the slogan, so a future change that starts or stops logging preflights is
-visible.
+1. **`tests/unit/` and the layout move.** No infrastructure decision, and it
+   holds the highest-value target in the repository (`resolveActionScope`).
+   Retire `scripts/probe/local` into it, fixing the fixture spelling and the
+   CLI-style-probe trap (§5.1) on the way.
+2. **`tests/helpers/database.ts` with all four guards — before a single
+   integration test.** The guards are what stands between a destructive suite and
+   the developer's `app` database, and `.env` auto-loading means the default is
+   unsafe. Add `.env.test` to `.gitignore` in the same change.
+3. **The CI `test` job** with the service container (§5.3). Unblocks branch
+   protection and Renovate automerge.
+4. **`tests/integration/`** — the §7.1c conformance walk first, since it is
+   table-driven over the manifest and immediately covers every route's routing
+   contract; then §7.4 (the driver assertions, which are the ones currently
+   protected by nothing at all), then the OTP and login-guard concurrency work.
+5. **`tests/process/`** — §7.1b1, §7.2, §7.3. Slowest, and the tier most likely
+   to need Linux.
+6. **The coverage gate**, last, when the numbers mean something.
 
-**J. The 413 needs a raw socket, not `fetch`.** Cross-reference to §10.2A, now
-measured: the transport-level 413 is `HTTP/1.1 413 Request Entity Too Large`
-with no body, no security headers, no envelope and no access-log line, and Bun's
-own `fetch` surfaces it as a closed socket rather than as a status. A
-`fetch`-based assertion of `status === 413` cannot pass. Use `Bun.connect`.
-
-**K. `lib/http/adapters/hono.ts.disabled` is unverifiable by construction and
-drifted.** It called `attachBody`, deleted three changes ago, and nothing caught
-it because `.ts.disabled` matches no tsconfig include and no test. The same
-file's CORS policy was extracted into `CORS_POLICY` precisely so it could not
-drift again; the body contract — the security-relevant half — drifted anyway.
-Either give it a check that can fail (a scanner rule that every identifier it
-imports from `lib/http/*` still exists, which is cheap and static) or accept
-that it is prose and stop describing it as "the working adapter". Do not leave
-it as code that looks maintained and is not.
-
-**L. What the probe count now proves.** `bun run test` runs **150 assertions
-across 9 files**, up from 60 across 6. `log-serializer`, `permission-schema` and
-`time-dst` were CLI-style probes without the `.test.ts` suffix and had never
-executed in CI; they are converted, not merely renamed — a bare rename would
-have been worse, because their explicit exit inside a test file ends the whole
-run and silently skips every file after it. If another probe is added in the CLI
-style, that trap is still open: a check that every file under
-`scripts/probe/local/` either matches the test glob or is a `_`-prefixed fixture
-would close it.
+**Critical path: 1 → 2 → 3 → 4.** Step 2 is the only one with a safety
+consequence if it is done late.

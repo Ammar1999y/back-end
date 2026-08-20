@@ -1,6 +1,6 @@
 /* eslint-disable unicorn/prefer-math-trunc */
 import type { EntityID } from '@/types';
-import type { NeonDbError } from '@neondatabase/serverless';
+import type { SQL } from 'bun';
 
 import { MAX_ID } from '@/constants';
 import { generateUuidV7 } from '@/lib/id';
@@ -75,14 +75,32 @@ const SENSITIVE_LOG_KEYS: ReadonlySet<string> = new Set([
   'resetcode',
 ]);
 
-/** Extra diagnostic fields worth keeping off Error-like objects (PG codes). */
-const ERROR_DETAIL_KEYS = ['code', 'constraint', 'status', 'statusCode'];
+/**
+ * Extra diagnostic fields worth keeping off Error-like objects (PG codes).
+ *
+ * `errno` is in this list because `bun:sql` puts the SQLSTATE there and its
+ * `code` on a `PostgresError` is the constant `'ERR_POSTGRES_SERVER_ERROR'` for
+ * every constraint violation — so without `errno` a driver error logs a name for
+ * a class of failures instead of the one code that identifies which failure it
+ * was. On Node errors the same key is a negative integer (`-4058`), which the
+ * numeric branch below keeps as-is.
+ */
+const ERROR_DETAIL_KEYS = [
+  'code',
+  'errno',
+  'constraint',
+  'status',
+  'statusCode',
+];
 
 /**
  * SQLSTATE (`23505`) or a Node/Nodemailer class (`ECONNRESET`). An Error's
  * `code` is kept only when it matches this — six plain digits, an OTP, does not.
  */
 const DRIVER_ERROR_CODE = /^(?:[0-9A-Z]{5}|[A-Z][A-Z0-9_]{1,31})$/;
+
+/** The keys in `ERROR_DETAIL_KEYS` that must look like driver metadata. */
+const SHAPE_CHECKED_ERROR_KEYS = new Set(['code', 'errno']);
 
 function isSensitiveLogKey(key: string, value: unknown): boolean {
   // A boolean cannot carry a credential, so a flag ABOUT one is safe by
@@ -162,7 +180,14 @@ function isParameterBearingQueryError(error: object): boolean {
  * throw arbitrary objects into a log call, which is a larger problem than this.
  */
 const QUERY_ERROR_SAFE_FIELDS = {
+  // Two spellings of the same field, both gated by the SQLSTATE shape. `errno`
+  // is where `bun:sql` puts it; `code` is where every other PostgreSQL client
+  // does, and Bun's own `code` (`ERR_POSTGRES_SERVER_ERROR`) fails this pattern
+  // and is dropped — which is the intended outcome, since it names a class of
+  // errors rather than one. Without `errno` here a query error reduced by this
+  // function carried no code at all.
   code: /^[0-9A-Z]{5}$/,
+  errno: /^[0-9A-Z]{5}$/,
   constraint: /^[a-z][a-z0-9_]{0,62}$/,
 } as const;
 
@@ -236,7 +261,7 @@ function serializeErrorLike(
     // A plain object's `code` is redacted outright; an Error's is kept because
     // that is where driver metadata lives. The shape test reconciles the two.
     out[key] =
-      key === 'code' && !DRIVER_ERROR_CODE.test(value)
+      SHAPE_CHECKED_ERROR_KEYS.has(key) && !DRIVER_ERROR_CODE.test(value)
         ? LOG_REDACTED
         : clampLogString(value);
   }
@@ -411,32 +436,60 @@ export const positiveInt = (val: unknown, maxValue = MAX_ID) => {
 };
 
 /**
- * Drizzle wraps the driver error, so the PostgreSQL fields sit either on the
- * thrown value or one `cause` level down. Read structurally, not with
- * `instanceof`: the import stays type-only so this module — which
- * `lib/data-table/parsers.ts` reaches from the browser — pulls in no db layer.
+ * Drizzle wraps the driver error in a `DrizzleQueryError`, so the PostgreSQL
+ * fields sit either on the thrown value or one `cause` level down. Read
+ * structurally, not with `instanceof`: no db layer is imported here, because
+ * `lib/data-table/parsers.ts` reaches this module from the browser.
+ *
+ * **`errno` carries the SQLSTATE, not `code`.** That is a `bun:sql` fact and it
+ * is the whole reason this block is not a one-liner. `Bun.SQL`'s `PostgresError`
+ * puts its own identifier in `code` — `'ERR_POSTGRES_SERVER_ERROR'` for every
+ * constraint violation — and the five-character SQLSTATE in `errno`, as a
+ * STRING. Measured on Bun 1.4.0 against PostgreSQL 18.6 across unique, not-null,
+ * check, FK, undefined-table, syntax, cast, divide-by-zero, lock-not-available
+ * and `RAISE … USING errcode` errors: `errno` was the SQLSTATE in all of them,
+ * letters intact (`42P01`, `23P01`), never a number.
+ *
+ * The previous driver put it in `code`, so reading `code` here now matches
+ * nothing — every unique violation would fall through to a generic 500 instead
+ * of the 409 the handlers raise. Both keys are therefore read: `errno` is what
+ * this driver sets, and `code` keeps a SQLSTATE recognised if it ever arrives
+ * under the name every other PostgreSQL client uses.
+ *
+ * The field names are `Pick`ed from Bun's own `PostgresError` rather than
+ * hand-written, so a rename or a type change there is a build failure instead of
+ * a matcher that silently stops matching — which is this exact defect. Worth the
+ * link because Bun's own spelling is not consistent across its drivers:
+ * `MySQLError` carries `errno: number` AND `sqlState: string`, while
+ * `PostgresError` puts the SQL state in `errno: string`. `import type` erases at
+ * compile time, so this module stays free of any db import — which is what lets
+ * `lib/data-table/parsers.ts` reach it from the browser.
  */
-type PgErrorFields = Pick<NeonDbError, 'code' | 'constraint'>;
+type PgErrorFields = Pick<SQL.PostgresError, 'code' | 'errno' | 'constraint'>;
 type ThrownDbError = Partial<PgErrorFields> & {
   cause?: Partial<PgErrorFields>;
 };
 
 const asDbError = (e: unknown) => e as ThrownDbError | null | undefined;
 
-export function isUniqueViolation(e: unknown): boolean {
+function hasSqlState(e: unknown, sqlState: string): boolean {
   const err = asDbError(e);
-  // TODO: test this
   return (
-    err?.code === '23505' || err?.cause?.code === '23505' /* ||
-    /duplicate|unique/i.test(anyErr?.message ?? '') ||
-    /duplicate|unique/i.test(anyErr?.cause?.message ?? '') */
+    err?.errno === sqlState ||
+    err?.code === sqlState ||
+    err?.cause?.errno === sqlState ||
+    err?.cause?.code === sqlState
   );
 }
 
-// PostgreSQL FK violation code: 23503
+/** PostgreSQL `unique_violation`. */
+export function isUniqueViolation(e: unknown): boolean {
+  return hasSqlState(e, '23505');
+}
+
+/** PostgreSQL `foreign_key_violation`. */
 export function isForeignKeyViolation(e: unknown): boolean {
-  const err = asDbError(e);
-  return err?.code === '23503' || err?.cause?.code === '23503';
+  return hasSqlState(e, '23503');
 }
 
 export function getConstraintName(e: unknown): string {

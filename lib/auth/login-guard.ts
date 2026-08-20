@@ -1,10 +1,10 @@
-import type { WsTx } from '@/db/ws';
+import type { Tx } from '@/db';
 import type { EntityID } from '@/types';
 
 import { and, eq, isNull, sql } from 'drizzle-orm';
 
+import { withTransaction } from '@/db';
 import { accounts, users } from '@/db/schema';
-import { withTransaction } from '@/db/ws';
 import { auditLog } from '@/lib/audit';
 
 import { CREDENTIAL_PROVIDER_ID } from '@/utils/api-messages';
@@ -41,7 +41,7 @@ export interface VerifyAttemptOptions {
   /** Return a CAS proof and leave the verified hash unchanged for an immediate password mutation */
   returnPasswordProof?: boolean;
   /** Reuse an existing transaction instead of creating a new one */
-  tx?: WsTx;
+  tx?: Tx;
   /**
    * When provided, lockout enter/exit and successful-login transitions are
    * recorded in audit_logs. Failed-password attempts are intentionally not
@@ -108,7 +108,7 @@ export async function verifyLoginAttempt(
     auditMeta,
   } = options;
 
-  const executor = async (tx: WsTx): Promise<AttemptResult> => {
+  const executor = async (tx: Tx): Promise<AttemptResult> => {
     const identityFilter = userId
       ? eq(users.id, userId)
       : email

@@ -17,14 +17,25 @@ service.
 by accident. They only run when a path is given explicitly:
 
 ```bash
-bun run probe:db      # scripts/probe/dev-live/database
+bun run probe:db
 ```
+
+That script passes `./scripts/probe/dev-live/database/*.dev-probe.ts` — the
+leading `./` is not decoration. Without it `bun test` treats the argument as a
+name FILTER, and since these files deliberately do not match the test glob it
+reports "did not match any test files" and exits non-zero. A bare directory path
+does not work either, with or without the `./`. Bun says so itself when it
+happens: _"To treat the … filter as a path, run `bun test ./…`"_.
+
+The script did not exist until the PostgreSQL driver swap, so the command this
+README and both probe headers told you to run had never worked.
 
 ## What they do to your services
 
-| Probe                                  | Effect                                                            |
-| -------------------------------------- | ----------------------------------------------------------------- |
-| `database/otp-verify-budget.dev-probe` | Inserts and deletes its own users/roles; writes verification rows |
+| Probe                                  | Effect                                                                                |
+| -------------------------------------- | ------------------------------------------------------------------------------------- |
+| `database/otp-verify-budget.dev-probe` | Inserts and deletes its own users/roles; writes verification rows                     |
+| `database/driver-contract.dev-probe`   | Inserts and deletes its own users/roles/sessions; provokes real constraint violations |
 
 `redis/otp-global-breaker.dev-probe` was removed with the Upstash migration. It
 verified the C-02 breaker against real Redis keys, and nothing it targeted

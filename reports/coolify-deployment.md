@@ -1,6 +1,6 @@
 # Coolify deployment: ElysiaJS, `bun:sqlite`, local cache and rate limits
 
-Updated: 2026-08-19
+Updated: 2026-08-20
 
 > **Rewritten for the Elysia migration.** This runbook targeted Next.js 16.3.1
 > under Node 24 with `better-sqlite3`. The application now runs on ElysiaJS
@@ -31,9 +31,12 @@ sweep. See gate 6.
 
 This runbook targets one Coolify application on one VPS:
 
-- ElysiaJS runs under Bun 1.3.14. There is no Node process any more — Bun is the
+- ElysiaJS runs under Bun 1.4.0. There is no Node process any more — Bun is the
   runtime, the package manager and the TypeScript loader.
-- Neon/PostgreSQL remains business database (`DATABASE_URL`).
+- PostgreSQL is the business database (`DATABASE_URL`), reached through Bun's
+  built-in `bun:sql` client. **Neon is gone** — no `@neondatabase/serverless`,
+  no HTTP-per-query driver, no second WebSocket driver for transactions. One
+  pooled client lives in `db/index.ts` and `withTransaction` runs on it.
 - Local SQLite holds rate-limit state and, when adopted, disposable cache data,
   through Bun's built-in `bun:sqlite`. No native addon, no prebuild, no
   `node-gyp`, and no Node major to pin.
@@ -113,6 +116,16 @@ single-VPS SQLite is insufficient; use durable shared storage.
   is configured in Coolify; Coolify pre-deployment command runs in old
   container, not new release. Apply compatible migrations through controlled DB
   workflow.
+
+  The command is now `bun run db:migrate`, and it applies BOTH phases: the
+  generated migrations in `db/drizzle/` and then the hand-written SQL in
+  `db/migrations/` (the `pg_trgm` extension and the GIN indexes). It replaced
+  `drizzle-kit migrate`, which cannot connect at all without one of the four
+  drivers it supports — and this project deliberately has none of them. The
+  separate `bun run db:migrate:sql` is gone; there is one command. It needs only
+  `DATABASE_URL`, not the application's other secrets, so it is safe to run from
+  a maintenance shell.
+
 - Record release commit, current Coolify environment, PostgreSQL migration
   version, and SQLite `user_version` before deployment.
 - For Upstash cutover, use sequence in section 10.
@@ -151,11 +164,11 @@ development posture.
 `NIXPACKS_NODE_VERSION` is no longer needed — nothing runs under Node. Remove it
 if it is still set from the previous deployment.
 
-Check the build log shows Bun 1.3.14, matching `packageManager` and `bun.lock`.
+Check the build log shows Bun 1.4.0, matching `packageManager` and `bun.lock`.
 Bun is now the RUNTIME, so a version mismatch is no longer only a build concern:
 `bun:sqlite` behaviour is tied to the Bun build. If Nixpacks supplies a
 different Bun version, stop and either add a repository-owned Dockerfile pinning
-Bun 1.3.14, or deliberately validate and update the pin and lockfile. Do not
+Bun 1.4.0, or deliberately validate and update the pin and lockfile. Do not
 accept unreviewed version drift.
 
 ## 3. Configure environment
@@ -177,7 +190,7 @@ BuildKit and Coolify falls back to `--build-arg`. Review
 | ---------------------------------- | ------- | ------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `NODE_ENV=production`              | Runtime | No     | **Now enforced.** `server.ts` refuses to boot unless this is exactly `development`, `test` or `production`. An absent or misspelt value is a non-zero exit with a `startup rejected` log line, not a silent development posture.                                                                                  |
 | `PUBLIC_URL=https://<domain>`      | Runtime | No     | **Renamed** from `NEXT_PUBLIC_URL`, which still works as a legacy alias. Setting BOTH to different values is a boot failure. Must be an absolute origin — scheme required, no path, query, fragment or credentials, HTTPS in production — and is the single value used for both CORS and Better Auth's `baseURL`. |
-| `DATABASE_URL`                     | Runtime | Yes    | Neon/PostgreSQL connection string                                                                                                                                                                                                                                                                                 |
+| `DATABASE_URL`                     | Runtime | Yes    | PostgreSQL connection string, consumed by `bun:sql`. See §12.9 — the URL's `sslmode` wins over any `PGSSLMODE`, and the pool is opened LAZILY, so a wrong value is a first-request failure rather than a boot failure.                                                                                            |
 | `BETTER_AUTH_SECRET`               | Runtime | Yes    | At least 32 chars; no surrounding whitespace                                                                                                                                                                                                                                                                      |
 | `PASSWORD_PEPPER_ACTIVE_ID`        | Runtime | Yes    | Must name key in keyring                                                                                                                                                                                                                                                                                          |
 | `PASSWORD_PEPPER_KEYRING`          | Runtime | Yes    | Valid one-line JSON; retain old keys used by stored hashes                                                                                                                                                                                                                                                        |
@@ -435,7 +448,7 @@ instead of silently serving a degraded limiter.
 Deliberately cheap enough to poll every 30s: PRAGMA reads only. It does **not**
 run `quick_check` and does **not** write, because doing either on every poll
 would put the health check itself in write-lock contention with the limiter. It
-also does not touch Neon/PostgreSQL or `cache.db`, and it reports status only —
+also does not touch PostgreSQL or `cache.db`, and it reports status only —
 no paths, schema contents or row counts.
 
 Note the cache gap that follows from that last point: a broken or unwritable
@@ -482,7 +495,7 @@ bun --version
 bun -e 'const {Database}=require("bun:sqlite");const d=new Database(":memory:");console.log(d.query("select sqlite_version() as v").get());d.close(false)'
 ```
 
-Expected: Bun 1.3.14, SQLite at least 3.51.3. A missing environment variable or
+Expected: Bun 1.4.0, SQLite at least 3.51.3. A missing environment variable or
 a read-only filesystem blocks release. There is no native addon left to fail to
 load, so `ERR_DLOPEN_FAILED` is no longer a failure class here — but the Bun
 version now determines the SQLite build itself, so check it.
@@ -590,7 +603,11 @@ alongside those.
 - Direct origin IP blocked on 80/443.
 - Protected request through domain no longer logs `missing client ip headers`.
 - Login/session and one non-delivery API flow work.
-- Neon, Turnstile, R2, and enabled OTP provider egress work.
+- PostgreSQL is reachable from the container, and Turnstile, R2 and the
+  enabled OTP provider egress work. PostgreSQL is listed FIRST and separately
+  because nothing at boot proves it any more: `bun:sql` connects lazily, so an
+  unreachable database passes the health check (which reads SQLite only) and
+  fails on the first request that queries it.
 - Coolify shows one running app container after deployment completes.
 
 ## 9. Expiry sweep, monitoring, backup and restore
@@ -768,7 +785,10 @@ database backup is for database resources, not arbitrary app volume. See
 [Coolify backup/restore scope](https://coolify.io/docs/knowledge-base/how-to/backup-restore-coolify)
 and [managed database backups](https://coolify.io/docs/databases/backups).
 
-- Back up Neon/PostgreSQL through Neon/provider policy.
+- Back up PostgreSQL through whatever owns that server. If it is the managed
+  provider's, theirs; if PostgreSQL is self-hosted on this or another VPS,
+  that is now a backup you own and must schedule — the previous entry pointed
+  at Neon's policy, which no longer applies by default.
 - Never back up `cache.db`; rebuild it.
 - Rate-limit data expires within one day, but loss resets paid OTP daily cap.
   Choose explicit RPO: no backup plus OTP shutdown after host loss, periodic
@@ -790,7 +810,7 @@ better-sqlite3's `Database#backup`, and `VACUUM INTO` is the SQLite-native
 answer: it is read-only with respect to the source, safe against a live writer,
 and produces a standalone, already-compacted database with no WAL to replay. It
 refuses to overwrite an existing file, which is what makes the `.partial`
-staging below safe. Verified on Bun 1.3.14 against a WAL database opened
+staging below safe. Verified on Bun 1.4.0 against a WAL database opened
 read-only. See [VACUUM INTO](https://www.sqlite.org/lang_vacuum.html#vacuuminto)
 and [SQLite Online Backup API](https://www.sqlite.org/backup.html).
 
@@ -960,7 +980,7 @@ driver change does not make a network filesystem or multi-host SQLite safe.
 
 - [ ] OTP auto-verify disabled and tested in code.
 - [ ] Release committed, pushed, CI green.
-- [ ] Bun 1.3.14 verified in the build log, and the SQLite version it ships
+- [ ] Bun 1.4.0 verified in the build log, and the SQLite version it ships
       recorded (§8). No `NIXPACKS_NODE_VERSION` remains set.
 - [ ] Build command `bun run build`, start command `bun run start`, and
       `NODE_ENV=production` present as a runtime variable.
@@ -983,7 +1003,7 @@ driver change does not make a network filesystem or multi-host SQLite safe.
       maintenance token is the second line of defence rather than the only one.
 - [ ] Disk/task/deploy notifications enabled, including server disk usage for
       peak WAL growth.
-- [ ] Neon and SQLite backup/RPO policies recorded and restore tested.
+- [ ] PostgreSQL and SQLite backup/RPO policies recorded and restore tested.
 - [ ] Upstash rollback window completed, credentials revoked.
 - [ ] **§12 items applied**: `PUBLIC_URL` set (not only the legacy
       `NEXT_PUBLIC_URL`); `NEXT_SERVER_ACTIONS_ENCRYPTION_KEY` deleted; stop
@@ -1006,14 +1026,14 @@ already wrong are made in place in §§2–9 rather than repeated here.
 runtime exits non-zero after printing one line: `{"msg":"startup rejected",…}`.
 A container that restart-loops with that line is misconfigured, not crashing.
 
-| Condition                                                           | Why it is fatal                                                                                                                                                                                                                                                             |
-| ------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `NODE_ENV` absent, or not exactly `development`/`test`/`production` | Every production guard is an exact string comparison — the Better Auth secret floor, the Turnstile secret requirement, the absolute-`SQLITE_DIR` rule, HSTS. `NODE_ENV=prodution` previously disabled all four at once and still served traffic. Reproduced before the fix. |
-| `PORT` not a decimal integer in `1..65535`                          | `Number(PORT)` accepted `''` as 0 and `3000abc` as `NaN`; Bun then bound an ephemeral port while the log reported the requested one.                                                                                                                                        |
-| Bun major/minor differs from the pinned `1.3.14`                    | `bun:sqlite` is compiled into the Bun binary, so transaction and locking semantics travel with the runtime version. A PATCH difference is not fatal — it logs `bun patch version drift` and continues.                                                                      |
-| `sqlite_version()` below `3.51.3`                                   | The WAL-reset floor this runbook already required (§6). It was a manual log check; it is now an assertion.                                                                                                                                                                  |
+| Condition                                                           | Why it is fatal                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| ------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `NODE_ENV` absent, or not exactly `development`/`test`/`production` | Every production guard is an exact string comparison — the Better Auth secret floor, the Turnstile secret requirement, the absolute-`SQLITE_DIR` rule, HSTS. `NODE_ENV=prodution` previously disabled all four at once and still served traffic. Reproduced before the fix.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| `PORT` not a decimal integer in `1..65535`                          | `Number(PORT)` accepted `''` as 0 and `3000abc` as `NaN`; Bun then bound an ephemeral port while the log reported the requested one.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| Bun major/minor differs from the pinned `1.4.0`                     | BOTH database drivers are compiled into the Bun binary, so their transaction semantics travel with the runtime version. `bun:sqlite` is the old reason; `bun:sql` is the sharper one — through 1.3.x a simple-protocol query concurrent with a not-yet-prepared parameterized query on the same connection could return the WRONG query's rows, and the `BEGIN`/`COMMIT`/`ROLLBACK` that `withTransaction` issues are simple-protocol queries (Bun #32772, fixed in 1.4.0). A third reason was added 2026-08-20: primary keys now come from `Bun.randomUUIDv7()` (`lib/id.ts`), and through 1.3.x that call wrapped its sub-millisecond counter at 4,096 ids and broke the time ordering the session keyset cursor depends on — so a downgrade below the pin silently degrades id ordering as well as transactions. A PATCH difference is not fatal — it logs `bun patch version drift` and continues. |
+| `sqlite_version()` below `3.51.3`                                   | The WAL-reset floor this runbook already required (§6). It was a manual log check; it is now an assertion.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
 
-**Operational consequence:** the manual "check the build log shows Bun 1.3.14"
+**Operational consequence:** the manual "check the build log shows Bun 1.4.0"
 step in §1 is now a backstop, not the control. If Nixpacks supplies Bun 1.4.x
 the container will refuse to start. That is intended. To move the pin, update
 `packageManager` in `package.json`, `bun.lock`, and `EXPECTED_BUN_VERSION` in
@@ -1027,7 +1047,7 @@ The startup log line gained fields worth alerting on:
   "port": 3000,
   "hostname": "localhost",
   "env": "production",
-  "bun": "1.3.14",
+  "bun": "1.4.0",
   "idleTimeoutSeconds": 60,
   "maxRouteTimeoutSeconds": 120,
   "maxRequestBodyBytes": 8388608,
@@ -1268,3 +1288,119 @@ server-side change; it is here because a failing CI step blocks a deploy and the
 message is easy to misread. "Unregistered handler" means a `handler.ts` exists
 under `app/api/` that no route table entry imports — the endpoint is dead code,
 not broken configuration.
+
+### 12.9 PostgreSQL is now `bun:sql`, and four things about it are operational
+
+Added 2026-08-20. `db/index.ts` was `drizzle-orm/neon-http` and `db/ws.ts` was a
+second, different Neon driver used only for transactions; both are gone, along
+with `@neondatabase/serverless`. One pooled `Bun.SQL` client serves everything,
+and `db/ws.ts` no longer exists.
+
+**Nothing here has been run against Coolify.** It has been verified against a
+local PostgreSQL 18.6 on Bun 1.4.0 — transactions on one backend PID, advisory
+transaction locks, `FOR UPDATE`/`FOR SHARE`, `RETURNING`, savepoints, the
+`pg_trgm` indexes, and the pool close.
+
+**a. `DATABASE_URL` is no longer proven at boot.** `neon-http` was a `fetch`
+wrapper and this is a real TCP pool — but Bun opens it LAZILY, on the first
+query, which is what keeps CI's boot smoke test working without a database
+(verified: an unreachable host constructs in ~1 ms and `close()` on a
+never-connected pool resolves in under 1 ms). The consequence for a deploy is
+that a wrong or unreachable `DATABASE_URL` is **not** a startup rejection and
+**not** a health-check failure — `/api/health/storage` reads SQLite only. It is a
+500 on the first request that queries PostgreSQL. Verify it explicitly during
+first deploy (§8), and treat "container healthy" as saying nothing about the
+database.
+
+**b. `sslmode` belongs in the URL.** Bun 1.4 honours `PGSSLMODE` from the
+environment, but a `?sslmode=` in the URL wins — so put it in the URL and the
+environment cannot move it. `PGSSLMODE=require` against a server without TLS now
+fails rather than silently connecting in plaintext, which is the correct
+direction but will surface as a connection error rather than a downgrade. If
+PostgreSQL is on the same host over the Docker network, decide `sslmode`
+deliberately; if it is remote, it must be `require` or stricter.
+
+**c. Pool size against `max_connections`.** `MAX_POOL_CONNECTIONS` in
+`db/index.ts` is 10, and it is the number of concurrent TRANSACTIONS the process
+supports, not a throughput knob — `withTransaction` reserves a connection for the
+whole block, and `processOtpSend` holds one across the provider HTTP call
+(`TODO.md` §2.1). Callers beyond 10 queue and then fail on Bun's 30 s
+`connectionTimeout`. Confirm the server's `max_connections` leaves headroom for a
+migration run and a `psql` session on top of the app's 10; measured locally, 12
+concurrent queries opened exactly 10 backends.
+
+**d. `prepare: true` is the default and is correct HERE only.** Bun creates named
+prepared statements on the server. That is right against PostgreSQL directly, and
+wrong behind a transaction-pooling proxy: PgBouncer in transaction mode can split
+a two-round-trip query across backends. If a pooler is ever put in front of this
+database, set `prepare: false` in `db/index.ts` — Bun 1.4 makes that safe by
+sending each query in a single round trip — and do not leave it at the default.
+
+**Shutdown now closes the pool.** `server.ts` closes PostgreSQL first, then the
+two SQLite stores, because `close()` is the only one that can still be waiting on
+something (it lets in-flight queries finish). This does not change the grace
+period: the drain is still bounded by the derived `shutdownTimeoutMs` in the
+startup log.
+
+---
+
+## 13. The test suite, and what it means for this server
+
+Added 2026-08-20 alongside the rewritten `reports/test-strategy.md`. Nothing
+here is a code change; it is what the suite requires — and forbids — on the
+deployment side.
+
+### 13.1 The suite never runs on this VPS
+
+It is destructive by design: it truncates tables, creates and drops databases,
+exhausts rate-limit budgets and inserts users and sessions. It runs on a
+developer machine and in GitHub Actions, against databases that are disposable.
+
+**Therefore, on this server:**
+
+- **There is no test database.** Not a second database on the production
+  PostgreSQL instance, not a second instance on the same box. Production
+  credentials must be the only database credentials the app environment holds.
+- **`TEST_DATABASE_URL` must never be set in the Coolify environment.** It is
+  the variable the test harness reads, and its presence is the one thing that
+  would let a destructive run resolve a target here. Treat it like a
+  forbidden variable rather than an unused one — if it ever appears in the
+  environment list, delete it and find out who added it.
+- **`NODE_ENV` stays `production`.** The harness refuses to run when it is, which
+  is a second line behind the first.
+
+### 13.2 What may run against production: a read-only smoke set
+
+Separate harness, separate command, and strictly read-only — health, the
+migration version, `GET /openapi.json` answering 200, one known-good login. It
+is kept separate from the test suite on purpose: the day a `DELETE` lands in a
+suite that runs against production, the separation stops protecting everything
+else too.
+
+Not yet written. When it is, it gets its own Coolify scheduled task or
+post-deploy step, and this section gets the command.
+
+### 13.3 What changes in CI
+
+- A new `test` job with a `postgres:18-alpine` service container. It affects
+  nothing on this server, but the container's PostgreSQL major should be kept
+  equal to the one running here — otherwise a fidelity gap is traded for a
+  smaller one rather than closed. **If the server's PostgreSQL major is ever
+  upgraded, update the CI service image in the same change.**
+- The existing **Boot smoke test** step keeps `DATABASE_URL` pointing at the
+  unreachable `db.example.com`. That is deliberate and load-bearing: it is the
+  only check proving the pool still connects lazily (§12.9a). Do not "fix" it by
+  giving it the service container.
+
+### 13.4 Two gates the suite will make visible
+
+- **Gate 1, OTP auto-verify.** `utils/config.ts` still has
+  `OTP_AUTO_VERIFY = true`. The suite will carry that assertion as a
+  deliberately-failing test, so it stays visible instead of being forgotten. It
+  is still a code change, and still blocks production traffic.
+- **The derived shutdown bound.** The suite asserts
+  `SHUTDOWN_TIMEOUT_MS >= (max(IDLE_TIMEOUT_SECONDS, MAX_ROUTE_TIMEOUT_SECONDS) + 15) * 1000`
+  rather than the number. So lowering the upload route's `timeoutSeconds` to
+  shorten the deploy window (§12.2) will not silently invalidate it — but the
+  grace period in Coolify must still be re-read from the startup log's
+  `shutdownTimeoutMs` after any such change.

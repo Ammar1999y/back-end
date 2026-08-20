@@ -19,11 +19,11 @@
     "scan:sast": "mise exec -- semgrep scan --config=p/typescript --config=p/secrets --error --metrics=off",
     "prepare": "lefthook install",
     "db:generate": "drizzle-kit generate",
-    "db:migrate": "drizzle-kit migrate",
-    "db:migrate:sql": "bun scripts/apply-sql-migrations.ts",
-    "smoke": "bun scripts/smoke.ts"
+    "db:migrate": "bun scripts/migrate.ts",
+    "smoke": "bun scripts/smoke.ts",
+    "probe:db": "bun test ./scripts/probe/dev-live/database/*.dev-probe.ts"
   },
-  "packageManager": "bun@1.3.14",
+  "packageManager": "bun@1.4.0",
   "overrides": {
     "nanoid": "^3.3.18",
     "esbuild": "^0.28.1"
@@ -34,11 +34,10 @@
     "@better-auth/core": "^1.6",
     "@better-auth/utils": "0.4.2",
     "@better-fetch/fetch": "^1.3",
+    "better-auth": "^1.6",
     "@elysia/cors": "^1.4.2",
-    "@neondatabase/serverless": "^1",
     "@tanstack/react-table": "^9",
     "argon2": "^0.45",
-    "better-auth": "^1.6",
     "blurhash": "^2",
     "drizzle-orm": "^0.45",
     "elysia": "^1.4.29",
@@ -47,7 +46,6 @@
     "nodemailer": "^9",
     "sharp": "^0.35",
     "svgo": "^4",
-    "uuid": "^14",
     "zod": "^4"
   },
   "devDependencies": {
@@ -67,12 +65,13 @@
     "eslint-plugin-prettier": "^5",
     "eslint-plugin-security": "^4",
     "eslint-plugin-unicorn": "^73",
-    "globals": "^17.11.0",
-    "knip": "^6.32.2",
-    "lefthook": "^2.1.10",
+    "globals": "^17",
+    "knip": "^6",
+    "lefthook": "^2",
     "prettier": "^3.6",
     "typescript": "^6",
-    "typescript-eslint": "^8.67.0"
+    "typescript-eslint": "^8",
+    "uuid": "^14"
   },
   "ignoreScripts": [
     "sharp",

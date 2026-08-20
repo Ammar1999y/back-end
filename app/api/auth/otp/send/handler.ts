@@ -2,10 +2,9 @@ import type { Handler } from '@/lib/http/contract';
 
 import { and, eq, isNull } from 'drizzle-orm';
 
-import { db } from '@/db';
+import { db, withTransaction } from '@/db';
 import { userContactColumn } from '@/db/queries';
 import { users } from '@/db/schema';
-import { withTransaction } from '@/db/ws';
 import { sanitizeForLog } from '@/utils';
 import { getAuditMeta } from '@/lib/audit';
 import { verifyTurnstileRequest } from '@/lib/captcha';
