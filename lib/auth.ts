@@ -5,6 +5,7 @@ import { betterAuth } from 'better-auth';
 import { drizzleAdapter } from 'better-auth/adapters/drizzle';
 import { APIError, createAuthMiddleware, isAPIError } from 'better-auth/api';
 import { captcha, haveIBeenPwned } from 'better-auth/plugins';
+import { PUBLIC_ORIGIN } from '@/lib/env';
 
 import {
   CUSTOM_AUTH_CODE,
@@ -35,6 +36,7 @@ import {
   TRUSTED_IP_HEADERS,
   USER_AGENT_MAX,
 } from './audit';
+import { BETTER_AUTH_ALLOWED_PATH_SET } from './auth/allowed-paths';
 import { toAuthApiError } from './auth/api-error';
 import { BASE_ERROR_CODES } from './auth/code-errors';
 import { LoginRejected, verifyLoginAttempt } from './auth/login-guard';
@@ -66,18 +68,30 @@ const SIGN_OUT_LIMIT_PER_MINUTE = 30;
 // hook already verifies credentials via verifyLoginAttempt(). If you add a new
 // path that relies on Better Auth's built-in password verification, you MUST
 // either add verification logic in the before hook or restore the real verify.
-const ALLOWED_PATHS = new Set([
-  '/get-session',
-  '/sign-out',
-  '/sign-in/email',
-  // Passwordless plugin endpoint — does its own captcha/rate-limit/OTP verify.
-  '/passwordless/verify',
-]);
+/**
+ * The complete Better Auth surface this deployment exposes. Every other Better
+ * Auth path is answered 404 by the `before` hook below, so this set — not Better
+ * Auth's own route table — is what the API contract may advertise.
+ *
+ * Defined in `./auth/allowed-paths` so `routes.ts` can read the same set without
+ * importing Better Auth. Enforcement and advertisement cannot drift apart.
+ */
+const ALLOWED_PATHS = BETTER_AUTH_ALLOWED_PATH_SET;
 
 const CUSTOM_CODE = CUSTOM_AUTH_CODE;
 
 export const auth = betterAuth({
-  baseURL: process.env.NEXT_PUBLIC_URL,
+  // `PUBLIC_ORIGIN`, not the raw environment variable. Both used to be read
+  // independently — CORS took a value canonicalised to scheme + hostname while
+  // Better Auth took the raw string — so a path, a query, a fragment or embedded
+  // credentials were discarded by one consumer and kept as input by the other.
+  // Reading the parsed value here is what makes `lib/env.js` the single parse:
+  // the CORS allow-list entry and the origin cookies are signed against are now
+  // the same string by construction. It also means the variable rename in
+  // lib/env.js (`PUBLIC_URL`, with `NEXT_PUBLIC_URL` as a legacy alias) reaches
+  // this consumer; reading `process.env` directly here left `baseURL` undefined
+  // whenever only the new name was set.
+  baseURL: PUBLIC_ORIGIN,
   database: drizzleAdapter(db, { provider: 'pg', schema: schema }),
   emailAndPassword: {
     enabled: true,
@@ -234,6 +248,12 @@ export const auth = betterAuth({
     // Pin it to the same trusted edge headers the rest of the app uses so the
     // IP written into session metadata — and any Better Auth limiter — can't
     // be forged. IPv6 is bucketed by /64, matching `ipBucket`.
+    //
+    // TODO(proxy-trust): the header is trusted on syntax alone here too — see
+    // the note on TRUSTED_IP_HEADERS in lib/audit.ts and
+    // reports/should-ignore.md #63. Note also that the development fallback in
+    // `getClientIp` does NOT apply to this path: Better Auth reads the headers
+    // itself, so it resolves no IP locally.
     ipAddress: {
       ipAddressHeaders: [...TRUSTED_IP_HEADERS],
       ipv6Subnet: 64,

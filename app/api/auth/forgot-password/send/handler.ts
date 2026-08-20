@@ -56,7 +56,7 @@ export const POST: Handler = async (ctx) => {
         new CustomError(otpMsg.captchaFailed, HTTP_STATUS.FORBIDDEN)
       );
 
-    const body = requireJsonBody(ctx.body);
+    const body = requireJsonBody(await ctx.readJson());
     const parsed = sendOtpSchema.safeParse(body);
     if (!parsed.success)
       throw new CustomError(otpMsg.invalidInput, HTTP_STATUS.UNPROCESSABLE);

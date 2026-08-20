@@ -39,11 +39,6 @@
       "groupName": "runtime dependencies (non-major)"
     },
     {
-      "description": "Next.js and its ESLint config must move together.",
-      "matchPackageNames": ["next", "eslint-config-next"],
-      "groupName": "next.js"
-    },
-    {
       "description": "Better Auth core and plugins must move together.",
       "matchPackageNames": ["better-auth", "@better-auth/**"],
       "groupName": "better-auth"

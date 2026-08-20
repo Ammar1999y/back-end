@@ -27,10 +27,15 @@ export const POST: Handler = async (ctx) => {
       limit: 20,
     });
 
-    // formData parsing stays on the raw Request — multipart is framework-specific
-    const formData = await ctx.rawRequest.formData().catch(() => {
+    // Read AFTER the limiter, never before: `readFormData` is a function
+    // precisely so the multipart body stays unbuffered until this request has
+    // been admitted. Parsed by the adapter rather than from `rawRequest` — a web
+    // Request body reads once, and Elysia's own parser drains it first, which
+    // threw `Body has already been used` and the old `.catch` turned into a
+    // generic "no files" 400.
+    const formData = await ctx.readFormData();
+    if (!formData)
       throw new CustomError(uploadMsg.noFiles, HTTP_STATUS.BAD_REQUEST);
-    });
     const entries = formData.getAll('files');
 
     if (entries.length === 0) {

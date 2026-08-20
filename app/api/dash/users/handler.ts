@@ -153,7 +153,7 @@ export const POST: Handler = async (ctx) => {
       failClosed: true,
     });
 
-    const body = requireJsonBody(ctx.body);
+    const body = requireJsonBody(await ctx.readJson());
 
     const validatedDataParsed = createUserSchema.safeParse(body);
     if (!validatedDataParsed.success)

@@ -34,8 +34,14 @@
  */
 
 /**
- * `name` on an Error is the class name (`SqliteError`, `TypeError`). Observed
- * values are fixed identifiers, not formatted text.
+ * `name` on an Error is a fixed identifier, not formatted text.
+ *
+ * Under `bun:sqlite` that identifier is `SQLiteError` — capital L, capital E.
+ * `better-sqlite3` spelled it `SqliteError`, and this comment named the old
+ * spelling after the driver had already changed. Nothing in production compares
+ * against either string (audited), so the drift was documentary only; the probe
+ * suite still manufactures the Node spelling, which is a test defect recorded in
+ * reports/test-strategy.md.
  */
 function errorClassOf(error: unknown): string {
   const name = (error as { name?: unknown } | null)?.name;

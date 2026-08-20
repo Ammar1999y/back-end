@@ -1,5 +1,27 @@
 {
   "$schema": "https://unpkg.com/knip@latest/schema.json",
+  // Entries used to be inferred by knip's Next.js plugin, which treated every
+  // `app/**/route.ts` as a root. Next is gone, and so are those files, so the
+  // real graph now has exactly one runtime root: `server.ts`. It validates the
+  // runtime and then dynamically imports `app.ts`, which imports `routes.ts`,
+  // which imports every handler — knip follows dynamic imports, so the chain
+  // needs no extra entry.
+  "entry": [
+    "server.ts",
+    "scripts/**/*.ts",
+    "drizzle.config.ts",
+    "eslint.config.mjs",
+    "prettier.config.js",
+    // The benchmark harness is tracked but standalone — run by hand, never
+    // imported. Declared the same way in scripts/find-unused-files.ts.
+    "bench/**/*.mjs",
+    "bench/**/*.ts",
+  ],
+  "ignore": [
+    // Spawned by path string from their sibling `.test.ts`, so no import edge
+    // exists for knip to follow.
+    "scripts/probe/local/_*-child.cjs",
+  ],
   // Both are loaded by name through `FlatCompat.extends()` in eslint.config.mjs.
   // Knip resolves imports statically, so it cannot see string-addressed plugins.
   // Verified active with `eslint --print-config`.

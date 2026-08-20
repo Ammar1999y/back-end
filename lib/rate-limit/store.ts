@@ -198,11 +198,17 @@ interface RateLimitStore {
  * re-preparing on every call measured meaningfully slower. (bun:sqlite's
  * `query()` caches by SQL string, so this stays correct after the driver swap.)
  */
-export const getRateLimitStore: () => RateLimitStore = (() => {
-  let store: RateLimitStore | null = null;
+/**
+ * Held on an object rather than in a bare `let`: the getter and the closer are
+ * both functions, and assigning a module-level binding from inside one is what
+ * `unicorn/no-top-level-assignment-in-function` forbids. A single-field record
+ * says the same thing without the lint suppression.
+ */
+const singleton: { store: RateLimitStore | null } = { store: null };
 
+export const getRateLimitStore: () => RateLimitStore = (() => {
   return () => {
-    if (store) return store;
+    if (singleton.store) return singleton.store;
 
     const db = openDatabase({
       path: RATE_LIMIT_DB_PATH,
@@ -227,7 +233,7 @@ export const getRateLimitStore: () => RateLimitStore = (() => {
         sweepAuth: db.prepare(SQL_SWEEP_AUTH),
         anyExpired: db.prepare(SQL_ANY_EXPIRED),
       };
-      store = candidate;
+      singleton.store = candidate;
       return candidate;
     } catch (error) {
       db.close();
@@ -235,6 +241,20 @@ export const getRateLimitStore: () => RateLimitStore = (() => {
     }
   };
 })();
+
+/**
+ * Closes the limiter database if this process ever opened it.
+ *
+ * Deliberately does NOT open one: called from the shutdown path, where opening
+ * a database in order to close it would create the file (and its WAL) on a
+ * container that never used it.
+ */
+export function closeRateLimitStore(): void {
+  const { store } = singleton;
+  if (!store) return;
+  singleton.store = null;
+  store.db.close();
+}
 
 /**
  * Deletes expired rows, in bounded batches, yielding between them.

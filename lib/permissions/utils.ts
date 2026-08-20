@@ -11,8 +11,8 @@ import { and, eq, isNull, ne, notInArray, sql } from 'drizzle-orm';
 
 import { db } from '@/db';
 import { rolePermissions, roles, users } from '@/db/schema';
-import { v7 as uuidv7 } from 'uuid';
 import { auditLog } from '@/lib/audit';
+import { generateUuidV7 } from '@/lib/id';
 
 import {
   HTTP_STATUS,
@@ -94,7 +94,7 @@ export async function createCustomRole(
     const [customRole] = await tx
       .insert(roles)
       .values({
-        roleName: `custom-${uuidv7()}`,
+        roleName: `custom-${generateUuidV7()}`,
         scope: CUSTOM_ROLE_VALUE,
         isActive: true,
         createdBy: createdBy ?? null,

@@ -58,12 +58,20 @@ const BASE_PRAGMAS = [
 ] as const;
 
 /**
- * 2000ms, not the 5000ms both drivers default to. Both drivers are SYNCHRONOUS,
- * so a busy wait blocks the entire worker's event loop rather than one request —
- * a five-second stall on a login rate-limit check is worse than failing it. If
- * this ceiling is ever reached in practice the answer is a shared store, not a
- * longer timeout: multi-process contention was measured to starve a worker
- * completely regardless of this value.
+ * 2000ms.
+ *
+ * NOT a reduction from a driver default, which is what the previous version of
+ * this comment claimed: a fresh `bun:sqlite` connection reads back
+ * `PRAGMA busy_timeout = 0` (measured on Bun 1.3.14), so without this line
+ * every lock conflict fails instantly. `better-sqlite3` is the driver that
+ * defaults to 5000ms, and it is not the driver in use.
+ *
+ * 2000 rather than more because both drivers are SYNCHRONOUS: a busy wait blocks
+ * the entire worker's event loop rather than one request, and a five-second
+ * stall on a login rate-limit check is worse than failing it. If this ceiling is
+ * ever reached in practice the answer is a shared store, not a longer timeout —
+ * multi-process contention was measured to starve a worker completely regardless
+ * of this value.
  */
 export const BUSY_TIMEOUT_MS = 2000;
 
@@ -93,8 +101,13 @@ export const SYNCHRONOUS_VALUE: Record<Durability, number> = {
  * as an open decision in TODO.md.
  */
 function applyPragmas(db: SqliteConnection, durability: Durability) {
-  for (const pragma of BASE_PRAGMAS) db.pragma(pragma);
+  // FIRST, before anything that can take a lock. `journal_mode = WAL` is a
+  // lock-taking statement, and a fresh bun:sqlite connection starts at
+  // `busy_timeout = 0` (measured — see the note on BUSY_TIMEOUT_MS), so setting
+  // the timeout after it would leave the one statement most likely to contend
+  // on a cold start with no wait at all.
   db.pragma(`busy_timeout = ${BUSY_TIMEOUT_MS}`);
+  for (const pragma of BASE_PRAGMAS) db.pragma(pragma);
   db.pragma(
     `synchronous = ${durability === 'process-crash-safe' ? 'NORMAL' : 'OFF'}`
   );
@@ -187,7 +200,15 @@ export function describeDatabase(db: SqliteConnection): {
  * readiness poll — see the route.
  */
 export function quickCheck(db: SqliteConnection): string {
-  const row = db.prepare('PRAGMA quick_check').get<Record<string, unknown>>();
-  const value = row ? Object.values(row)[0] : undefined;
-  return typeof value === 'string' ? value : 'unknown';
+  // Finalized here, not left to the connection's own cleanup: this runs on a
+  // manual health poll, so one statement per call would accumulate for the
+  // lifetime of the process.
+  const statement = db.prepare('PRAGMA quick_check');
+  try {
+    const row = statement.get<Record<string, unknown>>();
+    const value = row ? Object.values(row)[0] : undefined;
+    return typeof value === 'string' ? value : 'unknown';
+  } finally {
+    statement.finalize();
+  }
 }

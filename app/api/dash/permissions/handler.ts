@@ -130,7 +130,7 @@ export const POST: Handler = async (ctx) => {
       failClosed: true,
     });
 
-    const body = requireJsonBody(ctx.body);
+    const body = requireJsonBody(await ctx.readJson());
 
     // Lenient on unknown TOP-LEVEL keys, matching the users collection POST: a
     // client may post back a response object carrying server-owned fields and

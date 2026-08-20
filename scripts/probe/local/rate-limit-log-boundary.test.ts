@@ -13,10 +13,11 @@
  *
  * So this no longer reproduces a live leak. It asserts the PROPERTY instead: the
  * boundary must emit no key content even when handed an error whose message
- * contains the whole key. That is the durable requirement, because the store is
- * scheduled to change again (better-sqlite3 -> `bun:sqlite`) and `sanitizeForLog`
- * keeps free-text messages by policy — so a future driver that does interpolate a
- * parameter must not be able to reach the log through this path.
+ * contains the whole key. That is the durable requirement: the driver has already
+ * changed once (better-sqlite3 -> `bun:sqlite`, at the Elysia migration) and
+ * `sanitizeForLog` keeps free-text messages by policy — so a future driver that
+ * does interpolate a parameter must not be able to reach the log through this
+ * path.
  *
  * The hostile fixture below is deliberate: a driver that behaves WORSE than
  * either real one, to prove containment rather than luck.

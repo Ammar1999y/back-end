@@ -705,7 +705,7 @@ export const PUT: Handler = async (ctx) => {
       failClosed: true,
     });
 
-    const body = requireJsonBody(ctx.body);
+    const body = requireJsonBody(await ctx.readJson());
     const auditMeta = getAuditMeta(ctx);
 
     const targetId = validID(ctx.params.id);

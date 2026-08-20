@@ -64,7 +64,7 @@ export const POST: Handler = async (ctx) => {
       );
     }
 
-    const body = requireJsonBody(ctx.body);
+    const body = requireJsonBody(await ctx.readJson());
 
     const parsed = sendOtpSchema.safeParse(body);
     if (!parsed.success)

@@ -63,7 +63,7 @@ export const POST: Handler = async (ctx) => {
     if (!captchaOk)
       throw new CustomError(otpMsg.captchaFailed, HTTP_STATUS.FORBIDDEN);
 
-    const body = requireJsonBody(ctx.body);
+    const body = requireJsonBody(await ctx.readJson());
     const parsed = changeEmailSchema.safeParse(body);
     if (!parsed.success)
       throw new CustomError(

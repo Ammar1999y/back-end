@@ -18,8 +18,11 @@
  * as false where SQLite reports true — so the SQL has to be run for real.
  *
  * `prefixUpperBound` lives in its own driver-free module so this file can import
- * it; `bun test` cannot load `better-sqlite3`, so the SQL half runs in a Node
- * child.
+ * it. The SQL half runs in a child process — under Bun, against the production
+ * `bun:sqlite` driver — so a file handle held open by a failing case cannot leak
+ * into the rest of the suite. (The child used to run under Node because
+ * `better-sqlite3` could not load under Bun; the driver swap removed that
+ * constraint, not the child.)
  *
  * Local: no database server, no network.
  */
@@ -88,7 +91,7 @@ const cases = PREFIXES.map((prefix) => ({
 
 const proc = Bun.spawn(
   [
-    'node',
+    'bun',
     CHILD,
     JSON.stringify({
       ddl: extractDdl(),

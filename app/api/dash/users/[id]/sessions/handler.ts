@@ -43,7 +43,12 @@ import { formatCursor, parseCursor, parseLimit } from './pagination';
 // Re-exported for the parent user GET, which renders the first page inline.
 export { SESSIONS_PAGE_SIZE } from './pagination';
 
-const deleteSessionsSchema = z.union([
+/**
+ * Exported so `lib/http/openapi.ts` can describe this body. The route declares
+ * `body: 'json'`, and a contract that omits the shape of a body it says exists
+ * is worse than one that admits it does not know.
+ */
+export const deleteSessionsSchema = z.union([
   z
     .object({
       sessionIds: z
@@ -247,7 +252,7 @@ export const DELETE: Handler = async (ctx) => {
       max: 15,
     });
 
-    const body = requireJsonBody(ctx.body);
+    const body = requireJsonBody(await ctx.readJson());
     const parsed = deleteSessionsSchema.safeParse(body);
     if (!parsed.success)
       throw new CustomError(

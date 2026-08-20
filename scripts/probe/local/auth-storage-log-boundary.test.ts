@@ -8,20 +8,23 @@
  * `authRateLimitStorage` through it, because `@upstash/redis` quoted the command
  * — and therefore the key, `${ip}|${path}` — in its message.
  *
- * That is no longer possible, for a reason worth recording rather than hiding.
- * The store is now local, and its driver is `better-sqlite3`, which CANNOT be
- * loaded under Bun: it is built against the V8 C++ API that Bun only partially
- * emulates (https://github.com/oven-sh/bun/issues/4290). Importing
- * `@/lib/rate-limit/auth-storage` here would pull in the driver and hard-panic
- * the test runner with `NAPI FATAL ERROR`. Bun is the runner, so this file must
- * stay clear of the driver.
+ * That stopped being possible when the store became local. At the time the
+ * driver was `better-sqlite3`, which cannot be loaded under Bun at all — it is
+ * built against the V8 C++ API that Bun only partially emulates
+ * (https://github.com/oven-sh/bun/issues/4290) — so importing
+ * `@/lib/rate-limit/auth-storage` here would hard-panic the test runner with
+ * `NAPI FATAL ERROR`, and this file had to stay clear of the driver.
  *
  * What that costs, stated plainly: this asserts the boundary FUNCTION, not the
  * `catch -> sanitizeForLog -> console.error` wiring inside `auth-storage.ts`. The
- * wiring is verified by reading it, not by this test. When the driver becomes
- * `bun:sqlite` at the framework migration, the import becomes safe again and this
- * should be restored to driving the real storage — by making the store fail (an
- * unwritable path is the cheapest way) rather than by faking an HTTP endpoint.
+ * wiring is verified by reading it, not by this test.
+ *
+ * TODO: the blocker is GONE. The Elysia migration swapped the driver to
+ * `bun:sqlite`, so importing the real `authRateLimitStorage` here is safe now.
+ * Restore this to driving the real storage — make the store fail with an
+ * unwritable `SQLITE_DIR`, which is the cheapest way, rather than faking an HTTP
+ * endpoint. Left as-is here because it is a test improvement, not part of the
+ * framework migration.
  *
  * The property under test is unchanged and is the one that matters: nothing
  * derived from the key may reach the log.

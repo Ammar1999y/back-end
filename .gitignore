@@ -22,6 +22,7 @@ TODO.md
 
 # production
 /build
+/dist
 
 # misc
 .DS_Store
@@ -45,7 +46,6 @@ yarn-error.log*
 
 # typescript
 *.tsbuildinfo
-next-env.d.ts
 
 .claude
 CLAUDE.md
@@ -57,14 +57,12 @@ CLAUDE.md
 
 lefthook-local.yml
 
-# The benchmark harness IS tracked: lib/sqlite/database.ts and lib/cache/index.ts
-# both cite bench/sqlite/FINAL-REPORT.md as the justification for the PRAGMA set
-# and the BLOB-over-JSONB choice, and a citation to a path that is not in the
-# repository is not evidence. Its generated databases and vendored driver are
-# ignored by bench/sqlite/.gitignore; the run output is ignored here because it is
-# reproducible from the harness and is host-specific.
-bench/sqlite/results/
+/bench/**/results/
 
 # Local SQLite databases (rate limits + cache). Never commit these:
 # they hold IP addresses and contact destinations as keys.
 data/
+
+
+
+read.txt

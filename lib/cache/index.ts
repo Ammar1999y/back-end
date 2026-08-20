@@ -95,11 +95,12 @@ interface CacheStore {
   readonly anyExpired: SqliteStatement;
 }
 
-const getStore: () => CacheStore = (() => {
-  let store: CacheStore | null = null;
+/** Same shape as the limiter store's singleton — see the note there. */
+const singleton: { store: CacheStore | null } = { store: null };
 
+const getStore: () => CacheStore = (() => {
   return () => {
-    if (store) return store;
+    if (singleton.store) return singleton.store;
 
     const db = openDatabase({
       path: CACHE_DB_PATH,
@@ -121,7 +122,7 @@ const getStore: () => CacheStore = (() => {
         sweep: db.prepare(SQL_SWEEP),
         anyExpired: db.prepare(SQL_ANY_EXPIRED),
       };
-      store = candidate;
+      singleton.store = candidate;
       return candidate;
     } catch (error) {
       db.close();
@@ -129,6 +130,17 @@ const getStore: () => CacheStore = (() => {
     }
   };
 })();
+
+/**
+ * Closes the cache database if this process ever opened it. Same rule as the
+ * limiter store: never opens one just to close it.
+ */
+export function closeCacheStore(): void {
+  const { store } = singleton;
+  if (!store) return;
+  singleton.store = null;
+  store.db.close();
+}
 
 const decoder = new TextDecoder();
 

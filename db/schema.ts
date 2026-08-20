@@ -28,8 +28,8 @@ import {
   varchar,
 } from 'drizzle-orm/pg-core';
 
-import { v7 as generateId } from 'uuid';
 import { API_PATH_MAX, USER_AGENT_MAX } from '@/lib/audit/constants';
+import { generateUuidV7 as generateId } from '@/lib/id';
 import {
   CUSTOM_ROLE_VALUE,
   DASHBOARD_PAGES,

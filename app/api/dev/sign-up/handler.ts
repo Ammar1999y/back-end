@@ -30,7 +30,8 @@ import {
   zodIssueMessage,
 } from '@/utils/validation/rules';
 
-const devSignUpSchema = z.object({
+/** Exported for the OpenAPI document — see the note in the sessions handler. */
+export const devSignUpSchema = z.object({
   name: z
     .string()
     .min(2, 'الاسم مطلوب')
@@ -48,7 +49,7 @@ export const POST: Handler = async (ctx) => {
   }
 
   try {
-    const body = requireJsonBody(ctx.body);
+    const body = requireJsonBody(await ctx.readJson());
 
     const parsed = devSignUpSchema.safeParse(body);
     if (!parsed.success)

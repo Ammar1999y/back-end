@@ -11,6 +11,7 @@ export const MSG_CANNOT_GRANT_UNOWNED_PERMISSIONS =
   'لا يمكنك منح صلاحيات لا تملكها';
 
 export const MSG_PAGE_NOT_FOUND = 'الصفحة غير موجودة';
+export const MSG_METHOD_NOT_ALLOWED = 'الطلب غير مدعوم لهذا المسار';
 export const MSG_NOT_FOUND = 'البيانات غير موجودة';
 export const MSG_INVALID_INPUT = 'قم بالتحقق من البيانات المدخله';
 export const MSG_INVALID_CREDENTIALS = 'البيانات المدخله غير صحيحه';
@@ -60,10 +61,12 @@ export const CUSTOM_AUTH_CODE = '__' as const;
 export const HTTP_STATUS = {
   OK: 200,
   CREATED: 201,
+  PERMANENT_REDIRECT: 308,
   BAD_REQUEST: 400,
   UNAUTHORIZED: 401,
   FORBIDDEN: 403,
   NOT_FOUND: 404,
+  METHOD_NOT_ALLOWED: 405,
   CONFLICT: 409,
   UNPROCESSABLE: 422,
   TOO_MANY_REQUESTS: 429,

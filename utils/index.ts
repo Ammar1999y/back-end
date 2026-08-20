@@ -3,7 +3,7 @@ import type { EntityID } from '@/types';
 import type { NeonDbError } from '@neondatabase/serverless';
 
 import { MAX_ID } from '@/constants';
-import { v7 as uuidv7 } from 'uuid';
+import { generateUuidV7 } from '@/lib/id';
 
 export function normalizeArabicDigits(input: string): string {
   const ARNums = ['٠', '١', '٢', '٣', '٤', '٥', '٦', '٧', '٨', '٩'];
@@ -472,7 +472,7 @@ export const validID = (val: unknown): string => {
  * @returns A new UUID v7 string
  */
 export const generateUUIDv7 = (): EntityID => {
-  return uuidv7();
+  return generateUuidV7();
 };
 
 /**

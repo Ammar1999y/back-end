@@ -1,10 +1,17 @@
 /**
  * Child runner for `sqlite-semantics.test.ts`.
  *
- * Plain CommonJS on purpose. The assertions have to execute `better-sqlite3`,
- * which cannot load under Bun (`NAPI FATAL ERROR`), and Bun is what runs the
- * probes — so this half runs under Node. Plain `.cjs` avoids needing a
- * TypeScript loader or the `@/` path aliases in the child.
+ * A separate process on purpose. Several assertions below need a SECOND
+ * connection to the same file to reproduce a cross-process race, and one of them
+ * runs the migration three times over — running that in the test process would
+ * leave open handles and a half-migrated file behind on failure. Plain `.cjs`
+ * avoids needing the `@/` path aliases in the child.
+ *
+ * It runs under Bun, against the production driver (`bun:sqlite`). It used to
+ * run under Node against `better-sqlite3` — that indirection existed only
+ * because better-sqlite3 hard-panics under Bun, and it disappeared with the
+ * driver swap. These assertions now exercise the driver the server actually
+ * uses, which is what they were always meant to do.
  *
  * It does NOT hardcode the SQL. The parent extracts every statement from
  * `lib/rate-limit/store.ts` and `lib/cache/index.ts` and passes them in, so these
@@ -16,7 +23,7 @@ const { mkdtempSync, rmSync } = require('node:fs');
 const { tmpdir } = require('node:os');
 const path = require('node:path');
 
-const Database = require('better-sqlite3');
+const { Database } = require('bun:sqlite');
 
 const sql = JSON.parse(process.argv[2]);
 const results = [];
@@ -27,9 +34,9 @@ function check(name, pass, detail) {
 }
 
 function open(file) {
-  const db = new Database(path.join(dir, file));
-  db.pragma('journal_mode = WAL');
-  db.pragma('busy_timeout = 2000');
+  const db = new Database(path.join(dir, file), { create: true });
+  db.run('PRAGMA journal_mode = WAL');
+  db.run('PRAGMA busy_timeout = 2000');
   return db;
 }
 
@@ -81,7 +88,7 @@ try {
       rolled && Number(rolled.count) === 1,
       `count after rollover = ${rolled ? rolled.count : 'no row'}`
     );
-    db.close();
+    db.close(false);
   }
 
   // ---- R-1 regression: retryAfter must not be read back ---------------------
@@ -122,35 +129,35 @@ try {
 
     check(
       'denial returns no row, so retryAfter comes from the bound window',
-      denied === undefined && correct === 1 && viaReadback > correct,
+      !denied && correct === 1 && viaReadback > correct,
       `bound=${correct}s readback=${viaReadback}s (readback is the race this avoids)`
     );
-    a.close();
-    b.close();
+    a.close(false);
+    b.close(false);
   }
 
   // ---- P-5 regression: concurrent migration under BEGIN IMMEDIATE ----------
   {
     const dbPath = path.join(dir, 'migrate.db');
     const runMigration = () => {
-      const db = new Database(dbPath);
-      db.pragma('journal_mode = WAL');
-      db.pragma('busy_timeout = 5000');
+      const db = new Database(dbPath, { create: true });
+      db.run('PRAGMA journal_mode = WAL');
+      db.run('PRAGMA busy_timeout = 5000');
       try {
         db.transaction(() => {
           const current = Number(
-            db.pragma('user_version', { simple: true }) ?? 0
+            db.query('PRAGMA user_version').get()?.user_version ?? 0
           );
           if (current < 1) {
             db.exec(sql.rateLimitDdl);
-            db.pragma('user_version = 1');
+            db.run('PRAGMA user_version = 1');
           }
         }).immediate();
         return null;
       } catch (error) {
         return error.message;
       } finally {
-        db.close();
+        db.close(false);
       }
     };
     const failures = [runMigration(), runMigration(), runMigration()].filter(
@@ -179,7 +186,7 @@ try {
       first === 500,
       `first batch removed ${first} (expected the 500 ceiling, not all 1200)`
     );
-    db.close();
+    db.close(false);
   }
 
   // ---- backlog probe must cover BOTH limiter tables ------------------------
@@ -234,7 +241,7 @@ try {
         !plan.includes('SCAN auth_rate_limit'),
       plan
     );
-    db.close();
+    db.close(false);
   }
 
   // ---- R-6 regression: prefix range must cover supplementary Unicode -------
@@ -272,7 +279,7 @@ try {
       left.includes('p*x:decoy') && left.includes('q:other'),
       `remaining: ${left.map((k) => JSON.stringify(k)).join(', ')}`
     );
-    db.close();
+    db.close(false);
   }
 } catch (error) {
   check('child completed', false, `${error.name}: ${error.message}`);

@@ -4,15 +4,26 @@ import type { PaginationMeta } from '@/utils/api-response';
 import { HTTP_STATUS } from '@/utils/api-messages';
 
 /**
- * Framework-agnostic request context passed to every handler.
+ * What a route is allowed to read from the request body.
  *
- * Built by the adapter layer from a framework-specific request object
- * (Next `Request`, Elysia `Context`, Hono `Context`) so handlers never
- * depend on the underlying framework.
+ * Declared per route, not inferred from the `Content-Type` the client happened
+ * to send. Inference is what let a JSON-only dashboard route parse
+ * attacker-supplied multipart data: the client picked the parser. Under an
+ * explicit policy a `json` route never parses multipart, and a `none` route
+ * never touches the body stream at all — which is what makes a token check on
+ * the maintenance route run against zero parsed input.
  */
-export interface HandlerInput {
-  /** Parsed JSON body, or null when no body was sent / parsing failed. */
-  body: unknown;
+export type BodyPolicy = 'none' | 'json' | 'multipart';
+
+/**
+ * Everything about a request that is derivable from the head alone — no body
+ * byte is read to produce it.
+ *
+ * Split out from `HandlerInput` so admission checks (the pre-auth per-IP limit,
+ * a maintenance token, a path guard) can run on a request BEFORE its body is
+ * parsed. Check-then-read, not read-then-check.
+ */
+export interface HandlerRequestMeta {
   /** URL search params. */
   query: URLSearchParams;
   /** Route params resolved by the adapter (e.g. `{ id: '...' }`). */
@@ -34,11 +45,51 @@ export interface HandlerInput {
    *
    * ⚠️ Only `headers`, `url`, and `method` are safe to read. The body stream
    * (`.json()`, `.text()`, `.formData()`, `.arrayBuffer()`) may already have
-   * been consumed by the adapter while building `ctx.body`, and web `Request`
-   * bodies can only be read once. If you genuinely need the raw body, clone
-   * the request first (`request.clone()`) at the call site.
+   * been consumed by `ctx.readJson()` or `ctx.readFormData()`, and web `Request`
+   * bodies can only be read once. If you genuinely need the raw body, clone the
+   * request first (`request.clone()`) at the call site.
    */
   rawRequest: Request;
+}
+
+/**
+ * Framework-agnostic request context passed to every handler.
+ *
+ * Built by the adapter layer from a framework-specific request object
+ * (Next `Request`, Elysia `Context`, Hono `Context`) so handlers never
+ * depend on the underlying framework.
+ */
+export interface HandlerInput extends HandlerRequestMeta {
+  /**
+   * Reads and parses the JSON body, or returns null when the route's policy is
+   * not `json`, no body was sent, the media type was not `application/json`, or
+   * parsing failed.
+   *
+   * A FUNCTION, like `readFormData`, and for the same reason. An eager `body`
+   * field meant the framework layer parsed before the handler ran, so a route
+   * whose only admission check is its OWN limiter — the OTP endpoints, which
+   * carry per-identifier budgets instead of the coarse per-IP one — still had an
+   * attacker-supplied body buffered before that limiter could reject it. Now
+   * NOTHING in the adapter reads a body byte: the handler decides when, after
+   * its own checks. Memoised, so a second call returns the first result.
+   */
+  readJson: () => Promise<unknown>;
+  /**
+   * Reads the multipart form, or returns null when the route's policy is not
+   * `multipart` or the media type was not `multipart/form-data`.
+   *
+   * A FUNCTION, not a field, and that is the point: multipart is the unbounded
+   * one, so nothing reads it until the handler has run its own admission checks
+   * (the upload limiter). Memoised — a web `Request` body reads once, so a
+   * second call returns the first result rather than throwing.
+   *
+   * Parsed by the adapter rather than from `rawRequest`, because reading it at
+   * the call site is not portable: every framework other than Next consumes the
+   * stream in its own parser first — on Elysia `rawRequest.formData()` throws
+   * `Body has already been used`, which a `.catch` silently turns into
+   * "no files".
+   */
+  readFormData: () => Promise<FormData | null>;
 }
 
 /**
@@ -69,18 +120,46 @@ export interface HandlerCookie {
   options?: HandlerCookieOptions;
 }
 
+/** The response envelope every application endpoint returns. */
+export interface HandlerEnvelope<T = unknown> {
+  success: boolean;
+  message: string;
+  data: T;
+  meta?: PaginationMeta;
+}
+
+/**
+ * Escape hatch for the few endpoints whose body shape is fixed by an external
+ * consumer and therefore cannot be the envelope: the Coolify health check and
+ * the scheduled sweep both parse specific top-level fields, and changing them
+ * would break a deployment rather than a client we control.
+ *
+ * A separate member of the body union rather than widening `body` to `unknown`,
+ * so an ordinary handler still cannot return a shape the API contract forbids
+ * by accident — it has to call `apiRaw` and say so.
+ */
+export interface HandlerRawBody {
+  raw: unknown;
+}
+
+export type HandlerBody<T = unknown> = HandlerEnvelope<T> | HandlerRawBody;
+
+export function isRawBody(body: HandlerBody): body is HandlerRawBody {
+  return 'raw' in body;
+}
+
+/** The value an adapter should JSON-serialise for a given output. */
+export function responsePayload(body: HandlerBody): unknown {
+  return isRawBody(body) ? body.raw : body;
+}
+
 /**
  * Framework-agnostic response. The adapter converts this to the
  * framework's native response type.
  */
 export interface HandlerOutput<T = unknown> {
   status: number;
-  body: {
-    success: boolean;
-    message: string;
-    data: T;
-    meta?: PaginationMeta;
-  };
+  body: HandlerBody<T>;
   /** Additional response headers (e.g. Retry-After on 429). */
   headers?: Record<string, string>;
   /**
@@ -145,4 +224,42 @@ export function parseSetCookieHeaders(values: string[]): HandlerCookie[] {
     parsed.push({ name, value, options });
   }
   return parsed;
+}
+
+/**
+ * Render a `HandlerCookie` back into one `Set-Cookie` header value — the exact
+ * inverse of `parseSetCookieHeaders`, and deliberately in the same file so the
+ * two cannot drift.
+ *
+ * Adapters whose framework has no cookie API rich enough for the full option
+ * set (`Partitioned`, `Priority`, …) use this and append the result themselves.
+ *
+ * The name and value are emitted VERBATIM. Most of these cookies originate as
+ * an already-formed `Set-Cookie` line from Better Auth, so percent-encoding
+ * them here would corrupt a signed session token rather than protect anything.
+ */
+export function serializeSetCookie(cookie: HandlerCookie): string {
+  const o = cookie.options ?? {};
+  const parts = [`${cookie.name}=${cookie.value}`];
+
+  if (o.maxAge !== undefined && Number.isFinite(o.maxAge))
+    parts.push(`Max-Age=${Math.trunc(o.maxAge)}`);
+  if (o.domain) parts.push(`Domain=${o.domain}`);
+  if (o.path) parts.push(`Path=${o.path}`);
+  // An unparsable date would serialise as "Invalid Date", which browsers treat
+  // as a session cookie — silently turning a deletion into a live cookie.
+  if (o.expires && !Number.isNaN(o.expires.getTime()))
+    parts.push(`Expires=${o.expires.toUTCString()}`);
+  if (o.httpOnly) parts.push('HttpOnly');
+  if (o.secure) parts.push('Secure');
+  if (o.sameSite)
+    parts.push(
+      `SameSite=${o.sameSite[0]?.toUpperCase() ?? ''}${o.sameSite.slice(1)}`
+    );
+  const extraFlags = o.extraFlags ?? [];
+  const extraAttributes = Object.entries(o.extra ?? {});
+  for (const flag of extraFlags) parts.push(flag);
+  for (const [key, value] of extraAttributes) parts.push(`${key}=${value}`);
+
+  return parts.join('; ');
 }

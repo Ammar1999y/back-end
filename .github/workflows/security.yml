@@ -30,7 +30,7 @@ jobs:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: |
           set -euo pipefail
-          args=(--config=p/typescript --config=p/nextjs --config=p/secrets --error --metrics=off)
+          args=(--config=p/typescript --config=p/secrets --error --metrics=off)
           if [ -n "${BASE_SHA:-}" ]; then
             args+=(--baseline-commit="$BASE_SHA")
           fi

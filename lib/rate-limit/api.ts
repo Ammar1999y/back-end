@@ -14,11 +14,12 @@ import { isPhoneChannel } from '@/utils/validation/otp';
 
 import { rateLimit } from './index';
 
-// The app runs on Vercel, or on a VPS behind Cloudflare — both always inject
-// a trusted IP header (`cf-connecting-ip` / `x-vercel-forwarded-for`). A null
-// result from `getClientIp` therefore means a misconfigured deployment or
-// direct origin access; fail closed instead of pooling traffic into a shared
-// `ip:unknown` bucket.
+// The app runs on a VPS behind Cloudflare, which always injects
+// `cf-connecting-ip`. A null result from `getClientIp` therefore means a
+// misconfigured deployment or direct origin access; fail closed instead of
+// pooling traffic into a shared `ip:unknown` bucket. In development
+// `getClientIp` resolves a loopback fallback instead, so this path is
+// production-only.
 //
 // Status is 503 (not 400): the client did nothing wrong — the trusted-proxy
 // header is missing because of a server/edge misconfiguration. Using 400
@@ -66,7 +67,9 @@ function ipBucket(ip: string): string {
   return segments.slice(0, 4).join(':') + '::/64';
 }
 
-// TODO: set the right header to get the IP when deplay the app
+// TODO(proxy-trust): the header this resolves is trusted on syntax alone —
+// see the note on TRUSTED_IP_HEADERS in lib/audit.ts and
+// reports/should-ignore.md #63.
 export function ipIdentifier(headers: Headers): string {
   const ip = getClientIp(headers);
   if (!ip) {
@@ -74,7 +77,6 @@ export function ipIdentifier(headers: Headers): string {
       sanitizeForLog({
         msg: 'missing client ip headers',
         cf: headers.get('cf-connecting-ip'),
-        vercel: headers.get('x-vercel-forwarded-for'),
         forwarded: headers.get('x-forwarded-for'),
         host: headers.get('host'),
         ua: headers.get('user-agent'),

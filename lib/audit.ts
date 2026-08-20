@@ -16,33 +16,58 @@ const IP_SCHEMA = z.union([z.ipv4(), z.ipv6()]);
 export { API_PATH_MAX, USER_AGENT_MAX } from './audit/constants';
 
 /**
- * Trusted edge headers, in priority order. Shared with Better Auth
+ * Trusted edge headers. Shared with Better Auth
  * (`advanced.ipAddress.ipAddressHeaders`) so every IP-derived decision in the
  * app — our limiters, Better Auth's limiter, and session IP metadata — reads
  * the same source instead of Better Auth defaulting to `x-forwarded-for`.
- * TODO: set the right header to get the IP when deplay the app
+ *
+ * `x-vercel-forwarded-for` was removed with the framework: there is no Vercel in
+ * this deployment, and a trusted-header entry nothing sets is pure attack
+ * surface — a forged value would have been accepted on syntax alone.
+ *
+ * TODO(proxy-trust): the value here is accepted on SYNTAX alone; nothing checks
+ * that the socket peer is the expected upstream, so a request that reaches the
+ * origin directly can forge it. Resolution is deferred until the edge is final
+ * (the correct TRUSTED_PROXY_CIDRS are not knowable before then) — see
+ * reports/should-ignore.md #63 and finding 14 of
+ * reports/elysia-migration-review-final.md. `server.requestIP(request)` is the
+ * mechanism; it asserts the PROXY, and does not replace this header rule.
  */
-export const TRUSTED_IP_HEADERS = [
-  'cf-connecting-ip',
-  'x-vercel-forwarded-for',
-] as const;
+export const TRUSTED_IP_HEADERS = ['cf-connecting-ip'] as const;
+
+/**
+ * The identifier used when no trusted header is present AND this is a
+ * development process.
+ *
+ * Not a security hole, and the reason is structural: `NODE_ENV` is now validated
+ * against exactly `development` / `test` / `production` in `server.ts` before any
+ * application module loads, so this branch cannot be reached by a misspelt or
+ * absent value the way the production guards previously could be.
+ *
+ * Without it, every `preAuthIpLimit` route answers 503 on a developer machine —
+ * `ipIdentifier` fails closed by design — which made local dashboard work
+ * impossible and pushed towards weakening the production rule instead.
+ */
+const DEVELOPMENT_FALLBACK_IP = '127.0.0.1';
 
 /**
  * Extracts the client IP from trusted proxy headers only.
- * Priority: cf-connecting-ip (Cloudflare) → x-vercel-forwarded-for (Vercel).
+ *
  * `x-forwarded-for` is intentionally NOT accepted — it is client-controllable
  * when the origin is directly reachable. Block direct-origin traffic at the
- * edge (Cloudflare-only ingress / firewall allowlist for Vercel).
- * TODO: set the right header to get the IP when deplay the app
+ * edge (Cloudflare-only ingress).
+ *
+ * TODO(proxy-trust): see the note on TRUSTED_IP_HEADERS.
  */
 export function getClientIp(headers: Headers): string | null {
-  const raw =
-    headers.get(TRUSTED_IP_HEADERS[0]) ??
-    headers.get(TRUSTED_IP_HEADERS[1])?.split(',', 1)[0]?.trim() ??
-    null;
+  const raw = headers.get(TRUSTED_IP_HEADERS[0]);
 
-  if (!raw || raw.length > MAX_IP_LENGTH) return null;
-  return IP_SCHEMA.safeParse(raw).success ? raw : null;
+  if (raw && raw.length <= MAX_IP_LENGTH && IP_SCHEMA.safeParse(raw).success)
+    return raw;
+
+  return process.env.NODE_ENV === 'development'
+    ? DEVELOPMENT_FALLBACK_IP
+    : null;
 }
 
 /** Extract request-scoped metadata used by audit logs from a HandlerInput. */

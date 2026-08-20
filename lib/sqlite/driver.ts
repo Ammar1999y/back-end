@@ -2,101 +2,74 @@
  * The ONLY module in this codebase that knows which SQLite driver is in use.
  *
  * ============================================================================
- * WHY better-sqlite3 AND NOT bun:sqlite
+ * WHY bun:sqlite
  * ============================================================================
- * `bun:sqlite` is the intended long-term driver, but it cannot be used yet:
- * Next.js route handlers execute under Node, not Bun. Verified on Next 16.3.1
- * in dev, in production (`next start`), and with `bun --bun` forcing the Bun
- * runtime for the CLI — every path reported `runtime: node` and
- * `import('bun:sqlite')` failed with `ERR_UNSUPPORTED_ESM_URL_SCHEME`.
- * Next/Turbopack forks its own Node workers, so `--bun` never reaches them.
+ * The driver and the server framework are one decision, not two. `better-sqlite3`
+ * is built against the V8 C++ API, which Bun (JavaScriptCore) only partially
+ * emulates — see https://github.com/oven-sh/bun/issues/4290, open since August
+ * 2023. Under Bun it either throws `ERR_DLOPEN_FAILED` or hard-panics the process
+ * with `NAPI FATAL ERROR`. The reverse also held: Next route handlers executed
+ * under Node regardless of `bun --bun`, so `bun:sqlite` was unreachable there
+ * (`ERR_UNSUPPORTED_ESM_URL_SCHEME`).
  *
- * The reverse also holds: better-sqlite3 CANNOT run under Bun. It is built
- * against the V8 C++ API, which Bun (JavaScriptCore) only partially emulates —
- * see https://github.com/oven-sh/bun/issues/4290, open since August 2023. Under
- * Bun it either throws `ERR_DLOPEN_FAILED` or hard-panics the process with
- * `NAPI FATAL ERROR`. So the driver MUST be swapped at the same time the server
- * stops being Next.js, not before and not after.
+ * Elysia runs the server under Bun, so the swap happened with the framework
+ * migration, exactly as the previous version of this file specified. Everything
+ * driver-specific stayed inside this file; no caller changed.
  *
  * ============================================================================
- * HOW TO SWAP TO bun:sqlite (do this with the Hono/Elysia migration)
+ * WHAT CHANGED, AND WHAT TO RE-CHECK IF THE DRIVER EVER MOVES AGAIN
  * ============================================================================
- * Everything below is contained in this file. No caller changes.
- *
- * 1. Replace the import:
- *      -  import Database from 'better-sqlite3';
- *      +  import { Database } from 'bun:sqlite';
- *
- * 2. Construct with `create` — bun:sqlite does not create the file by default:
- *      -  new Database(path)
- *      +  new Database(path, { create: true })
- *
- * 3. PRAGMA is `exec`, not a method:
- *      -  db.pragma('journal_mode = WAL')
- *      +  db.exec('PRAGMA journal_mode = WAL')
- *    and reading one back:
- *      -  db.pragma(name, { simple: true })
- *      +  Object.values(db.query(`PRAGMA ${name}`).get() ?? {})[0]
- *
- * 4. Prefer `db.query()` over `db.prepare()`: bun:sqlite caches compiled
- *    statements by SQL string (20 by default), better-sqlite3 caches nothing —
- *    which is why callers here prepare once at module scope. Either works.
- *
- * 5. BLOB columns come back as `Uint8Array`, not `Buffer`. Everything in this
- *    codebase already reads them through `new TextDecoder().decode(...)`, which
- *    accepts both, so no change is expected — but grep for `Buffer.isBuffer`
- *    and `.toString('utf8')` on a query result before trusting that.
- *
- * 6. A missing row is `null` in bun:sqlite and `undefined` in better-sqlite3.
- *    Callers here use `if (!row)`, which covers both. Keep it that way.
- *
- * 7. Statements hold native handles in bun:sqlite and should be `.finalize()`d
- *    when discarded. Module-scope statements live for the process, so this only
- *    matters if a future caller prepares statements per request.
- *
- * 8. `close()` takes an argument: `db.close(true)` finalizes outstanding
- *    statements immediately. better-sqlite3 takes none.
- *
- * 9. Integers past 2^53 lose precision in BOTH drivers (measured). bun:sqlite
- *    can fix it with `{ safeIntegers: true }`, but that returns EVERY integer as
- *    a bigint, which breaks `JSON.stringify` and forces conversions everywhere.
+ * 1. `new Database(path, { create: true })` — bun:sqlite does not create the
+ *    file unless asked.
+ * 2. PRAGMA is a statement, not a method: `db.run('PRAGMA journal_mode = WAL')`,
+ *    and reading one back goes through `db.query`.
+ * 3. A missing row is `null` here and was `undefined` under better-sqlite3.
+ *    `SqliteStatement.get` is typed `Row | null` for that reason; every caller
+ *    tests falsiness, which covers both.
+ * 4. BLOB columns come back as `Uint8Array`, not `Buffer`. Everything here reads
+ *    them through `new TextDecoder().decode(...)`, which accepts both.
+ * 5. `prepare()` over `query()`, deliberately. `query()` caches compiled
+ *    statements by SQL string with a bounded cache (20), and every statement in
+ *    this codebase is prepared once at module scope and held for the process —
+ *    a cache eviction finalising one of them would be a latent failure. `prepare`
+ *    hands back a statement this code owns outright.
+ * 6. Integers past 2^53 lose precision, as they did before. `safeIntegers` would
+ *    fix it but returns EVERY integer as a bigint, which breaks `JSON.stringify`.
  *    Do not enable it: the largest value stored here is a millisecond timestamp
  *    (~1.7e12) against a ~9e15 ceiling.
- *
- * 10. `transactionImmediate` maps to `db.transaction(fn).immediate` here. In
- *     bun:sqlite the equivalent is `db.transaction(fn).immediate(...)` as well —
- *     same name, but verify it acquires the write lock eagerly before relying on
- *     it for the migration lock.
- *
- * 11. The bounded sweep uses `DELETE ... LIMIT`, which requires SQLite to be
- *     compiled with `SQLITE_ENABLE_UPDATE_DELETE_LIMIT`. Both current builds have
- *     it (verified). If a future build does not, rewrite as
- *     `DELETE FROM t WHERE key IN (SELECT key FROM t WHERE ... LIMIT ?)`.
- *
- * 12. Delete `better-sqlite3` and `@types/better-sqlite3` from package.json, and
- *     drop `better-sqlite3` from `serverExternalPackages` in next.config.js and
- *     from `ignoreScripts`.
+ * 7. The bounded sweep uses `DELETE ... LIMIT`, which requires SQLite compiled
+ *    with `SQLITE_ENABLE_UPDATE_DELETE_LIMIT`. Bun's build has it (verified in
+ *    bench/sqlite/bun-sqlite). If a future build does not, rewrite as
+ *    `DELETE FROM t WHERE key IN (SELECT key FROM t WHERE ... LIMIT ?)`.
  *
  * ============================================================================
  * PORTABILITY RULE THAT APPLIES TO EVERY CALLER
  * ============================================================================
- * Use anonymous `?` placeholders, never `?1` / `?2`. better-sqlite3 rejects
- * numbered placeholders when binding positionally with
- * `RangeError: Too many parameter values were provided`; bun:sqlite accepts
- * both. Writing `?1` would silently couple this codebase to Bun.
+ * Use anonymous `?` placeholders, never `?1` / `?2`. bun:sqlite accepts both,
+ * better-sqlite3 rejects numbered placeholders when binding positionally with
+ * `RangeError: Too many parameter values were provided`. Writing `?1` would
+ * silently make the rollback to better-sqlite3 impossible.
  */
 
-// Types come from DefinitelyTyped at 9.x while the library is 13.x. The surface
-// used here — Database, prepare, Statement.run/get/all, pragma, transaction,
-// exec, close — is unchanged between those versions and matches the v13 docs.
-// Both packages disappear at the bun:sqlite swap.
-import Database from 'better-sqlite3';
+import type { SQLQueryBindings } from 'bun:sqlite';
+
+import { Database } from 'bun:sqlite';
 
 export interface SqliteStatement {
-  get<Row>(...params: readonly SqliteBindValue[]): Row | undefined;
+  /** `null`, not `undefined`, when no row matched — see the driver notes. */
+  get<Row>(...params: readonly SqliteBindValue[]): Row | null;
   all<Row>(...params: readonly SqliteBindValue[]): Row[];
   /** `changes` is what lets the bounded sweep know when a batch came up short. */
   run(...params: readonly SqliteBindValue[]): { changes: number };
+  /**
+   * Releases the native statement.
+   *
+   * Idempotent, and safe to skip: `close()` finalizes everything this
+   * connection prepared. Call it only for a statement with a lifetime shorter
+   * than the connection's — the deep health check's `quick_check` is the one
+   * such case, and without it every readiness poll leaked a statement.
+   */
+  finalize(): void;
 }
 
 export type SqliteBindValue = string | number | bigint | Uint8Array | null;
@@ -122,36 +95,88 @@ export interface SqliteConnection {
    * it — schema migration is exactly that case.
    */
   transactionImmediate(fn: () => void): () => void;
+  /**
+   * Finalizes every statement this connection prepared, then closes the handle
+   * strictly. See the note on `openConnection`.
+   */
   close(): void;
 }
 
 /**
- * A missing row is `undefined` here and `null` under bun:sqlite; callers must
- * test falsiness rather than compare against either literal.
+ * ============================================================================
+ * STATEMENT LIFETIME — why this connection tracks what it prepares
+ * ============================================================================
+ * SQLite's `close_v2` DEFERS the real close while any prepared statement is
+ * still alive, and reports success while doing it. Measured on this Bun build:
+ * a statement prepared from a connection, then `db.close(false)`, still
+ * returned rows afterwards — the handle, its file lock and its memory were all
+ * still held, and nothing said so.
+ *
+ * The consequence was not theoretical. `lib/rate-limit/store.ts` closes the
+ * connection when one prepare in its batch fails, in order to release the
+ * handle; every statement prepared BEFORE the failure kept it open until
+ * garbage collection, so the guard did not do what it was written to do. The
+ * deep health check leaked one statement per poll for the same reason.
+ *
+ * So: every native statement is tracked here, `close()` finalizes all of them
+ * first, and only then closes with `throwOnError = true`. Measured: `close(true)`
+ * with an outstanding statement throws `database is locked` and leaves the
+ * database open — which is exactly the signal wanted. Finalizing first means the
+ * throw can only mean a statement this connection does not know about, and that
+ * is a bug worth surfacing rather than deferring.
  */
 export function openConnection(path: string): SqliteConnection {
-  const db = new Database(path);
+  // The path comes from SQLITE_DIR (deployment configuration), never a request.
+  const db = new Database(path, { create: true, readwrite: true });
+  const live = new Set<{ finalize(): void }>();
 
   return {
     prepare(sql) {
-      const statement = db.prepare(sql);
+      const statement = db.prepare<unknown, SQLQueryBindings[]>(sql);
+      live.add(statement);
+      let finalized = false;
       return {
         get: (...params) => statement.get(...params) as never,
         all: (...params) => statement.all(...params) as never,
         run: (...params) => ({ changes: statement.run(...params).changes }),
+        finalize: () => {
+          if (finalized) return;
+          finalized = true;
+          live.delete(statement);
+          statement.finalize();
+        },
       };
     },
     exec: (sql) => {
-      db.exec(sql);
+      db.run(sql);
     },
     pragma: (statement) => {
-      db.pragma(statement);
+      db.run(`PRAGMA ${statement}`);
     },
-    pragmaValue: (name) => db.pragma(name, { simple: true }),
+    pragmaValue: (name) => {
+      // `prepare` + immediate finalize, not `query`. `query` caches the compiled
+      // statement inside the Database, and that cached statement is invisible to
+      // the tracking above — it would make the strict `close(true)` throw on a
+      // connection with no real leak.
+      const statement = db.prepare<Record<string, unknown>, []>(
+        `PRAGMA ${name}`
+      );
+      try {
+        const row = statement.get();
+        return row ? Object.values(row)[0] : undefined;
+      } finally {
+        statement.finalize();
+      }
+    },
     transaction: (fn) => db.transaction(fn),
     transactionImmediate: (fn) => db.transaction(fn).immediate,
     close: () => {
-      db.close();
+      for (const statement of live) statement.finalize();
+      live.clear();
+      // `true`, not `false`. With every statement this connection handed out
+      // already finalized, a throw here means an untracked one exists — a real
+      // leak, and better as an error than as a close that silently did nothing.
+      db.close(true);
     },
   };
 }

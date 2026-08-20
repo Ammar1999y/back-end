@@ -1,6 +1,17 @@
-# Coolify deployment: Next.js, `better-sqlite3`, local cache and rate limits
+# Coolify deployment: ElysiaJS, `bun:sqlite`, local cache and rate limits
 
 Updated: 2026-08-19
+
+> **Rewritten for the Elysia migration.** This runbook targeted Next.js 16.3.1
+> under Node 24 with `better-sqlite3`. The application now runs on ElysiaJS
+> under Bun with `bun:sqlite` — see
+> [docs/framework-migration.md](../docs/framework-migration.md). Sections §2 and
+> §3 are the ones that changed materially; the volume, sweep, monitoring and
+> gate sections are unaffected because none of them depended on the framework.
+>
+> **Nothing in this runbook has been executed against a live Coolify instance
+> since the migration.** Treat §2 and §3 as revised instructions, not as a
+> verified deployment.
 
 ## Decisions this runbook assumes
 
@@ -20,18 +31,21 @@ sweep. See gate 6.
 
 This runbook targets one Coolify application on one VPS:
 
-- Next.js 16.3.1 runs under Node 24, not Bun.
-- Bun 1.3.14 remains package manager/build tool.
+- ElysiaJS runs under Bun 1.3.14. There is no Node process any more — Bun is the
+  runtime, the package manager and the TypeScript loader.
 - Neon/PostgreSQL remains business database (`DATABASE_URL`).
-- Local SQLite holds rate-limit state and, when adopted, disposable cache data.
+- Local SQLite holds rate-limit state and, when adopted, disposable cache data,
+  through Bun's built-in `bun:sqlite`. No native addon, no prebuild, no
+  `node-gyp`, and no Node major to pin.
 - Cloudflare proxies public traffic to Coolify/Traefik.
-- One steady-state application container runs one `next start` process.
+- One steady-state application container runs one `bun server.ts` process.
 
-Coolify supports Next.js through Nixpacks; current repository has no Dockerfile,
-so instructions below use Nixpacks. A Dockerfile becomes preferable if exact Bun
-or OS versions cannot be reproduced. See
-[Coolify Next.js deployment](https://coolify.io/docs/applications/nextjs) and
-[Nixpacks commands/configuration](https://coolify.io/docs/applications/build-packs/nixpacks).
+Current repository has no Dockerfile, so instructions below use Nixpacks. A
+Dockerfile becomes preferable if the exact Bun version cannot be reproduced —
+and that risk is higher now than it was, because Bun is the runtime rather than
+only the build tool. See
+[Nixpacks commands/configuration](https://coolify.io/docs/applications/build-packs/nixpacks)
+and [Deploy Elysia to production](https://elysiajs.com/patterns/deploy).
 
 ## Production gates
 
@@ -41,22 +55,37 @@ Do not expose production traffic until these are resolved:
    `OTP_AUTO_VERIFY = true`. `NEXT_PUBLIC_OTP_AUTO_VERIFY` does not control it.
    Change and test code; no Coolify variable can make current build verify OTPs.
 2. **Cloudflare ingress is mandatory with current IP trust policy.** Code trusts
-   `cf-connecting-ip` and `x-vercel-forwarded-for`, not Traefik's normal
-   `x-forwarded-for`. Direct Coolify traffic makes IP-protected handlers
+   `cf-connecting-ip` and nothing else. `x-vercel-forwarded-for` was removed —
+   there is no Vercel in this deployment and a trusted-header entry nothing sets
+   is pure attack surface. Traefik's normal `x-forwarded-for` is deliberately
+   NOT accepted: it is client-controllable whenever the origin is reachable
+   directly. Direct Coolify traffic therefore makes IP-protected handlers
    return 503. Proxy DNS through Cloudflare and block direct origin access.
+
+   In **development only** (`NODE_ENV=development`, now validated as an exact
+   string at startup) the code falls back to a loopback identifier instead of
+   503, so local work does not need a forged header. That branch cannot be
+   reached in production — see `getClientIp` in `lib/audit.ts`.
+
+   The header is still trusted on SYNTAX ALONE — nothing verifies the socket
+   peer is Cloudflare/Traefik. That is deferred until the edge is final; every
+   site carries a greppable `TODO(proxy-trust)` comment, and the resolution is
+   in `reports/should-ignore.md` #63.
+
 3. **Confirm the expiry sweep is scheduled.** The sweeper ships as a tracked
-   HTTP route (`app/api/internal/sqlite-sweep/route.ts`) running in the Node
-   runtime Next already uses; the earlier CLI script was removed because
-   `better-sqlite3` cannot load under Bun. Configure exactly one scheduled task
-   (§9), and confirm it authenticates — an unset `SQLITE_MAINTENANCE_TOKEN`
-   makes it 401 forever and the databases grow unbounded.
+   HTTP route (`app/api/internal/sqlite-sweep/handler.ts`, registered in
+   `server.ts`). Configure exactly one scheduled task (§9), and confirm it
+   authenticates — an unset `SQLITE_MAINTENANCE_TOKEN` makes it 401 forever and
+   the databases grow unbounded.
 4. **Choose deployment overlap policy.** Safe current default is stop-first
    deployment. Rolling deployments need version-skew handling and migration
    compatibility described below.
-5. **Protect secrets used by `next build`.** Current build-time validation needs
-   several production secrets. Enable Coolify's **Use Docker Build Secrets** and
-   confirm BuildKit did not fall back to image build arguments. Otherwise stop:
-   ordinary build arguments remain visible in image metadata/history.
+5. **Confirm no secret is scoped to the build.** This gate inverted with the
+   Elysia migration: the build stage is `tsc --noEmit`, which reads no
+   environment, so every secret below is runtime-only. Re-scope any variable
+   still marked "build + runtime" from the Next deployment — a build-scoped
+   secret stays visible in image metadata/history unless BuildKit secrets are in
+   use, and there is no longer any reason to take that risk.
 6. **Decide `secure_delete`.** This is the one SQLite policy choice still open.
    Both databases run with `secure_delete=OFF`, so deleted rows keep their bytes
    in the file until those pages are reused — and the deleted bytes here are
@@ -92,71 +121,81 @@ single-VPS SQLite is insufficient; use durable shared storage.
 
 Under **Configuration > General**:
 
-| Field           | Value                                        |
-| --------------- | -------------------------------------------- |
-| Build Pack      | `Nixpacks`                                   |
-| Base Directory  | `/`                                          |
-| Static Site     | Off                                          |
-| Ports Exposes   | `3000`                                       |
-| Port Mappings   | Empty                                        |
-| Install Command | `bun install --frozen-lockfile`              |
-| Build Command   | `node node_modules/next/dist/bin/next build` |
-| Start Command   | `node node_modules/next/dist/bin/next start` |
+| Field           | Value                           |
+| --------------- | ------------------------------- |
+| Build Pack      | `Nixpacks`                      |
+| Base Directory  | `/`                             |
+| Static Site     | Off                             |
+| Ports Exposes   | `3000`                          |
+| Port Mappings   | Empty                           |
+| Install Command | `bun install --frozen-lockfile` |
+| Build Command   | `bun run build`                 |
+| Start Command   | `bun run start`                 |
 
-Explicit Node commands matter: `better-sqlite3` is a native Node N-API addon;
-constructing it under Bun 1.3.14 hard-crashed in repository verification.
-`next start` is the supported self-hosted production server and listens on
-`0.0.0.0` by default; Coolify supplies `PORT`. See
-[Next.js CLI](https://nextjs.org/docs/app/api-reference/cli/next) and
-[Next.js self-hosting](https://nextjs.org/docs/app/guides/self-hosting).
+`bun run build` is `tsc --noEmit`. There is no bundle: Bun executes the
+TypeScript directly, so a type error is the only build-time failure the server
+can still have, and running the compiler is what keeps the build stage from
+being a no-op that always succeeds.
 
-Set `NIXPACKS_NODE_VERSION=24` as build variable. This matches the repository's
-`@types/node` major and the Node 24.12 verification environment;
-`better-sqlite3` 13.0.3 requires Node `>=22`. Nixpacks only selects a Node
-major, not an exact patch; see
-[Coolify Node versioning](https://next.coolify.io/docs/applications/build-packs/nixpacks/node-versioning)
-and
-[`better-sqlite3` 13.0.3 package metadata](https://github.com/WiseLibs/better-sqlite3/blob/v13.0.3/package.json).
+`bun run start` is `NODE_ENV=production bun server.ts`. Elysia binds `0.0.0.0`
+by default and `server.ts` reads Coolify's `PORT`, defaulting to 3000.
 
-Check build log shows Bun 1.3.14, matching `packageManager` and `bun.lock`. If
-Nixpacks supplies different Bun version, stop and choose one:
+**`NODE_ENV` matters more than it did.** Next set it automatically; Bun does
+not. It is set inside the `start` script for exactly that reason — several
+security behaviours key off it (`Strict-Transport-Security`, the production-only
+env validation in `lib/env.server.ts`, the absolute-`SQLITE_DIR` requirement,
+and the dev-only endpoints). If the start command is ever overridden in Coolify,
+`NODE_ENV=production` must be carried over or the deployment silently runs with
+development posture.
 
-- add repository-owned Dockerfile pinning Node 24 and Bun 1.3.14; or
-- deliberately validate and update package-manager pin/lockfile.
+`NIXPACKS_NODE_VERSION` is no longer needed — nothing runs under Node. Remove it
+if it is still set from the previous deployment.
 
-Do not accept unreviewed version drift. `better-sqlite3` 13.0.3 includes Linux
-x64/arm64 glibc and musl prebuilds, so normal target needs no compiler or
-`node-gyp`. Keep `better-sqlite3` in Next `serverExternalPackages`.
+Check the build log shows Bun 1.3.14, matching `packageManager` and `bun.lock`.
+Bun is now the RUNTIME, so a version mismatch is no longer only a build concern:
+`bun:sqlite` behaviour is tied to the Bun build. If Nixpacks supplies a
+different Bun version, stop and either add a repository-owned Dockerfile pinning
+Bun 1.3.14, or deliberately validate and update the pin and lockfile. Do not
+accept unreviewed version drift.
 
 ## 3. Configure environment
 
-Coolify separates build and runtime flags. Current `next build` evaluates server
-configuration, so validation secrets below must be available during both phases.
-Before entering them, enable **Use Docker Build Secrets** in the application's
-environment-variable settings. Inspect the build log and image history; abort if
-the build host lacks BuildKit and Coolify falls back to `--build-arg`. Review
+Coolify separates build and runtime flags. The build stage is now only
+`tsc --noEmit`, which reads no environment at all — so unlike the previous
+`next build`, the secrets below are needed at RUNTIME ONLY. Scope them
+accordingly; a value scoped "build + runtime" out of habit widens its exposure
+for no benefit. The paragraph on Docker build secrets below therefore applies
+only if you deliberately keep a build-time consumer. Before entering them,
+enable **Use Docker Build Secrets** in the application's environment-variable
+settings. Inspect the build log and image history; abort if the build host lacks
+BuildKit and Coolify falls back to `--build-arg`. Review
 [Coolify environment-variable scopes and Docker build secrets](https://coolify.io/docs/knowledge-base/environment-variables).
 
 ### Required
 
-| Variable                           | Scope           | Secret | Notes                                                                                                                                                                  |
-| ---------------------------------- | --------------- | ------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `NIXPACKS_NODE_VERSION=24`         | Build           | No     | Major version only                                                                                                                                                     |
-| `NEXT_PUBLIC_URL=https://<domain>` | Build + runtime | No     | Exact public origin; no path                                                                                                                                           |
-| `DATABASE_URL`                     | Build + runtime | Yes    | Neon/PostgreSQL connection string                                                                                                                                      |
-| `BETTER_AUTH_SECRET`               | Build + runtime | Yes    | At least 32 chars; no surrounding whitespace                                                                                                                           |
-| `PASSWORD_PEPPER_ACTIVE_ID`        | Build + runtime | Yes    | Must name key in keyring                                                                                                                                               |
-| `PASSWORD_PEPPER_KEYRING`          | Build + runtime | Yes    | Valid one-line JSON; retain old keys used by stored hashes                                                                                                             |
-| `TURNSTILE_SECRET_KEY`             | Build + runtime | Yes    | Production Cloudflare secret                                                                                                                                           |
-| `SQLITE_DIR=/app/data`             | Build + runtime | No     | Absolute, no default in prod. `next build` imports the env module, so the build needs it too (CI passes a placeholder).                                                |
-| `SQLITE_MAINTENANCE_TOKEN`         | Runtime         | Yes    | Gates the sweep and deep-health routes; `openssl rand -hex 32`. Runtime only — deliberately NOT a build requirement, so the secret stays out of the build environment. |
-| `NEXT_PUBLIC_ENABLED_OTP_CHANNELS` | Build + runtime | No     | Comma list: `email`, `sms`, `whatsapp`                                                                                                                                 |
+| Variable                           | Scope   | Secret | Notes                                                                                                                                                                                                                                                                                                             |
+| ---------------------------------- | ------- | ------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `NODE_ENV=production`              | Runtime | No     | **Now enforced.** `server.ts` refuses to boot unless this is exactly `development`, `test` or `production`. An absent or misspelt value is a non-zero exit with a `startup rejected` log line, not a silent development posture.                                                                                  |
+| `PUBLIC_URL=https://<domain>`      | Runtime | No     | **Renamed** from `NEXT_PUBLIC_URL`, which still works as a legacy alias. Setting BOTH to different values is a boot failure. Must be an absolute origin — scheme required, no path, query, fragment or credentials, HTTPS in production — and is the single value used for both CORS and Better Auth's `baseURL`. |
+| `DATABASE_URL`                     | Runtime | Yes    | Neon/PostgreSQL connection string                                                                                                                                                                                                                                                                                 |
+| `BETTER_AUTH_SECRET`               | Runtime | Yes    | At least 32 chars; no surrounding whitespace                                                                                                                                                                                                                                                                      |
+| `PASSWORD_PEPPER_ACTIVE_ID`        | Runtime | Yes    | Must name key in keyring                                                                                                                                                                                                                                                                                          |
+| `PASSWORD_PEPPER_KEYRING`          | Runtime | Yes    | Valid one-line JSON; retain old keys used by stored hashes                                                                                                                                                                                                                                                        |
+| `TURNSTILE_SECRET_KEY`             | Runtime | Yes    | Production Cloudflare secret                                                                                                                                                                                                                                                                                      |
+| `SQLITE_DIR=/app/data`             | Runtime | No     | Absolute, no default in prod                                                                                                                                                                                                                                                                                      |
+| `SQLITE_MAINTENANCE_TOKEN`         | Runtime | Yes    | Gates the sweep and deep-health routes; `openssl rand -hex 32`                                                                                                                                                                                                                                                    |
+| `NEXT_PUBLIC_ENABLED_OTP_CHANNELS` | Runtime | No     | Comma list: `email`, `sms`, `whatsapp`                                                                                                                                                                                                                                                                            |
+
+Every row is runtime-only. Under Next these were build + runtime because
+`next build` evaluated `lib/env.server.ts`; `tsc --noEmit` does not, so nothing
+here belongs in the build environment any more. `NIXPACKS_NODE_VERSION` is gone
+with the Node runtime.
 
 `BETTER_AUTH_SECRETS` must be absent: project rejects it in production because
 it would override `BETTER_AUTH_SECRET`.
 
 `SQLITE_DIR` has **no production default** and must be absolute: the app refuses
-to boot without it, and `next build` fails without it too.
+to boot without it. The build no longer reads it.
 
 `SQLITE_MAINTENANCE_TOKEN` behaves differently, and the difference matters
 operationally: a missing token does **not** stop boot. The maintenance routes
@@ -170,16 +209,18 @@ proof in §8 does.
 
 ### Optional/recommended
 
-| Variable                        | Scope           | Notes                                      |
-| ------------------------------- | --------------- | ------------------------------------------ |
-| `NEXT_PUBLIC_BUSINESS_TIMEZONE` | Build + runtime | Valid IANA zone; defaults to `Asia/Riyadh` |
-| `NEXT_TELEMETRY_DISABLED=1`     | Build + runtime | Disables Next.js telemetry                 |
+| Variable                        | Scope   | Notes                                             |
+| ------------------------------- | ------- | ------------------------------------------------- |
+| `NEXT_PUBLIC_BUSINESS_TIMEZONE` | Runtime | Valid IANA zone; defaults to `Asia/Riyadh`        |
+| `PORT`                          | Runtime | Supplied by Coolify; `server.ts` defaults to 3000 |
 
-`SQLITE_DIR` is **build + runtime**, as the Required table states. An earlier
-revision of this section called it runtime-only; that was wrong and is corrected
-here. `next build` imports `lib/env.server.ts`, which resolves the database
-paths at module load, so the build fails without it. CI supplies a throwaway
-`/tmp/ci-sqlite`; production must supply the real mount path in both scopes.
+`NEXT_TELEMETRY_DISABLED` is obsolete — there is no Next.js to opt out of.
+
+`SQLITE_DIR` is **runtime-only**. It was build + runtime under Next, because
+`next build` imported `lib/env.server.ts` and resolved the database paths at
+module load. `tsc --noEmit` does not execute the module, so the build no longer
+needs it. CI still supplies a throwaway `/tmp/ci-sqlite` — not for the build,
+but for `bun run smoke`, which boots the real server.
 
 ### Feature-dependent secrets
 
@@ -188,9 +229,11 @@ paths at module load, so the build fails without it. CI supplies a throwaway
 - WhatsApp OTP: `WHATSAPP_API_KEY`.
 - R2 uploads: `R2_ACCOUNT_ID`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`,
   `R2_PUBLIC_BUCKET`, `R2_PRIVATE_BUCKET`, `R2_PUBLIC_URL`.
-- Rolling overlap only: stable `NEXT_SERVER_ACTIONS_ENCRYPTION_KEY` as a secret
-  build variable, generated once with `openssl rand -base64 32` and retained in
-  the deployment keyring. All overlapping builds must use the same value.
+  `NEXT_SERVER_ACTIONS_ENCRYPTION_KEY` used to be listed here for rolling
+  overlap. **Delete it if it is still set.** There are no Server Actions — there
+  is no Next.js — and the value encrypts nothing. It was already unused before
+  this runbook was written; it is listed now only so it gets removed rather than
+  carried forward.
 
 Use Coolify Normal view. Lock secrets. Enable **Literal** for any value
 containing `$` so Coolify does not interpolate it. Never paste local `.env`
@@ -223,9 +266,18 @@ Requirements:
 - Mount directory, not individual `.db` file. SQLite also creates `-wal` and
   `-shm` beside each database.
 - Do not share production bind path with preview/staging applications.
-- Keep one steady-state replica and one Node process. No PM2 cluster, Docker
-  Swarm replica increase, or second VPS against this volume.
-- Do not persist `.next`; only `/app/data` belongs on this mount.
+- Keep one steady-state replica and one **Bun** process. No PM2 cluster, Docker
+  Swarm replica increase, or second VPS against this volume. (The previous
+  wording said "one Node process"; there is no Node process any more.)
+- Only `/app/data` belongs on this mount. (`.next` no longer exists.)
+
+  **This is now enforced rather than assumed.** Elysia defaults Bun's
+  `reusePort` to `true`, which meant a second process would bind the SAME port
+  and the kernel would split traffic between them — each with its own SQLite
+  files, so the rate-limit counters silently halved with no error and no log.
+  `app.ts` sets `reusePort: false`, so a second process now dies immediately
+  with `EADDRINUSE` (verified). If a deploy starts failing with that error,
+  something is starting two processes; that is the bug, not the setting.
 
 Current paths:
 
@@ -299,9 +351,8 @@ untrusted proxy hops are reachable.
 
 Enable **Consistent Container Names** (or configured custom container name) so
 Coolify stops old container before starting replacement. This causes brief
-downtime but avoids two app versions sharing SQLite and avoids Next.js asset/
-Server Function version skew. Current Coolify lists consistent/custom names as
-settings that prevent rolling overlap in
+downtime but avoids two app versions sharing SQLite. Current Coolify lists
+consistent/custom names as settings that prevent rolling overlap in
 [Rolling Updates](https://next.coolify.io/docs/applications/deployments/rolling-updates).
 
 Keep:
@@ -317,23 +368,23 @@ Use default container naming and rolling overlap only after all are true:
 - health check below represents readiness;
 - old/new releases use backward-compatible PostgreSQL and SQLite schemas;
 - no SQLite schema migration occurs while old process has prepared statements;
-- Next.js `deploymentId` or equivalent version-skew strategy is implemented;
-- every overlapping build uses the same secret
-  `NEXT_SERVER_ACTIONS_ENCRYPTION_KEY`;
-- Next.js cache/tag coordination is designed for multiple instances;
 - both containers mount same named volume on same host;
 - no host port mapping exists;
 - transition was load-tested.
 
-Next.js documents missing assets, Server Function mismatches, and navigation
-failures during multi-instance version skew in
-[self-hosting guidance](https://nextjs.org/docs/app/guides/self-hosting#version-skew).
+The Next-specific entries that used to be on this list — `deploymentId`, the
+shared Server Actions encryption key, cache/tag coordination — are gone with the
+framework. This is a JSON API with no client bundle and no server functions, so
+version skew is now only about the two schemas and the shared SQLite file, which
+are the entries that remain. That makes rolling updates easier to justify than
+before; it does not make them verified.
 
 SQLite WAL supports same-host processes, but only one writer at a time. Use
 SQLite 3.51.3 or newer as the conservative deployment floor for the WAL-reset
 race. The fix was also backported to 3.50.7 and 3.44.6, so it is not accurate to
-call every lower version vulnerable. Current `better-sqlite3` 13.0.3 reports
-SQLite 3.53.4 in repository verification. See
+call every lower version vulnerable. Verify the version the deployed Bun ships
+with using the command in §8 — it is a property of the Bun build now, not of a
+pinned npm package. See
 [SQLite WAL-reset notice](https://www.sqlite.org/wal.html#the_wal_reset_bug).
 
 ## 7. Configure health check
@@ -427,14 +478,14 @@ Deploy manually first. Keep auto-deploy off until full checklist passes.
 In deployment log and Terminal:
 
 ```sh
-node --version
 bun --version
-node -e 'const D=require("better-sqlite3");const d=new D(":memory:");console.log(d.prepare("select sqlite_version() as v").get());d.close()'
+bun -e 'const {Database}=require("bun:sqlite");const d=new Database(":memory:");console.log(d.query("select sqlite_version() as v").get());d.close(false)'
 ```
 
-Expected: Node 24.x, Bun 1.3.14, SQLite at least 3.51.3. Any
-`ERR_DLOPEN_FAILED`, native binding, missing environment, or read-only
-filesystem error blocks release.
+Expected: Bun 1.3.14, SQLite at least 3.51.3. A missing environment variable or
+a read-only filesystem blocks release. There is no native addon left to fail to
+load, so `ERR_DLOPEN_FAILED` is no longer a failure class here — but the Bun
+version now determines the SQLite build itself, so check it.
 
 ### Health and SQLite
 
@@ -446,29 +497,32 @@ test -w /app/data
 # Coolify polls, and it is the one that fails on a bad volume or schema.
 wget -qO- "http://127.0.0.1:${PORT:-3000}/api/health/storage"
 ls -la /app/data
-node - <<'NODE'
-const Database = require('better-sqlite3');
+bun - <<'BUN'
+const { Database } = require('bun:sqlite');
 
 if (process.env.SQLITE_DIR !== '/app/data') {
   throw new Error('SQLITE_DIR must be exactly /app/data');
 }
 const file = '/app/data/rate-limit.db';
-const db = new Database(file, { readonly: true, fileMustExist: true });
+// readonly implies no create, so a missing file fails here rather than being
+// silently created — the equivalent of better-sqlite3's fileMustExist.
+const db = new Database(file, { readonly: true });
+const one = (sql) => Object.values(db.query(sql).get() ?? {})[0];
 try {
   console.log({
     file,
-    sqliteVersion: db.prepare('select sqlite_version() as v').get().v,
-    journalMode: db.pragma('journal_mode', { simple: true }),
-    userVersion: db.pragma('user_version', { simple: true }),
-    quickCheck: db.pragma('quick_check', { simple: true }),
+    sqliteVersion: one('select sqlite_version() as v'),
+    journalMode: one('PRAGMA journal_mode'),
+    userVersion: one('PRAGMA user_version'),
+    quickCheck: one('PRAGMA quick_check'),
     tables: db
-      .prepare("select name from sqlite_schema where type='table' order by name")
+      .query("select name from sqlite_schema where type='table' order by name")
       .all(),
   });
 } finally {
-  db.close();
+  db.close(false);
 }
-NODE
+BUN
 ```
 
 Expected:
@@ -488,7 +542,7 @@ Database counters cannot prove persistence: the health counter rolls over and a
 new database can recreate the same key. Use a non-sensitive volume sentinel:
 
 ```sh
-node - <<'NODE'
+bun - <<'BUN'
 const fs = require('node:fs');
 const crypto = require('node:crypto');
 const file = '/app/data/.coolify-volume-sentinel';
@@ -499,7 +553,7 @@ if (process.env.SQLITE_DIR !== '/app/data') {
 const value = crypto.randomUUID();
 fs.writeFileSync(file, `${value}\n`, { encoding: 'utf8', flag: 'wx', mode: 0o600 });
 console.log(value);
-NODE
+BUN
 ```
 
 Record the value, redeploy the same release, then run:
@@ -523,8 +577,11 @@ alongside the release commit.
 Retaining it does not by itself detect a lost mount — nothing reads it
 automatically yet. A startup check that verifies the sentinel, the exact path
 and the driver in one place is the natural next step and is tracked in
-`TODO.md`; Next 16.3.1 supports `instrumentation.register()` and skips it during
-`phase-production-build`, so there is a correct place to put it.
+`TODO.md`. The previous version of this paragraph pointed at Next's
+`instrumentation.register()`; there is no Next.js. The correct place now is
+`server.ts`, which already runs startup assertions (`NODE_ENV`, `PORT`,
+`Bun.version`, `sqlite_version()`) before importing the application — add it
+alongside those.
 
 ### External smoke checks
 
@@ -542,12 +599,11 @@ and the driver in one place is the natural next step and is tracked in
 
 **Unblocked.** The sweep is now a tracked HTTP route,
 `app/api/internal/sqlite-sweep/route.ts`, invoked with `curl`. That shape was
-forced by a runtime constraint, not chosen for style: `better-sqlite3`
-hard-panics under Bun (`NAPI FATAL ERROR`) so `bun some-script.ts` is not
-runnable here, and Node cannot execute this project's TypeScript with its path
-aliases without a runner that is not a declared dependency. The route runs in
-the one runtime already proven to work — Node, inside Next. (`scripts/` used to
-be git-ignored too; it is tracked now, so packaging is no longer the obstacle.)
+originally forced by a runtime constraint: `better-sqlite3` hard-panicked under
+Bun, and Node could not execute this project's TypeScript with its path aliases
+without an extra runner. Neither still holds — Bun runs both — but the route
+stays, because the scheduled task below targets its URL and relocating it is a
+deployment change rather than a code change.
 
 Configure exactly one Coolify Scheduled Task:
 
@@ -691,7 +747,7 @@ Practical consequences for this deployment:
   checkpoint is being blocked. A truncating checkpoint reclaims it:
 
   ```sh
-  node -e 'const D=require("better-sqlite3");const d=new D("/app/data/rate-limit.db");console.log(d.pragma("wal_checkpoint(TRUNCATE)"));d.close()'
+  bun -e 'const {Database}=require("bun:sqlite");const d=new Database("/app/data/rate-limit.db");console.log(d.query("PRAGMA wal_checkpoint(TRUNCATE)").get());d.close(false)'
   ```
 
   It takes the writer lock for its duration, so run it manually while
@@ -724,84 +780,90 @@ and [managed database backups](https://coolify.io/docs/databases/backups).
   retention/deletion policy consistent with the rate-limit window and legal
   requirements.
 
-For manual consistent snapshot, use `better-sqlite3` online backup API while app
-runs; never copy live `.db` alone because committed data may still be in WAL.
-Mount a restricted staging/backup filesystem outside `/app/data`, expose its
-path as runtime-only `SQLITE_BACKUP_DIR`, and check host capacity first. The API
-produces a standalone SQLite DB; see
-[`Database#backup` for 13.0.3](https://github.com/WiseLibs/better-sqlite3/blob/v13.0.3/docs/api.md#backupdestination-options---promise)
+For manual consistent snapshot, use SQLite's online backup while app runs; never
+copy live `.db` alone because committed data may still be in WAL. Mount a
+restricted staging/backup filesystem outside `/app/data`, expose its path as
+runtime-only `SQLITE_BACKUP_DIR`, and check host capacity first.
+
+`VACUUM INTO`, not a driver backup call. `bun:sqlite` exposes no equivalent of
+better-sqlite3's `Database#backup`, and `VACUUM INTO` is the SQLite-native
+answer: it is read-only with respect to the source, safe against a live writer,
+and produces a standalone, already-compacted database with no WAL to replay. It
+refuses to overwrite an existing file, which is what makes the `.partial`
+staging below safe. Verified on Bun 1.3.14 against a WAL database opened
+read-only. See [VACUUM INTO](https://www.sqlite.org/lang_vacuum.html#vacuuminto)
 and [SQLite Online Backup API](https://www.sqlite.org/backup.html).
 
 ```sh
-node - <<'NODE'
-const Database = require('better-sqlite3');
+bun - <<'BUN'
+const { Database } = require('bun:sqlite');
 const crypto = require('node:crypto');
 const fs = require('node:fs');
 const path = require('node:path');
 
-async function main() {
-  process.umask(0o077);
+process.umask(0o077);
 
-  const dir = process.env.SQLITE_DIR;
-  const backupDir = process.env.SQLITE_BACKUP_DIR;
-  if (dir !== '/app/data') throw new Error('SQLITE_DIR must be exactly /app/data');
-  if (!backupDir) throw new Error('SQLITE_BACKUP_DIR is required');
+const dir = process.env.SQLITE_DIR;
+const backupDir = process.env.SQLITE_BACKUP_DIR;
+if (dir !== '/app/data') throw new Error('SQLITE_DIR must be exactly /app/data');
+if (!backupDir) throw new Error('SQLITE_BACKUP_DIR is required');
 
-  const dataReal = fs.realpathSync(dir);
-  const backupReal = fs.realpathSync(backupDir);
-  const relative = path.relative(dataReal, backupReal);
-  if (relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative))) {
-    throw new Error('SQLITE_BACKUP_DIR must be outside /app/data');
-  }
-
-  const source = path.join(dir, 'rate-limit.db');
-  const sourceBytes = fs.statSync(source).size;
-  const stats = fs.statfsSync(backupReal);
-  const availableBytes = stats.bavail * stats.bsize;
-  const requiredBytes = Math.max(sourceBytes * 2, 128 * 1024 * 1024);
-  if (availableBytes < requiredBytes) {
-    throw new Error(`insufficient backup space: need ${requiredBytes} bytes`);
-  }
-
-  const stamp = new Date().toISOString().replaceAll(':', '-');
-  const suffix = crypto.randomUUID();
-  const destination = path.join(backupReal, `rate-limit-backup-${stamp}-${suffix}.db`);
-  const partial = `${destination}.partial`;
-
-  try {
-    const db = new Database(source, { readonly: true, fileMustExist: true });
-    try {
-      await db.backup(partial);
-    } finally {
-      db.close();
-    }
-
-    const check = new Database(partial, {
-      readonly: true,
-      fileMustExist: true,
-    });
-    try {
-      if (check.pragma('quick_check', { simple: true }) !== 'ok') {
-        throw new Error('SQLite backup quick_check failed');
-      }
-    } finally {
-      check.close();
-    }
-
-    fs.chmodSync(partial, 0o600);
-    fs.renameSync(partial, destination);
-    console.log(destination);
-  } catch (error) {
-    fs.rmSync(partial, { force: true });
-    throw error;
-  }
+const dataReal = fs.realpathSync(dir);
+const backupReal = fs.realpathSync(backupDir);
+const relative = path.relative(dataReal, backupReal);
+if (relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative))) {
+  throw new Error('SQLITE_BACKUP_DIR must be outside /app/data');
 }
 
-main().catch((error) => {
+const source = path.join(dir, 'rate-limit.db');
+const sourceBytes = fs.statSync(source).size;
+const stats = fs.statfsSync(backupReal);
+const availableBytes = stats.bavail * stats.bsize;
+const requiredBytes = Math.max(sourceBytes * 2, 128 * 1024 * 1024);
+if (availableBytes < requiredBytes) {
+  throw new Error(`insufficient backup space: need ${requiredBytes} bytes`);
+}
+
+const stamp = new Date().toISOString().replaceAll(':', '-');
+const suffix = crypto.randomUUID();
+const destination = path.join(backupReal, `rate-limit-backup-${stamp}-${suffix}.db`);
+const partial = `${destination}.partial`;
+
+// VACUUM INTO takes a string LITERAL, not a bound parameter, so the path is
+// escaped by SQL rules: a single quote is doubled. The path is assembled from a
+// deployment-configured directory and a UUID, never from input, but escaping it
+// costs nothing and removes the question.
+const sqlPath = (value) => `'${value.replaceAll("'", "''")}'`;
+
+try {
+  // readonly implies no create, so a missing source fails here rather than
+  // silently producing a backup of an empty database.
+  const db = new Database(source, { readonly: true });
+  try {
+    db.run(`VACUUM INTO ${sqlPath(partial)}`);
+  } finally {
+    db.close(false);
+  }
+
+  const check = new Database(partial, { readonly: true });
+  try {
+    const row = check.query('PRAGMA quick_check').get();
+    if (Object.values(row ?? {})[0] !== 'ok') {
+      throw new Error('SQLite backup quick_check failed');
+    }
+  } finally {
+    check.close(false);
+  }
+
+  fs.chmodSync(partial, 0o600);
+  fs.renameSync(partial, destination);
+  console.log(destination);
+} catch (error) {
+  fs.rmSync(partial, { force: true });
   console.error(error);
   process.exitCode = 1;
-});
-NODE
+}
+BUN
 ```
 
 The script sets restrictive creation permissions before writing and cleans a
@@ -872,34 +934,41 @@ change or accept downtime. Current `user_version` guard only checks when process
 opens DB; already-open old process does not continuously re-check after new
 container migrates it.
 
-## 11. Future `bun:sqlite` migration
+## 11. `bun:sqlite` migration — done, with one item outstanding
 
-Do not change runtime while app remains current Next.js deployment. Current
-server and sweeper must use Node + `better-sqlite3`.
+The driver swap happened with the Elysia migration. `lib/sqlite/driver.ts` is
+still the only file that knows the driver; `better-sqlite3`, its types, the
+`serverExternalPackages` entry and the `ignoreScripts` entry are removed.
 
-When server framework genuinely runs under Bun:
+Verified in the repository: migrations under `BEGIN IMMEDIATE`, PRAGMA readback,
+the max-aware `RETURNING` upsert including its no-row denial,
+`DELETE ... LIMIT`, BLOB/null behaviour, and the full probe suite against the
+real driver.
 
-- swap driver only through `lib/sqlite/driver.ts`;
-- remove `better-sqlite3`, its types, and Next `serverExternalPackages` entry;
-- change start/scheduled commands to Bun only after tests pass;
-- test existing volume copy, migrations, BLOB/null behavior, busy handling,
-  crash recovery, backup/restore, and bundled SQLite version;
-- retain same local-volume, single-host, WAL, replica, and backup constraints.
+**Outstanding before the first deploy on this driver, and NOT yet done:** run
+the migration, busy-handling, crash-recovery and backup/restore checks against a
+**copy of the live volume**, and record the SQLite version the deployed Bun
+build ships (§8). Everything verified so far was against freshly created
+databases on a developer machine.
 
-Bun documents WAL sidecars and `bun:sqlite` behavior in
-[Bun SQLite documentation](https://bun.com/docs/runtime/sqlite). Driver change
-does not make network filesystem or multi-host SQLite safe.
+Unchanged by the swap: the local-volume, single-host, WAL, single-replica and
+backup constraints all still apply. Bun documents WAL sidecars and `bun:sqlite`
+behaviour in [Bun SQLite documentation](https://bun.com/docs/runtime/sqlite). A
+driver change does not make a network filesystem or multi-host SQLite safe.
 
 ## Final checklist
 
 - [ ] OTP auto-verify disabled and tested in code.
 - [ ] Release committed, pushed, CI green.
-- [ ] Nixpacks Node 24; Bun 1.3.14 verified.
-- [ ] Node-only build/start commands configured.
-- [ ] Required secrets scoped correctly; Docker build secrets verified with no
-      BuildKit fallback or image-history exposure.
+- [ ] Bun 1.3.14 verified in the build log, and the SQLite version it ships
+      recorded (§8). No `NIXPACKS_NODE_VERSION` remains set.
+- [ ] Build command `bun run build`, start command `bun run start`, and
+      `NODE_ENV=production` present as a runtime variable.
+- [ ] Every secret scoped **runtime-only**; nothing left scoped to the build
+      from the previous Next deployment.
 - [ ] Named volume mounted at `/app/data`; `SQLITE_DIR=/app/data`.
-- [ ] One replica, one Node process.
+- [ ] One replica, one Bun process (`reusePort: false` now makes a second one
+      fail with `EADDRINUSE` instead of silently splitting traffic — §12.1).
 - [ ] Cloudflare proxied; Full (strict); visitor-IP removal off; Pseudo IPv4 not
       overwriting headers; direct origin blocked.
 - [ ] Stop-first/rolling decision recorded.
@@ -916,3 +985,286 @@ does not make network filesystem or multi-host SQLite safe.
       peak WAL growth.
 - [ ] Neon and SQLite backup/RPO policies recorded and restore tested.
 - [ ] Upstash rollback window completed, credentials revoked.
+- [ ] **§12 items applied**: `PUBLIC_URL` set (not only the legacy
+      `NEXT_PUBLIC_URL`); `NEXT_SERVER_ACTIONS_ENCRYPTION_KEY` deleted; stop
+      grace period longer than the `shutdownTimeoutMs` the startup log reports
+      (135 s with the current route table); proxy read timeout above 120 s;
+      proxy body limit set to 8 MiB; health check pointed at the canonical path
+      without a trailing slash; `/openapi.json` exposure decided.
+
+---
+
+## 12. What changed on the server side in the migration-review pass
+
+Added 2026-08-20. Everything in this section is a consequence of a code change,
+not a restatement of the sections above. Corrections to instructions that were
+already wrong are made in place in §§2–9 rather than repeated here.
+
+### 12.1 Startup now refuses to boot on four conditions
+
+`server.ts` validates the runtime BEFORE it imports the application. A rejected
+runtime exits non-zero after printing one line: `{"msg":"startup rejected",…}`.
+A container that restart-loops with that line is misconfigured, not crashing.
+
+| Condition                                                           | Why it is fatal                                                                                                                                                                                                                                                             |
+| ------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `NODE_ENV` absent, or not exactly `development`/`test`/`production` | Every production guard is an exact string comparison — the Better Auth secret floor, the Turnstile secret requirement, the absolute-`SQLITE_DIR` rule, HSTS. `NODE_ENV=prodution` previously disabled all four at once and still served traffic. Reproduced before the fix. |
+| `PORT` not a decimal integer in `1..65535`                          | `Number(PORT)` accepted `''` as 0 and `3000abc` as `NaN`; Bun then bound an ephemeral port while the log reported the requested one.                                                                                                                                        |
+| Bun major/minor differs from the pinned `1.3.14`                    | `bun:sqlite` is compiled into the Bun binary, so transaction and locking semantics travel with the runtime version. A PATCH difference is not fatal — it logs `bun patch version drift` and continues.                                                                      |
+| `sqlite_version()` below `3.51.3`                                   | The WAL-reset floor this runbook already required (§6). It was a manual log check; it is now an assertion.                                                                                                                                                                  |
+
+**Operational consequence:** the manual "check the build log shows Bun 1.3.14"
+step in §1 is now a backstop, not the control. If Nixpacks supplies Bun 1.4.x
+the container will refuse to start. That is intended. To move the pin, update
+`packageManager` in `package.json`, `bun.lock`, and `EXPECTED_BUN_VERSION` in
+`server.ts` together, after re-running the suite.
+
+The startup log line gained fields worth alerting on:
+
+```json
+{
+  "msg": "server started",
+  "port": 3000,
+  "hostname": "localhost",
+  "env": "production",
+  "bun": "1.3.14",
+  "idleTimeoutSeconds": 60,
+  "maxRouteTimeoutSeconds": 120,
+  "maxRequestBodyBytes": 8388608,
+  "shutdownTimeoutMs": 135000
+}
+```
+
+`port` is the BOUND port, not the requested one. They differ whenever the kernel
+assigns one, and the requested value is the number that misleads.
+
+**`hostname` reads `localhost` and that is NOT the bind scope.** An earlier
+revision of this block showed `0.0.0.0` here, which is what the socket is bound
+to but not what the field says. Measured: with no `hostname` passed to `listen`
+(`server.ts` passes none, and Elysia forwards only what it is given), `netstat`
+reports `0.0.0.0:<port>` and `[::]:<port>` LISTENING and the server answers on a
+non-loopback interface — the value in the log is just what Bun reports for
+`server.hostname`. So do not read this field as evidence of a loopback-only
+bind, and do not "fix" it by passing `hostname: '0.0.0.0'` explicitly without
+re-measuring. Confirmed on Windows; the one-line Linux check is
+`ss -ltnp | grep <port>`, and it is worth running once on the VPS, because a
+loopback-only bind is the shape that makes the container unreachable through the
+proxy.
+
+### 12.2 SIGTERM is now handled — set the grace period deliberately
+
+Nothing previously responded to the SIGTERM that Coolify's stop-first deployment
+sends. Elysia wires only `process.on('beforeExit')`, which is not a container
+signal handler, so in-flight mutations, uploads and external calls were
+terminated mid-flight. WAL keeps the database consistent; it does not finish an
+application operation for the client, and an upload can reach R2 with no
+matching row.
+
+On `SIGTERM` or `SIGINT`, `server.ts` now:
+
+1. logs `{"msg":"server stopping","signal":"SIGTERM"}`
+2. calls `app.stop()` — **drains** in-flight requests rather than aborting them
+   (measured: a request 300 ms into a 2 s handler completed with 200, and
+   `stop()` resolved only after it did)
+3. waits up to 10 s for queued post-response work (the access log and anything
+   else enqueued through `lib/http/after-response.ts`)
+4. closes the SQLite stores this process actually opened — it never opens one in
+   order to close it
+5. logs `{"msg":"server stopped",…}` and exits 0
+
+A forced shutdown fires regardless, logging `{"msg":"forced shutdown",…}` with
+the count of unfinished post-response work, and exits 1.
+
+**The forced-shutdown bound is DERIVED, and it is currently 135 s.** It is
+`MAX_ROUTE_TIMEOUT_SECONDS + 15`, where the first term is the longest ceiling
+any route grants itself — 120 s on `POST /api/upload/image`. A flat 15 s bound
+was wrong and is worth naming as a mistake rather than quietly correcting: it
+would have aborted at 15 s exactly the long upload the per-route ceiling exists
+to permit, so the drain was not a drain for the one route that needed it. The
+number is logged at startup as `shutdownTimeoutMs`, so read it there rather than
+inferring it here.
+
+**What to configure:** Coolify's stop grace period must be **longer than
+`shutdownTimeoutMs`** — so above 135 s with the current route table, not the
+20–30 s an earlier revision of this section suggested. If the grace period is
+shorter, the orchestrator kills the container mid-drain and the drain buys
+nothing.
+
+**If a 135-second deploy window is unacceptable — and it may well be — the lever
+is the UPLOAD ceiling, not the shutdown bound.** Lowering `timeoutSeconds` on
+that route in `routes.ts` lowers this number with it, because the bound is
+derived. Lowering the bound directly would silently reintroduce the abort.
+Decide this alongside the VPS measurement in `TODO.md` EM-1: if uploads actually
+finish in 20 s on the target host, a 30 s route ceiling brings the window down
+to **75 s** — the 60 s global ceiling then becomes the binding term, so getting
+below that means lowering `IDLE_TIMEOUT_SECONDS` too, and both are measurements
+you still owe. (An earlier revision of this paragraph said 45 s, which was the
+bound before the global ceiling was included in the derivation; see the note
+below.)
+
+Two measured caveats, both of which the explicit `process.exit` covers. **The
+first is a correction**: an earlier revision of this section said `app.stop()`
+does not close the listening socket. It does.
+
+- `app.stop()` **closes the listener** — a fresh connection is refused as soon
+  as it resolves (re-measured on `elysia@1.4.29`, whose `stop()` delegates
+  straight to `Bun.serve`'s, which Bun documents as preventing new connections
+  from being accepted without cancelling in-flight requests). What survives is
+  an ALREADY-ESTABLISHED keep-alive connection: a second request written on a
+  socket opened before the stop is still served afterwards. During a stop-first
+  deploy the proxy has already stopped routing, so this is not reachable from
+  outside; the explicit exit is what stops those lingering connections holding
+  the process past the grace period.
+- Because existing connections survive, post-response work can still be queued
+  while the drain is running. The drain therefore waits for the queue to be
+  _observably empty for 50 ms_ rather than checking it once — a single check
+  could return before a just-finished request registered its work.
+
+**Two things about the bound and the exit code, both deliberate:**
+
+- `shutdownTimeoutMs` is
+  `max(IDLE_TIMEOUT_SECONDS, MAX_ROUTE_TIMEOUT_SECONDS) + 15`, not the per-route
+  maximum alone. Both terms matter: every route without its own `timeoutSeconds`
+  may still run for the 60 s global ceiling, so lowering the upload route to 30
+  s — exactly what the paragraph above recommends — would otherwise have
+  produced a 45 s bound against requests the server still permits to take 60 s.
+  Taking that advice now yields a 75 s window, not 45 s. Read the number from
+  the startup log rather than from here.
+- A drain that times out logs `after-response drain timed out` with a pending
+  count and still **exits 0**. That is a decision, not an oversight:
+  `app.stop()` has already resolved by then, so every in-flight request
+  completed, and what was abandoned is post-response work — today only
+  access-log lines. Exiting non-zero would make a routine deploy's stop phase
+  look like a crash to the orchestrator. If real post-response work is ever
+  added (nothing calls `enqueueAfterResponse` yet), revisit this alongside it.
+
+### 12.3 Request timeouts — and what the proxy must allow
+
+There was previously no per-request ceiling at all under Node/Next. Elysia
+inherits one from Bun and defaulted it to **30 seconds**, which was measured to
+drop a 35-second request at 32.1 s with an empty reply and no error body — a
+contract regression nobody chose.
+
+Now set deliberately:
+
+| Scope                    | Value | Where                                                                                     |
+| ------------------------ | ----- | ----------------------------------------------------------------------------------------- |
+| Server-wide              | 60 s  | `IDLE_TIMEOUT_SECONDS` in `server.ts`                                                     |
+| `POST /api/upload/image` | 120 s | `timeoutSeconds` on that route in `routes.ts`, applied per request via `server.timeout()` |
+
+**Neither number is measured on the target VPS** — see `TODO.md` EM-1. They are
+deliberately generous ceilings, not targets.
+
+**What to configure:** Cloudflare's proxy read timeout and Traefik's
+`responseHeaderTimeout` must both exceed 120 s, or the edge will cut an upload
+the application would have completed. Cloudflare's free-plan 100-second limit is
+below the upload ceiling; if large uploads are expected, either raise it on a
+paid plan or lower the application ceiling to match, deliberately.
+
+### 12.4 Request body size limit — align the proxy
+
+Bun accepted up to its **128 MiB** default before any per-file check could run,
+so a 100 MB POST was buffered in full before rejection. `app.ts` now sets
+`maxRequestBodySize` to **8 MiB** (`MAX_REQUEST_BODY_BYTES`), which returns
+**413** at the transport layer. The per-file limit stays: it is per file, this
+is per request.
+
+Measured, and it matters to anything downstream that inspects the response: the
+413 is a **bare transport reply** — `HTTP/1.1 413 Request Entity Too Large` with
+no body, no `Cache-Control`, no CSP, no API envelope and no access-log line,
+because the request never reaches Elysia at all. It arrives after roughly 64 KiB
+of a declared 12 MiB body, so the rejection genuinely precedes buffering. Bun's
+own `fetch` also surfaces it as a closed socket rather than as a 413; a raw
+socket is needed to observe the status. Do not write a WAF rule or an uptime
+check that expects this API's envelope or headers on a 413.
+
+**What to configure:** set the Cloudflare and Traefik body limits to the same 8
+MiB so a rejected upload is refused at the edge rather than after crossing it.
+If the largest legitimate image ever grows, both the code constant and the two
+proxy limits move together.
+
+### 12.5 Two new HTTP behaviours the edge and any WAF will see
+
+- **405 with `Allow`.** A known path called with an unregistered method now
+  returns `405` and an `Allow` header instead of `404`. Anything matching on
+  status codes — a WAF rule, an uptime check, a log alert — should expect it.
+- **308 on the trailing-slash form, for every method including `OPTIONS`.**
+  `GET /api/health/storage/` returns `308` with `Location: /api/health/storage`,
+  restoring what the App Router did. Elysia had been serving both URLs with
+  `200`, which split cache keys and security-rule matching. A health check
+  pointed at the trailing-slash form will now see a redirect — point it at the
+  canonical path. `OPTIONS` on the slash form used to answer `404` while every
+  other method redirected, because the route-aware OPTIONS gate runs before the
+  router and did not canonicalise; it redirects too now, so a browser preflight
+  against a slash-form URL behaves like the request that follows it. An unknown
+  path with a trailing slash is still a `404` rather than a redirect, on every
+  method.
+- **`Allow` no longer advertises `HEAD` under `/api/auth`.** Elysia derives
+  `HEAD` from a `GET` route in the table but not from the Better Auth wildcard
+  (measured: `HEAD /api/auth/get-session` answers `404` while `GET` answers
+  `200`), so the 405 boundary was naming a method the handler rejects. `Allow`
+  for those paths is now `GET, POST, OPTIONS`; table routes still advertise
+  `HEAD` alongside `GET`.
+- **Unknown `/api/auth/*` paths now answer this API's envelope, and stop before
+  Better Auth.** They used to reach `auth.handler` and come back as Better
+  Auth's own bodyless 404 with no `Content-Type` — two different 404 contracts
+  on one API. `app.ts` now checks `BETTER_AUTH_ALLOWED_PATHS` before calling the
+  handler at all.
+
+  **This one is a security fix, not only a tidy-up.** Better Auth runs plugin
+  `onRequest` handlers ahead of its own hooks, and the captcha plugin matches
+  its endpoint list with `pathname.includes(...)` (read in
+  `node_modules/better-auth/dist/plugins/captcha/index.mjs`). Measured before
+  the fix: `POST /api/auth/zz/sign-in/email/zz` — an arbitrary nonexistent path
+  that merely CONTAINS `sign-in/email` — answered
+  `400 Missing CAPTCHA response`, and with an `x-captcha-response` header it
+  would perform an outbound Turnstile siteverify for a path this server does not
+  serve. That is unauthenticated, attacker-triggerable spend against the
+  Turnstile quota from any URL shaped that way. Every such path now answers
+  `404` with the envelope and makes no outbound call. Nothing to configure;
+  recorded because it changes what the edge sees.
+
+### 12.6 `/openapi.json` is a new public route
+
+`GET /openapi.json` serves the generated API contract: paths, methods, path
+parameters, request-body JSON Schema derived from the existing Zod schemas, and
+the four Better Auth paths this deployment actually exposes. It contains no
+secrets and no data — it is the shape of the API, which any client can infer
+from use anyway.
+
+**Decide whether to expose it.** If the front-end consumes it directly, leave it
+open. If not, block it at Cloudflare the same way §9 blocks `/api/internal/*`;
+it costs nothing to serve and nothing to block.
+
+**It can now fail the deploy, deliberately.** `openApiDocument` throws when the
+route table disagrees with the three hand-maintained maps behind it — a route
+declaring `body: 'json'` with no schema, a stale key left by a rename, a
+`CREATED_ROUTES` entry naming a path that no longer exists. The route then
+answers 500, and `bun run smoke` asserts it answers 200, so CI stops the
+release. That is the intended trade: a contract a generator consumes without
+complaint and gets wrong is worse than one that is briefly unavailable. Two
+routes shipped with a missing request body before this check existed. If a 500
+here is ever the wrong answer for your deployment, block the route at the edge —
+do not remove the check, which is the only thing standing between a rename and a
+silently wrong contract.
+
+### 12.7 The sweep endpoint stays — with one class of problem removed
+
+No change to the scheduled task, `SQLITE_MAINTENANCE_TOKEN`, or gate 3. An
+in-process cron was considered and **declined** — the reasoning is in the header
+of `lib/sqlite/maintenance.ts` and in `TODO.md` EM-8.
+
+One thing did change, and it removes the reason the move looked attractive: the
+route previously parsed a caller-supplied body BEFORE checking the token. It now
+declares `body: 'none'`, so an unauthenticated caller's body is never read at
+all. The sweep logic also moved into a plain function (`runMaintenanceSweep`),
+so switching the trigger later is a wiring change rather than a rewrite.
+
+### 12.8 CI now gates on unreachable files and unregistered handlers
+
+`bun run find:unused-files` exits non-zero on an unreachable file OR a handler
+module that `routes.ts` does not import, and CI runs it. This is not a
+server-side change; it is here because a failing CI step blocks a deploy and the
+message is easy to misread. "Unregistered handler" means a `handler.ts` exists
+under `app/api/` that no route table entry imports — the endpoint is dead code,
+not broken configuration.

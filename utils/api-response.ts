@@ -69,6 +69,30 @@ export function apiSuccess<T = unknown>({
   };
 }
 
+/**
+ * Response whose body is NOT the standard envelope.
+ *
+ * Only for endpoints whose shape is fixed by an external consumer — the Coolify
+ * health check and the scheduled sweep task both read specific top-level
+ * fields, so wrapping them would break a deployment rather than a client we
+ * control. Everything reachable by an API client uses `apiSuccess`/`apiError`.
+ */
+export function apiRaw({
+  body,
+  status = HTTP_STATUS.OK,
+  headers,
+}: {
+  body: unknown;
+  status?: number;
+  headers?: Record<string, string>;
+}): HandlerOutput<never> {
+  return {
+    status,
+    body: { raw: body },
+    ...(headers && { headers }),
+  };
+}
+
 export function apiError({
   message,
   status = HTTP_STATUS.BAD_REQUEST,

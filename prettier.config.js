@@ -5,8 +5,6 @@ module.exports = {
     '^type$',
     '<TYPES>',
     '',
-    '^(next/(.*)$)|^(next$)',
-    '^(react/(.*)$)|^(react$)',
     '^(drizzle-orm/(.*)$)|^(drizzle-orm$)',
     '',
     '<THIRD_PARTY_MODULES>',
@@ -37,7 +35,7 @@ module.exports = {
   importOrderTypeScriptVersion: '5.0.0',
   // TODO: uncomment after install tailwind
   // tailwindConfig: './tailwind.config.ts',
-  proseWrap: 'always',
+  proseWrap: 'preserve',
   bracketSameLine: false,
   bracketSpacing: true,
 };

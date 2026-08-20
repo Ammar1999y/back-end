@@ -6,11 +6,17 @@
  * proved them and CI could not enforce them. Each assertion below corresponds to
  * a defect that was reproduced before it was fixed.
  *
- * ## Why a Node child process
+ * ## Why a child process
  *
- * `better-sqlite3` cannot load under Bun (`NAPI FATAL ERROR`), and Bun runs the
- * probes. So the assertions execute in a Node child (`_sqlite-semantics-child.cjs`)
- * and report back as JSON.
+ * The assertions run in a child (`_sqlite-semantics-child.cjs`) and report back as
+ * JSON. Several of them need a SECOND connection to the same file to reproduce a
+ * cross-process race, and one runs the migration three times over; keeping that
+ * out of the test process means a failure cannot leave open handles behind.
+ *
+ * The child runs under Bun against the production driver, `bun:sqlite`. It used
+ * to run under Node against `better-sqlite3`, which cannot load under Bun at all
+ * (`NAPI FATAL ERROR`) — the Elysia migration swapped the driver and removed that
+ * constraint.
  *
  * ## Why the SQL is extracted rather than rewritten
  *
@@ -72,7 +78,7 @@ async function runChild(): Promise<ChildResult> {
     deletePrefix: extractSql(CACHE, 'SQL_DELETE_PREFIX'),
   };
 
-  const proc = Bun.spawn(['node', CHILD, JSON.stringify(sql)], {
+  const proc = Bun.spawn(['bun', CHILD, JSON.stringify(sql)], {
     stdout: 'pipe',
     stderr: 'pipe',
   });

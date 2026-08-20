@@ -140,7 +140,7 @@ export const PUT: Handler = async (ctx) => {
       failClosed: true,
     });
 
-    const body = requireJsonBody(ctx.body);
+    const body = requireJsonBody(await ctx.readJson());
 
     // Strict server contract: unknown keys are rejected rather than stripped.
     const validatedDataParsed = adminUpdatePermissionSchema.safeParse({
