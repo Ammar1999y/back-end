@@ -10,7 +10,7 @@ import { safeDate } from '@/utils/time';
  * not be discovered at all — and selective revocation needs its id.
  */
 export const SESSIONS_PAGE_SIZE = 50;
-export const SESSIONS_MAX_PAGE_SIZE = 100;
+const SESSIONS_MAX_PAGE_SIZE = 100;
 const CURSOR_MAX_LENGTH = 128;
 
 /**

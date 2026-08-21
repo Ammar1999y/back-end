@@ -10,6 +10,7 @@ import {
 } from '@/lib/permissions/constants';
 
 import {
+  CREDENTIAL_ISSUER,
   CREDENTIAL_PROVIDER_ID,
   HTTP_STATUS,
   MSG_CREATE_ERROR,
@@ -98,8 +99,11 @@ export const POST: Handler = async (ctx) => {
       if (!newUser)
         throw new CustomError(MSG_CREATE_ERROR, HTTP_STATUS.INTERNAL_ERROR);
 
+      // See the note on the same insert in app/api/dash/users/handler.ts:
+      // (issuer, accountId) is the pair Better Auth's sign-in lookup matches on.
       await tx.insert(accounts).values({
         accountId: newUser.id,
+        issuer: CREDENTIAL_ISSUER,
         providerId: CREDENTIAL_PROVIDER_ID,
         userId: newUser.id,
         password: hashedPassword,

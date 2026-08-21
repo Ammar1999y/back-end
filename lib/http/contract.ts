@@ -1,8 +1,6 @@
 /* eslint-disable unicorn/prefer-switch */
 import type { PaginationMeta } from '@/utils/api-response';
 
-import { HTTP_STATUS } from '@/utils/api-messages';
-
 /**
  * What a route is allowed to read from the request body.
  *
@@ -100,7 +98,7 @@ export interface HandlerInput extends HandlerRequestMeta {
  * (e.g. `Partitioned` for CHIPS) so they can be re-emitted verbatim instead
  * of silently dropped by the parser.
  */
-export interface HandlerCookieOptions {
+interface HandlerCookieOptions {
   path?: string;
   domain?: string;
   maxAge?: number;
@@ -121,7 +119,7 @@ export interface HandlerCookie {
 }
 
 /** The response envelope every application endpoint returns. */
-export interface HandlerEnvelope<T = unknown> {
+interface HandlerEnvelope<T = unknown> {
   success: boolean;
   message: string;
   data: T;
@@ -138,13 +136,13 @@ export interface HandlerEnvelope<T = unknown> {
  * so an ordinary handler still cannot return a shape the API contract forbids
  * by accident — it has to call `apiRaw` and say so.
  */
-export interface HandlerRawBody {
+interface HandlerRawBody {
   raw: unknown;
 }
 
 export type HandlerBody<T = unknown> = HandlerEnvelope<T> | HandlerRawBody;
 
-export function isRawBody(body: HandlerBody): body is HandlerRawBody {
+function isRawBody(body: HandlerBody): body is HandlerRawBody {
   return 'raw' in body;
 }
 
@@ -171,9 +169,6 @@ export interface HandlerOutput<T = unknown> {
 }
 
 export type Handler = (ctx: HandlerInput) => Promise<HandlerOutput>;
-
-/** Convenience: default status codes used across adapters. */
-export const DEFAULT_STATUS = HTTP_STATUS.OK;
 
 /**
  * Parse raw `Set-Cookie` header values (e.g. from Better Auth's

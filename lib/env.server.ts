@@ -1,6 +1,7 @@
 /* eslint-disable unicorn/no-top-level-side-effects -- the load-time crash IS this module's contract */
 import path from 'node:path';
 
+import { validateOtpKeyConfiguration } from '@/lib/auth/otp-key';
 import { validatePasswordPepperConfiguration } from '@/lib/auth/password-pepper';
 
 /**
@@ -15,6 +16,11 @@ const REQUIRED_SERVER_ENV = [
   'DATABASE_URL',
   'PASSWORD_PEPPER_ACTIVE_ID',
   'PASSWORD_PEPPER_KEYRING',
+  // The OTP MAC key. Required unconditionally, like the pepper: without it every
+  // OTP send throws at hash time, so a "start now, configure later" deployment
+  // is a silently broken one.
+  'OTP_HMAC_ACTIVE_ID',
+  'OTP_HMAC_KEYRING',
 ] as const;
 
 // Vars that are only required outside development. The Turnstile module falls
@@ -103,7 +109,11 @@ function assertEnv(): void {
 }
 
 assertEnv();
+// Presence is not validity: `assertEnv` only proves the variables are set, and a
+// keyring is a JSON document with rules. Both parses are forced here so a bad
+// keyring crashes the boot rather than the first login or the first OTP send.
 validatePasswordPepperConfiguration();
+validateOtpKeyConfiguration();
 
 /**
  * Re-reads a variable `assertEnv` has already proven present. The throw is

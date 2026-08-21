@@ -96,4 +96,4 @@ export const REQUIRE_PHONE_VERIFICATION = false as boolean;
  *
  * ⚠️ when change it, you need to update NEXT_PUBLIC_OTP_AUTO_VERIFY in .env to update the UI
  */
-export const OTP_AUTO_VERIFY = true;
+export const OTP_AUTO_VERIFY = false;

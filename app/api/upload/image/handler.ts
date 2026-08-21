@@ -1,11 +1,14 @@
 import type { Handler } from '@/lib/http/contract';
+import type { DashboardPage } from '@/lib/permissions/constants';
 
+import { requireAnyPermission } from '@/lib/http/session';
+import { DASHBOARD_PAGES } from '@/lib/permissions/constants';
 import {
   isAllowedImageType,
   uploadImagesToR2,
   validateMagicBytes,
 } from '@/lib/r2/upload-helper';
-import { enforceRateLimit, ipIdentifier } from '@/lib/rate-limit';
+import { enforceRateLimit, userIdentifier } from '@/lib/rate-limit';
 
 import { HTTP_STATUS } from '@/utils/api-messages';
 import { apiSuccess, handleApiError } from '@/utils/api-response';
@@ -18,13 +21,65 @@ import { uploadMsg } from './messages';
 const MAX_FILE_SIZE = MAX_IMAGE_SIZE * 1024 * 1024;
 const MAX_FILES_PER_REQUEST = 1;
 
+/**
+ * The upload is authorised against the resource the image is FOR, not against a
+ * permission of its own: this endpoint owns no data, and a standalone
+ * "may upload" grant would let anyone holding it attach images to a resource
+ * they cannot otherwise touch. Either write action qualifies — an image is
+ * attached while creating a record or while editing one.
+ */
+const UPLOAD_ACTIONS = ['create', 'edit'] as const;
+
+/**
+ * Resolved from the QUERY STRING, not a form field, and that is load-bearing:
+ * the permission check has to run before `readFormData()`, and a form field is
+ * only readable by parsing the multipart body this route exists to guard.
+ *
+ * `Object.hasOwn` against the page map, so the value is one of the enum's own
+ * keys — a bare `in` would accept `__proto__` and `toString`.
+ *
+ * **Runs BEFORE the session check, which inverts the order every other handler
+ * here uses** (`requirePermission` first, input validation after). Unavoidable:
+ * the resource IS the subject of the permission check, so it has to be parsed to
+ * know what to check. The visible consequence is that an unauthenticated caller
+ * gets 400 for an unknown resource and 401 for a known one (measured), which
+ * distinguishes valid page names.
+ *
+ * That is not a leak today, for a specific reason: the valid names are published
+ * in `/openapi.json`, which is a public route. It WOULD become an enumeration
+ * oracle if `DASHBOARD_PAGES` ever gained a name that is not public, or if the
+ * OpenAPI route were closed. Either change means moving the session check ahead
+ * of this — at the cost of a second session lookup.
+ */
+function requireUploadResource(query: URLSearchParams): DashboardPage {
+  const requested = query.get('resource');
+  if (!requested || !Object.hasOwn(DASHBOARD_PAGES, requested))
+    throw new CustomError(uploadMsg.invalidResource, HTTP_STATUS.BAD_REQUEST);
+  return requested as DashboardPage;
+}
+
 export const POST: Handler = async (ctx) => {
   try {
-    // TODO: Add authentication check when auth is implemented
+    const resource = requireUploadResource(ctx.query);
+    const { userId } = await requireAnyPermission(ctx, {
+      resource,
+      actions: UPLOAD_ACTIONS,
+    });
+
+    // Per USER, not per IP. The route is authenticated now, so the identity is
+    // known and is the thing worth bounding; an IP bucket would let one account
+    // spend every colleague's budget from a shared NAT egress. The coarse
+    // per-IP bound still runs ahead of this, in the adapter (`preAuth:
+    // 'ip-limit'` in routes.ts).
+    //
+    // Fail-closed: each admitted request costs image processing, two R2 writes
+    // and a database insert. Losing the limiter on a paid-work path is a cost
+    // event, which is exactly the case `failClosed` exists for.
     await enforceRateLimit({
       scope: 'upload.image.post',
-      identifier: ipIdentifier(ctx.headers),
+      identifier: userIdentifier(userId),
       limit: 20,
+      failClosed: true,
     });
 
     // Read AFTER the limiter, never before: `readFormData` is a function
@@ -73,7 +128,9 @@ export const POST: Handler = async (ctx) => {
       const magicValidation = validateMagicBytes(buffer, entry.type);
       if (!magicValidation.valid) {
         throw new CustomError(
-          uploadMsg.contentMismatch(safeName),
+          magicValidation.animated
+            ? uploadMsg.animatedNotAllowed(safeName)
+            : uploadMsg.contentMismatch(safeName),
           HTTP_STATUS.BAD_REQUEST
         );
       }
@@ -88,6 +145,7 @@ export const POST: Handler = async (ctx) => {
     const r2Keys = await uploadImagesToR2({
       files: files.map((f) => f.file),
       preBuffers: files.map((f) => f.buffer),
+      uploadedBy: userId,
     });
 
     return apiSuccess({ message: uploadMsg.uploaded, data: r2Keys });

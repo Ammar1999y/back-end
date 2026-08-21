@@ -22,7 +22,7 @@ const PRE_AUTH_SEGMENT_MAX = 40;
  * enough to isolate surfaces, coarse enough that dynamic ids don't explode the
  * keyspace.
  */
-export function preAuthScope(pathname: string): string {
+function preAuthScope(pathname: string): string {
   const segments = pathname
     .split('/')
     .filter(Boolean)

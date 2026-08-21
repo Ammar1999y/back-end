@@ -1288,6 +1288,32 @@ containing `newPassword` stores the key with no value; `jsonb_typeof` is `object
 (§7.4g — audit's three jsonb columns are in the same class); `apiPath` and
 `userAgent` truncate at their constants rather than erroring.
 
+**The insert must be against a REAL database, and the payload must come from
+`stripSensitive` rather than be a hand-written literal.** That is the whole
+assertion, and it is the only shape that catches what shipped. `redactValue`
+builds its result with `Object.create(null)`, and Drizzle's `is()` — run on every
+value handed to `.values()` — reads
+`Object.getPrototypeOf(value).constructor`, which throws `null is not an object`
+for a prototype-free object. Every audited write was a `TypeError`, including the
+one on the login-success path, and `bun run test` was 150/150 green throughout,
+because no test ever put a `stripSensitive` result into a real insert. A test
+that calls `stripSensitive` and inspects the returned object proves the redaction
+and cannot see this at all.
+
+**Nesting is NOT what makes the test work** — worth stating, because the obvious
+guess is that it is. A flat prototype-free object throws exactly the same way:
+`is()` reads only the top-level prototype. So one level is enough to catch the
+regression. Include a nested object anyway, for a different assertion: it pins
+that the fix preserves structure rather than flattening it.
+
+**Also assert `changed_fields` survives as an ARRAY.** `clampJson` is the shared
+choke point for all three jsonb columns, and `changedFields` is a `string[]`. The
+fix re-parses the JSON string it already builds; the tempting cheaper fix, a
+spread, would have turned that column into `{ 0: '…', 1: '…' }`. Assert
+`jsonb_typeof(changed_fields) = 'array'` after an UPDATE audit, so a future
+"simplification" back to a spread fails here instead of silently changing the
+column's shape.
+
 **Per-route enforcement, table-driven.** §7.1c proves each route is _reachable_;
 this proves each one _enforces_. For every mutating route in `ROUTES`:
 unauthenticated is 401; authenticated-but-unauthorized is 403; a malformed body
@@ -1301,6 +1327,54 @@ passing 429 test does not prove it.
 rejection, and that the route is still **unauthenticated** (`TODO.md` item 1).
 Write that last one as the current contract with a comment naming the open
 decision, so changing it is deliberate rather than accidental.
+
+**The upload pipeline runs on `Bun.Image`, not `sharp`** (as of 2026-08-21 —
+`bench/image/` holds the measurement). Four assertions follow from that change,
+and the first is a shipped-defect regression test.
+
+**a. The alpha channel survives** (shipped). Encode a PNG carrying soft
+transparency through the real `optimizeImage`, decode the result, and assert the
+alpha channel still has **more than two distinct levels**. That is the
+assertion — not a byte or size comparison — and the reason is what it caught: the
+two `.webp()` calls passed `alphaQuality: 1`, the WORST value on sharp's 0-100
+scale rather than an "on" flag. Measured: 167 distinct alpha levels became 2, a
+pixel at alpha 127 decoded as 0, anti-aliased edges became a 1-bit mask, and the
+file was 9% LARGER for it. Nothing failed and every upload looked successful. The
+option does not exist on `Bun.Image`, so the specific defect cannot return — but
+the property is what matters, and it holds the new encoder to it too.
+
+**b. Animated WebP is REJECTED, with its own message.** `image/webp` is in
+`ALLOWED_IMAGE_TYPES` and the magic-byte check only proves `RIFF`/`WEBP`, so an
+animated file is a well-formed upload of an unwanted kind. `validateMagicBytes`
+now walks the RIFF chunks and refuses when `VP8X` carries the animation flag,
+returning `{ valid: false, animated: true }` so the handler can say "animated
+images are not supported" instead of "content does not match its type". Assert
+three things, because two of them are the ways this breaks: an animated WebP is
+refused with `animated: true`; a still WebP is **still accepted** (a chunk walk
+that over-matches would reject every WebP); and a PNG declared as `image/webp` is
+still refused with `animated` absent, so the two rejection reasons cannot be
+confused. Before this, sharp silently kept the first frame and the user got back
+a still image with no explanation. Authoring the fixture needs hand-assembled
+RIFF chunks — `sharp` cannot write one in this tree (measured) — and
+`bench/image/shared/corpus.mjs` has a working builder to lift.
+
+**c. An SVG upload stores no blurhash, and never reaches a raster decoder.**
+`Bun.Image` cannot decode SVG at all, which is fine because the rasterisation
+only ever existed to produce a placeholder for a file that arrives in a few
+kilobytes already sanitised and minified. Assert that an SVG upload succeeds with
+`blurhash` null and that `files.blurhash` stays nullable — the column, not just
+the code, is what a future consumer will trust.
+
+**d. The blurhash is computed on a white composite.** `blurhash.encode` ignores
+the alpha channel, so without compositing the placeholder is derived from
+whatever RGB sits under fully transparent pixels — a value no viewer sees, and
+one the two decoders disagree about (measured: decoded placeholders differed by
+up to 101/255 on a transparent PNG). Assert the property rather than a hash
+string: for an image with transparency, the decoded placeholder must be close to
+what "flatten onto white, then encode" produces — hash strings legitimately
+differ because two lanczos3 implementations round differently and blurhash
+quantises to 83 buckets per component. Comparing hashes for equality is the wrong
+assertion at this layer and will fail for reasons that do not matter.
 
 **`app/api/dash/users/[id]/handler.ts` and `.../sessions/handler.ts`.** The
 `editOwn` gate: an actor with `editOwn` viewing a user they did not create is
@@ -1321,6 +1395,87 @@ scanning from the start.
 user role change (the same user moving off the role as it is renamed) converges
 to a consistent final state — no orphan sessions, no stale `roleName` in
 `session.metadata`.
+
+### 7.7 The Better Auth sign-in contract
+
+Added 2026-08-21 from `reports/better-auth-1.7-upgrade-review.md`. The framing
+that earns this its own subsection: **a complete authentication outage passed
+`tsc --noEmit` AND 150/150 probes.** Better Auth 1.7 changed the credential
+lookup from `providerId === 'credential'` to a three-part match on
+`(providerId, issuer, accountId)`; `accounts` had no `issuer` column, so every
+password login answered a well-formed `401` with correct credentials. Nothing in
+either gate could see it, because the project's own type-checking never meets the
+library's account-model requirement and no test signed anybody in.
+
+§7.1d already covers the Better Auth **path allowlist** — which paths are
+reachable. This is a different axis: whether a request that reaches the handler
+with valid credentials actually authenticates.
+
+**a. Sign-in succeeds.** `POST /api/auth/sign-in/email` with a correct password
+for a seeded user returns **200** and sets a `session_token` cookie. Assert both.
+"Not a 500" is not the assertion — the defect's signature was a clean, correctly
+shaped 401, so only the positive case detects it. This single assertion is the
+highest-value test in this document: it is the one that would have caught the
+outage.
+
+**b. The account row satisfies the library's own predicate.** After creating a
+user through the real path (`POST /api/dev/sign-up`, or the dashboard's user
+create), assert the `accounts` row has `issuer = 'local:credential'`
+(`CREDENTIAL_ISSUER`) and `account_id = user.id`. A row-level guard that fails at
+the cause rather than four layers downstream at the response — worth having
+alongside (a), because (a) tells you login broke and this tells you why.
+
+**c. The check constraint holds.** An insert with any other `issuer` for a
+`credential` row is rejected by `chk_credential_issuer`. Cheap, and it is what
+stops a future third insert site from writing a value that reads as "wrong
+password" forever.
+
+**d. The whole allowed-path surface, in sequence.** Table-driven over
+`BETTER_AUTH_ALLOWED_PATHS`: sign-in → `get-session` (from the cookie cache) →
+`get-session?disableCookieCache=true` (from the database) → `sign-out`, asserting
+`session.metadata.roleName` survives both read paths and that the `sessions` row
+count drops to zero after sign-out. This exercises session create, read and
+delete through `drizzle-orm/bun-sql` — a driver-and-adapter pairing nothing else
+in this document covers, and the path 1.7's new affected-row validation runs on.
+
+**e. Captcha fires on the configured endpoint, and only on it.** `400
+MISSING_RESPONSE` for `/sign-in/email` with no `x-captcha-response`, and **404 —
+not 400** — for `/api/auth/zz/sign-in/email/zz`. The second assertion is the
+load-bearing one: it pins the matching semantics in both directions. 1.6.26
+matched by substring and answered 400 there; 1.7 matches exactly and answers 404.
+Either behaviour changing again is a security-relevant change to what triggers an
+outbound Turnstile call, and only this assertion notices.
+
+**f. Origin behaviour is pinned.** With valid credentials: same-origin → 200;
+untrusted `Origin` → 403; `Sec-Fetch-*` present with no `Origin` → 403; and **no
+`Origin` and no `Sec-Fetch-*` → 200**. Write the last one down explicitly — it
+records that the protection is browser-only, which is easy to mistake for a gap
+and is the reason API clients are unaffected. Note these run BEFORE any
+per-account lockout matters: re-seed between cases, or a rejected attempt's
+`failed_login_attempts` increment masks the next one.
+
+**g. Every reachable `BASE_ERROR_CODES` key has an Arabic mapping.** Derivable
+rather than a hand-kept list: iterate the codes the library exports, filter to
+those reachable from the four allowed paths, and assert each is present in
+`lib/auth/code-errors.ts`. Unmapped codes fall through `lib/auth.ts`'s `after`
+hook and reach an Arabic-only UI as raw English — which is how
+`INVALID_ORIGIN`, `MISSING_OR_NULL_ORIGIN`,
+`CROSS_SITE_NAVIGATION_LOGIN_BLOCKED` and
+`METHOD_NOT_ALLOWED_DEFER_SESSION_REQUIRED` all shipped unmapped. Assert the
+status is PRESERVED through that hook too (403 stays 403, 405 stays 405); it
+re-throws with `failure.status`, and a regression there would turn a security
+rejection into a 400.
+
+**Seam.** All of (a)–(g) are in-process via `app.handle(new Request(...))` against
+the real route table, plus direct SQL for the row-level assertions in (b) and (c).
+No socket, no subprocess. Seeding needs three things the reproduction got wrong
+first, so they are recorded here rather than rediscovered: ids must be **UUID v7**
+(`validID` rejects v4, and the failure is a 401 from the session-create hook that
+looks exactly like the defect in (a)); the email domain must be one
+`emailSchema` allows (gmail/outlook/hotmail/live/yahoo, else a 422 before Better
+Auth is reached); and the request needs `cf-connecting-ip` (the per-IP limiter
+fails closed without a trusted header) and `x-captcha-response` (any value passes
+against the development Turnstile test secret).
 
 ---
 

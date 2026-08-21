@@ -24,6 +24,10 @@ const REQUIRED = {
   DATABASE_URL: 'postgres://u:p@localhost:5432/db',
   PASSWORD_PEPPER_ACTIVE_ID: '1',
   PASSWORD_PEPPER_KEYRING: `{"1":{"generation":1,"secret":"${PEPPER_SECRET}"}}`,
+  // The OTP MAC keyring, validated at load beside the pepper. Same 32-byte
+  // base64url rule — `lib/auth/keyring.ts` parses both.
+  OTP_HMAC_ACTIVE_ID: '1',
+  OTP_HMAC_KEYRING: `{"1":{"generation":1,"secret":"${PEPPER_SECRET}"}}`,
   TURNSTILE_SECRET_KEY: 'turnstile',
   // Production-required since the move off Upstash: SQLITE_DIR has no default in
   // production (an unmounted volume must not boot silently) and the maintenance

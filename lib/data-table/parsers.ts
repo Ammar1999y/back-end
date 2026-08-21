@@ -95,7 +95,7 @@ function parseJsonArray(value: string): unknown[] | null {
   return Array.isArray(parsed) ? parsed : null;
 }
 
-export function parseSortingState<TData>(
+function parseSortingState<TData>(
   value: string | null | undefined,
   columnIds?: string[] | Set<string>,
   /**
@@ -233,7 +233,7 @@ function parseFilterItem(raw: unknown): FilterItemSchema | null {
   };
 }
 
-export function parseFiltersState<TData>(
+function parseFiltersState<TData>(
   value: string | null | undefined,
   columnIds?: string[] | Set<string>,
   /**
@@ -284,7 +284,7 @@ export function parseFiltersState<TData>(
 
 // ─── Search Params ──────────────────────────────────────────────────
 
-export const MAX_PAGE = 10_000;
+const MAX_PAGE = 10_000;
 export const MAX_PER_PAGE = 100;
 
 export interface GetDataSchema<T = Record<string, unknown>> {

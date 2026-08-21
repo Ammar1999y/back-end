@@ -122,20 +122,6 @@ const SQL_AUTH_CONSUME = `
      OR auth_rate_limit.count < ?
   RETURNING count, window_start`;
 
-const SQL_AUTH_GET = `
-  SELECT key, count, last_request FROM auth_rate_limit
-  WHERE key = ? AND expires_at > ?`;
-
-/** Binds, in order: key, count, windowStart, lastRequest, expiresAt. */
-const SQL_AUTH_SET = `
-  INSERT INTO auth_rate_limit (key, count, window_start, last_request, expires_at)
-  VALUES (?, ?, ?, ?, ?)
-  ON CONFLICT(key) DO UPDATE SET
-    count        = excluded.count,
-    window_start = excluded.window_start,
-    last_request = excluded.last_request,
-    expires_at   = excluded.expires_at`;
-
 /**
  * Bounded, not a single unbounded DELETE. After a missed run or a
  * high-cardinality attack the backlog can be large, and one DELETE would hold the
@@ -183,8 +169,6 @@ interface RateLimitStore {
   readonly db: SqliteConnection;
   readonly consume: SqliteStatement;
   readonly authConsume: SqliteStatement;
-  readonly authGet: SqliteStatement;
-  readonly authSet: SqliteStatement;
   readonly sweepRateLimit: SqliteStatement;
   readonly sweepAuth: SqliteStatement;
   readonly anyExpired: SqliteStatement;
@@ -227,8 +211,6 @@ export const getRateLimitStore: () => RateLimitStore = (() => {
         db,
         consume: db.prepare(SQL_CONSUME),
         authConsume: db.prepare(SQL_AUTH_CONSUME),
-        authGet: db.prepare(SQL_AUTH_GET),
-        authSet: db.prepare(SQL_AUTH_SET),
         sweepRateLimit: db.prepare(SQL_SWEEP_RATE_LIMIT),
         sweepAuth: db.prepare(SQL_SWEEP_AUTH),
         anyExpired: db.prepare(SQL_ANY_EXPIRED),

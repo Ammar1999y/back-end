@@ -5,7 +5,6 @@ import { sanitizeForLog } from '@/utils';
 import { getRateLimitStore } from './store';
 import { describeStoreFailure } from './store-failure';
 
-export { authRateLimitStorage } from './auth-storage';
 export {
   enforceOtpGlobalSendBudget,
   enforceOtpSendQuota,
@@ -15,7 +14,6 @@ export {
   otpContactKind,
   userIdentifier,
 } from './api';
-export type { OtpContactKind, OtpSendSurface } from './api';
 
 export interface RateLimitResult {
   success: boolean;

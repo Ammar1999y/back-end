@@ -2,7 +2,7 @@ import type { EntityID } from '@/types';
 
 import * as z from 'zod';
 
-import { normalizeArabicDigits, positiveInt, validID } from '..';
+import { normalizeArabicDigits, validID } from '..';
 import { sanitizeSvg } from '../images/svg-optimizer';
 import { safeDate } from '../time';
 import {
@@ -11,9 +11,6 @@ import {
   PASSWORD_MIN,
   PHONE_NUMBER_MAX,
 } from './constants';
-
-export const NAME_MAX = 150;
-export const DIST_MAX = 100;
 
 export const sanitizeStrict = (v: string) =>
   typeof v === 'string'
@@ -36,11 +33,6 @@ export const sanitizeStrictSingleLine = (v: string) =>
         .trim()
     : '';
 
-export const trimed = (v: string) => (typeof v === 'string' ? v.trim() : '');
-
-export const safeStringRegex =
-  /^[\p{L}\p{M}\p{N}\p{Zs}\n\.,!?:/\\;\-+=\(\)\[\]''"؟،؛@#_&%]*$/u;
-
 export const idRequired =
   'رقم المعرف غير صحيح، اعد تحميل الصفحة ثم حاول مرة اخرى';
 
@@ -57,7 +49,7 @@ export function zodIssueMessage(error: z.ZodError): string {
   return issue?.message ?? 'قم بالتحقق من البيانات المدخله';
 }
 
-export function getIDSchema(
+function getIDSchema(
   props: {
     optional?: boolean;
   } = {}
@@ -81,15 +73,99 @@ export const idSchema = getIDSchema({ optional: false }) as z.ZodPipe<
   z.ZodString /* when EntityID is UUID, use ZodString, and when EntityID is number, use ZodInt */
 >;
 
-export const richTextSchema = z.any();
+export const emailSchema = z.preprocess(
+  (v: string) =>
+    typeof v === 'string' ? v.replaceAll(/\s+/g, ' ').trim().toLowerCase() : '',
+  z
+    .email('يرجى إدخال بريد إلكتروني صحيح')
+    .max(EMAIL_MAX, `يجب أن لا يتجاوز البريد الإلكتروني ${EMAIL_MAX} حرفاً`)
+    .regex(
+      /^[A-Za-z0-9._%+-]+@(?:gmail\.com|outlook\.com|hotmail\.com|live\.com|yahoo\.com)$/,
+      'نعتذر، حالياً نقبل التسجيل فقط عبر بريد Gmail أو Outlook أو Hotmail أو Yahoo. يرجى استخدام أحد هذه العناوين.'
+    )
+);
 
+/**
+ * Canonical password form. `hashPassword` / `verifyPassword` NFKC-normalize
+ * before hashing, so every other check has to see the SAME string: policy
+ * validation, old-vs-new comparison and the HIBP breach lookup all run on the
+ * schema output. Normalizing only at the storage layer let a
+ * compatibility-equivalent input (e.g. U+FB01 "ﬁ" → "fi") pass a breach check
+ * and then normalize into a breached credential. NFKC is idempotent, so the
+ * storage-layer normalization stays as defense in depth for non-schema callers.
+ */
+const normalizePasswordInput = (v: string) =>
+  typeof v === 'string' ? v.normalize('NFKC') : v;
+
+export const passwordSchema = z.preprocess(
+  normalizePasswordInput,
+  z
+    .string('كلمة المرور مطلوبة')
+    .min(PASSWORD_MIN, `كلمة المرور يجب أن تكون ${PASSWORD_MIN} أحرف على الأقل`)
+    .max(PASSWORD_MAX, `كلمة المرور يجب أن لا تتجاوز ${PASSWORD_MAX} حرفاً`)
+    .refine(
+      (val) =>
+        /[a-z]/.test(val) &&
+        /[A-Z]/.test(val) &&
+        /[0-9]/.test(val) &&
+        /[^a-zA-Z0-9]/.test(val),
+      {
+        error: 'تحقق من صحة كلمة المرور',
+      }
+    )
+);
+
+// Saudi phone: strips non-digits, accepts 966XXXXXXXXX / 05XXXXXXXX / 5XXXXXXXX
+const phoneCleanupRegex = /[^\d]/g;
+const saudiPhoneEmptyError = 'رقم الهاتف مطلوب';
+const saudiPhoneFormatError = 'يرجى إدخال رقم هاتف سعودي صحيح';
+
+export const phoneSchema = z.preprocess(
+  (v) => {
+    if (typeof v === 'number') v = String(v);
+    if (typeof v !== 'string') return v;
+    return normalizeArabicDigits(v).replaceAll(phoneCleanupRegex, '');
+  },
+  z
+    .string(saudiPhoneEmptyError)
+    .min(1, saudiPhoneEmptyError)
+    .max(PHONE_NUMBER_MAX, saudiPhoneFormatError)
+    .refine(
+      (val) => {
+        // 966XXXXXXXXX (12 digits), 05XXXXXXXX (10 digits), or 5XXXXXXXX (9 digits)
+        if (val.startsWith('966')) return /^9665\d{8}$/.test(val);
+        if (val.startsWith('05')) return /^05\d{8}$/.test(val);
+        if (val.startsWith('5')) return /^5\d{8}$/.test(val);
+        return false;
+      },
+      { message: saudiPhoneFormatError }
+    )
+    .transform((val) => {
+      // Normalize to 9665XXXXXXXX
+      if (val.startsWith('966')) return val;
+      if (val.startsWith('05')) return '966' + val.slice(1);
+      if (val.startsWith('5')) return '966' + val;
+      return val;
+    })
+);
+
+// Optional phone: empty string / null → no number (null); otherwise validated
+// and normalized by phoneSchema. The key is always present (nullable, not
+// optional) so the inferred input/output shapes stay consistent for
+// react-hook-form resolvers — callers send `null` to mean "no number".
+export const optionalPhoneSchema = z.preprocess(
+  (v) => (v == null || (typeof v === 'string' && v.trim() === '') ? null : v),
+  phoneSchema.nullable()
+);
+
+export const trimed = (v: string) => (typeof v === 'string' ? v.trim() : '');
+export const richTextSchema = z.any();
 export const datePreprocess = (val: unknown) => {
   const accepted =
     typeof val === 'string' || typeof val === 'number' || val instanceof Date;
   const date = accepted ? safeDate(val) : null;
   return date ? date.toISOString() : null;
 };
-
 export const fileUploadSchema = ({
   max,
   withPdf = false,
@@ -153,56 +229,6 @@ export const slugSchema = z.preprocess(
       'الـ slug لا يمكن أن يكون أرقام فقط'
     )
 );
-
-export const emailSchema = z.preprocess(
-  (v: string) =>
-    typeof v === 'string' ? v.replaceAll(/\s+/g, ' ').trim().toLowerCase() : '',
-  z
-    .email('يرجى إدخال بريد إلكتروني صحيح')
-    .max(EMAIL_MAX, `يجب أن لا يتجاوز البريد الإلكتروني ${EMAIL_MAX} حرفاً`)
-    .regex(
-      /^[A-Za-z0-9._%+-]+@(?:gmail\.com|outlook\.com|hotmail\.com|live\.com|yahoo\.com)$/,
-      'نعتذر، حالياً نقبل التسجيل فقط عبر بريد Gmail أو Outlook أو Hotmail أو Yahoo. يرجى استخدام أحد هذه العناوين.'
-    )
-);
-
-/**
- * Canonical password form. `hashPassword` / `verifyPassword` NFKC-normalize
- * before hashing, so every other check has to see the SAME string: policy
- * validation, old-vs-new comparison and the HIBP breach lookup all run on the
- * schema output. Normalizing only at the storage layer let a
- * compatibility-equivalent input (e.g. U+FB01 "ﬁ" → "fi") pass a breach check
- * and then normalize into a breached credential. NFKC is idempotent, so the
- * storage-layer normalization stays as defense in depth for non-schema callers.
- */
-export const normalizePasswordInput = (v: string) =>
-  typeof v === 'string' ? v.normalize('NFKC') : v;
-
-export const passwordSchema = z.preprocess(
-  normalizePasswordInput,
-  z
-    .string('كلمة المرور مطلوبة')
-    .min(PASSWORD_MIN, `كلمة المرور يجب أن تكون ${PASSWORD_MIN} أحرف على الأقل`)
-    .max(PASSWORD_MAX, `كلمة المرور يجب أن لا تتجاوز ${PASSWORD_MAX} حرفاً`)
-    .refine(
-      (val) =>
-        /[a-z]/.test(val) &&
-        /[A-Z]/.test(val) &&
-        /[0-9]/.test(val) &&
-        /[^a-zA-Z0-9]/.test(val),
-      {
-        error: 'تحقق من صحة كلمة المرور',
-      }
-    )
-);
-
-const itemOrderError = 'ترتيب العنصر يجب ان يكون رقم صحيحاً';
-
-export const orderSchema = z.preprocess(
-  (v: string | number) => positiveInt(v, 999),
-  z.int(itemOrderError).min(0, itemOrderError).max(999, itemOrderError)
-);
-
 export const SVGIconSchema = z
   .string()
   .min(1, 'الأيقونه مطلوبه')
@@ -210,46 +236,3 @@ export const SVGIconSchema = z
     message: 'أيقونة SVG غير صحيحة أو تحتوي على محتوى غير آمن',
   })
   .transform((val) => sanitizeSvg(val).cleanedSvg);
-
-// Saudi phone: strips non-digits, accepts 966XXXXXXXXX / 05XXXXXXXX / 5XXXXXXXX
-const phoneCleanupRegex = /[^\d]/g;
-const saudiPhoneEmptyError = 'رقم الهاتف مطلوب';
-const saudiPhoneFormatError = 'يرجى إدخال رقم هاتف سعودي صحيح';
-
-export const phoneSchema = z.preprocess(
-  (v) => {
-    if (typeof v === 'number') v = String(v);
-    if (typeof v !== 'string') return v;
-    return normalizeArabicDigits(v).replaceAll(phoneCleanupRegex, '');
-  },
-  z
-    .string(saudiPhoneEmptyError)
-    .min(1, saudiPhoneEmptyError)
-    .max(PHONE_NUMBER_MAX, saudiPhoneFormatError)
-    .refine(
-      (val) => {
-        // 966XXXXXXXXX (12 digits), 05XXXXXXXX (10 digits), or 5XXXXXXXX (9 digits)
-        if (val.startsWith('966')) return /^9665\d{8}$/.test(val);
-        if (val.startsWith('05')) return /^05\d{8}$/.test(val);
-        if (val.startsWith('5')) return /^5\d{8}$/.test(val);
-        return false;
-      },
-      { message: saudiPhoneFormatError }
-    )
-    .transform((val) => {
-      // Normalize to 9665XXXXXXXX
-      if (val.startsWith('966')) return val;
-      if (val.startsWith('05')) return '966' + val.slice(1);
-      if (val.startsWith('5')) return '966' + val;
-      return val;
-    })
-);
-
-// Optional phone: empty string / null → no number (null); otherwise validated
-// and normalized by phoneSchema. The key is always present (nullable, not
-// optional) so the inferred input/output shapes stay consistent for
-// react-hook-form resolvers — callers send `null` to mean "no number".
-export const optionalPhoneSchema = z.preprocess(
-  (v) => (v == null || (typeof v === 'string' && v.trim() === '') ? null : v),
-  phoneSchema.nullable()
-);

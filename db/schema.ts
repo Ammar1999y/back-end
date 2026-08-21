@@ -37,6 +37,7 @@ import {
   ROLE_SCOPE,
 } from '@/lib/permissions/constants';
 
+import { CREDENTIAL_ISSUER } from '@/utils/api-messages';
 import { PHONE_NUMBER_MODE, PHONE_REQUIRED } from '@/utils/config';
 import {
   EMAIL_MAX,
@@ -211,6 +212,14 @@ export const users = pgTable(
       precision: 2,
       mode: 'string',
     }),
+    // Soft delete, and it stays soft. There is deliberately NO sweep that hard-
+    // deletes these rows: `auditLogs.userId` is `onDelete: 'restrict'`, so a
+    // purge would fail for exactly the users who did anything, and succeed only
+    // for the ones with no history — the opposite of a useful rule. Every read
+    // path already filters `isNull(deletedAt)`, and the partial unique indexes
+    // below release the email and phone for reuse, so the row costs a row.
+    // Erasing a user for real is a data-subject request, not a cron job: it has
+    // to decide what happens to their audit trail, which is a policy question.
     deletedAt: timestamp('deleted_at', {
       withTimezone: true,
       precision: 2,
@@ -278,7 +287,11 @@ export const users = pgTable(
 // ================================
 // Sessions Table
 // ================================
-// TODO: Add cron job to delete sessions older than 30 days
+// Retention: `db/maintenance.ts` deletes rows 30 days past `expiresAt`, on the
+// `/api/internal/db-sweep` schedule. Not a correctness boundary — every read
+// already filters on `expiresAt` — so the sweep only reclaims disk, and the
+// 30-day tail keeps a just-expired session inspectable while someone is asking
+// why a user was logged out.
 export const sessions = pgTable(
   'sessions',
   {
@@ -319,6 +332,14 @@ export const accounts = pgTable(
   {
     id: uuid('id').primaryKey().$defaultFn(generateId),
     accountId: varchar('account_id', { length: 255 }).notNull(),
+    // Better Auth 1.7 identifies an account by (issuer, accountId); `provider_id`
+    // alone no longer resolves one. `/sign-in/email` requires this to equal
+    // `local:credential` and answers a plain 401 otherwise, so the column is NOT
+    // NULL with a default rather than nullable: a row that reaches this table
+    // without it is an unauthenticatable user. See CREDENTIAL_ISSUER.
+    issuer: varchar('issuer', { length: 255 })
+      .notNull()
+      .default(CREDENTIAL_ISSUER),
     providerId: providerId('provider_id').notNull(),
     userId: uuid('user_id')
       .notNull()
@@ -329,6 +350,11 @@ export const accounts = pgTable(
   (t) => [
     uniqueIndex('ux_accounts_provider_user').on(t.providerId, t.userId),
     uniqueIndex('ux_accounts_provider_account').on(t.providerId, t.accountId),
+    // The uniqueness Better Auth itself assumes over the pair it looks accounts
+    // up by. Redundant with ux_accounts_provider_account while `provider_id` has
+    // one possible value; the two diverge as soon as a second provider exists,
+    // and only this one matches the library's own index.
+    uniqueIndex('ux_accounts_issuer_account').on(t.issuer, t.accountId),
     index('idx_accounts_user_id').on(t.userId),
     check(
       'chk_password_hash_length',
@@ -338,6 +364,21 @@ export const accounts = pgTable(
     check(
       'chk_credential_password',
       sql`provider_id <> 'credential' OR password IS NOT NULL`
+    ),
+    // Pins the pair the sign-in lookup matches on. The column default already
+    // supplies the value; this is what stops a caller from writing a different
+    // one, which would be a silent login outage rather than an error.
+    //
+    // The literals are duplicated from CREDENTIAL_PROVIDER_ID / CREDENTIAL_ISSUER
+    // deliberately, and this is the one place that cannot be deduplicated:
+    // drizzle-kit DROPS interpolated params from a check constraint instead of
+    // inlining them. `sql\`... = ${CREDENTIAL_ISSUER}\`` generates
+    // `CHECK (provider_id <>  OR issuer = )` — measured — which is invalid DDL
+    // the migration only fails on when applied. Same reason the sibling
+    // constraints above spell 'credential' out.
+    check(
+      'chk_credential_issuer',
+      sql`provider_id <> 'credential' OR issuer = 'local:credential'`
     ),
   ]
 );
@@ -363,6 +404,12 @@ export const files = pgTable(
     height: integer('height'),
     blurhash: varchar('blurhash', { length: 100 }),
     sortOrder: integer('sort_order').notNull().default(0),
+    // An upload starts unclaimed. `db/maintenance.ts` deletes rows still flagged
+    // after 24h along with their R2 objects, so whatever eventually attaches an
+    // upload to a record MUST clear this in the same transaction that writes
+    // that record — otherwise the sweep deletes the image out from under it.
+    // Nothing clears it today, which is why the sweep is currently the only
+    // thing bounding bucket growth.
     isTemporary: boolean('is_temporary').notNull().default(true),
     uploadedBy: uuid('uploaded_by').references(() => users.id, {
       onDelete: 'set null',
@@ -384,11 +431,23 @@ export const files = pgTable(
 // Audit Log Table
 // ================================
 /**
- * Retention & Archival Strategy:
- * 1. Archive old logs to cold storage (S3/R2) before deletion
- * 2. Keep summary statistics for compliance reporting
- * 3. Use pg_partman for automated partition management
- * 4. TODO: Add cron job to archive/delete audit logs older than 30 days
+ * Retention: NOTHING deletes from this table, and that is a decision, not a gap.
+ *
+ * The retention sweep in `db/maintenance.ts` deliberately skips it. Two reasons,
+ * and either alone is sufficient:
+ *
+ * 1. **It is the trail everything else is measured against.** The
+ *    `verification_sessions` sweep is only safe because every flow that consumes
+ *    a proof writes its row here — contact change, password reset, passwordless
+ *    sign-in. Expiring these rows at 30 days would delete the history that
+ *    justifies expiring those, leaving neither.
+ * 2. **`userId` is `onDelete: 'restrict'`**, so these rows are also what pins a
+ *    soft-deleted user's identity in place. See `users.deletedAt`.
+ *
+ * If volume ever forces the issue, the options in preference order are
+ * partitioning with `pg_partman` and detaching cold partitions, or archiving to
+ * R2 before deletion — never a bare `DELETE`. Revisit on measured table size,
+ * not on a calendar.
  */
 export const auditLogs = pgTable(
   'audit_logs',

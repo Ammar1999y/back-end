@@ -26,7 +26,7 @@ import type { BodyPolicy, Handler } from './contract';
  * boundary advertises this set in `Allow`, and a typo would advertise a method
  * that routes nowhere.
  */
-export type HttpMethod = 'GET' | 'POST' | 'PUT' | 'DELETE';
+type HttpMethod = 'GET' | 'POST' | 'PUT' | 'DELETE';
 
 /**
  * What `Allow` may name: the registered methods, plus `HEAD` where the runtime
@@ -44,7 +44,27 @@ export type AdvertisedMethod = HttpMethod | 'HEAD';
  * route line sees which of the two it is instead of inferring it from a missing
  * argument. `none` is a decision; a missing option was an accident.
  */
-export type PreAuthPolicy = 'ip-limit' | 'none';
+type PreAuthPolicy = 'ip-limit' | 'none';
+
+/**
+ * A query-string parameter a route reads, for the OpenAPI contract.
+ *
+ * Declared here rather than inferred, because a query parameter is invisible to
+ * every other artefact: the path carries `:params`, `body` carries the payload,
+ * and a value read from `ctx.query` appeared in no contract at all. That was
+ * tolerable while every such parameter was optional — `limit`, `cursor`, `deep`
+ * only refine a request that works without them — and stopped being tolerable
+ * when the upload route grew a REQUIRED one. A client cannot guess a parameter it
+ * must send.
+ */
+interface RouteQueryParam {
+  name: string;
+  required: boolean;
+  /** One line, shown in the generated document. */
+  description: string;
+  /** Closed value set, when there is one. */
+  enum?: readonly string[];
+}
 
 export interface RouteDefinition {
   method: HttpMethod;
@@ -53,6 +73,14 @@ export interface RouteDefinition {
   handler: Handler;
   preAuth: PreAuthPolicy;
   body: BodyPolicy;
+  /**
+   * Query parameters this route reads. Optional, and absent means "none that can
+   * be enumerated" rather than "none": the data-table routes consume the whole
+   * query string as an open filter DSL (`db/queries/data-table.ts` reads
+   * `searchParams.entries()` wholesale), so their surface is not a fixed list and
+   * is deliberately left undeclared.
+   */
+  query?: readonly RouteQueryParam[];
   /**
    * Raises this request's idle timeout above the server-wide ceiling.
    *
@@ -70,6 +98,7 @@ export interface RouteManifestEntry {
   path: string;
   preAuth: PreAuthPolicy;
   body: BodyPolicy;
+  query?: readonly RouteQueryParam[];
 }
 
 /**
@@ -101,11 +130,12 @@ export interface RoutePrefix {
 export function toManifest(
   routes: readonly RouteDefinition[]
 ): RouteManifestEntry[] {
-  return routes.map(({ method, path, preAuth, body }) => ({
+  return routes.map(({ method, path, preAuth, body, query }) => ({
     method,
     path,
     preAuth,
     body,
+    query,
   }));
 }
 

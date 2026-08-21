@@ -19,7 +19,7 @@ export function safeDate(
 // (BUSINESS_TIMEZONE); doing it with `setHours` uses the *host* zone, so the
 // same filter selected a different day depending on where the code ran.
 
-export const CALENDAR_DATE_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
+const CALENDAR_DATE_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
 
 const zoneFormatters = new Map<string, Intl.DateTimeFormat>();
 

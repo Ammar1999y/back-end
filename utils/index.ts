@@ -1,9 +1,7 @@
 /* eslint-disable unicorn/prefer-math-trunc */
-import type { EntityID } from '@/types';
 import type { SQL } from 'bun';
 
 import { MAX_ID } from '@/constants';
-import { generateUuidV7 } from '@/lib/id';
 
 export function normalizeArabicDigits(input: string): string {
   const ARNums = ['٠', '١', '٢', '٣', '٤', '٥', '٦', '٧', '٨', '٩'];
@@ -418,7 +416,7 @@ export function sanitizeForLog(input: unknown, maxLength = 1024) {
   return serializeForLog(input, maxLength);
 }
 
-export const returnNumber = (value: string | undefined | number | null) => {
+const returnNumber = (value: string | undefined | number | null) => {
   const num = Number(value);
   return Number.isNaN(num) ? 0 : num;
 };
@@ -518,14 +516,6 @@ export const validID = (val: unknown): string => {
   if (typeof val !== 'string') return '';
   const trimmed = val.trim();
   return UUID_V7_REGEX.test(trimmed) ? trimmed : '';
-};
-
-/**
- * Generates a UUID v7 (time-ordered UUID)
- * @returns A new UUID v7 string
- */
-export const generateUUIDv7 = (): EntityID => {
-  return generateUuidV7();
 };
 
 /**

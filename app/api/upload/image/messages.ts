@@ -8,9 +8,12 @@ export const uploadMsg = {
     `نوع الملف ${name} غير مسموح. الأنواع المسموحة: PNG, WebP, SVG`,
   contentMismatch: (name: string) =>
     `محتوى الملف ${name} لا يتطابق مع نوعه المعلن`,
+  animatedNotAllowed: (name: string) =>
+    `الملف ${name} صورة متحركة، والصور المتحركة غير مدعومة`,
   uploaded: 'تم رفع الملفات بنجاح',
   uploadFailed: 'حدث خطأ في رفع الملفات',
   invalidMimeType: (type: string) =>
     `نوع الملف غير مسموح: ${type}. الأنواع المسموحة: PNG, WebP, SVG`,
   invalidSvg: 'ملف SVG غير صالح',
+  invalidResource: 'المورد المطلوب رفع الصورة له غير صالح',
 };

@@ -40,11 +40,15 @@ import * as meChangePhoneVerify from '@/app/api/dash/users/me/change-phone/verif
 import * as devEmailTestFixed from '@/app/api/dev/email-test/fixed/handler';
 import * as devSignUp from '@/app/api/dev/sign-up/handler';
 import * as healthStorage from '@/app/api/health/storage/handler';
+import * as internalDbSweep from '@/app/api/internal/db-sweep/handler';
 import * as internalSqliteSweep from '@/app/api/internal/sqlite-sweep/handler';
 import * as uploadImage from '@/app/api/upload/image/handler';
 import { BETTER_AUTH_ALLOWED_PATHS } from '@/lib/auth/allowed-paths';
 import { openApiRouteHandler } from '@/lib/http/openapi';
 import { toManifest } from '@/lib/http/route-manifest';
+// A plain frozen object of page keys — no server library, so the framework-free
+// property above holds.
+import { DASHBOARD_PAGE_NAMES } from '@/lib/permissions/constants';
 
 export const ROUTES: readonly RouteDefinition[] = [
   // ---- auth ---------------------------------------------------------------
@@ -209,6 +213,18 @@ export const ROUTES: readonly RouteDefinition[] = [
     handler: dashUsersIdSessions.GET,
     preAuth: 'ip-limit',
     body: 'none',
+    query: [
+      {
+        name: 'limit',
+        required: false,
+        description: 'Page size. Clamped server-side.',
+      },
+      {
+        name: 'cursor',
+        required: false,
+        description: 'Opaque cursor from a previous page.',
+      },
+    ],
   },
   // The only DELETE with a body: it takes the session ids to revoke.
   {
@@ -221,13 +237,30 @@ export const ROUTES: readonly RouteDefinition[] = [
 
   // ---- upload -------------------------------------------------------------
   // The only `multipart` route, and the only one whose body is read lazily —
-  // the handler runs its own limiter before calling `readFormData()`.
+  // the handler authorises the caller and runs its own per-user limiter before
+  // calling `readFormData()`.
+  //
+  // `ip-limit`, like every other authenticated surface: the handler now performs
+  // a session lookup and a permissions read, so unauthenticated traffic must be
+  // bounded before it can force either. Its own limiter is keyed per user, which
+  // by definition cannot bound a caller that has no session yet.
   {
     method: 'POST',
     path: '/api/upload/image',
     handler: uploadImage.POST,
-    preAuth: 'none',
+    preAuth: 'ip-limit',
     body: 'multipart',
+    // Required, and read from the query rather than the form because the
+    // permission check on it has to run before the multipart body is parsed.
+    query: [
+      {
+        name: 'resource',
+        required: true,
+        description:
+          'Dashboard resource the image is for. The caller must hold create or edit on it.',
+        enum: DASHBOARD_PAGE_NAMES,
+      },
+    ],
     // Image processing, two parallel R2 operations and a database insert can
     // exceed the server-wide ceiling on a small VPS, and the client then sees a
     // dropped connection rather than an error body. NOT measured on the target
@@ -243,8 +276,17 @@ export const ROUTES: readonly RouteDefinition[] = [
     handler: healthStorage.GET,
     preAuth: 'none',
     body: 'none',
+    query: [
+      {
+        name: 'deep',
+        required: false,
+        description:
+          'Set to 1 to probe the object store, not just process state.',
+        enum: ['1'],
+      },
+    ],
   },
-  // `body: 'none'` is load-bearing here: the token check now runs against a
+  // `body: 'none'` is load-bearing on both: the token check runs against a
   // request whose body was never touched.
   {
     method: 'POST',
@@ -252,6 +294,17 @@ export const ROUTES: readonly RouteDefinition[] = [
     handler: internalSqliteSweep.POST,
     preAuth: 'none',
     body: 'none',
+  },
+  {
+    method: 'POST',
+    path: '/api/internal/db-sweep',
+    handler: internalDbSweep.POST,
+    preAuth: 'none',
+    body: 'none',
+    // Retention over four tables, batched, plus one R2 delete per abandoned
+    // upload. The default ceiling is for request/response work, not for a
+    // scheduled job that walks a backlog.
+    timeoutSeconds: 120,
   },
 
   // ---- dev-only -----------------------------------------------------------

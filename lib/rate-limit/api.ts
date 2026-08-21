@@ -118,12 +118,12 @@ export type OtpSendSurface =
   'verify_contact' | 'recovery' | 'passwordless' | 'contact_change';
 
 /** Aggregate outbound send ATTEMPTS per contact kind per day. */
-export const OTP_GLOBAL_SEND_CAP_PER_DAY = 2000;
+const OTP_GLOBAL_SEND_CAP_PER_DAY = 2000;
 /**
  * Send attempts to one destination per hour, shared by every NON-recovery
  * surface. Recovery is excluded on purpose — see below.
  */
-export const OTP_DESTINATION_SEND_CAP_PER_HOUR = 6;
+const OTP_DESTINATION_SEND_CAP_PER_HOUR = 6;
 /**
  * Recovery's own destination budget. A separate key, not a slice of the
  * shared one: with a single shared pool two non-recovery surfaces could fill
@@ -131,12 +131,12 @@ export const OTP_DESTINATION_SEND_CAP_PER_HOUR = 6;
  * targeted account-recovery denial. Reserved capacity only counts as reserved
  * if nothing else can spend it.
  */
-export const OTP_RECOVERY_SEND_CAP_PER_HOUR = 5;
+const OTP_RECOVERY_SEND_CAP_PER_HOUR = 5;
 /** Send attempts to one destination per hour from a single surface. */
-export const OTP_SURFACE_SEND_CAP_PER_HOUR = 5;
+const OTP_SURFACE_SEND_CAP_PER_HOUR = 5;
 /** Verify attempts against one destination, across every purpose. */
-export const OTP_DESTINATION_VERIFY_CAP = 10;
-export const OTP_DESTINATION_VERIFY_WINDOW_S = 600;
+const OTP_DESTINATION_VERIFY_CAP = 10;
+const OTP_DESTINATION_VERIFY_WINDOW_S = 600;
 
 const ONE_HOUR_S = 3600;
 const ONE_DAY_S = 86_400;

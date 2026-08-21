@@ -10,7 +10,7 @@ import { users, verificationCodes, verificationSessions } from '@/db/schema';
 import { sanitizeForLog } from '@/utils';
 import nodemailer from 'nodemailer';
 import { auditLog } from '@/lib/audit';
-import { hashPassword, verifyPassword } from '@/lib/auth/password';
+import { hashOtpCode, verifyOtpCode } from '@/lib/auth/otp-hash';
 import { enforceOtpGlobalSendBudget, otpContactKind } from '@/lib/rate-limit';
 
 import { HTTP_STATUS } from '@/utils/api-messages';
@@ -41,17 +41,15 @@ function getTransporter() {
 
 // ── OTP Generation & Hashing ──
 
-export function generateOtpCode() {
+function generateOtpCode() {
   return crypto.randomInt(100_000, 1_000_000).toString();
 }
 
-export async function hashOtpCode(code: string) {
-  return hashPassword(code);
-}
-
-export async function verifyOtpCode(code: string, hashedCode: string) {
-  return verifyPassword({ password: code, hash: hashedCode });
-}
+// Re-exported, not reimplemented: the primitive and its key lifecycle live in
+// `lib/auth/otp-hash.ts`, which records why OTPs no longer share the password
+// KDF profile or the password pepper keyring. Imported as well as re-exported —
+// `export ... from` does not bind the names in this module, and both are used
+// below.
 
 // ── Time Calculations ──
 
@@ -377,7 +375,9 @@ interface ProcessOtpSendResult {
 
 /**
  * Handles rate-limiting, OTP generation, storage, and delivery.
- * Storage and delivery run inside a transaction with row-level locking.
+ *
+ * Storage runs inside a transaction with row-level locking; delivery runs after
+ * it commits, for the pool-exhaustion reason recorded at the call itself.
  */
 export async function processOtpSend({
   userId,
@@ -392,9 +392,11 @@ export async function processOtpSend({
   // The session row is keyed on what is being proven, not on the transport.
   const contactKind = otpContactKind(channel);
 
-  // Argon2id is intentionally computed before acquiring advisory or row locks.
+  // Still computed before the locks are taken. It is an HMAC now rather than a
+  // 64 MiB Argon2id hash, so the ordering no longer buys much — but "do no work
+  // you can do earlier while holding a row lock" is the rule worth keeping.
   const otpCode = generateOtpCode();
-  const hashedCode = await hashOtpCode(otpCode);
+  const hashedCode = hashOtpCode(otpCode);
 
   // Buffer deferred errors so max-attempts block persists (commit) before we throw.
   let deferredError: CustomError | null = null;
@@ -568,10 +570,6 @@ export async function processOtpSend({
     // rejection rolls back the code just stored.
     await enforceOtpGlobalSendBudget({ channel });
 
-    // TODO: Test this, if it takes more than 1s, move it outside the transaction — see `External OTP Delivery Inside Database Transaction` from TODO.md
-    // ── Send OTP (still inside tx so a delivery failure rolls back) ──
-    await sendOtp(channel, sendTo, otpCode, smsMessage);
-
     return {
       nextAllowedIn: Math.ceil(
         (nextAllowedAt.getTime() - now.getTime()) / 1000
@@ -580,7 +578,37 @@ export async function processOtpSend({
     };
   });
 
+  // Before delivery: a max-attempts block stored no code, so there is nothing to
+  // send. The throw also has to precede `sendOtp` because `result` is null on
+  // that path.
   if (deferredError) throw deferredError;
+
+  // ── Delivery, AFTER the commit ──
+  //
+  // `sendOtp` is an SMTP session or a provider HTTPS call, so it can take
+  // seconds — an SMTP timeout, tens. Inside the transaction it held a reserved
+  // connection out of `MAX_POOL_CONNECTIONS` (10, the process's entire
+  // transaction capacity) plus the `FOR UPDATE` row lock and the advisory lock
+  // for that whole time. Ten concurrent sends against a hanging provider
+  // exhausted the pool, and every other transactional path in the process then
+  // queued behind Bun's 30 s `connectionTimeout`. A provider outage became a
+  // full-application outage.
+  //
+  // What moving it out costs, accepted deliberately: a failed delivery no longer
+  // rolls back, so it spends one of the user's OTP_MAX_ATTEMPTS and leaves a
+  // code that nobody received. Bounded — the code expires in
+  // OTP_EXPIRY_MINUTES, and the next send overwrites it in the one-row-per-
+  // session slot. NOT compensated by decrementing the counter afterwards: that
+  // write cannot be atomic with the failure that triggers it, so every dropped
+  // compensation silently overcharges a real user, and a caller able to force
+  // delivery failures would get its attempts refunded. Same reasoning as the
+  // absent refund primitive in `lib/rate-limit/index.ts`.
+  //
+  // The reverse order is not an option: delivering first would hand out a code
+  // that a subsequent rollback erases, so the user holds a valid-looking code
+  // the database has no record of.
+  await sendOtp(channel, sendTo, otpCode, smsMessage);
+
   // result is non-null when no deferred error was set.
   return result as ProcessOtpSendResult;
 }
@@ -1018,3 +1046,5 @@ export async function processOtpVerify({
     );
   throw new CustomError('رمز التحقق غير صحيح', HTTP_STATUS.BAD_REQUEST);
 }
+
+export { hashOtpCode } from '@/lib/auth/otp-hash';

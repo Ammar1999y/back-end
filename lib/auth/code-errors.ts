@@ -3,6 +3,9 @@ import { MSG_INVALID_CREDENTIALS } from '@/utils/api-messages';
 export const MSG_ACCOUNT_LOCKED = (secondsLeft: number) =>
   `تم حظر الحساب مؤقتًا. حاول مرة أخرى بعد ${secondsLeft} ثانية.`;
 
+const MSG_UNTRUSTED_ORIGIN =
+  'تعذر إكمال الطلب من هذا الموقع. أعد تحميل الصفحة من الرابط الرسمي ثم حاول مرة أخرى.';
+
 export const BASE_ERROR_CODES: Record<string, string> = {
   USER_NOT_FOUND: 'المستخدم غير موجود',
   FAILED_TO_CREATE_USER:
@@ -34,7 +37,28 @@ export const BASE_ERROR_CODES: Record<string, string> = {
   EMAIL_NOT_VERIFIED: 'البريد الالكتروني غير موثوق',
   EMAIL_CAN_NOT_BE_UPDATED: 'لايمكن تحديث البريد الالكتروني',
   SESSION_EXPIRED: 'قم باعادة تسجيل الدخول',
+  SESSION_NOT_FRESH: 'مضى وقت طويل على تسجيل دخولك، قم بتسجيل الدخول مرة أخرى',
   ACCOUNT_NOT_FOUND: 'الحساب غير موجود',
+
+  // Origin / CSRF rejections on /sign-in/email, measured. One message for all
+  // three: from the caller's side they are the same situation — the browser sent
+  // the request from an origin this API does not trust — and none of them
+  // reveals anything about an account, so there is no reason to tell them apart
+  // in the response. Note `trustedOrigins` is not configured, so Better Auth
+  // defaults it to `[baseURL]` — i.e. PUBLIC_ORIGIN alone. A browser front-end
+  // served from any other origin gets 403 here on every sign-in, even with
+  // correct credentials, and `app.ts`'s CORS_POLICY is a separate list that will
+  // happily have allowed the preflight. Set `trustedOrigins` from the same value
+  // as CORS_POLICY if the front-end is ever cross-origin.
+  INVALID_ORIGIN: MSG_UNTRUSTED_ORIGIN,
+  MISSING_OR_NULL_ORIGIN: MSG_UNTRUSTED_ORIGIN,
+  CROSS_SITE_NAVIGATION_LOGIN_BLOCKED: MSG_UNTRUSTED_ORIGIN,
+
+  // `POST /get-session` always answers 405 with this code unless
+  // `session.deferSessionRefresh` is enabled, and `ROUTE_PREFIXES` registers
+  // POST for the whole `/api/auth/*` prefix, so the path is reachable. Nothing
+  // the caller can act on beyond retrying with GET.
+  METHOD_NOT_ALLOWED_DEFER_SESSION_REQUIRED: 'حاول مجددا، او اعد تحميل الصفحة',
 
   USER_ALREADY_EXISTS:
     'المستخدم موجود بالفعل، استخدم بريد الكتروني اخر لإنشاء الحساب',

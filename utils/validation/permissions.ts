@@ -177,7 +177,7 @@ export const createPermissionSchema = z.object({
   isActive: z.boolean(),
 });
 
-export const updatePermissionSchema = createPermissionSchema
+const updatePermissionSchema = createPermissionSchema
   .extend({
     id: idSchema,
   })
@@ -200,14 +200,9 @@ export const updatePermissionSchema = createPermissionSchema
  */
 export const adminUpdatePermissionSchema = updatePermissionSchema.strict();
 
-// Type inference
-export type CreatePermissionInput = z.input<typeof createPermissionSchema>;
-export type UpdatePermissionInput = z.input<typeof updatePermissionSchema>;
-export type CreatePermissionOutput = z.output<typeof createPermissionSchema>;
-export type UpdatePermissionOutput = z.output<typeof updatePermissionSchema>;
-export type PagePermission = z.input<typeof pagePermissionSchema>;
-
-/** @deprecated Use CreatePermissionInput instead */
-export type CreatePermissionFormData = CreatePermissionInput;
-/** @deprecated Use UpdatePermissionInput instead */
-export type UpdatePermissionFormData = UpdatePermissionInput;
+// Type inference, used in the front end
+// type CreatePermissionInput = z.input<typeof createPermissionSchema>;
+// type UpdatePermissionInput = z.input<typeof updatePermissionSchema>;
+// type CreatePermissionOutput = z.output<typeof createPermissionSchema>;
+// type UpdatePermissionOutput = z.output<typeof updatePermissionSchema>;
+// type PagePermission = z.input<typeof pagePermissionSchema>;

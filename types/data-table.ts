@@ -20,19 +20,19 @@ import type { ColumnSort } from '@tanstack/react-table';
 //   }
 // }
 
-export interface QueryKeys {
-  page: string;
-  perPage: string;
-  sort: string;
-  filters: string;
-  joinOperator: string;
-}
+// interface QueryKeys {
+//   page: string;
+//   perPage: string;
+//   sort: string;
+//   filters: string;
+//   joinOperator: string;
+// }
 
-export interface Option {
-  label: string;
-  value: string;
-  count?: number;
-}
+// interface Option {
+//   label: string;
+//   value: string;
+//   count?: number;
+// }
 
 export type FilterOperator = DataTableConfig['operators'][number];
 export type FilterVariant = DataTableConfig['filterVariants'][number];

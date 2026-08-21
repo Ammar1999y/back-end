@@ -82,8 +82,31 @@ function finish(request: Request, response: Response): Response {
  * CORS policy as data, so the Hono example in
  * `lib/http/adapters/hono.ts.disabled` cannot drift away from it again — it
  * already had: the missing captcha header was present in both copies.
+ *
+ * **This is also one of the three things standing in for a CSRF token, so read it
+ * as a security control and not as a browser convenience.** There is deliberately
+ * no CSRF token anywhere in this application; a fourth mechanism would duplicate
+ * these three:
+ *
+ * 1. Better Auth's own routes are origin-checked. `originCheckMiddleware`
+ *    validates `Origin`/`Referer` against `trustedOrigins` on every non-GET
+ *    request that carries a cookie, and `trustedOrigins` defaults to `baseURL`,
+ *    which is `PUBLIC_ORIGIN`.
+ * 2. The session cookie is `SameSite=Lax` — Better Auth's default, and nothing
+ *    here sets `advanced.defaultCookieAttributes` to change it — so a cross-site
+ *    POST/PUT/DELETE arrives with no session at all.
+ * 3. Application JSON routes require exactly `application/json`
+ *    (`lib/http/request.ts`, matched as a media-type essence). That is not a
+ *    CORS-simple content type, so a cross-site attempt needs a preflight, and the
+ *    single origin below is what answers it.
+ *
+ * The gap layer 3 does not cover is `multipart/form-data`, which IS CORS-simple:
+ * a cross-site form can POST to the upload route with no preflight. That route is
+ * session-gated (`app/api/upload/image/handler.ts`) and layer 2 keeps the cookie
+ * off such a request; `bun run smoke` asserts the 401. **Any future multipart or
+ * form-encoded route inherits this gap and needs the same treatment.**
  */
-export const CORS_POLICY = {
+const CORS_POLICY = {
   // A single trusted origin, not `*`: these endpoints are credentialed
   // (session cookie), and the browser refuses `*` with credentials anyway.
   origin: PUBLIC_ORIGIN,
@@ -338,17 +361,26 @@ function register(instance: typeof base): typeof base {
    * **The allowlist is enforced HERE, before `auth.handler` is called at all.**
    * `lib/auth.ts` also enforces it, in a `before` hook, and that is not the same
    * position: Better Auth runs plugin `onRequest` handlers ahead of its own hooks,
-   * so a path outside the list still reached the captcha plugin first. That
-   * plugin matches its endpoint list with `pathname.includes(...)` — read in
-   * `node_modules/better-auth/dist/plugins/captcha/index.mjs` — so ANY path
-   * containing `sign-in/email` matched. Measured: `/api/auth/zz/sign-in/email/zz`
-   * answered `400 Missing CAPTCHA response` instead of 404, and supplying a token
-   * makes it perform an outbound Turnstile siteverify for a path this server does
-   * not serve — unauthenticated, attacker-triggerable spend against the Turnstile
-   * quota. Checking first removes the whole class rather than that one plugin.
+   * so a path outside the list reaches every plugin before the hook can reject
+   * it. Through better-auth 1.6.26 the captcha plugin matched its endpoint list
+   * with `pathname.includes(...)`, so ANY path containing `sign-in/email`
+   * matched: `/api/auth/zz/sign-in/email/zz` answered `400 Missing CAPTCHA
+   * response` instead of 404, and supplying a token made it perform an outbound
+   * Turnstile siteverify for a path this server does not serve —
+   * unauthenticated, attacker-triggerable spend against the Turnstile quota.
    *
-   * The `before` hook stays. It is defence in depth, and it is what protects any
-   * future caller that reaches `auth.handler` by another route.
+   * 1.7 fixed that plugin: it strips the base path and compares exactly
+   * (`endpoint === pathname`, wildcards only when the configured entry contains
+   * `*` — read in `node_modules/better-auth/dist/plugins/captcha/index.mjs`),
+   * and the same request now answers 404 here with no captcha involvement
+   * (re-measured on 1.7.1). So this check is no longer what stops that specific
+   * leak.
+   *
+   * It stays anyway, and so does the `before` hook. The reason for checking
+   * first was never that one plugin — it is that ANY plugin's `onRequest` runs
+   * ahead of the hook, so the class stays open as long as the decision is made
+   * downstream of the plugin chain. Making it here removes the class; the
+   * upstream fix removed one instance of it.
    */
   for (const prefix of ROUTE_PREFIXES)
     for (const method of prefix.methods)

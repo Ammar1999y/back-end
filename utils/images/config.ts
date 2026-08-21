@@ -1,8 +1,5 @@
 import type { Config } from 'svgo';
 
-export const MAX_IMAGE_SIZE = 1; // MB - placeholder, will be replaced
-export const SERVER_MAX_IMAGE_SIZE = 0.2;
-
 export const svgoConfig: Config = {
   multipass: true,
   plugins: [

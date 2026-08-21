@@ -15,7 +15,7 @@ import {
 // flags all derive from these two lists. `OTP_CHANNELS` is the concatenation,
 // so its order — which the `otp_channel` pgEnum depends on — stays stable.
 // ⚠️ Changing these requires a DB migration (otp_channel pgEnum).
-export const EMAIL_OTP_CHANNELS = ['email'] as const;
+const EMAIL_OTP_CHANNELS = ['email'] as const;
 export const PHONE_OTP_CHANNELS = ['sms', 'whatsapp'] as const;
 export const OTP_CHANNELS = [
   ...EMAIL_OTP_CHANNELS,
@@ -74,7 +74,7 @@ const bypassChannels: readonly OtpChannel[] = OTP_AUTO_VERIFY
 
 // Enabled channels — exposed to the client via NEXT_PUBLIC_ so the UI adapts.
 // Empty array means OTP is completely disabled.
-export const ENABLED_OTP_CHANNELS: readonly OtpChannel[] = [
+const ENABLED_OTP_CHANNELS: readonly OtpChannel[] = [
   ...new Set([...envChannels, ...bypassChannels]),
 ];
 
@@ -103,10 +103,6 @@ export function channelEnabledRefine(
     });
   }
 }
-
-export const channelSchema = z
-  .enum(OTP_CHANNELS)
-  .refine(isChannelEnabled, { message: MSG_CHANNEL_DISABLED });
 
 export const otpCodeSchema = z.preprocess(
   sanitizeStrictSingleLine,
@@ -145,8 +141,6 @@ export const sendOtpSchema = z
   ])
   .superRefine(channelEnabledRefine);
 
-export type SendOtpInput = z.infer<typeof sendOtpSchema>;
-
 // ── Verify OTP Schemas ──
 const verifyOtpPhoneSchema = z.object({
   channel: z.literal('whatsapp'),
@@ -174,8 +168,6 @@ export const verifyOtpSchema = z
   ])
   .superRefine(channelEnabledRefine);
 
-export type VerifyOtpInput = z.infer<typeof verifyOtpSchema>;
-
 // ── Reset-Password Schema (forgot-password) ──
 // Same shape as verify (channel + identifier + code) plus the new password.
 export const resetPasswordSchema = z
@@ -186,4 +178,7 @@ export const resetPasswordSchema = z
   ])
   .superRefine(channelEnabledRefine);
 
-export type ResetPasswordInput = z.infer<typeof resetPasswordSchema>;
+// used in the front end
+// type ResetPasswordInput = z.infer<typeof resetPasswordSchema>;
+// type VerifyOtpInput = z.infer<typeof verifyOtpSchema>;
+// type SendOtpInput = z.infer<typeof sendOtpSchema>;

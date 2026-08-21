@@ -34,7 +34,7 @@ const validateR2Config = !!(
  * - forcePathStyle: true for S3-compatible API
  * - endpoint: R2-specific endpoint
  */
-export const r2Client = new S3Client({
+const r2Client = new S3Client({
   endpoint: `https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com`,
   credentials: {
     accessKeyId: R2_ACCESS_KEY_ID || '',

@@ -26,8 +26,6 @@ export const loginSchema = z.object({
     .max(1000, 'الرجاء التحقق من أنك لست روبوت'),
 });
 
-export type LoginFormData = z.input<typeof loginSchema>;
-
 const userRoleSchema = z.object({
   email: emailSchema,
   password: passwordSchema,
@@ -165,10 +163,6 @@ const updateUserObject = userRoleSchema.omit({ password: true }).extend({
     .nullish(),
 });
 
-export const updateUserSchema = updateUserObject.superRefine(
-  refineUserUpdatePayload
-);
-
 /**
  * Server-side admin update contract.
  *
@@ -230,15 +224,12 @@ export const changePhoneVerifySchema = z
   })
   .superRefine(channelEnabledRefine);
 
-// Type inference
-export type CreateUserInput = z.input<typeof createUserSchema>;
-export type UpdateUserInput = z.input<typeof updateUserSchema>;
-export type CreateUserOutput = z.output<typeof createUserSchema>;
-export type UpdateUserOutput = z.output<typeof updateUserSchema>;
+// Type inference for the front end
+// type CreateUserInput = z.input<typeof createUserSchema>;
+// type UpdateUserInput = z.input<typeof updateUserSchema>;
+// type CreateUserOutput = z.output<typeof createUserSchema>;
+// type UpdateUserOutput = z.output<typeof updateUserSchema>;
+// type LoginFormData = z.input<typeof loginSchema>;
 
-/** @deprecated Use CreateUserInput instead */
-export type CreateUserFormData = CreateUserInput;
-/** @deprecated Use CreateUserOutput instead */
-export type CreateUserFormDataOutput = CreateUserOutput;
-/** @deprecated Use UpdateUserInput instead */
-export type UpdateUserFormData = UpdateUserInput;
+// used in front-end
+// const updateUserSchema = updateUserObject.superRefine(refineUserUpdatePayload);

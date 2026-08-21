@@ -389,7 +389,7 @@ function commonResponses(entry: RouteManifestEntry): JsonSchema {
  * Exported so it can be asserted directly, rather than only through the 500 that
  * `openApiDocument` raises.
  */
-export function openApiConsistencyProblems(
+function openApiConsistencyProblems(
   manifest: readonly RouteManifestEntry[]
 ): string[] {
   const problems: string[] = [];
@@ -439,7 +439,7 @@ export function openApiConsistencyProblems(
  * The CI boot smoke test fetches this route and asserts 200, so the failure lands
  * before a deploy rather than in a client.
  */
-export function openApiDocument(
+function openApiDocument(
   manifest: readonly RouteManifestEntry[] = []
 ): JsonSchema {
   const problems = openApiConsistencyProblems(manifest);
@@ -452,6 +452,22 @@ export function openApiDocument(
 
   for (const entry of manifest) {
     const { path, parameters } = toOpenApiPath(entry.path);
+    // Query parameters come from the route table, not from the path. They are the
+    // one part of a request that no other artefact reveals, and the upload route's
+    // `resource` is required — a client that omits it gets a 400 it could not have
+    // anticipated from this document.
+    const queryParams = entry.query ?? [];
+    for (const param of queryParams)
+      parameters.push({
+        name: param.name,
+        in: 'query',
+        required: param.required,
+        description: param.description,
+        schema: param.enum
+          ? { type: 'string', enum: [...param.enum] }
+          : { type: 'string' },
+      });
+
     const operation: JsonSchema = {
       operationId: `${entry.method.toLowerCase()}${entry.path.replaceAll(/[^a-zA-Z0-9]/g, '_')}`,
       responses: commonResponses(entry),

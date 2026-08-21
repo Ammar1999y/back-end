@@ -11,6 +11,38 @@ scratch directory and reading both trees side by side — not from the upgrade
 guide's prose and not from memory. The verification method for each claim is in
 Appendix A; the reproduction is in Appendix B.
 
+> ## APPLIED — 2026-08-21
+>
+> Steps 1–5 of §8 are done in code and verified end to end through the real
+> route table: `POST /api/dev/sign-up` → 201 writing `issuer=local:credential`,
+> `POST /api/auth/sign-in/email` → **200 with both cookies**, the login-success
+> audit row written with its `jsonb` intact, `GET /get-session` → 200 with
+> `metadata.roleName`, `POST /sign-out` → 200 with the session row deleted, a
+> wrong `issuer` rejected by `chk_credential_issuer`, and the new codes answering
+> in Arabic with their status preserved (403 origin, 405 `POST /get-session`).
+>
+> Migration: `db/drizzle/0004_add_account_issuer.sql`, applied. PostgreSQL fills
+> existing rows from the column `DEFAULT` in the same statement, so the
+> add-nullable/backfill/tighten sequence sketched in §3 turned out to be
+> unnecessary — the generated one-statement form is what shipped.
+>
+> Gates after the change: `bun install --frozen-lockfile`, `bun run lint`,
+> `bun run format:check`, `bun run test` (156 pass / 0 fail),
+> `bun scripts/find-unused-files.ts`, `bun run smoke` — all green.
+> `bun run db:generate` reports no schema changes.
+>
+> Steps 6–7 were **routed, not applied**, because they are not code:
+> the `trustedOrigins` decision is recorded at its own site in
+> `lib/auth/code-errors.ts`, and the assertions in §9
+> are now `reports/test-strategy.md` **§7.7** plus an extension to the existing
+> `auditLog` item in §7.6. The remaining decisions from §1, §6.4 and §7 are
+> `TODO.md` **BA-4** and **BA-5**. Two further notes did not survive triage and
+> are recorded here instead: the `@better-auth/utils` pin is REQUIRED, not a
+> choice (§1, corrected), and mapping the origin codes also stopped them being
+> logged — the rejection still happens, only the log line is gone.
+>
+> Everything below is the review as written, kept as the record of why.
+
 ---
 
 ## 0. Bottom line
@@ -66,13 +98,25 @@ runs.
   `@better-auth/core`. Leaving `^1.6` means the manifest documents a version the
   code cannot actually run on (§3), and anyone resolving from `package.json` alone
   would reach a different, incompatible tree.
-- **`@better-auth/utils` is now duplicated.** It is pinned exactly at `0.4.2` at
-  the top level, and `better-call@1.4.0` depends on `^0.5.0`, so `bun.lock` also
-  carries a nested `@better-auth/utils@0.5.0`. `lib/auth/check-password.ts`
-  imports `createHash` from the top-level `0.4.2`. Harmless today — the two copies
-  do not interact — but it is a second copy of a hashing utility in the tree, and
-  the exact pin is what forces the duplication rather than a single hoisted
-  `0.5.0`. Decide whether that pin is still buying anything.
+- **`@better-auth/utils` is duplicated in the tree, and the exact `0.4.2` pin must
+  stay.** Corrected after this section was first written: an earlier revision
+  called the pin a possible leftover and asked whether to relax it to `^0.5`. It
+  is not a leftover — it is what better-auth requires. `better-auth@1.7.1` depends
+  on exactly `0.4.2`, and **seven** of its packages restate that as an exact
+  _peerDependency_: `@better-auth/core`, the drizzle / kysely / memory / mongo /
+  prisma adapters, and `telemetry`. Latest published is `0.5.0`, and there is also
+  a `0.4.3`; both would violate that exact peer, so being behind is correct.
+
+  The duplication is upstream's own inconsistency, not this project's:
+  `better-call@1.4.0` — a better-auth dependency — requires `^0.5.0`, so
+  `bun.lock` carries `0.4.2` hoisted and `0.5.0` nested under `better-call`.
+  Nothing this project declares can collapse that. The copies never meet:
+  `lib/auth/check-password.ts` uses the top-level `0.4.2` for HIBP prefix
+  hashing, and better-auth uses its own copy internally. Dropping the direct
+  dependency is not an option either — `better-auth` does not re-export
+  `createHash` on its public surface (checked). **No action; revisit only when a
+  better-auth release moves its own pin**, which Renovate's existing
+  `@better-auth/**` group already tracks.
 
 ---
 
@@ -445,10 +489,22 @@ Observed live as a `500` on the login-success path — `auditLog` called from
 
 **Fix at the boundary, not in the traversal.** The prototype-free guard is correct
 where it is, and removing it would reopen the `__proto__` hole. Convert once,
-where the value crosses into Drizzle. Note that a shallow spread is not enough:
-`redactValue` recurses, so nested levels are prototype-free too. `clampJson`
-already calls `JSON.stringify` on the value, so doing the round-trip there is
-close to free.
+where the value crosses into Drizzle. `clampJson` already calls `JSON.stringify`
+on the value to measure it, so re-parsing that same string there is the cheap
+place to do it.
+
+**Corrected after this section was written.** An earlier revision said a shallow
+spread would not be enough because `redactValue` recurses and leaves nested
+levels prototype-free. That reasoning is wrong, and measured to be wrong: `is()`
+inspects only the top-level column value, and the driver JSON-serializes
+whatever is underneath, so `{ ...oldData }` inserts fine with prototype-free
+children. Two accurate statements replace it. First, nesting is not needed to
+reproduce or to catch this at all — a FLAT prototype-free object throws just the
+same, because the top-level prototype is the only one `is()` reads. Second, the
+reason to prefer the round trip is `changedFields`, which is an **array**:
+`{ ...['a', 'b'] }` is `{ 0: 'a', 1: 'b' }`, so a spread applied at this shared
+choke point would silently store that column as an object. The round trip
+preserves it.
 
 **This is a class, not an instance.** Every `auditLog` caller that passes
 `oldData` or `newData` is affected — user, permission, contact-change,

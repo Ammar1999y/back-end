@@ -1,17 +1,18 @@
 import type { BucketType } from './client';
 import type { NewFile } from '@/db/schema';
+import type { EntityID } from '@/types';
 
 import { uploadMsg } from '@/app/api/upload/image/messages';
 import { db } from '@/db';
 import { files } from '@/db/schema';
 import { sanitizeForLog } from '@/utils';
 import { encode } from 'blurhash';
-import sharp from 'sharp';
 
 import { HTTP_STATUS } from '@/utils/api-messages';
 import { CustomError } from '@/utils/error-class';
+import { imageToRgba } from '@/utils/images/rgba';
+import { sanitizeSvgServer, svgOptimizerServer } from '@/utils/images/server';
 import { generateShortId, sanitizeFilename } from '@/utils/sanitize-filename';
-import { sanitizeSvgServer, svgOptimizerServer } from '@/utils/svg/server';
 import {
   MAX_IMAGE_PIXELS,
   SERVER_MAX_IMAGE_SIZE,
@@ -54,13 +55,46 @@ const MAGIC_BYTES = {
 } as const;
 
 /**
+ * A WebP whose extended header declares the ANIMATION flag.
+ *
+ * Rejected deliberately: animated uploads are not a feature of this application,
+ * and until now they were accepted and silently flattened to their first frame,
+ * so a user got back a still image with no explanation. Refusing them here is
+ * also what keeps the decode path narrow — `Bun.Image` cannot decode animated
+ * WebP at all (`ERR_IMAGE_DECODE_FAILED`), and a rejection with a message beats
+ * a 500 four layers down.
+ *
+ * The flag lives in bit 1 of the first byte of the `VP8X` chunk, which a simple
+ * (non-extended) WebP does not have at all — hence the chunk walk rather than a
+ * fixed offset. Structure per the WebP container spec: `RIFF<size>WEBP` then
+ * 8-byte-headed chunks, each padded to an even length.
+ */
+const WEBP_ANIMATION_FLAG = 0x02;
+
+function isAnimatedWebp(buffer: Buffer): boolean {
+  let offset = 12; // past `RIFF<size>WEBP`
+  while (offset + 8 <= buffer.length) {
+    const fourcc = buffer.toString('ascii', offset, offset + 4);
+    const size = buffer.readUInt32LE(offset + 4);
+    if (fourcc === 'VP8X')
+      return ((buffer[offset + 8] ?? 0) & WEBP_ANIMATION_FLAG) !== 0;
+    // An `ANIM` chunk without a VP8X flag is malformed, but treat it as animated
+    // rather than reasoning about which of two contradictory headers wins.
+    if (fourcc === 'ANIM' || fourcc === 'ANMF') return true;
+    if (size <= 0) return false;
+    offset += 8 + size + (size % 2);
+  }
+  return false;
+}
+
+/**
  * Validates file content matches its declared MIME type using magic bytes.
  * SVG is text-based and fully validated by sanitizeSvgServer.
  */
 export function validateMagicBytes(
   buffer: Buffer,
   mimeType: string
-): { valid: boolean } {
+): { valid: boolean; animated?: boolean } {
   // SVG validation is handled by sanitizeSvgServer
   if (mimeType === 'image/svg+xml') return { valid: true };
 
@@ -82,20 +116,43 @@ export function validateMagicBytes(
     if (!secondaryMatch) return { valid: false };
   }
 
+  if (mimeType === 'image/webp' && isAnimatedWebp(buffer))
+    return { valid: false, animated: true };
+
   return { valid: true };
 }
 
-// Generate blurhash from image buffer
-async function generateBlurhash(imageBuffer: Buffer): Promise<string> {
-  const { data, info } = await sharp(imageBuffer, {
-    limitInputPixels: MAX_IMAGE_PIXELS,
-  })
-    .resize(32, 32, { fit: 'inside' })
-    .ensureAlpha()
-    .raw()
-    .toBuffer({ resolveWithObject: true });
+/**
+ * Blurhash from a 32px thumbnail. `imageToRgba` exists because `Bun.Image` has
+ * no raw-pixel terminal and `blurhash.encode` needs RGBA — see that module.
+ *
+ * Raster only: an SVG never reaches here (see `processImage`).
+ *
+ * **Transparent pixels are composited onto white first**, and that is a decision
+ * rather than a formality. `blurhash.encode` reads RGB and ignores the alpha
+ * channel completely, so without this step the placeholder is computed from
+ * whatever colour happens to sit underneath a fully transparent pixel — a value
+ * no viewer ever sees and which the two decoders disagree about (measured:
+ * sharp's resize zeroes it, `Bun.Image` keeps the source colour, and the decoded
+ * placeholders differed by up to 101/255 on a transparent PNG). Compositing
+ * makes the placeholder mean "what this image looks like on a light page", which
+ * is where it renders, and makes it independent of the decoder.
+ */
+const BLURHASH_BACKGROUND = 0xff;
 
-  return encode(new Uint8ClampedArray(data), info.width, info.height, 4, 3);
+async function generateBlurhash(imageBuffer: Buffer): Promise<string> {
+  const { width, height, rgba } = await imageToRgba(imageBuffer, 32);
+  for (let i = 0; i < rgba.length; i += 4) {
+    const alpha = rgba[i + 3] ?? 0xff;
+    if (alpha === 0xff) continue;
+    for (let channel = 0; channel < 3; channel++) {
+      const value = rgba[i + channel] ?? 0;
+      rgba[i + channel] =
+        (value * alpha + BLURHASH_BACKGROUND * (0xff - alpha)) / 0xff;
+    }
+    rgba[i + 3] = 0xff;
+  }
+  return encode(new Uint8ClampedArray(rgba), width, height, 4, 3);
 }
 
 // Generate R2 key for temporary files with sanitized name
@@ -162,7 +219,12 @@ async function processImage(
     buffer = Buffer.from(optimizedSvg, 'utf8');
     finalSize = buffer.length;
     finalExtension = 'svg';
-    blurhash = await generateBlurhash(buffer);
+    // No blurhash for SVG, deliberately. It used to be produced by rasterising
+    // the markup through sharp, which was the only reason this project needed a
+    // rasteriser at all. An SVG is XML: it is small, it is already sanitised and
+    // minified above, and a placeholder for a file that arrives in a few
+    // kilobytes buys nothing. `files.blurhash` is nullable, so consumers must
+    // already tolerate its absence.
   }
   // Optimize raster images (PNG, WebP)
   else if (shouldOptimizeImage(file.type)) {
@@ -179,10 +241,12 @@ async function processImage(
     blurhash = await generateBlurhash(buffer);
     finalExtension = 'webp';
   } else {
-    // Image doesn't need optimization
+    // Image doesn't need optimization. Unreachable with the current
+    // `ALLOWED_IMAGE_TYPES` — `shouldOptimizeImage` is true for every raster
+    // type on the list — and kept because the list is what would change.
     blurhash = await generateBlurhash(buffer);
-    const metadata = await sharp(buffer, {
-      limitInputPixels: MAX_IMAGE_PIXELS,
+    const metadata = await new Bun.Image(buffer, {
+      maxPixels: MAX_IMAGE_PIXELS,
     }).metadata();
     width = metadata.width;
     height = metadata.height;
@@ -209,12 +273,20 @@ export async function uploadImagesToR2(params: {
   preBuffers?: Buffer[];
   targetSize?: number;
   bucketType?: BucketType;
+  /**
+   * Who uploaded these. Optional only because the column is nullable and
+   * `onDelete: 'set null'` — every current caller passes it, and the retention
+   * sweep in `db/maintenance.ts` needs it to say WHOSE abandoned upload it
+   * removed. A temporary row with no owner is untraceable.
+   */
+  uploadedBy?: EntityID;
 }): Promise<string[]> {
   const {
     files: imageFiles,
     preBuffers,
     bucketType = 'public',
     targetSize = SERVER_MAX_IMAGE_SIZE * 1024 * 1024,
+    uploadedBy,
   } = params;
 
   let uploadedKeys: string[] = [];
@@ -268,6 +340,7 @@ export async function uploadImagesToR2(params: {
       height: img.height,
       blurhash: img.blurhash,
       isTemporary: true,
+      uploadedBy: uploadedBy ?? null,
     }));
 
     try {

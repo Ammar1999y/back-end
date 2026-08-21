@@ -38,7 +38,7 @@ const READ_ACTIONS = new Set<PermissionAction>(['view', 'viewOwn']);
  *   unrestricted grant first, then the own grant itself.
  * - Anything else: exact match only.
  */
-export function resolveActionScope(
+function resolveActionScope(
   permissions:
     | Record<string, Record<string, boolean>>
     | Partial<Record<DashboardPage, Record<PermissionAction, boolean>>>,

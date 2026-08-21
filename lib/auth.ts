@@ -457,7 +457,14 @@ export const auth = betterAuth({
         process.env.NODE_ENV === 'development'
           ? '1x0000000000000000000000000000000AA'
           : (process.env.TURNSTILE_SECRET_KEY ?? ''),
-      endpoints: ['/sign-in/email'], // TODO: add the proper endpoints
+      // Paths are matched EXACTLY from 1.7 (base path stripped first), not by
+      // substring as through 1.6.26. So an entry covers one path and nothing
+      // else: `'/sign-in'` would protect nothing, and a prefix has to be written
+      // as `'/sign-in/*'`. Verified on 1.7.1 — omitting the header here answers
+      // `400 MISSING_RESPONSE`, and `/api/auth/zz/sign-in/email/zz` no longer
+      // matches at all.
+      // TODO: add the proper endpoints — and write each one in full.
+      endpoints: ['/sign-in/email'],
     }),
     // Passwordless sign-in (OTP → session). Verifies its own captcha/OTP.
     passwordless(),

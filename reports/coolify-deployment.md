@@ -18,11 +18,12 @@ Updated: 2026-08-20
 Three previously open choices are settled, and the instructions below depend on
 them. If any is revisited, the marked sections change with it.
 
-| Decision              | Choice                                                                                        | Affects        |
-| --------------------- | --------------------------------------------------------------------------------------------- | -------------- |
-| Sweep execution model | **HTTP route** (`POST /api/internal/sqlite-sweep`), invoked by a Coolify Scheduled Task       | §9, §7, gate 3 |
-| Power-loss RPO        | **`synchronous = NORMAL`** retained for the limiter database, including the daily OTP cap     | §4, gate 6     |
-| Retained WAL ceiling  | **`journal_size_limit = 64 MiB`** accepted as the RETAINED size, with peak WAL monitored (§9) | §4, §9         |
+| Decision              | Choice                                                                                            | Affects        |
+| --------------------- | ------------------------------------------------------------------------------------------------- | -------------- |
+| Sweep execution model | **HTTP route** (`POST /api/internal/sqlite-sweep`), invoked by a Coolify Scheduled Task           | §9, §7, gate 3 |
+| Retention sweep       | **Second HTTP route** (`POST /api/internal/db-sweep`), daily; separate cadence and failure domain | §9             |
+| Power-loss RPO        | **`synchronous = NORMAL`** retained for the limiter database, including the daily OTP cap         | §4, gate 6     |
+| Retained WAL ceiling  | **`journal_size_limit = 64 MiB`** accepted as the RETAINED size, with peak WAL monitored (§9)     | §4, §9         |
 
 One decision remains open: **`secure_delete`**. Both databases currently run
 with it OFF, which means deleted rate-limit keys — raw IP addresses, email
@@ -194,6 +195,8 @@ BuildKit and Coolify falls back to `--build-arg`. Review
 | `BETTER_AUTH_SECRET`               | Runtime | Yes    | At least 32 chars; no surrounding whitespace                                                                                                                                                                                                                                                                      |
 | `PASSWORD_PEPPER_ACTIVE_ID`        | Runtime | Yes    | Must name key in keyring                                                                                                                                                                                                                                                                                          |
 | `PASSWORD_PEPPER_KEYRING`          | Runtime | Yes    | Valid one-line JSON; retain old keys used by stored hashes                                                                                                                                                                                                                                                        |
+| `OTP_HMAC_ACTIVE_ID`               | Runtime | Yes    | Must name a key in `OTP_HMAC_KEYRING`. The OTP MAC keyring is SEPARATE from the password pepper on purpose — see the retirement note below.                                                                                                                                                                       |
+| `OTP_HMAC_KEYRING`                 | Runtime | Yes    | Same one-line JSON shape as the pepper keyring: `{"<id>":{"generation":1,"secret":"<32 bytes, unpadded base64url>"}}`. Generate with `openssl rand -base64 32 \| tr '+/' '-_' \| tr -d '='`. A malformed value is a BOOT failure, not a first-request failure.                                                    |
 | `TURNSTILE_SECRET_KEY`             | Runtime | Yes    | Production Cloudflare secret                                                                                                                                                                                                                                                                                      |
 | `SQLITE_DIR=/app/data`             | Runtime | No     | Absolute, no default in prod                                                                                                                                                                                                                                                                                      |
 | `SQLITE_MAINTENANCE_TOKEN`         | Runtime | Yes    | Gates the sweep and deep-health routes; `openssl rand -hex 32`                                                                                                                                                                                                                                                    |
@@ -219,6 +222,24 @@ would let an unmounted volume boot happily and write to the container layer,
 where every redeploy silently resets the auth, API and daily OTP counters. Boot
 validation still cannot prove a volume is mounted there — only the persistence
 proof in §8 does.
+
+#### Key retirement: the two keyrings have different rules
+
+Both keyrings are parsed by `lib/auth/keyring.ts`, and in both a hash records the
+id of the key that produced it. Removing a key whose id is still referenced makes
+those values **unverifiable** — the lookup throws a configuration error, which
+reaches the client as a 500, not as a failed login or a wrong code.
+
+The horizons are not the same, and conflating them is what motivated splitting
+them apart:
+
+| Keyring                   | A key may be removed once…                                                                                                                                                                      |
+| ------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `PASSWORD_PEPPER_KEYRING` | every stored password hash has been rehashed under a newer generation. Users rehash on their next successful login, so this is **months**, and there is no event that tells you it is finished. |
+| `OTP_HMAC_KEYRING`        | no unexpired OTP was issued under it. Codes live 10 minutes (`OTP_EXPIRY_MINUTES`), so **an hour of grace is ample**.                                                                           |
+
+Add the new key with a higher `generation`, deploy, then remove the old one on
+the horizon above. Never remove and add in one step.
 
 ### Optional/recommended
 
@@ -496,9 +517,19 @@ bun -e 'const {Database}=require("bun:sqlite");const d=new Database(":memory:");
 ```
 
 Expected: Bun 1.4.0, SQLite at least 3.51.3. A missing environment variable or
-a read-only filesystem blocks release. There is no native addon left to fail to
-load, so `ERR_DLOPEN_FAILED` is no longer a failure class here — but the Bun
-version now determines the SQLite build itself, so check it.
+a read-only filesystem blocks release. There is no native addon left **on the
+request path** — `bun:sqlite` replaced `better-sqlite3`, and as of 2026-08-21
+`Bun.Image` replaced `sharp` in the upload pipeline, so nothing the server
+imports at runtime does a `dlopen`. Two native addons still exist in the tree
+and are worth knowing about: `argon2`, which the auth path loads on every
+password verify, and `sharp`, which is now a **devDependency** kept only for
+`bench/image/`. `bun install --frozen-lockfile` still installs both — dropping
+`sharp` from the image would need `--production`, which cannot be used here
+because the build step (`tsc --noEmit`) needs TypeScript from devDependencies.
+So the win is that no request touches it, not that the bytes are gone.
+
+The Bun version now determines the SQLite build, the WebP/PNG codecs and the
+image resampler, so checking it matters more than it used to.
 
 ### Health and SQLite
 
@@ -665,6 +696,44 @@ full, even if that batch removed the last expired row.
 
 Requires `SQLITE_MAINTENANCE_TOKEN` (see §3). The route rejects an unset or
 mismatched token with 401 and compares in constant time.
+
+### PostgreSQL retention sweep
+
+A SECOND scheduled task, against `POST /api/internal/db-sweep`
+(`app/api/internal/db-sweep/handler.ts`, work in `db/maintenance.ts`). Separate
+from the sweep above rather than folded into it: that one reclaims disk from rows
+that expire in minutes and runs hourly, this is retention over days and performs
+network I/O to R2. One schedule cannot serve both cadences, and one response
+cannot report an R2 outage without making the limiter sweep look broken.
+
+| Field     | Value                                                   |
+| --------- | ------------------------------------------------------- |
+| Name      | `postgres-retention-sweep`                              |
+| Command   | see below — same `hasMore` handling as the SQLite sweep |
+| Frequency | `30 3 * * *` (daily, off-peak)                          |
+| Timeout   | `180` seconds                                           |
+
+```sh
+out=$(curl -fsS -X POST -H "x-maintenance-token: $SQLITE_MAINTENANCE_TOKEN" \
+  http://127.0.0.1:3000/api/internal/db-sweep) \
+  && echo "$out" \
+  && ! echo "$out" | grep -q '"hasMore":true'
+```
+
+Reuses `SQLITE_MAINTENANCE_TOKEN` — one operational secret for the whole
+maintenance surface, and the edge block below already covers `/api/internal/*`,
+so this route needs no separate rule.
+
+**This one IS load-bearing, unlike the SQLite sweep.** Expired sessions, codes
+and proof rows are filtered on every read, so delaying those only costs disk. But
+nothing else in the codebase ever deletes a temporary upload: if this task is not
+scheduled, R2 objects accumulate and are billed indefinitely. `hasMore` staying
+`true` across runs while `removed.tempFiles.removed` stays `0` means R2 deletes
+are failing — check the R2 credentials, not the database. The rows are left in
+place deliberately in that state, so nothing is orphaned while it is broken.
+
+What it does NOT touch, deliberately: `audit_logs` and user rows. Both decisions
+are recorded on those tables in `db/schema.ts`.
 
 ### Block `/api/internal/*` at the edge
 
@@ -1175,6 +1244,13 @@ Now set deliberately:
 **Neither number is measured on the target VPS** — see `TODO.md` EM-1. They are
 deliberately generous ceilings, not targets.
 
+**The image work inside that ceiling got 1.8x-3.7x cheaper on 2026-08-21**, when
+the upload pipeline moved from `sharp` to `Bun.Image` (`bench/image/`). That
+widens the margin under the existing 120 s; it does not change what to configure,
+and it does not substitute for the VPS measurement EM-1 still owes. One number
+did move in the other direction and belongs in capacity planning rather than
+here: a 25 MP upload now costs ~230 MB of resident memory instead of ~145 MB.
+
 **What to configure:** Cloudflare's proxy read timeout and Traefik's
 `responseHeaderTimeout` must both exceed 120 s, or the edge will cut an upload
 the application would have completed. Cloudflare's free-plan 100-second limit is
@@ -1232,17 +1308,24 @@ proxy limits move together.
   handler at all.
 
   **This one is a security fix, not only a tidy-up.** Better Auth runs plugin
-  `onRequest` handlers ahead of its own hooks, and the captcha plugin matches
-  its endpoint list with `pathname.includes(...)` (read in
-  `node_modules/better-auth/dist/plugins/captcha/index.mjs`). Measured before
-  the fix: `POST /api/auth/zz/sign-in/email/zz` — an arbitrary nonexistent path
-  that merely CONTAINS `sign-in/email` — answered
+  `onRequest` handlers ahead of its own hooks, and through better-auth 1.6.26
+  the captcha plugin matched its endpoint list with `pathname.includes(...)`.
+  Measured before the fix: `POST /api/auth/zz/sign-in/email/zz` — an arbitrary
+  nonexistent path that merely CONTAINS `sign-in/email` — answered
   `400 Missing CAPTCHA response`, and with an `x-captcha-response` header it
   would perform an outbound Turnstile siteverify for a path this server does not
   serve. That is unauthenticated, attacker-triggerable spend against the
   Turnstile quota from any URL shaped that way. Every such path now answers
   `404` with the envelope and makes no outbound call. Nothing to configure;
   recorded because it changes what the edge sees.
+
+  **Updated for better-auth 1.7.1 (2026-08-21).** That plugin now strips the
+  base path and compares endpoints EXACTLY (wildcards only when the configured
+  entry contains `*`), so the substring match is gone upstream and the same
+  request answers `404` even without the allowlist check — re-measured on 1.7.1.
+  The allowlist check stays: the class it closes is "any plugin's `onRequest`
+  runs before the hook", not that one plugin's matching rule. See
+  `reports/better-auth-1.7-upgrade-review.md` §5.1. Still nothing to configure.
 
 ### 12.6 `/openapi.json` is a new public route
 

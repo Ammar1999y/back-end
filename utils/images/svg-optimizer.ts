@@ -2,17 +2,16 @@ import type { SanitizeResult } from './config';
 
 import { sanitize } from 'isomorphic-dompurify';
 
+import { SERVER_MAX_IMAGE_SIZE } from '@/utils/validation/constants';
+
 import {
   DANGEROUS_ATTRIBUTES,
   DANGEROUS_CSS_PATTERNS,
   DANGEROUS_ELEMENTS,
   isDangerousValue,
   safeDecodeURI,
-  SERVER_MAX_IMAGE_SIZE,
   SVG_MAX_ELEMENTS,
 } from './config';
-
-export { SVG_MAX_ELEMENTS, type SanitizeResult } from './config';
 
 // 🟥 اذا مستقبلا قررت اسمح للانميشن انه يتم تمريره، اقوم بفك التعليق الخاص بالانميشن، واخلي المكتبه تسمح بمرور الانميشن
 
@@ -174,10 +173,10 @@ export function sanitizeSvg(
       const normalized = value.toLowerCase().trim();
       return !(
         !normalized ||
+        normalized === 'currentcolor' ||
         normalized === 'inherit' ||
         normalized === 'transparent' ||
         normalized === 'none' ||
-        normalized === 'currentcolor' ||
         normalized.startsWith('url(')
       );
     };
@@ -214,26 +213,18 @@ export function sanitizeSvg(
     const allElementsWithColors = svgElement.querySelectorAll('*');
     allElementsWithColors.forEach((element) => {
       ['fill', 'stroke'].forEach((attr) => {
-        if (!element.hasAttribute(attr)) {
-          return;
-        }
+        if (!element.hasAttribute(attr)) return;
 
-        const value = element.getAttribute(attr);
-        if (shouldConvertColor(value)) {
+        if (shouldConvertColor(element.getAttribute(attr)))
           element.setAttribute(attr, 'currentColor');
-        }
       });
     });
 
     ['fill', 'stroke'].forEach((attr) => {
-      if (!svgElement.hasAttribute(attr)) {
-        return;
-      }
+      if (!svgElement.hasAttribute(attr)) return;
 
-      const value = svgElement.getAttribute(attr);
-      if (shouldConvertColor(value)) {
+      if (shouldConvertColor(svgElement.getAttribute(attr)))
         svgElement.setAttribute(attr, 'currentColor');
-      }
     });
 
     const cleanedSvg = xmlSerializer.serializeToString(svgElement);
@@ -241,13 +232,12 @@ export function sanitizeSvg(
       USE_PROFILES: { svg: true, svgFilters: true },
     });
 
-    if (!sanitized || !sanitized.includes('<svg')) {
+    if (!sanitized || !sanitized.includes('<svg'))
       return {
         isValid: false,
         cleanedSvg: '',
         errors: ['فشل في تنظيف SVG'],
       };
-    }
 
     return {
       isValid: true,
@@ -262,20 +252,16 @@ export function sanitizeSvg(
     };
   }
 }
-
+// svg - optimizer;
 export function validateSvgFile(file: File): string | null {
-  if (!file) {
-    return 'لم يتم اختيار ملف';
-  }
+  if (!file) return 'لم يتم اختيار ملف';
 
-  if (file.type !== 'image/svg+xml' && !file.name.endsWith('.svg')) {
+  if (file.type !== 'image/svg+xml' && !file.name.endsWith('.svg'))
     return 'الرجاء اختيار ملف SVG فقط';
-  }
 
   const maxSize = SERVER_MAX_IMAGE_SIZE * 2 * 1024 * 1024;
-  if (file.size > maxSize) {
+  if (file.size > maxSize)
     return `حجم الملف كبير جداً (الحد الأقصى ${SERVER_MAX_IMAGE_SIZE * 2}MB)`;
-  }
 
   return null;
 }

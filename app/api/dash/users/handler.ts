@@ -23,6 +23,7 @@ import {
 import { enforceRateLimit, userIdentifier } from '@/lib/rate-limit';
 
 import {
+  CREDENTIAL_ISSUER,
   CREDENTIAL_PROVIDER_ID,
   HTTP_STATUS,
   MSG_CREATE_ERROR,
@@ -220,8 +221,12 @@ export const POST: Handler = async (ctx) => {
 
       const userId = newUser.id;
 
+      // `issuer` is written explicitly even though the column defaults to it:
+      // Better Auth's sign-in lookup matches on (issuer, accountId), so this is
+      // the field that decides whether the user can log in at all.
       await tx.insert(accounts).values({
         accountId: userId,
+        issuer: CREDENTIAL_ISSUER,
         providerId: CREDENTIAL_PROVIDER_ID,
         userId: userId,
         password: hashedPassword,

@@ -208,7 +208,7 @@ export function sanitizePermissions(
  * Normalize permissions to include ALL dashboard pages with ALL actions.
  * Missing pages/actions default to false — ensures consistent comparison.
  */
-export function normalizeFullPermissions(
+function normalizeFullPermissions(
   rolePerms: Array<{ pageName: string; permissions: unknown }>
 ): PermissionObject {
   const sanitized = sanitizePermissions(rolePerms);

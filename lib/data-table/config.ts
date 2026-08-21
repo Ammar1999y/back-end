@@ -29,8 +29,8 @@ const filterVariants = [
   'multiSelect',
 ] as const;
 
-type JoinOperator = (typeof joinOperators)[number];
-type FilterVariant = (typeof filterVariants)[number];
+export type JoinOperator = (typeof joinOperators)[number];
+export type FilterVariant = (typeof filterVariants)[number];
 type Operator = (typeof operators)[number];
 
 const dataTableConfig = {
@@ -91,5 +91,4 @@ const dataTableConfig = {
   joinOperators,
 };
 
-export type { Operator, JoinOperator, FilterVariant };
 export { dataTableConfig };

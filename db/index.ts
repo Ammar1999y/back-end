@@ -28,11 +28,14 @@ import * as schema from './schema';
 /**
  * Pool ceiling, and it is load-bearing rather than decorative.
  *
- * `withTransaction` reserves one connection for the whole block, and some blocks
- * are long: `processOtpSend` holds one across the provider HTTP call (TODO.md
- * §2.1), which can be seconds on an SMTP timeout. So this is the number of
- * concurrent transactions the process supports before callers queue behind
- * `connectionTimeout` (Bun's default, 30 s) rather than a throughput knob.
+ * `withTransaction` reserves one connection for the whole block, so this is the
+ * number of concurrent transactions the process supports before callers queue
+ * behind `connectionTimeout` (Bun's default, 30 s) rather than a throughput knob.
+ *
+ * Nothing here may hold a block open across a network call to a third party.
+ * `processOtpSend` used to, and ten concurrent sends against a hanging SMTP
+ * server exhausted this pool and stalled every other transactional path;
+ * delivery now runs after the commit (see `utils/otp.ts`).
  *
  * 10 is Bun's own default, restated here because it has to be read against the
  * server's `max_connections` — one process must not be able to exhaust it, and
@@ -43,6 +46,22 @@ const MAX_POOL_CONNECTIONS = 10;
 /**
  * Module-private on purpose: one pool per process, reachable only through `db`,
  * `withTransaction` and `closeDatabase`, so nothing can open a second one.
+ */
+/**
+ * No `statement_timeout`, and that is a standing decision rather than an
+ * oversight.
+ *
+ * Setting it is one line — Bun's `connection` option passes PostgreSQL runtime
+ * parameters, so `connection: { statement_timeout: '...' }` is all it takes. The
+ * reason not to is that any value below a real query's duration converts a slow
+ * request into a failed one, and no query here has been profiled against the
+ * target host.
+ *
+ * What would justify adding it: a measured p99 for the slowest legitimate query
+ * — realistically the data-table routes, which can run a sequential scan when a
+ * `allowScanOnly` filter is used — with the ceiling set well above it. Until
+ * then the exposure is bounded and known: a runaway query holds one of
+ * `MAX_POOL_CONNECTIONS` until it finishes or the client disconnects.
  */
 const client = new SQL(DATABASE_URL, { max: MAX_POOL_CONNECTIONS });
 

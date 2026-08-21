@@ -10,8 +10,7 @@
 
 # testing
 /coverage
-TODO.md
-/TODO.md
+TODO*.md
 # next.js
 /.next/
 /out/

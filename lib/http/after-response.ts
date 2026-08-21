@@ -39,7 +39,7 @@
  * period.
  */
 
-export type AfterResponseTask = () => void | Promise<void>;
+type AfterResponseTask = () => void | Promise<void>;
 
 /** What every request contributes to the access log. */
 export interface RequestSummary {

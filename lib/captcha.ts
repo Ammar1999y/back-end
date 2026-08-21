@@ -17,7 +17,7 @@ const MAX_TOKEN_LENGTH = 2048;
 const SITEVERIFY_TIMEOUT_MS = 3000;
 
 /** Fails closed on any error. */
-export async function verifyTurnstileToken(
+async function verifyTurnstileToken(
   token: string,
   remoteIp?: string | null
 ): Promise<boolean> {

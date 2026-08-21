@@ -29,6 +29,20 @@ export const DASHBOARD_PAGES = {
 } as const;
 
 /**
+ * The page keys as a list, for consumers that need values rather than a lookup —
+ * today the `resource` query parameter's enum in the OpenAPI contract.
+ *
+ * Derived, never written out again: a second hand-maintained copy of these keys
+ * would be one page away from disagreeing with the map the permission checker
+ * reads. `db/schema.ts` derives the `page_name` pgEnum from the same object and
+ * deliberately keeps its own cast — the enum's VALUE ORDER is part of the
+ * database schema, so it must not start reading from a general-purpose list.
+ */
+export const DASHBOARD_PAGE_NAMES = Object.keys(
+  DASHBOARD_PAGES
+) as readonly DashboardPage[];
+
+/**
  * الصلاحيات المتاحة لكل صفحة.
  * - view/edit/delete: تطبق على كل السجلات.
  * - viewOwn/editOwn/deleteOwn: تطبق فقط على السجلات التي أنشأها المستخدم نفسه.

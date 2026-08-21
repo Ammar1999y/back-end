@@ -158,10 +158,27 @@ const MAX_AUDIT_JSON_CHARS = 32_768;
 /** Guard against a pathological nested payload; audit data is 2–3 deep. */
 const MAX_AUDIT_DEPTH = 6;
 
+/**
+ * Bound a value for a `jsonb` column, and hand back one the driver will accept.
+ *
+ * The re-parse is not a formality. `redactValue` builds every level with
+ * `Object.create(null)`, and Drizzle's `is()` — run on every value passed to
+ * `.values()` — reads `Object.getPrototypeOf(value).constructor`, which throws
+ * on a null prototype. Every audited write was a `TypeError` (reproduced on
+ * `drizzle-orm@0.45.2`), including the one on the login-success path.
+ *
+ * It re-parses rather than spreading because this also runs on `changedFields`,
+ * an array: `{ ...['a', 'b'] }` is `{ 0: 'a', 1: 'b' }`, so a spread would
+ * quietly store that column as an object. Re-parsing is also indifferent to how
+ * deeply the driver inspects — `is()` reads only the top level today, which is
+ * an implementation detail and not a contract. What is stored does not change:
+ * the driver JSON-serializes the value anyway, so this round trip is an identity
+ * on the column — which is also why the cast is safe.
+ */
 function clampJson<T>(value: T): T | { _truncated: true; preview: string } {
   if (value == null) return value;
   const s = JSON.stringify(value);
-  if (s.length <= MAX_AUDIT_JSON_CHARS) return value;
+  if (s.length <= MAX_AUDIT_JSON_CHARS) return JSON.parse(s) as T;
   return { _truncated: true, preview: s.slice(0, 1024) };
 }
 

@@ -3,7 +3,7 @@
 // path (DB lookup + argon2 + SMS/email delivery). Tune after measuring
 // real p99 delivery in production.
 // TODO: Measure the real `processOtpSend` latency distribution and tune this value if needed.
-export const MINIMUM_RESPONSE_MS = 1500;
+const MINIMUM_RESPONSE_MS = 1500;
 
 export async function ensureMinDelay(elapsed: number): Promise<void> {
   if (elapsed < MINIMUM_RESPONSE_MS)

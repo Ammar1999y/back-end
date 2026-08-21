@@ -109,9 +109,7 @@ export function apiError({
  * Read `responseHeaders` off an unknown error shape (CustomError or any
  * object carrying the field) without pulling in the class at the call site.
  */
-export function getErrorHeaders(
-  error: unknown
-): Record<string, string> | undefined {
+function getErrorHeaders(error: unknown): Record<string, string> | undefined {
   if (error && typeof error === 'object' && 'responseHeaders' in error) {
     return (error as { responseHeaders?: Record<string, string> })
       .responseHeaders;
@@ -191,7 +189,7 @@ const USER_UNIQUE_CONSTRAINTS = new Map<string, string>([
   ['ux_users_phone_number', MSG_PHONE_EXISTS],
 ]);
 
-export function resolveUserUniqueViolation(error: unknown): string | null {
+function resolveUserUniqueViolation(error: unknown): string | null {
   const constraintName = getConstraintName(error);
   return (
     USER_UNIQUE_CONSTRAINTS.get(constraintName) ??
@@ -203,7 +201,7 @@ export function resolveUserUniqueViolation(error: unknown): string | null {
  * Resolves the 409 message for permission/role endpoints.
  * Returns `null` when the constraint is not a known, user-correctable one.
  */
-export function resolvePermissionUniqueViolation(
+function resolvePermissionUniqueViolation(
   error: unknown,
   messages: {
     nameExists: string;

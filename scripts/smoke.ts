@@ -58,6 +58,24 @@ async function runChecks(health: Response): Promise<Check[]> {
   const sweep = await fetch(`${BASE}/api/internal/sqlite-sweep`, {
     method: 'POST',
   });
+  const dbSweep = await fetch(`${BASE}/api/internal/db-sweep`, {
+    method: 'POST',
+  });
+  // The upload route's authentication gate, checked here because it is the only
+  // gate in the app that a request can reach WITHOUT a preflight: multipart is a
+  // CORS-simple content type, so CORS does not stand in front of it. It must
+  // answer 401 — and it must do so before reading the body, which is why the
+  // request below sends a real multipart form. A 400 would mean the body was
+  // parsed first; a 200 would mean this endpoint is open again.
+  const uploadForm = new FormData();
+  uploadForm.append(
+    'files',
+    new File(['x'], 'probe.png', { type: 'image/png' })
+  );
+  const upload = await fetch(`${BASE}/api/upload/image?resource=users`, {
+    method: 'POST',
+    body: uploadForm,
+  });
   // `openApiDocument` THROWS when the route table and its three hand-maintained
   // maps disagree, which surfaces here as a 500. That is the point: a route that
   // declares `body: 'json'` with no schema, or a stale key left behind by a
@@ -98,9 +116,19 @@ async function runChecks(health: Response): Promise<Check[]> {
       detail: `HTTP ${authProbe.status}`,
     },
     {
-      name: 'sweep rejects a missing maintenance token',
+      name: 'sqlite sweep rejects a missing maintenance token',
       ok: sweep.status === 401,
       detail: `HTTP ${sweep.status}`,
+    },
+    {
+      name: 'db sweep rejects a missing maintenance token',
+      ok: dbSweep.status === 401,
+      detail: `HTTP ${dbSweep.status}`,
+    },
+    {
+      name: 'image upload rejects an unauthenticated request',
+      ok: upload.status === 401,
+      detail: `HTTP ${upload.status}`,
     },
     {
       name: 'the OpenAPI contract builds and agrees with the route table',

@@ -72,7 +72,7 @@ export interface SqliteStatement {
   finalize(): void;
 }
 
-export type SqliteBindValue = string | number | bigint | Uint8Array | null;
+type SqliteBindValue = string | number | bigint | Uint8Array | null;
 
 export interface SqliteConnection {
   prepare(sql: string): SqliteStatement;

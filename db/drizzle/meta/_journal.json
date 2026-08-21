@@ -29,6 +29,13 @@
       "when": 1786285983918,
       "tag": "0003_collapse_otp_session_by_contact_kind",
       "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "7",
+      "when": 1787260825341,
+      "tag": "0004_add_account_issuer",
+      "breakpoints": true
     }
   ]
 }

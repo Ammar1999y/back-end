@@ -1,7 +1,6 @@
 // Shared API response messages used across multiple endpoints.
 
 export const MSG_INTERNAL_ERROR = 'حدث خطأ في الخادم';
-export const MSG_DATA_ALREADY_EXISTS = 'البيانات مستخدمة بالفعل';
 export const MSG_EMAIL_EXISTS = 'البريد الإلكتروني مستخدم بالفعل';
 export const MSG_PHONE_EXISTS = 'رقم الهاتف مستخدم بالفعل';
 
@@ -50,6 +49,20 @@ export const MSG_PASSWORD_COMPROMISED =
   'هذه الكلمة مستخدمة بكثرة أو مُسرّبة سابقًا، لذلك لا تُعد آمنة. يرجى اختيار كلمة مرور مختلفة.';
 
 export const CREDENTIAL_PROVIDER_ID = 'credential' as const;
+
+/**
+ * The `accounts.issuer` value Better Auth requires for a password account.
+ *
+ * From 1.7 an account is identified by `(issuer, accountId)`, not by
+ * `providerId` alone: `/sign-in/email` looks for
+ * `providerId === 'credential' && issuer === createLocalAccountIssuer('credential')`
+ * and answers a plain 401 when nothing matches — so a wrong or missing value
+ * here is a total password-login outage that reads as "wrong password" and that
+ * `tsc` cannot see. `createLocalAccountIssuer` is `local:${providerId}`
+ * (`@better-auth/core/dist/db/schema/account.mjs`), and `providerIdEnumValues`
+ * has exactly one member, so this is a constant rather than a derivation.
+ */
+export const CREDENTIAL_ISSUER = 'local:credential' as const;
 
 /**
  * Sentinel error `code` used for all of our own better-auth APIError throws, so
