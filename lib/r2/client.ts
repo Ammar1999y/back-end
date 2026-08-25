@@ -298,7 +298,7 @@ export function getContentDisposition(params: {
     `filename*=UTF-8''${encodeExtValue(filename)}`
   );
 }
-
+/** @knipignore */
 export function getR2ConfigStatus() {
   return {
     configured: validateR2Config,

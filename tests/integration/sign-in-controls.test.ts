@@ -8,26 +8,11 @@
  *   different rows behind.
  * - **A Turnstile REFUSAL.** The egress fake answers `{ success: true }` by
  *   default, so until now no test had ever seen the endpoint decline one.
- * - **The bound on the outbound siteverify call** — or the absence of one; see
- *   the `audit §3` describe below, which records what the code actually does.
+ * - **The bound on outbound siteverify calls.** Admission runs before Better
+ *   Auth plugins, so request N+1 cannot buy siteverify call N+1.
  * - **The attributes of the cookie sign-in sets.** `tests/helpers/session.ts`
  *   has exposed `setCookie` "for assertions about attributes" with no caller.
  *
- * ---
- *
- * **This suite runs at UTC, and that is what makes the lockout observable
- * here.** `users.locked_until` is `mode: 'string'`, and Drizzle's decoder
- * appends the PROCESS-local offset to a UTC wall-clock, so at offset −180 an
- * armed lock decodes three hours early and the comparison at
- * `login-guard.ts:152` reads it as already expired — the fail-open in
- * `reports/claude-opus-autonomous-audit.md` §1.1. `bun test` forces the process
- * to UTC (measured: offset 0 under the runner, −180 in a plain `bun` child, and
- * a `TZ=` prefix changes neither), and at offset 0 the value round-trips.
- *
- * So the lockout assertions below describe the runner, not a deployment. They
- * cannot see that defect class at all, and a green run here is NOT evidence that
- * the lockout holds on a server whose clock is not UTC. The first test in that
- * describe pins the offset so this stays a measured statement.
  */
 import {
   afterEach,
@@ -50,6 +35,7 @@ import {
   MAX_FAILED_ATTEMPTS,
 } from '@/lib/auth/login-guard';
 import { PUBLIC_ORIGIN } from '@/lib/env';
+import { PRE_AUTH_LIMIT } from '@/lib/http/pre-auth';
 
 import { HTTP_STATUS } from '@/utils/api-messages';
 
@@ -60,12 +46,6 @@ import { resetSqliteStores } from '../helpers/sqlite';
 
 const SIGN_IN_URL = 'http://localhost/api/auth/sign-in/email';
 const TURNSTILE_HOST = 'challenges.cloudflare.com';
-
-/** `SIGN_IN_IP_LIMIT_PER_MINUTE` in `lib/auth.ts:55`, unexported for the same reason. */
-const SIGN_IN_IP_LIMIT_PER_MINUTE = 20;
-
-/** The limiter's window, from the same `enforceRateLimit` call. */
-const LIMITER_WINDOW_MS = 60_000;
 
 /**
  * Satisfies `passwordSchema` (lower, upper, digit, symbol, length).
@@ -209,14 +189,6 @@ describe('the per-account login lockout', () => {
         row: await lockRow(actor().userId),
       });
     }
-  });
-
-  test('the runner clock is UTC, which is why the lock below is visible', () => {
-    // If this fails, every other assertion in this describe fails with it and
-    // this one names the cause: at a non-zero offset the `mode: 'string'`
-    // decoder shifts `locked_until` and `login-guard.ts:152` reads an armed lock
-    // as expired. See the file header.
-    expect(new Date().getTimezoneOffset()).toBe(0);
   });
 
   test('each wrong password increments the counter, and nothing locks early', () => {
@@ -414,19 +386,7 @@ describe('a refused or unavailable Turnstile verification', () => {
   }, 40_000);
 });
 
-/**
- * `reports/claude-opus-autonomous-audit.md` §3, pinned as CURRENT BEHAVIOUR.
- *
- * The captcha plugin's `onRequest` runs ahead of Better Auth's own limiter and
- * far ahead of the app's `before` hook, and `/sign-in/email` is disabled in
- * `customRules`, so the outbound siteverify is the FIRST thing an
- * unauthenticated request buys. These tests record what the code does today; the
- * `test.failing` at the end states the invariant a fix has to establish and
- * turns red the moment one lands.
- */
-describe('audit §3 — the outbound captcha call has nothing in front of it', () => {
-  const ATTEMPTS = SIGN_IN_IP_LIMIT_PER_MINUTE + 5;
-
+describe('outbound captcha admission', () => {
   test('the control: with no captcha header, nothing goes out at all', async () => {
     const response = await app.handle(
       new Request(SIGN_IN_URL, {
@@ -450,57 +410,21 @@ describe('audit §3 — the outbound captcha call has nothing in front of it', (
     expect(egressCallsTo(TURNSTILE_HOST)).toEqual([]);
   });
 
-  test('N refused attempts spend N siteverify calls and trip no limiter', async () => {
+  test('N+1 requests produce at most N siteverify calls', async () => {
     scriptEgress(TURNSTILE_HOST, () => Response.json({ success: false }));
 
     const statuses: number[] = [];
-    for (let n = 0; n < ATTEMPTS; n++) {
+    for (let n = 0; n <= PRE_AUTH_LIMIT; n++) {
       const response = await attempt(UNKNOWN_EMAIL, WRONG_PASSWORD);
       statuses.push(response.status);
     }
 
-    // Every one refused by the plugin, none by a limiter — 25 attempts against a
-    // 20/min budget and not one 429, because the budget is consumed downstream
-    // of the call this counts.
-    expect(statuses.filter((s) => s !== HTTP_STATUS.FORBIDDEN)).toEqual([]);
-    expect(egressCallsTo(TURNSTILE_HOST).length).toBe(ATTEMPTS);
-  });
-
-  test('a rate-limited attempt has ALREADY spent its outbound call', async () => {
-    // Pinned to the start of a fixed 60-second window: 25 attempts straddling
-    // a rollover would re-admit the ones this asserts are denied.
-    setSystemTime(new Date(Date.now() - (Date.now() % LIMITER_WINDOW_MS)));
-
-    const statuses: number[] = [];
-    for (let n = 0; n < ATTEMPTS; n++) {
-      const response = await attempt(UNKNOWN_EMAIL, WRONG_PASSWORD);
-      statuses.push(response.status);
-    }
-
-    // The limiter is real and it does fire.
-    expect(
-      statuses.filter((s) => s === HTTP_STATUS.TOO_MANY_REQUESTS).length
-    ).toBe(ATTEMPTS - SIGN_IN_IP_LIMIT_PER_MINUTE);
-    // And it fired too late to save anything: every throttled request had
-    // already paid for a Turnstile verification.
-    expect(egressCallsTo(TURNSTILE_HOST).length).toBe(ATTEMPTS);
+    expect(statuses.slice(0, PRE_AUTH_LIMIT)).toEqual(
+      Array.from({ length: PRE_AUTH_LIMIT }, () => HTTP_STATUS.FORBIDDEN)
+    );
+    expect(statuses.at(-1)).toBe(HTTP_STATUS.TOO_MANY_REQUESTS);
+    expect(egressCallsTo(TURNSTILE_HOST).length).toBe(PRE_AUTH_LIMIT);
   }, 120_000);
-
-  test.failing(
-    'FIXME(audit §3): outbound siteverify calls are bounded by something',
-    async () => {
-      scriptEgress(TURNSTILE_HOST, () => Response.json({ success: false }));
-
-      for (let n = 0; n < ATTEMPTS; n++)
-        await attempt(UNKNOWN_EMAIL, WRONG_PASSWORD);
-
-      // Deliberately the weakest statement of the fix, so it holds for either
-      // remedy §3 proposes: fewer calls out than requests in. It passes today
-      // BECAUSE it fails; when a bound lands, `test.failing` turns red and this
-      // becomes an ordinary assertion.
-      expect(egressCallsTo(TURNSTILE_HOST).length).toBeLessThan(ATTEMPTS);
-    }
-  );
 });
 
 describe('the cookie sign-in sets', () => {

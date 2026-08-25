@@ -107,6 +107,9 @@ jobs:
           --health-timeout 5s
           --health-retries 10
     env:
+      # Bun honors TZ for tests. +03 keeps timestamp decoding bugs visible.
+      TZ: Asia/Riyadh
+      REQUIRE_NON_UTC_TZ: '1'
       # The harness reads this and derives every database name from it; the
       # database component is ignored (it connects to `postgres` for DDL).
       TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres

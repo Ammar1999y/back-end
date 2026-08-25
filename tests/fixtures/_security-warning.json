@@ -1,0 +1,3 @@
+{
+  "source": "export function compilePattern(pattern: string): RegExp {\n  return new RegExp(pattern);\n}\n"
+}

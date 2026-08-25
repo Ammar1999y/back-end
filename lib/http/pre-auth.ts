@@ -5,7 +5,7 @@ import { enforceRateLimit, ipIdentifier } from '@/lib/rate-limit';
 // Coarse pre-auth limit so traffic without a valid session can't force
 // repeated session lookups. Generous enough that a shared NAT egress isn't
 // punished, tight enough to cap unauthenticated abuse.
-const PRE_AUTH_LIMIT = 120;
+export const PRE_AUTH_LIMIT = 120;
 const PRE_AUTH_WINDOW_S = 60;
 const PRE_AUTH_SURFACE_SEGMENTS = 2;
 const PRE_AUTH_SEGMENT_MAX = 40;

@@ -509,7 +509,7 @@ const UUID_V7_REGEX =
 export const validID = (val: unknown): string => {
   if (typeof val !== 'string') return '';
   const trimmed = val.trim();
-  return UUID_V7_REGEX.test(trimmed) ? trimmed : '';
+  return UUID_V7_REGEX.test(trimmed) ? trimmed.toLowerCase() : '';
 };
 
 /**

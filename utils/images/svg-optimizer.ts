@@ -63,6 +63,16 @@ export function sanitizeSvg(
     errors.push('تم إزالة Processing Instructions');
   }
 
+  // XML entities expand synchronously inside `parseFromString`. Reject the DTD
+  // before the parser can turn a small upload into an unbounded document.
+  if (/<!doctype\b/i.test(trimmed) || /<!entity\b/i.test(trimmed)) {
+    return {
+      isValid: false,
+      cleanedSvg: '',
+      errors: ['تعريفات XML الخارجية غير مسموح بها'],
+    };
+  }
+
   if (!trimmed.includes('<svg')) {
     return {
       isValid: false,
@@ -166,6 +176,26 @@ export function sanitizeSvg(
           element.removeAttribute(attr.name);
         }
       });
+
+      if (element.localName?.toLowerCase() === 'use') {
+        let hasLocalReference = false;
+        for (const name of ['href', 'xlink:href']) {
+          const raw = element.getAttribute(name);
+          if (raw === null) continue;
+          const reference = raw.trim();
+          if (/^#[^\s#"'<>]+$/u.test(reference)) {
+            element.setAttribute(name, reference);
+            hasLocalReference = true;
+          } else {
+            errors.push(`تم إزالة مرجع خارجي من: ${name}`);
+            element.removeAttribute(name);
+          }
+        }
+        if (!hasLocalReference) {
+          errors.push('تم إزالة عنصر use بدون مرجع محلي');
+          element.remove();
+        }
+      }
     });
 
     const shouldConvertColor = (value: string | null | undefined): boolean => {
@@ -230,6 +260,7 @@ export function sanitizeSvg(
     const cleanedSvg = xmlSerializer.serializeToString(svgElement);
     const sanitized = sanitize(cleanedSvg, {
       USE_PROFILES: { svg: true, svgFilters: true },
+      ADD_TAGS: ['use'],
     });
 
     if (!sanitized || !sanitized.includes('<svg'))
@@ -237,6 +268,15 @@ export function sanitizeSvg(
         isValid: false,
         cleanedSvg: '',
         errors: ['فشل في تنظيف SVG'],
+      };
+
+    if (new Blob([sanitized]).size > maxSize)
+      return {
+        isValid: false,
+        cleanedSvg: '',
+        errors: [
+          `حجم المحتوى كبير جداً بعد المعالجة (الحد الأقصى ${SERVER_MAX_IMAGE_SIZE * 2}MB)`,
+        ],
       };
 
     return {
@@ -252,7 +292,6 @@ export function sanitizeSvg(
     };
   }
 }
-/** @knipignore */
 export function validateSvgFile(file: File): string | null {
   if (!file) return 'لم يتم اختيار ملف';
 

@@ -26,7 +26,7 @@ import { app } from '@/app';
 import { auth } from '@/lib/auth';
 
 import { resetTables } from '../helpers/database';
-import { authedRequest, seedUser, signedInUser } from '../helpers/session';
+import { authedRequest, signedInUser } from '../helpers/session';
 
 /**
  * Both actors are seeded ONCE, up front.
@@ -127,23 +127,21 @@ describe('every site that reads it', () => {
     expect(response.status).toBe(200);
   });
 
-  test('hasRole in an update response is true, not always false', async () => {
-    // `hasRole: !!session.user.roleId` was constantly `false`, so the field lied
-    // to the client on every successful self-edit. Asserted through the response
-    // body rather than the status, because the status was already 200 while the
-    // field was wrong.
-    const target = await seedUser();
+  test('hasRole admits the authenticated user through self-edit', async () => {
     const response = await app.handle(
-      authedRequest(granted(), `/api/dash/users/${target.userId}`, {
+      authedRequest(granted(), `/api/dash/users/${granted().user.userId}`, {
         method: 'PUT',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ name: 'Renamed By Harness' }),
       })
     );
+    const body = (await response.json()) as {
+      success?: boolean;
+      data?: { updatedAt?: unknown };
+    };
 
-    // The route is reachable and authorized — the point of the assertion is that
-    // it got past the `hasRole` gate at all, which a constantly-false field
-    // blocked for the self-edit branch.
-    expect(response.status).not.toBe(403);
+    expect(response.status).toBe(200);
+    expect(body.success).toBe(true);
+    expect(typeof body.data?.updatedAt).toBe('string');
   });
 });

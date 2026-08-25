@@ -354,48 +354,26 @@ const entityBomb = (bodyLength: number, references: number) =>
 describe('entity expansion', () => {
   const bomb = entityBomb(2048, 512);
 
-  test('no structural gate sees it: both ceilings are measured before expansion', () => {
-    // This is the whole of audit §2 stated as a property rather than a stopwatch.
-    // The size cap reads the raw text and the element ceiling counts `<…>` runs
-    // in it; a DOCTYPE with one entity is a handful of tags and a few kilobytes,
-    // whatever it expands to.
+  test('the pre-parse gate refuses a payload below both structural ceilings', () => {
     expect(bomb.length).toBeLessThan(SVG_SIZE_CAP);
     expect((bomb.match(/<[^>]+>/g) || []).length).toBeLessThan(
       SVG_MAX_ELEMENTS
     );
 
     const result = clean(bomb);
-    // Accepted, and the stored document is orders of magnitude larger than the
-    // upload. Nothing between the parser and R2 re-measures it.
-    expect(result.isValid).toBe(true);
-    expect(result.cleanedSvg.length).toBeGreaterThan(bomb.length * 100);
+    expect(result.isValid).toBe(false);
+    expect(result.cleanedSvg).toBe('');
   });
 
-  test('expansion is one level only, which is what bounds it to quadratic', () => {
-    // A nested entity would make this exponential. The audit measured one level;
-    // asserted here so a parser change that enables nesting is caught.
+  test('nested entities are refused before parser behavior can matter', () => {
     const nested =
       `<!DOCTYPE svg [<!ENTITY inner "AAAAAAAA"><!ENTITY outer "&inner;&inner;&inner;&inner;">]>` +
       `<svg xmlns="${SVG_NS}"><desc>${'&outer;'.repeat(8)}</desc></svg>`;
 
     const result = clean(nested);
-    expect(result.isValid).toBe(true);
-    // 8 refs x 4 inner refs x 8 chars = 256 if nesting expanded; far less if not.
-    expect(result.cleanedSvg.length).toBeLessThan(nested.length * 4);
+    expect(result.isValid).toBe(false);
+    expect(result.cleanedSvg).toBe('');
   });
-
-  test.failing(
-    'DEFECT (audit §2): an entity-expansion payload is refused',
-    () => {
-      // Currently accepted with `errors: []`. Measured: 1,910 bytes in ->
-      // 262,237 bytes out; the audit measured 26,598 bytes in -> 40,960,093 out,
-      // 3.8 s of fully synchronous work with zero timer ticks fired.
-      //
-      // Either fix in the audit satisfies this: refuse a `<!DOCTYPE` containing
-      // `<!ENTITY` before parsing, or re-measure the size after serialisation.
-      expect(clean(bomb).isValid).toBe(false);
-    }
-  );
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -495,19 +473,22 @@ describe('hostile SVG, NOT neutralised', () => {
     }
   });
 
-  test.failing(
-    'DEFECT (audit §14): a <use> sprite survives sanitisation',
-    () => {
-      // `use` is in no blocklist in this repo — DOMPurify's SVG allowlist simply
-      // does not contain it. svgo's `removeUselessDefs`/`cleanupIds` then collects
-      // the orphaned `<symbol>`, and the stored object is
-      // `<svg viewBox="0 0 24 24"/>`: a blank image, HTTP 200, `errors: []`, so
-      // not even the log records the loss. Silent data loss, not a security issue.
-      const sprite = `<svg xmlns="${SVG_NS}" viewBox="0 0 24 24"><symbol id="i"><rect width="8" height="8"/></symbol><use href="#i"/></svg>`;
+  test('a local <use> sprite survives sanitisation', () => {
+    const sprite = `<svg xmlns="${SVG_NS}" viewBox="0 0 24 24"><symbol id="i"><rect width="8" height="8"/></symbol><use href="#i"/></svg>`;
 
-      expect(clean(sprite).cleanedSvg).toInclude('<use');
-    }
-  );
+    const result = clean(sprite);
+    expect(result.isValid).toBe(true);
+    expect(result.cleanedSvg).toInclude('<use');
+    expect(result.cleanedSvg).toInclude('href="#i"');
+  });
+
+  test('a <use> element cannot opt into an external reference', () => {
+    const external = `<svg xmlns="${SVG_NS}"><use href="https://evil.example/i.svg#i"/></svg>`;
+
+    const result = clean(external);
+    expect(result.cleanedSvg).not.toInclude('evil.example');
+    expect(result.cleanedSvg).not.toInclude('<use');
+  });
 });
 
 // ─────────────────────────────────────────────────────────────────────────────

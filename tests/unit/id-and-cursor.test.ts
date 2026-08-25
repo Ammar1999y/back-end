@@ -12,9 +12,8 @@
  * - `pagination.ts` line 46 says "the round trip is asserted in the tests". It
  *   was not asserted anywhere. This file is what makes that sentence true.
  *
- * Several behaviours below are PINNED, not endorsed — each says so at its own
- * test. Pinning keeps the suite honest about what ships today and turns any fix
- * into a visible test update rather than a silent behaviour change.
+ * Inputs may vary in case, but every accepted id leaves this boundary in one
+ * canonical lowercase spelling before JavaScript identity guards see it.
  */
 import { describe, expect, test } from 'bun:test';
 
@@ -133,38 +132,20 @@ describe('validID — the gate every id passes before it reaches SQL', () => {
     expect(validID(ID.slice(0, 18) + '\t' + ID.slice(19))).toBe('');
   });
 
-  test('an uppercase hex digit is ACCEPTED and its case is PRESERVED', () => {
-    // The live High finding, `reports/claude-opus-audit.md` F27. The regex
-    // carries `/i` and the function returns its input verbatim, so `validID`
-    // mints a SECOND spelling of one row id.
+  test('uppercase hex is accepted and canonicalised to lowercase', () => {
     const oneUpper = ID.replace(/[a-f]/, (c) => c.toUpperCase());
 
     expect(oneUpper).not.toBe(ID);
-    expect(validID(oneUpper)).toBe(oneUpper);
-    expect(validID(ID.toUpperCase())).toBe(ID.toUpperCase());
-    // Preserved, NOT canonicalised. A `.toLowerCase()` in `validID` — the fix
-    // F27 asks for — is exactly what this pair of assertions would flag.
-    expect(validID(oneUpper)).not.toBe(ID);
-    expect(validID(oneUpper).toLowerCase()).toBe(ID);
+    expect(validID(oneUpper)).toBe(ID);
+    expect(validID(ID.toUpperCase())).toBe(ID);
   });
 
-  test('so an `a === b` self-guard is walked past by one uppercase digit', () => {
-    // What the preserved case implies, spelled out. A session id comes out of a
-    // PostgreSQL `uuid` column, which always renders lowercase; a path id comes
-    // out of `validID`, which does not. The two name ONE row in SQL and are two
-    // different strings in JavaScript, so a `userId === targetId` guard sees "a
-    // different user" and routes to the admin branch instead of the self one.
-    //
-    // The SQL half — `'01a0…'::uuid = '01A0…'::uuid` is true — is measured in
-    // F27 against a real database and is not re-measured here: this tier has no
-    // database. What is asserted is the JavaScript half, which is the half that
-    // decides which branch runs.
+  test('an `a === b` self-guard sees an uppercase path id as the same id', () => {
     const sessionUserId = ID;
     const pathId = validID(ID.replace(/[a-f]/, (c) => c.toUpperCase()));
 
-    expect(pathId).not.toBe('');
-    expect(sessionUserId === pathId).toBe(false);
-    expect(pathId.toLowerCase()).toBe(sessionUserId);
+    expect(pathId).toBe(sessionUserId);
+    expect(sessionUserId === pathId).toBe(true);
   });
 
   test.each([
@@ -423,17 +404,15 @@ describe('pinned: the round-trip guarantee runs one way only', () => {
     );
   });
 
-  test('an UPPERCASE id passes the cursor parser too', () => {
-    // `parseCursor` gates the id through `validID`, so it inherits F27: the
-    // cursor's id keeps whatever case the caller sent. It is cast `::uuid` in
-    // the keyset comparison, so PostgreSQL still resolves the right row and
-    // paging is unaffected — but the `id` this returns must never be compared to
-    // a row id with `===`.
+  test('an UPPERCASE id passes the cursor parser and is canonicalised to lowercase', () => {
+    // `parseCursor` gates the id through `validID`, which normalises to
+    // lowercase. The cursor accepts uppercase hex from clients and canonicalises
+    // it before returning.
     const upper = ID.toUpperCase();
 
     expect(parseCursor(`2026-08-25T12:34:56.789Z|${upper}`)).toEqual({
       createdAt: new Date(Date.UTC(2026, 7, 25, 12, 34, 56, 789)),
-      id: upper,
+      id: ID,
     });
   });
 
