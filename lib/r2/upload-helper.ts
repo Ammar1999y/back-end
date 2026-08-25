@@ -26,8 +26,15 @@ import {
 } from './client';
 import { optimizeImage, shouldOptimizeImage } from './optimize-image';
 
-// Allowed image MIME types
-const ALLOWED_IMAGE_TYPES = [
+/**
+ * Allowed image MIME types.
+ *
+ * Exported so `tests/unit/upload-validation.test.ts` can walk the real list
+ * instead of a copy: the property that matters is that every admitted type has a
+ * magic-byte signature (or is the SVG exemption), and a hand-written list in the
+ * test would keep passing for a type added here and nowhere else.
+ */
+export const ALLOWED_IMAGE_TYPES = [
   'image/png',
   'image/webp',
   'image/svg+xml',

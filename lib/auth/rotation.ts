@@ -35,25 +35,8 @@ export async function revokeOtherSessions(
 }
 
 /**
- * Drop the user's pending OTP proofs.
- *
- * An unconsumed `forgot_password` / `passwordless_login` proof outliving a
- * password change lets whoever holds that code reset the *new* password —
- * i.e. it defeats the remediation the user just performed. Sibling
- * `change_email` / `change_phone` proofs are equally stale once the identity
- * they were issued against has moved.
- *
- * `keepVerificationSessionId` preserves the proof currently being consumed so
- * the caller can still stamp it verified/consumed as an auditable record.
- *
- * Retention note: this deletes ALREADY-CONSUMED sibling rows too. Those rows
- * are single-use replay markers, not the audit trail: their code is already
- * deleted and `consumedAt` makes them unreplayable, so nothing depends on them
- * surviving. Every flow that consumes one now writes its own `audit_logs`
- * entry (contact change, password reset, and — since this was previously
- * missing — passwordless sign-in), so the forensic record does not live in
- * this table. Rotation is the natural point to clear them; see the
- * verification-session TTL item in TODO.md for the periodic sweep.
+ * Removes proofs invalidated by credential rotation. The proof being consumed
+ * may be retained long enough to record its final state.
  */
 export async function revokePendingProofs(
   tx: Tx,

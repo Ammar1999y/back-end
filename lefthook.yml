@@ -1,21 +1,5 @@
-# Local gates. GitHub Actions re-runs the same checks, so a skipped hook
-# (`--no-verify`, or a clone that never ran `bun install`) is still caught.
-#
-#   bun run precommit  fix what is auto-fixable, then run every gate
-#   bun run verify     gates only, no writes — same set as pre-push
-#   bun run fix        writes only
-#
-# `verify` is NOT the same set as CI, and the previous version of this comment
-# claimed it was. CI additionally runs `bun run smoke`, which boots the real
-# server and therefore needs a full production-shaped environment — deliberately
-# left out of the local hooks, because a developer without those variables would
-# have every push blocked by a gate that says nothing about their change. The two
-# checks that DID belong here and were missing (the probe suite and the
-# registration scanner) are below; both need no environment at all, which is why
-# CI's own steps for them carry no `env:` block.
-#
-# The scanners run through `mise exec` so they are the exact versions pinned in
-# mise.toml — the same file CI installs from. Run `mise install` once.
+# Smoke runs in CI because it needs a production-shaped environment.
+# Scanners run through mise so local checks use the pinned toolchain.
 
 pre-commit:
   parallel: true

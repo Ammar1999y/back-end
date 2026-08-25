@@ -7,7 +7,6 @@ import {
 } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 
-// R2 Configuration - loaded from environment variables
 const R2_ACCOUNT_ID = process.env.R2_ACCOUNT_ID;
 const R2_ACCESS_KEY_ID = process.env.R2_ACCESS_KEY_ID;
 const R2_SECRET_ACCESS_KEY = process.env.R2_SECRET_ACCESS_KEY;
@@ -15,25 +14,16 @@ const R2_PUBLIC_BUCKET = process.env.R2_PUBLIC_BUCKET;
 const R2_PRIVATE_BUCKET = process.env.R2_PRIVATE_BUCKET;
 const R2_PUBLIC_URL = process.env.R2_PUBLIC_URL;
 
-// Constants
-const MAX_PRESIGNED_URL_EXPIRY = 604_800; // 7 days in seconds (R2 maximum)
-const MIN_PRESIGNED_URL_EXPIRY = 1; // 1 second (R2 minimum)
-const DEFAULT_PRESIGNED_URL_EXPIRY = 300; // 5 minutes
+const MAX_PRESIGNED_URL_EXPIRY = 604_800;
+const MIN_PRESIGNED_URL_EXPIRY = 1;
+const DEFAULT_PRESIGNED_URL_EXPIRY = 300;
 
-// Validate R2 configuration
 const validateR2Config = !!(
   R2_ACCOUNT_ID &&
   R2_ACCESS_KEY_ID &&
   R2_SECRET_ACCESS_KEY
 );
 
-/**
- * Initialize S3 Client for R2
- * Best practices:
- * - region: 'auto' for R2 compatibility
- * - forcePathStyle: true for S3-compatible API
- * - endpoint: R2-specific endpoint
- */
 const r2Client = new S3Client({
   endpoint: `https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com`,
   credentials: {
@@ -49,13 +39,6 @@ export type BucketType = 'public' | 'private';
 const getBucketName = (bucketType: BucketType) =>
   bucketType === 'public' ? R2_PUBLIC_BUCKET : R2_PRIVATE_BUCKET;
 
-/**
- * Upload a file to R2 with metadata
- * Best practices:
- * - Set ContentType for proper MIME type handling
- * - Set CacheControl for CDN optimization
- * - Set ContentDisposition for download behavior
- */
 export async function uploadToR2(params: {
   file: Buffer;
   key: string;
@@ -91,7 +74,7 @@ export async function uploadToR2(params: {
         ContentType: contentType,
         CacheControl: cacheControl,
         ContentDisposition: contentDisposition,
-        Metadata: metadata, // Custom metadata (x-amz-meta-*)
+        Metadata: metadata,
       })
     );
 
@@ -101,9 +84,6 @@ export async function uploadToR2(params: {
   }
 }
 
-/**
- * Delete a file from R2
- */
 export async function deleteFromR2(params: {
   key: string;
   bucketType: BucketType;
@@ -126,12 +106,7 @@ export async function deleteFromR2(params: {
   }
 }
 
-/**
- * Copy a file to a new location in R2
- * Does NOT delete the original - orphan cleanup is handled by cron job
- *
- * @knipignore
- */
+/** @knipignore */
 export async function copyFileInR2(params: {
   sourceKey: string;
   destinationKey: string;
@@ -162,16 +137,7 @@ export async function copyFileInR2(params: {
   }
 }
 
-/**
- * Generate a presigned URL for temporary access to a file
- * Best practices:
- * - Use short expiry times for sensitive files (default: 5 minutes)
- * - Maximum expiry: 7 days (604,800 seconds)
- * - URLs are signed and cannot be tampered with
- *
- * @knipignore
- * @param expiresIn - Expiration time in seconds (default: 300 = 5 minutes)
- */
+/** @knipignore */
 export async function getPresignedUrl(params: {
   key: string;
   bucketType: BucketType;
@@ -193,7 +159,6 @@ export async function getPresignedUrl(params: {
     );
   }
 
-  // Validate expiry time
   const validExpiry = Math.max(
     MIN_PRESIGNED_URL_EXPIRY,
     Math.min(expiresIn, MAX_PRESIGNED_URL_EXPIRY)
@@ -226,23 +191,7 @@ export async function getPresignedUrl(params: {
   }
 }
 
-/**
- * Get public URL for a file in the public bucket
- *
- * DEVELOPMENT: Returns r2.dev subdomain URL (rate limited)
- * PRODUCTION: Returns custom domain URL (no rate limits)
- *
- * To switch from development to production:
- * 1. Setup custom domain in Cloudflare Dashboard
- * 2. Update R2_PUBLIC_URL in .env (e.g., https://cdn.yoursite.com)
- * 3. Redeploy - No code changes needed!
- *
- * @knipignore
- * @param key - R2 object key (e.g., "projects/5/project/uuid.jpg")
- * @returns Public URL (e.g., "https://pub-xxxxx.r2.dev/projects/5/project/uuid.jpg")
- *
- * @throws Error if R2_PUBLIC_URL is not configured
- */
+/** @knipignore */
 export function getPublicUrl(key: string): string {
   if (!R2_PUBLIC_URL) {
     throw new Error(
@@ -254,26 +203,19 @@ export function getPublicUrl(key: string): string {
   return `${R2_PUBLIC_URL}/${key}`;
 }
 
-/**
- * MIME type validation
- * Returns true if MIME type is allowed
- *
- * @knipignore
- */
+/** @knipignore */
 export function isAllowedMimeType(
   mimeType: string,
   allowedTypes?: string[]
 ): boolean {
   if (!allowedTypes || allowedTypes.length === 0) {
-    return true; // Allow all if no restrictions
+    return true;
   }
 
-  // Exact match
   if (allowedTypes.includes(mimeType)) {
     return true;
   }
 
-  // Wildcard match (e.g., 'image/*')
   const wildcardMatch = allowedTypes.some((allowed) => {
     if (allowed.endsWith('/*')) {
       const prefix = allowed.slice(0, -2);
@@ -285,26 +227,20 @@ export function isAllowedMimeType(
   return wildcardMatch;
 }
 
-/**
- * Get recommended cache control header based on file type
- */
 export function getCacheControlHeader(params: {
   mimeType: string;
   isPublic: boolean;
 }): string {
   const { mimeType, isPublic } = params;
 
-  // Private files should not be cached
   if (!isPublic) {
     return 'private, no-cache, no-store, must-revalidate';
   }
 
-  // Public images - cache for 1 year
   if (mimeType.startsWith('image/')) {
     return 'public, max-age=31536000, immutable';
   }
 
-  // Public documents - cache for 1 hour
   if (
     mimeType === 'application/pdf' ||
     mimeType.includes('document') ||
@@ -314,17 +250,10 @@ export function getCacheControlHeader(params: {
     return 'public, max-age=3600';
   }
 
-  // Default for other public files - cache for 1 day
   return 'public, max-age=86400';
 }
 
-/**
- * RFC 5987 `ext-value` percent-encoding for the `filename*` parameter.
- *
- * Not `encodeURIComponent`, which leaves `!'()*` unescaped — none of those is an
- * RFC 5987 `attr-char`, and `(` and `)` are reachable here because
- * `sanitizeFilename` keeps them.
- */
+/** RFC 5987 encoding; `encodeURIComponent` leaves `'*()` unescaped. */
 const ATTR_CHARS = new Set(
   [
     ...'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!#$&+-.^_`|~',
@@ -342,19 +271,8 @@ function encodeExtValue(filename: string): string {
 }
 
 /**
- * The ASCII half of the header.
- *
- * A header value is transmitted as Latin-1, so a non-ASCII code point here does
- * not survive: `@aws-sdk/client-s3` replaces each one with `U+FFFD` and Bun's S3
- * client sends the raw UTF-8 bytes, so the same filename produces two different
- * stored headers and neither is the name. Non-ASCII therefore belongs only in
- * `filename*`, and this parameter carries a transliteration-free `_` placeholder
- * — which is what RFC 6266 §4.3 intends the ASCII parameter to be.
- *
- * `"` and `\` are dropped rather than escaped: a `quoted-string` can escape them,
- * but parsers disagree about how, and no filename needs them. Control characters
- * are dropped for the reason that outranks tidiness — CR and LF in a header value
- * are request splitting, and this value is built from a caller-supplied string.
+ * Keeps `filename` portable across SDK encodings; `filename*` carries the
+ * original name. Controls, quotes, and backslashes are unsafe in this fallback.
  */
 function asciiFallback(filename: string): string {
   let out = '';
@@ -367,12 +285,7 @@ function asciiFallback(filename: string): string {
   return out || 'download';
 }
 
-/**
- * Get content disposition header for downloads.
- *
- * Both parameters are emitted per RFC 6266: `filename` for parsers that read
- * only that, `filename*` for the real name. Browsers prefer `filename*`.
- */
+/** Emits an ASCII fallback and the RFC 5987 filename. */
 export function getContentDisposition(params: {
   filename: string;
   inline?: boolean;

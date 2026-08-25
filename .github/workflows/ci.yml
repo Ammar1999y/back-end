@@ -38,15 +38,12 @@ jobs:
         # latter fails if any file under `tests/` is in no tier.
         run: bun run test
       - name: Unreachable files and unregistered handlers
-        # The scanner alone, not `bun run find:unused-files`, which also runs
-        # knip. Knip currently reports 85 unused exports and 34 unused exported
-        # types that predate this work; gating on it would fail every build
-        # until that is cleaned up, which is tracked in TODO.md. This step is a
-        # real gate: non-zero on an unreachable file AND on a handler module
-        # that `routes.ts` does not import — and the second check is the one the
-        # previous scanner could not make, because reachability through a
-        # commented-out import is not registration.
+        # This scanner checks handler registration; Knip below covers files under
+        # `tests/`, which this import graph treats as entry points.
         run: bun scripts/find-unused-files.ts
+      - name: Unused files, including under tests/
+        # Scope Knip to the unused-file gap without gating on its export report.
+        run: bunx knip --include files
       - name: Boot smoke test
         # Replaces `next build`. A Bun server has no build artefact, so this is
         # what forces the module graph to evaluate — lib/env.server.ts throws at
@@ -143,21 +140,8 @@ jobs:
       # populated. No test that assumes an installed tree can detect that.
       - run: bun install --frozen-lockfile
       - name: Integration tests
-        # The harness creates the migrated template on first use, so there is no
-        # separate `db:migrate` step: the migration runner IS what builds the
-        # template, which is also what keeps the template's schema identical to
-        # production's.
-        #
-        # `--reporter=junit` so a failure becomes a check annotation instead of
-        # something to find in the log, and `--coverage` because §8 of the plan
-        # reports coverage everywhere and gates almost nowhere. Both are forwarded
-        # to `bun test` by the tier runner.
-        #
-        # `--shard`/`--timings` are deliberately NOT here yet: with one
-        # integration file they would split one file across three jobs and record
-        # timings for nothing. They go in when there are enough files to balance,
-        # and that is the point at which the timings artefact starts paying for
-        # itself.
+        # The harness migration builds the test template, so no separate migrate
+        # step can drift from the schema used by the tests.
         run: >-
           bun run test:integration --
           --reporter=junit --reporter-outfile=reports/junit-integration.xml

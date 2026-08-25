@@ -37,14 +37,7 @@ const CURSOR_TIMESTAMP =
 const daysInMonth = (year: number, month: number) =>
   new Date(Date.UTC(year, month, 0)).getUTCDate();
 
-/**
- * The canonical string every cursor in a response is built from.
- *
- * Single source of truth deliberately: while the emitter interpolated the raw
- * Postgres timestamp and the parser accepted a family of formats, the two could
- * disagree without anything failing loudly. Now a cursor this function did not
- * produce cannot be parsed, and the round trip is asserted in the tests.
- */
+/** Emits the only timestamp form accepted by `parseCursor`. */
 export function formatCursor(createdAt: string | Date, id: string): string {
   const date = safeDate(createdAt);
   if (!date) throw new Error('formatCursor received an unparseable timestamp');

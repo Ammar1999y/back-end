@@ -1,26 +1,6 @@
 /**
- * Reports code files that the app can never reach, and proves that every route
- * handler is actually registered.
- *
- * Roots are the files a runtime or tool loads directly (`server.ts`,
- * `*.config.*`, the benchmark harness). Every other file is reachable only if
- * some reachable file imports it, so an orphan cluster — dead files importing
- * each other — is reported too, not just files nobody imports.
- *
- * Two things this deliberately does NOT claim, both corrections of what the
- * previous version implied:
- *
- * 1. **Reachability is not registration.** A handler module can be imported and
- *    still be wired to no route. `assertHandlersRegistered` below is the actual
- *    check, and it reads `routes.ts` — the generated route table — rather than
- *    inferring anything from the import graph.
- * 2. **Comments are not code.** The specifier scan runs over source with
- *    comments stripped. It previously did not, so a commented-out import kept
- *    its target "reachable" — which is the exact inverse of the guarantee the
- *    scan is for, and it hid every handler whose live registration had been
- *    deleted while a commented one remained.
- *
- * Run: bun scripts/find-unused-files.ts
+ * Import-graph gate for unreachable files and handlers absent from `routes.ts`.
+ * Comments are stripped so dead imports cannot create false reachability.
  */
 
 import { readdirSync, readFileSync } from 'node:fs';
@@ -49,19 +29,7 @@ const SKIP_DIRECTORIES = new Set([
 const CODE_EXTENSIONS = ['.ts', '.tsx', '.mts', '.js', '.jsx', '.mjs', '.cjs'];
 const RESOLVE_EXTENSIONS = [...CODE_EXTENSIONS, '.json', '.css'];
 
-/**
- * Loaded by a runtime or by tooling, not by an import — always a root.
- *
- * `bench/` is here because the harness is run by hand and imported by nothing;
- * without it every benchmark file is reported as unreachable, which trains the
- * reader to ignore the output. It is declared the same way in `knip.jsonc`.
- *
- * `app/` is deliberately NOT a root. Under Next it had to be — the framework
- * loaded every `route.ts` by file path — so the scan could say nothing about
- * that directory. Under Elysia a handler is reached only because `routes.ts`
- * imports it, which makes "this handler is registered nowhere" a real and
- * newly detectable defect.
- */
+/** Tests and benchmarks are tool entry points; handlers must flow through `routes.ts`. */
 const ENTRY_DIRECTORIES = ['tests/', 'bench/'];
 const ENTRY_FILE_PATTERN =
   /^(server|app|routes|middleware|instrumentation|drizzle\.config|eslint\.config|prettier\.config|postcss\.config|tailwind\.config)\.[a-z]+$/;
@@ -69,22 +37,8 @@ const ENTRY_FILE_PATTERN =
 /** The generated route table. Every handler must be imported by this file. */
 const ROUTE_TABLE = 'routes.ts';
 
-/**
- * Known-unreachable files this scan should not fail on.
- *
- * Deliberately a NAMED list with a reason each, not a pattern: an entry here is
- * a decision someone has to defend, and a pattern would quietly absorb the next
- * orphan too.
- *
- * `utils/images/server.ts` — a second, DIVERGENT copy of the server-side SVG
- * sanitiser/optimiser. The live one is `utils/svg/server.ts`
- * (`lib/r2/upload-helper.ts` imports it); its siblings `utils/images/config.ts`
- * and `utils/images/svg-optimizer.ts` are reachable through
- * `utils/validation/rules.ts`, so only this file is orphaned. It predates the
- * framework migration and the two copies are not identical, so choosing which
- * survives is not this pass's call — recorded in TODO.md.
- */
-const KNOWN_UNREACHABLE = new Set(['utils/images/server.ts']);
+/** Keep exceptions explicit so a pattern cannot absorb future orphaned files. */
+const KNOWN_UNREACHABLE = new Set<string>();
 
 /** `from '…'`, `import '…'`, `import('…')`, `require('…')`, `export … from '…'`. */
 const SPECIFIER_PATTERN = /(?:from|import|require)\s*\(?\s*['"]([^'"]+)['"]/g;

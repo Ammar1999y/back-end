@@ -134,18 +134,10 @@ const CORS_POLICY = {
   maxAge: 600,
 } as const;
 
-/** Body big enough for the largest legitimate upload plus multipart framing. */
+/** Bounds framework buffering before route-specific payload validation. */
 export const MAX_REQUEST_BODY_BYTES = 8 * 1024 * 1024;
 
-/**
- * The longest per-request ceiling any route grants itself.
- *
- * Derived, not written down twice. A shutdown that force-exits sooner than this
- * cannot honestly be called a drain: it would abort exactly the long request the
- * per-route ceiling exists to permit. `server.ts` sizes its forced shutdown from
- * this value, so raising a route's `timeoutSeconds` raises the shutdown bound
- * with it instead of silently invalidating it.
- */
+/** Lets shutdown honor the longest route-specific timeout. */
 export const MAX_ROUTE_TIMEOUT_SECONDS = ROUTES.reduce(
   (longest, route) => Math.max(longest, route.timeoutSeconds ?? 0),
   0
@@ -207,12 +199,7 @@ const base = new Elysia({
   // path, which the redirect in `onError` below restores.
   strictPath: true,
   serve: {
-    // Elysia defaults this to `true`, so two processes both bind the port and
-    // the kernel splits traffic between them instead of the second failing with
-    // EADDRINUSE (measured, both defaults confirmed at
-    // node_modules/elysia/dist/adapter/bun/index.js:166-167). Each process opens
-    // its own SQLite files, so the rate-limit counters silently halve during an
-    // accidental double-start — no error, no log, half the protection.
+    // Fail a second bind instead of letting the kernel split traffic silently.
     reusePort: false,
     // Bun's default is 128 MiB, which is buffered before any per-file check can
     // run. The per-file limit stays: it is per file, this is per request.

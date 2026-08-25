@@ -101,9 +101,8 @@ import { OTP_CHANNELS, OTP_PURPOSES } from '@/utils/validation/otp';
  * (`audit_logs`' `old_data`, `new_data`, `changed_fields`) are typed `unknown`,
  * where jsonb legitimately admits arrays and scalars; `changed_fields` already
  * stores an array. Refusing a non-object on read would assert an invariant the
- * type does not carry. The enforcement that belongs to a write-time invariant is
- * a database CHECK constraint, which needs a migration — tracked in `TODO.md`
- * PG-4.
+ * type does not carry. A database CHECK constraint is the correct boundary for
+ * any write-time invariant added here.
  */
 const jsonb = customType<{ data: unknown; driverData: unknown }>({
   dataType: () => 'jsonb',

@@ -82,23 +82,9 @@ export const SYNCHRONOUS_VALUE: Record<Durability, number> = {
 };
 
 /**
- * On durability, precisely:
- *
- * WAL + `synchronous = NORMAL` is **process-crash-safe**. A SIGKILL
- * mid-transaction was verified to leave `integrity_check = ok`, roll the
- * in-flight transaction back, and recover every committed row. That is what was
- * tested and that is all it claims.
- *
- * It is NOT the same as surviving host power loss. Under NORMAL, SQLite does not
- * fsync the WAL on every commit, so a power cut or host-level crash can lose the
- * most recently committed transactions. The database stays consistent; recent
- * commits may be gone.
- *
- * That trade is accepted here because the values are short-lived counters, and
- * because NORMAL costs nothing at the median versus OFF. If a counter ever needs
- * a zero power-loss RPO — the daily paid-OTP budget is the candidate — it needs
- * `synchronous = FULL` or a durable shared authority, not this default. Recorded
- * as an open decision in TODO.md.
+ * WAL with NORMAL preserves consistency across process crashes but may lose
+ * recent commits on host power loss. Zero-RPO counters need FULL or a durable
+ * shared authority instead.
  */
 function applyPragmas(db: SqliteConnection, durability: Durability) {
   // FIRST, before anything that can take a lock. `journal_mode = WAL` is a

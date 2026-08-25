@@ -114,10 +114,8 @@ function isSensitiveLogKey(key: string, value: unknown): boolean {
   );
 }
 
-// Cc = control chars (CR/LF/TAB…), Zl/Zp = Unicode line/paragraph separators.
 const LOG_CONTROL_CHARS = /[\p{Cc}\p{Zl}\p{Zp}]+/gu;
 
-/** Strip CR/LF and Unicode line separators so a log line can't be forged. */
 function stripLogControlChars(value: string): string {
   return value.replaceAll(LOG_CONTROL_CHARS, ' ');
 }

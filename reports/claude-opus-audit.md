@@ -1,295 +1,12 @@
 # Claude Opus Audit — full-codebase sweep + Bun 1.4 compatibility
 
-Scope: whole codebase (not a diff). Audit sources: `CLAUDE.md` (as a requirement on
-the code, not only on me), the official Bun 1.4 release post
-(<https://bun.com/blog/bun-v1.4>), and the dimensions listed in the audit brief.
-Exclusions: everything in `reports/should-ignore.md` (both sections) unless
-materially new evidence contradicts the recorded reasoning.
-
-Environment recorded at run start: `bun --version` → `1.4.0`;
-`package.json#packageManager` → `bun@1.4.0`; `bun.lock` →
-`"lockfileVersion": 2, "configVersion": 1`.
-
-## Summary
-
-47 entries: **2 High, 18 Medium, 26 Low**, and 1 withdrawn.
-No Critical. Ranked below by severity, original numbering preserved.
-
-| #   | Severity | Finding                                                                                                                                                    |
-| --- | -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| F27 | High     | `validID` does not canonicalise case, so three "you may not do this to yourself" guards can be walked past with one uppercase hex digit                    |
-| F30 | High     | The verify-side per-destination budget is shared across all three surfaces, so anyone can cheaply deny a named victim's password recovery                  |
-| F1  | Medium   | `/openapi.json` is unauthenticated and publishes the dev + internal maintenance surface                                                                    |
-| F4  | Medium   | Bun 1.4: one half-sent request makes `app.stop()` hang, turning every deploy into a 135 s stall that exits 1 and skips the store closes                    |
-| F6  | Medium   | The two `.js` files are inside the type-check program but their bodies are never type-checked                                                              |
-| F8  | Medium   | No type-aware ESLint configuration: `no-floating-promises` and the whole thenable family are absent                                                        |
-| F12 | Medium   | The `haveIBeenPwned` plugin can never fire, and the hand-rolled replacement fails OPEN where the plugin fails CLOSED                                       |
-| F13 | Medium   | Bun 1.4 invalidates two specified assertions in `reports/test-strategy.md` §7.3, and the document actively steers away from the case that is now reachable |
-| F14 | Medium   | `lib/r2/client.ts` sits outside every convention the rest of the codebase follows                                                                          |
-| F16 | Medium   | The entire self-service credential surface has no test of any kind                                                                                         |
-| F22 | Medium   | Closing `/openapi.json` (F1) turns the upload route into an enumeration oracle; the two are coupled and only one side knows it                             |
-| F25 | Medium   | The three OTP delivery channels are the only outbound calls in the codebase with no timeout, and Bun 1.4 `fetch()` has no default                          |
-| F28 | Medium   | `sanitizeFilename` truncates by UTF-16 code unit and can emit a lone surrogate, which the S3 SDK turns into a 500                                          |
-| F29 | Medium   | `zodIssueMessage` reflects unbounded, attacker-controlled JSON key names into the 422 response body                                                        |
-| F31 | Medium   | All three OTP send handlers report `200 "code sent"` for a malformed body and for OTP being switched off                                                   |
-| F32 | Medium   | A NUL byte in any data-table search or filter value reaches a bound parameter and returns a deterministic 500                                              |
-| F33 | Medium   | `notILike` and `ne` silently drop NULL rows, in a module that handles NULL correctly for `isEmpty`                                                         |
-| F39 | Medium   | Public `verify_contact` sends starve the shared per-destination send budget, throttling a named victim's passwordless login to one code per hour           |
-| F44 | Medium   | Bun 1.4's `Bun.cron()` removes the primary recorded objection to an in-process sweep, and with it two internet-reachable maintenance endpoints             |
-| F45 | Medium   | `TODO.md` is gitignored, and eleven tracked source files cite it as the register of deferred decisions                                                     |
-| F2  | Low      | `openApiConsistencyProblems` is documented as exported and is not                                                                                          |
-| F3  | Low      | The two dev-only endpoints answer a production probe differently                                                                                           |
-| F5  | Low      | Bun 1.4 invalidates the recorded measurement that justifies the after-response settle loop                                                                 |
-| F7  | Low      | `constants/index.js` is a one-constant barrel with one consumer, in the wrong language and the wrong place                                                 |
-| F9  | Low      | `SQLITE_MAINTENANCE_TOKEN` has no length floor, and the endpoints it guards are unthrottled and log no failures                                            |
-| F10 | Low      | `page.out` is a 1.3 MB scraped HTML page committed to the repository                                                                                       |
-| F11 | Low      | `knip` is a devDependency with a 95-line config that no gate ever runs                                                                                     |
-| F15 | Low      | Four exported functions in `lib/r2/client.ts` have no production caller and each is hidden from the dead-code scanner with `@knipignore`                   |
-| F17 | Low      | `@tanstack/react-table` is a production dependency for one type-only import, in a repository with no React                                                 |
-| F18 | Low      | `should-ignore.md` #52 no longer describes the code it excuses                                                                                             |
-| F19 | Low      | `sharp` and `unrs-resolver` are listed in both `trustedDependencies` and `ignoreScripts`, where Bun 1.4 makes the first entry dead                         |
-| F20 | Low      | No `unhandledRejection` / `uncaughtException` handler: an escaped async error hard-kills the process and bypasses the entire shutdown design               |
-| F21 | Low      | Bun 1.4 makes the `Set-Cookie` re-append workaround unnecessary, and its stated premise is false on the pinned runtime                                     |
-| F23 | Low      | `MAX_REQUEST_BODY_BYTES` is 8× the largest body any route accepts, and its comment claims a derivation that does not exist                                 |
-| F26 | Low      | Two log sites bypass the structured-logging convention with a bracket-prefixed string                                                                      |
-| F34 | Low      | `positiveInt` accepts non-canonical number spellings and substitutes a default for out-of-range, which the sibling paginator explicitly refuses            |
-| F35 | Low      | An inverted `isBetween` range is accepted and answered 200 with a provably empty set                                                                       |
-| F36 | Low      | 403-vs-404 divergence on `PUT`/`DELETE /api/dash/users/:id` discloses which accounts outrank the caller                                                    |
-| F37 | Low      | `serializeLogValue`'s `seen` set is visit-scoped, so a shared reference is reported as `[circular]`                                                        |
-| F38 | Low      | The CI dead-code gate carries a named exemption for the live SVG sanitiser, justified by a directory that no longer exists                                 |
-| F40 | Low      | The HIBP network call and the argon2 hash run before any check on the _target_ user                                                                        |
-| F41 | Low      | The daily OTP spend breaker allows 2× the day's budget in one second at the UTC boundary, which its own justification does not cover                       |
-| F42 | Low      | `ipIdentifier`'s failure log emits present, IP-bearing headers, which is the opposite of the boundary rule the sibling module states                       |
-| F43 | Low      | A `roleId` union failure returns Zod's English `"Invalid input"`, defeating the reason `zodIssueMessage` exists                                            |
-| F46 | Low      | The `@types/node` pin is a major behind the runtime Bun 1.4 emulates, and two majors are in one type program                                               |
-| F47 | Low      | The Coolify health check verifies SQLite and never touches PostgreSQL                                                                                      |
-| F24 | —        | withdrawn (premise was false)                                                                                                                              |
-
-The two High findings share a property worth stating up front: both are cases
-where the codebase states the correct rule in a comment and the code does not
-implement it. F27 is a case-sensitivity mismatch between JavaScript string
-equality and PostgreSQL `uuid` equality that walks past three separate
-"not to yourself" guards; F30 is a reserved-capacity rule that the send path
-implements and the verify path does not.
-
-## Worklist
-
-### Root / entry points
-
-- [x] `app.ts`
-- [x] `server.ts`
-- [x] `routes.ts`
-- [x] `package.json`
-- [x] `bunfig.toml`
-- [x] `tsconfig.json`
-- [x] `drizzle.config.ts`
-- [x] `eslint.config.mjs`
-- [x] `prettier.config.js` / `.prettierignore`
-- [x] `knip.jsonc`
-- [x] `lefthook.yml`
-- [x] `mise.toml`
-- [x] `renovate.json`
-- [x] `.gitignore` / `.gitleaksignore` / `.semgrepignore`
-- [x] `.env` / `.env.test` / `.env.test.example` (handling, not contents)
-- [x] `page.out`, `prompt*.md`, `read.txt`, `TODO.md` (tracked junk check)
-
-### `.github/`
-
-- [x] `.github/workflows/ci.yml`
-- [x] `.github/workflows/security.yml`
-
-### `app/api/` — HTTP handlers
-
-- [x] `app/api/auth/forgot-password/reset/handler.ts`
-- [x] `app/api/auth/forgot-password/send/handler.ts`
-- [x] `app/api/auth/otp/messages.ts`
-- [x] `app/api/auth/otp/send/handler.ts`
-- [x] `app/api/auth/otp/verify/handler.ts`
-- [x] `app/api/auth/passwordless/send/handler.ts`
-- [x] `app/api/dash/permissions/handler.ts`
-- [x] `app/api/dash/permissions/[id]/handler.ts`
-- [x] `app/api/dash/permissions/messages.ts`
-- [x] `app/api/dash/roles/handler.ts`
-- [x] `app/api/dash/users/handler.ts`
-- [x] `app/api/dash/users/messages.ts`
-- [x] `app/api/dash/users/[id]/handler.ts`
-- [x] `app/api/dash/users/[id]/target-user.ts`
-- [x] `app/api/dash/users/[id]/sessions/handler.ts`
-- [x] `app/api/dash/users/[id]/sessions/pagination.ts`
-- [x] `app/api/dash/users/me/contact-change.ts`
-- [x] `app/api/dash/users/me/change-email/handler.ts`
-- [x] `app/api/dash/users/me/change-email/verify/handler.ts`
-- [x] `app/api/dash/users/me/change-password/handler.ts`
-- [x] `app/api/dash/users/me/change-phone/handler.ts`
-- [x] `app/api/dash/users/me/change-phone/verify/handler.ts`
-- [x] `app/api/dev/email-test/fixed/handler.ts`
-- [x] `app/api/dev/sign-up/handler.ts`
-- [x] `app/api/health/storage/handler.ts`
-- [x] `app/api/internal/db-sweep/handler.ts`
-- [x] `app/api/internal/sqlite-sweep/handler.ts`
-- [x] `app/api/upload/image/handler.ts`
-- [x] `app/api/upload/image/messages.ts`
-
-### `lib/`
-
-- [x] `lib/audit.ts` + `lib/audit/constants.ts`
-- [x] `lib/auth.ts`
-- [x] `lib/auth/allowed-paths.ts`
-- [x] `lib/auth/api-error.ts`
-- [x] `lib/auth/check-password.ts`
-- [x] `lib/auth/code-errors.ts`
-- [x] `lib/auth/keyring.ts`
-- [x] `lib/auth/live-session.ts`
-- [x] `lib/auth/login-guard.ts`
-- [x] `lib/auth/otp-hash.ts`
-- [x] `lib/auth/otp-key.ts`
-- [x] `lib/auth/password.ts`
-- [x] `lib/auth/password-pepper.ts`
-- [x] `lib/auth/passwordless.ts`
-- [x] `lib/auth/rotation.ts`
-- [x] `lib/cache/index.ts` + `lib/cache/prefix.ts`
-- [x] `lib/captcha.ts`
-- [x] `lib/data-table/column-specs.ts`
-- [x] `lib/data-table/config.ts`
-- [x] `lib/data-table/filter-columns.ts`
-- [x] `lib/data-table/parsers.ts`
-- [x] `lib/env.js`
-- [x] `lib/env.server.ts`
-- [x] `lib/http/adapters/elysia.ts`
-- [x] `lib/http/adapters/hono.ts.disabled`
-- [x] `lib/http/after-response.ts`
-- [x] `lib/http/contract.ts`
-- [x] `lib/http/openapi.ts`
-- [x] `lib/http/pre-auth.ts`
-- [x] `lib/http/request.ts`
-- [x] `lib/http/response.ts`
-- [x] `lib/http/response-policy.ts`
-- [x] `lib/http/route-manifest.ts`
-- [x] `lib/http/security-headers.ts`
-- [x] `lib/http/session.ts`
-- [x] `lib/id.ts`
-- [x] `lib/permissions/checker.ts`
-- [x] `lib/permissions/constants.ts`
-- [x] `lib/permissions/utils.ts`
-- [x] `lib/r2/client.ts`
-- [x] `lib/r2/optimize-image.ts`
-- [x] `lib/r2/upload-helper.ts`
-- [x] `lib/rate-limit/api.ts`
-- [x] `lib/rate-limit/auth-storage.ts`
-- [x] `lib/rate-limit/index.ts`
-- [x] `lib/rate-limit/store.ts`
-- [x] `lib/rate-limit/store-failure.ts`
-- [x] `lib/sqlite/database.ts`
-- [x] `lib/sqlite/driver.ts`
-- [x] `lib/sqlite/maintenance.ts`
-- [x] `lib/sqlite/maintenance-token.ts`
-- [x] `lib/sqlite/sweep.ts`
-
-### `db/`
-
-- [x] `db/index.ts`
-- [x] `db/schema.ts`
-- [x] `db/limits.ts`
-- [x] `db/maintenance.ts`
-- [x] `db/queries/index.ts`
-- [x] `db/queries/data-table.ts`
-- [x] `db/drizzle/*.sql` + `db/drizzle/meta/` (migration/journal consistency)
-- [x] `db/migrations/001_add_trgm_indexes.sql`
-
-### `utils/`
-
-- [x] `utils/api-messages.ts`
-- [x] `utils/api-response.ts`
-- [x] `utils/config.ts`
-- [x] `utils/error-class.ts`
-- [x] `utils/index.ts`
-- [x] `utils/otp.ts`
-- [x] `utils/sanitize-filename.ts`
-- [x] `utils/time.ts`
-- [x] `utils/images/config.ts`
-- [x] `utils/images/rgba.ts`
-- [x] `utils/images/server.ts`
-- [x] `utils/images/svg-optimizer.ts`
-- [x] `utils/svg/config.ts`
-- [x] `utils/validation/auth.ts`
-- [x] `utils/validation/constants.ts`
-- [x] `utils/validation/otp.ts`
-- [x] `utils/validation/permissions.ts`
-- [x] `utils/validation/rules.ts`
-
-### `constants/`, `types/`, `data/`
-
-- [x] `constants/index.js`
-- [x] `types/index.ts`
-- [x] `types/data-table.ts`
-- [x] `data/` (contents)
-
-### `scripts/`
-
-- [x] `scripts/find-non-null-assertions.ts`
-- [x] `scripts/find-unused-files.ts`
-- [x] `scripts/migrate.ts`
-- [x] `scripts/smoke.ts`
-- [x] `scripts/strip-comments.ts`
-- [x] `scripts/probe/dev-live/*` (4 probes + README)
-
-### `tests/`
-
-- [x] `tests/helpers/*` (17 files — harness, provisioning, guards)
-- [x] `tests/fixtures/*`
-- [x] `tests/unit/*`
-- [x] `tests/integration/*`
-- [x] `tests/process/*`
-- [x] Coverage gaps: which reachable route/lib has no test at all
-
-### `bench/`
-
-- [x] `bench/image/`
-- [x] `bench/otp/`
-- [x] `bench/s3/` (untracked, in-progress Bun S3 migration)
-- [x] `bench/sqlite/`
-- [x] `bench/uuid/`
-
-### `docs/`, `.claude/`, stray dirs
-
-- [x] `docs/` (which are vendored refs vs. project docs)
-- [x] `.claude/settings.json` + `settings.local.json` + agents/skills
-- [x] `.tmp-probe/` (untracked stray probes in repo root)
-
-### Bun 1.4 cross-cutting passes
-
-- [x] B1 `.env` loading under `bun --bun` (dev/start scripts) — proven by probe
-- [x] B2 Duplicate-header combining (`,`) vs. IP/header readers
-- [x] B3 `Request#clone()` / `Response#clone()` after body read
-- [x] B4 `Bun.password.hash` argon2 `memoryCost >= 8`
-- [x] B5 `server.stop()` semantics vs. graceful shutdown
-- [x] B6 `Bun.sql` UTC decode / `.simple()` / named params / 65535 param cap
-- [x] B7 test-runner features left on the table (`--parallel`, `--isolate`,
-      `--shard`, `--timings`, `--changed`, `--retry`, fake timers)
-- [x] B8 package-manager features (`bun audit fix`, `dedupe --check`, `prune
---production`, `pm licenses`, lockfile v2, linker)
-- [x] B9 dependencies Bun 1.4 now replaces (`sharp`, `@aws-sdk/*`, `uuid`,
-      `tar`, `json5`, `fast-xml-parser`, `string-width`)
-- [x] B10 `Bun.cron()` vs. the deferred cron/sweep requirements
-- [x] B11 `fetch()` behaviour changes (TypeError, bodyUsed, compress, timeouts)
-- [x] B12 `fs.rmdir({recursive})`, Bun Shell globbing, TOML strictness, `import "."`
-- [x] B13 `Bun.serve` static-dir routes / Range / conditional requests
-- [x] B14 `process.on("memoryPressure")`, `--no-orphans`, profiling flags
-- [x] B15 `jest.resetAllMocks()` / `toContain()` semantics in existing tests
-
-### Sweep passes
-
-- [x] Pass 1 — file-by-file sweep of every box above
-- [x] Pass 2 — cross-cutting re-read (contract/consistency/placement/dead code)
-- [x] Pass 3 — confirm two consecutive passes surface nothing new
-
 ## Findings
 
 ### F27 — `validID` does not canonicalise case, so three "you may not do this to yourself" guards can be walked past with one uppercase hex digit (High)
 
 **The most serious finding in this audit. Every link verified by my own measurement.**
 
-**Root cause — `utils/index.ts:503-515`:**
+**Root cause — `utils/index.ts:501-513`:**
 
 ```ts
 const UUID_V7_REGEX =
@@ -476,7 +193,7 @@ prescribe opposite designs for the same shape, and the consequence of the
 verify-side choice was not weighed.
 
 Failure scenario, with numbers. The window is fixed and 600 s wide
-(`lib/rate-limit/index.ts:57`: `windowStart = now - (now % windowMs)`). An
+(`lib/rate-limit/index.ts:46`: `windowStart = now - (now % windowMs)`). An
 attacker who knows `victim@gmail.com` POSTs `/api/auth/otp/verify` ten times with
 `{channel:'email', email:'victim@gmail.com', code:'000000'}`. Each passes the
 per-IP cap (60/min) and charges `otp.verify.dest.email:victim@gmail.com`. After
@@ -497,8 +214,8 @@ itself.
 
 ### F1 — `/openapi.json` is unauthenticated and publishes the dev + internal maintenance surface (Medium)
 
-`routes.ts:333-339` registers `GET /openapi.json` with `preAuth: 'none'`, and
-`lib/http/openapi.ts:442-543` builds the document from the **whole** manifest with
+`routes.ts:330-336` registers `GET /openapi.json` with `preAuth: 'none'`, and
+`lib/http/openapi.ts:395-496` builds the document from the **whole** manifest with
 no `NODE_ENV` filter and no allow/deny list. Every route in `ROUTES` is therefore
 advertised to an unauthenticated caller in production, including:
 
@@ -519,12 +236,9 @@ This is not a generic "APIs expose their contract" observation: it defeats a
 security decision this codebase makes explicitly, by name, one file away.
 `app/api/dev/email-test/fixed/handler.ts:24-33` chose 404 over 403 precisely so
 the endpoint is _"indistinguishable from an unrouted path in every other mode"_ —
-and `/openapi.json` prints the path. Same reasoning applies to
-`lib/http/openapi.ts:27-35`, which argues at length against merging Better
-Auth's document because _"advertising dozens of endpoints that this server
-rejects [is] a contract that is worse than an incomplete one"_; the identical
-argument applies to endpoints this server refuses by environment, and is not
-applied.
+and `/openapi.json` prints the path. The generator already limits Better Auth's
+documented paths to the server's allowlist (`lib/http/openapi.ts:454-484`), but
+does not apply the equivalent environment filter to manifest routes.
 
 CLAUDE.md, Fix discipline: _"A reported defect is a **sample of a class**, not
 the class… Inventory every site with the same shape."_ The dev-route disclosure
@@ -556,36 +270,33 @@ $ bun stopprobe.ts
 {"escalation":"stop(true)","resolvedInMs":1}
 ```
 
-`server.ts:298` is `await app.stop()` — no argument, and the file argues at
-length (lines 240-243) that the no-argument form is the correct one. It is, for
-in-flight requests. It is not survivable for a stalled one.
+`server.ts:265` is `await app.stop()` with no argument. That preserves in-flight
+requests but is not survivable for a stalled one.
 
 Failure scenario: Coolify sends SIGTERM. One connection is mid-handshake — a
 half-written request from a scanner, a client that died between headers, a
 load-balancer health probe that was cut, or an attacker holding a socket open
 with one byte. `await app.stop()` never resolves, so:
 
-1. `drainAfterResponse` at `server.ts:299` is never reached.
-2. The `finally` at `server.ts:322-332` never runs — **`closeDatabase`,
+1. `drainAfterResponse` at `server.ts:266` is never reached.
+2. The `finally` at `server.ts:283-288` never runs — **`closeDatabase`,
    `closeRateLimitStore` and `closeCacheStore` are all skipped**, because the
-   forced-shutdown `process.exit(1)` at line 294 terminates the process from
+   forced-shutdown `process.exit(1)` at line 261 terminates the process from
    inside the timer callback and `finally` blocks do not run on `process.exit`.
 3. The process sits for the full `SHUTDOWN_TIMEOUT_MS` and then exits **1**.
 
 `SHUTDOWN_TIMEOUT_MS` is `(Math.max(60, MAX_ROUTE_TIMEOUT_SECONDS) + 15) * 1000`
-(`server.ts:203-204`). `MAX_ROUTE_TIMEOUT_SECONDS` is 120 — `routes.ts:269`
-(upload) and `routes.ts:307` (db-sweep) both declare `timeoutSeconds: 120`. So
+(`server.ts:220-221`). `MAX_ROUTE_TIMEOUT_SECONDS` is 120 — `routes.ts:266`
+(upload) and `routes.ts:304` (db-sweep) both declare `timeoutSeconds: 120`. So
 the bound is **135 000 ms**, so every routine deploy becomes a 135-second stop
 phase ending in a non-zero exit code, from one stalled socket. What that looks
 like from the orchestrator's side, and how to tell it apart from a genuinely
 failed deploy, is now `reports/coolify-deployment.md` §6.
 
-Note the asymmetry this creates with the file's own design intent: `server.ts:300-307`
-deliberately keeps a timed-out _drain_ at exit 0 so _"a routine deploy's stop
-phase [does not] look like a crash to the orchestrator for the sake of a log
-line."_ The stalled-`stop()` path defeats that reasoning entirely — it produces
-both the crash-looking exit code and the skipped store closes, for a cause that
-is not the application's fault.
+Note the asymmetry: a timed-out post-response drain is logged without changing
+the successful shutdown status (`server.ts:266-275`), while a stalled `stop()`
+produces both a non-zero exit and skipped store closes for a cause outside the
+application.
 
 The shape of the fix is already named by the release note (`stop(true)` closes
 such connections, and resolved in 1 ms in the probe above); a bounded escalation
@@ -672,7 +383,7 @@ config (deleted afterwards; `git status` count unchanged) and got **zero**
 `no-floating-promises` and **zero** `no-misused-promises` violations. The only
 hits were four benign `require-await` reports
 (`app/api/health/storage/handler.ts:49`, `lib/auth.ts:103` and `:205`,
-`lib/rate-limit/auth-storage.ts:35`, `lib/rate-limit/index.ts:48`) — async
+`lib/rate-limit/auth-storage.ts:35`, `lib/rate-limit/index.ts:37`) — async
 functions satisfying an async interface without awaiting, which is correct.
 
 So this is a finding about the **gate**, not about today's code, and it is the
@@ -735,7 +446,7 @@ export const BETTER_AUTH_ALLOWED_PATHS = [
 ```
 
 The intersection of the two lists is **empty**. And the allowlist is enforced
-twice before the plugin could matter: `app.ts:395` only calls `auth.handler` when
+twice before the plugin could matter: `app.ts:382` only calls `auth.handler` when
 `prefix.paths.includes(subPath)`, and `lib/auth.ts:109-113` throws 404 for
 anything else. So no request can reach a path on which this plugin does anything.
 It is inert configuration.
@@ -771,60 +482,17 @@ issue is that the dead registration is load-bearing documentation that is wrong.
 entry no longer describes the code. The _duplication_ and the _inert plugin_ are
 not in that entry.)
 
-### F13 — Bun 1.4 invalidates two specified assertions in `reports/test-strategy.md` §7.3, and the document actively steers away from the case that is now reachable (Medium)
-
-Companion to F4/F5, in a different artefact: the test specification, not the
-code.
-
-`reports/test-strategy.md:817-822` specifies as a requirement to assert:
-
-> **Record and assert the real `app.stop()` semantics** (shipped as four wrong
-> comments…). Measured on `elysia@1.4.29`: `stop()` **does** close the listener…
-> and **what survives is an already-established keep-alive connection, on which a
-> further request is still served. Assert both halves.**
-
-My probe (see F5) shows the second half is false on Bun 1.4.0: the further
-request on the pre-existing keep-alive socket was not served and the socket was
-closed. Anyone implementing §7.3 as written produces a failing test for correct
-runtime behaviour — and the likely resolutions are all bad: weaken the
-assertion, or "fix" the shutdown path to restore a property Bun deliberately
-changed.
-
-`reports/test-strategy.md:836-842` is sharper, because it rules out the exact
-case that is now reachable:
-
-> **Forced shutdown must actually fire when the drain hangs** (shipped)… Assert a
-> non-zero exit and the log line for a hung drain. **This needs a hang _after_
-> `stop()` resolves, not during it: a hang during `stop()` leaves a ref'd handle
-> and masks the defect.**
-
-On Bun 1.3 that was correct test design — a hang _during_ `stop()` was not a
-state production could enter, so exercising it only masked the `unref` bug. On
-Bun 1.4 a hang during `stop()` is trivially reachable from the network (F4: one
-half-sent request), and it is the _worse_ failure, because it also skips the
-store closes. The document's advice therefore now points the test author away
-from the only production-reachable hang.
-
-Failure scenario: §7.3 gets implemented as specified. The suite then encodes
-Bun 1.3 semantics as the expected contract and has no coverage at all for the
-half-sent-request hang. The next Bun upgrade review reads a green suite as
-evidence that shutdown is characterised.
-
-CLAUDE.md, Verification: _"A passing test proves that the test passed; whether
-that settles the question is yours to judge."_ Here the specification would make
-a passing test the wrong answer.
-
 ### F14 — `lib/r2/client.ts` sits outside every convention the rest of the codebase follows (Medium)
 
 This file reads as though written by a different person than everything around
 it, and CLAUDE.md's Consistency section is explicit that this is a defect in
-itself: _"The codebase should read as though one person wrote it."_ Six concrete
-divergences, all in one 399-line file:
+itself: _"The codebase should read as though one person wrote it."_ Five concrete
+divergences remain in this file:
 
 **a. `deleteFromR2` is the one R2 function with no configuration guard.**
-`uploadToR2` (`:78-81`), `copyFileInR2` (`:142-146`) and `getPresignedUrl`
-(`:190-194`) all begin with `if (!validateR2Config) throw new Error('R2 is not
-configured…')`. `deleteFromR2` (`:107-128`) does not. Failure scenario: on a
+`uploadToR2` (`:61-64`), `copyFileInR2` (`:117-121`) and `getPresignedUrl`
+(`:156-160`) all begin with `if (!validateR2Config) throw new Error('R2 is not
+configured…')`. `deleteFromR2` (`:87-106`) does not. Failure scenario: on a
 deploy with `R2_*` unset, the retention sweep (`db/maintenance.ts:280` is the
 production caller) issues a DeleteObject to the literal host
 `https://undefined.r2.cloudflarestorage.com` with `accessKeyId: ''` and fails
@@ -833,19 +501,13 @@ the sentence naming the cause. Already known and written down in a test helper �
 `tests/helpers/object-store.ts:13`: _"`deleteFromR2` has no such [guard]"_ — but
 not fixed and not in `should-ignore.md`.
 
-**b. The doc comment prescribes the opposite of what the code does.**
-`:30-36` says `* - region: 'auto' for R2 compatibility`; `:44` is
-`region: 'weur'`. A reader following the comment would "fix" a working
-configuration. CLAUDE.md Baseline 4-5: a comment must supply what the code
-cannot — this one contradicts it.
-
-**c. Four `try { … } catch (error) { throw error; }` blocks.** Lines 100, 125,
-161, 225 (`grep -n 'throw error;' lib/r2/client.ts` returns exactly those four).
+**b. Four `try { … } catch (error) { throw error; }` blocks.** Lines 83, 105,
+136, 190 (`grep -n 'throw error;' lib/r2/client.ts` returns exactly those four).
 Every one is a no-op that only widens the stack. This is a class of four, not one
 slip.
 
-**d. R2 is the only env group with no boot-time validation.**
-`:11-16` reads all six `R2_*` variables straight from `process.env`, and
+**c. R2 is the only env group with no boot-time validation.**
+`:10-15` reads all six `R2_*` variables straight from `process.env`, and
 `rg` confirms they appear nowhere else in application code.
 `lib/env.server.ts:8-14` states its contract — _"Hard-fail at module-load time
 when a required server env var is missing… Imported by every server-only module
@@ -853,13 +515,13 @@ that depends on these values (auth, DB, rate-limit, captcha, OTP)"_ — and R2 i
 absent from that list. So a deploy missing R2 credentials boots green, passes the
 health check, and fails on the first upload.
 
-**e. Logging convention.** `:203-207` uses
+**d. Logging convention.** `:167-171` uses
 `console.error('[R2] Expiry time …')` — a plain interpolated string, with an
 `[R2]` prefix used nowhere else, at `error` level for a value that was
 successfully clamped (not an error). Every other module in this codebase logs
 `console.error(JSON.stringify({ msg: …, errorClass: … }))`.
 
-**f. `getR2ConfigStatus` leaks values where it reports presence.** `:389-398`
+**e. `getR2ConfigStatus` leaks values where it reports presence.** `:302-311`
 returns `accountId`/`accessKeyId`/`secretAccessKey` as booleans but
 `publicBucket`, `privateBucket` and `publicUrl` as their **actual values**. It
 has no HTTP caller today (only `scripts/probe/dev-live/database/retention-sweep.dev-probe.ts:267`),
@@ -867,54 +529,6 @@ so this is latent rather than live — but the shape invites exposure, and
 `app/api/health/storage/handler.ts:18-19` states the opposite rule for this
 codebase: _"The body reports status only: no paths, schema contents, or row
 counts."_
-
-### F16 — The entire self-service credential surface has no test of any kind (Medium)
-
-Five routes change a user's own credentials, and none of them is referenced
-anywhere under `tests/` or `scripts/`:
-
-```
-$ rg -n 'change-password|change-email|change-phone|forgot-password|passwordless/send' tests/ scripts/
-(no output)
-```
-
-The URL literals that appear anywhere in `tests/` are only these two:
-
-```
-$ rg -o "'/api/[a-z0-9/:._-]+'" tests/ -N --no-filename | sort -u
-'/api/dash/roles'
-'/api/dash/users'
-```
-
-Untested routes, verified individually: `POST /api/dash/users/me/change-password`,
-`POST /api/dash/users/me/change-email`,
-`POST /api/dash/users/me/change-email/verify`,
-`POST /api/dash/users/me/change-phone`,
-`POST /api/dash/users/me/change-phone/verify`,
-`POST /api/auth/forgot-password/send`, `POST /api/auth/forgot-password/reset`,
-`POST /api/auth/passwordless/send`, `GET /api/dash/users/:id`,
-`DELETE /api/dash/users/:id`, `DELETE /api/dash/users/:id/sessions`,
-`GET|PUT|DELETE /api/dash/permissions/:id`, `GET /api/health/storage`,
-`POST /api/internal/sqlite-sweep`, `GET /api/dev/email-test/fixed`.
-
-Failure scenario: these are precisely the endpoints where a regression is a
-credential-boundary failure rather than a broken feature. `change-password` calls
-re-auth (`verifyLoginAttempt`), a HIBP check, an argon2 rehash, a session-revocation
-sweep and an audit write, in a transaction — and `should-ignore.md` "Known
-Issues" #1 and #6, plus entry #54, all describe live race and notification gaps
-in exactly this code. Every one of those accepted risks is accepted without a
-single test pinning the current behaviour, so there is nothing to detect the
-moment an accepted risk turns into a realised one. `forgot-password/reset` is the
-unauthenticated password-reset path; it has no test either.
-
-This is not a gap the strategy document already tracks: `reports/test-strategy.md`
-mentions `forgot-password` exactly once (line 1126, in a note about rate-limit
-keyspaces) and never mentions `change-password`, `change-email` or `change-phone`
-at all.
-
-CLAUDE.md, Verification: _"Write and run a test when reasoning isn't enough."_
-For a re-auth-then-mutate sequence with a documented TOCTOU window, reasoning is
-not enough.
 
 ### F22 — Closing `/openapi.json` (F1) turns the upload route into an enumeration oracle; the two are coupled and only one side knows it (Medium)
 
@@ -1022,17 +636,15 @@ hangs the handler.
 
 Failure scenario, concrete: `POST /api/auth/otp/send` declares no
 `timeoutSeconds` in `routes.ts:71-77`, so it inherits `IDLE_TIMEOUT_SECONDS = 60`
-(`server.ts:178`). The provider accepts the TCP connection and stops responding.
+(`server.ts:214`). The provider accepts the TCP connection and stops responding.
 The transaction has already committed — `utils/otp.ts:579` closes it and `:610`
 is `await sendOtp(channel, sendTo, otpCode, smsMessage)`, deliberately _after_
 the commit — so the row is durable with `nextAllowedAt` set. Result:
 
 1. The user is throttled for the backoff window (`calculateNextAllowedAt`,
    30 s on the first attempt) having received no code.
-2. The client's connection is dropped at ~60 s with an empty body and no error —
-   the exact failure `server.ts:169-171` records as measured (_"a 35-second
-   handler had its connection dropped at 32.1 s with an empty reply and no error
-   body"_).
+2. The client's connection can be dropped at the 60-second ceiling with an empty
+   body and no application error response.
 3. The handler keeps running. For SMS/WhatsApp there is nothing to stop it; for
    email it can sit for up to 600 s.
 4. Those in-flight requests are "busy" connections, so under Bun 1.4 they also
@@ -1087,7 +699,7 @@ Failure scenario: upload a genuine PNG (so the MIME and magic-byte checks at
 a truncated astral character. `handler.ts:111` sanitises it, and
 `lib/r2/upload-helper.ts:160-162` builds the object key
 `temp/${shortId}_${safeName}.${extension}`, which reaches
-`uploadToR2({ key })` → `lib/r2/client.ts:86-96`
+`uploadToR2({ key })` → `lib/r2/client.ts:69-79`
 `new PutObjectCommand({ Key: key })`. A lone surrogate cannot be
 percent-encoded — `encodeURIComponent` on the composed key throws `URIError`
 (measured above). `URIError` is not a `CustomError`, so
@@ -1279,7 +891,7 @@ case 'isEmpty': {
 SQL three-valued logic: `NULL NOT ILIKE '%abc%'` evaluates to NULL, not TRUE, so
 the row is excluded from a predicate that plainly describes it.
 
-The reachable nullable column is `roles.description` — `db/schema.ts:491` is
+The reachable nullable column is `roles.description` — `db/schema.ts:490` is
 `description: varchar('description', { length: ROLE_DESCRIPTION_MAX })` with no
 `.notNull()` (verified), `utils/validation/permissions.ts:159-169` makes it
 `.optional().nullish()` so a POST without one writes NULL, and it is registered
@@ -1325,35 +937,12 @@ per hour, well inside the 60/min per-IP cap.
 Recovery is genuinely protected here — that is what the reserved key buys. The
 finding is that the same reasoning was applied to one of four surfaces.
 
-### F44 — Bun 1.4's `Bun.cron()` removes the primary recorded objection to an in-process sweep, and with it two internet-reachable maintenance endpoints (Medium)
+### F44 — Bun 1.4's `Bun.cron()` can replace two internet-reachable maintenance endpoints (Medium)
 
-This is the brief's third category — _"a relevant Bun 1.4 feature would produce a
-concrete, evidenced improvement in security."_
-
-`lib/sqlite/maintenance.ts:10-25` records the decision and its reasons:
-
-> _"ON THE IN-PROCESS CRON, decided rather than left open: `@elysia/cron` would
-> remove an authenticated, internet-reachable maintenance endpoint from the
-> attack surface, along with `SQLITE_MAINTENANCE_TOKEN` and one gate of the
-> deployment runbook. It is NOT adopted now, for three reasons:_
-> _1. It is another Elysia coupling while the Elysia-versus-Hono question is
-> open, and the trigger would have to be rewritten with the framework._
-> _2. The sweep must run as ONE job. That is a single-process assumption, and
-> Elysia's `reusePort` defaulted to `true` until this pass…_
-> _3. The specific defect that motivated it … is fixed at the source."_
-
-All three arguments are about `@elysia/cron`, a **framework plugin**. Bun 1.4
-ships `Bun.cron()` as a **runtime** API, and that dissolves reason 1 exactly:
-
-- It is not a framework coupling. It survives an Elysia→Hono move untouched,
-  which is precisely the property this module says it needs. The trigger would
-  live next to the work in `lib/sqlite/maintenance.ts`, not in `app.ts`.
-- Reason 2 is already satisfied by this codebase: `app.ts:216` now sets
-  `reusePort: false`, and the module's own text says the single-process
-  assumption _"is only sound now that `reusePort: false` makes a second process
-  fail loudly."_
-- Reason 3 was never an argument against a cron — it records that a _separate_
-  defect was fixed at source.
+`runMaintenanceSweep` is already independent of its trigger, and
+`reusePort: false` enforces the single-process assumption required by an
+in-process schedule. Bun 1.4 supplies a runtime-level cron API, so adopting it
+would not couple the sweep to Elysia.
 
 From the release post: _"Bun.cron() registers a scheduled job with the operating
 system… You can also pass a function instead of a file. Bun runs it on the event
@@ -1365,7 +954,7 @@ Non-overlap matters here — `runMaintenanceSweep` is a bounded batch loop
 What adopting it would concretely remove:
 
 - `POST /api/internal/sqlite-sweep` and `POST /api/internal/db-sweep` as
-  unauthenticated-reachable routes (`routes.ts:291-308`, `preAuth: 'none'`);
+  unauthenticated-reachable routes (`routes.ts:288-305`, `preAuth: 'none'`);
 - `SQLITE_MAINTENANCE_TOKEN` and every gap in **F9** (no length floor, no
   throttle, no failure logging);
 - both paths from the public contract in **F1**;
@@ -1379,81 +968,13 @@ used UTC… To keep the old times, pass `{ tz: 'UTC' }`."_ This project already 
 a timezone concept (`resolveBusinessTimezone`, `utils/config.ts`), so the
 schedule must state its zone explicitly rather than inherit the container's.
 
-Reported as a finding rather than a suggestion because the recorded decision is
-now resting on a premise the runtime has removed, and nothing in the module will
-say so the next time someone reads it.
+### F45 — Tracked documentation still cites the gitignored `TODO.md` as a decision register (Medium)
 
-### F45 — `TODO.md` is gitignored, and eleven tracked source files cite it as the register of deferred decisions (Medium)
-
-```
-$ git ls-files --error-unmatch TODO.md
-error: pathspec 'TODO.md' did not match any file(s) known to git
-$ git check-ignore -v TODO.md
-.gitignore:15:TODO*.md	TODO.md
-```
-
-The file is 17.5 KB on this machine and is referenced by name — often by item ID —
-from tracked source:
-
-| tracked file                          | reference                                              |
-| ------------------------------------- | ------------------------------------------------------ |
-| `server.ts:174`                       | _"the target VPS, which is recorded in `TODO.md`"_     |
-| `routes.ts:267`                       | _"NOT measured on the target host yet — see TODO.md"_  |
-| `db/index.ts:60`                      | _"(TODO.md items 2 and 3)"_                            |
-| `db/schema.ts:105`                    | _"needs a migration — tracked in `TODO.md`"_           |
-| `lib/id.ts:20`                        | _"`TODO.md` EM-5 for the decision"_                    |
-| `lib/http/openapi.ts:24`              | _"That trade is recorded in `TODO.md`"_                |
-| `lib/auth/rotation.ts:56`             | _"see the verification-session TTL item in TODO.md"_   |
-| `lib/sqlite/maintenance.ts:27`        | _"Recorded in TODO.md so the decision is revisitable"_ |
-| `lib/sqlite/database.ts:101`          | _"as an open decision in TODO.md"_                     |
-| `scripts/find-unused-files.ts:85`     | _"recorded in TODO.md"_                                |
-| `docs/framework-migration.md:125,129` | _"`TODO.md` EM-1"_, _"`TODO.md` EM-6"_                 |
-
-plus `bench/uuid/README.md` and `bench/image/README.md`, and the CI gate's own
-justification (`.github/workflows/ci.yml:44-46`: _"which is tracked in
-TODO.md"_).
-
-Failure scenario: CLAUDE.md §1 states this repository _"is the **starter kit** for
-most of my upcoming projects."_ Clone it and you get eleven source files pointing
-at a register that is not there — including the deferred measurements that make
-several **numbers in the code** provisional (`IDLE_TIMEOUT_SECONDS`, the upload
-route's 120 s ceiling, `MAX_IMAGE_SIZE = 1 // placeholder`). Each of those reads
-as a settled value with a pointer to the reasoning, and the pointer resolves to
-nothing. The same applies to a second machine, to CI, and to anyone reviewing a
-PR. It also means the knip backlog (F11) and the `utils/images/server.ts`
-exemption (F38) are both "tracked" in a file no reviewer can open.
-
-The ignore rule is `TODO*.md`, a pattern rather than a path — so this was almost
-certainly aimed at scratch files like `TODO-notes.md` and caught the register
-too. (`CLAUDE.md` and `/prompt-*.md` are ignored by the same block; those read as
-deliberate personal-workflow exclusions and I am not reporting them. `TODO.md` is
-different precisely because tracked code depends on it.)
-
-CLAUDE.md, Baseline 4-5: a comment must supply what the code cannot. Eleven of
-them delegate that job to a file the reader does not have.
-
-### F2 — `openApiConsistencyProblems` is documented as exported and is not (Low)
-
-`lib/http/openapi.ts:391` states: _"Exported so it can be asserted directly,
-rather than only through the 500 that `openApiDocument` raises."_ Line 392 is
-`function openApiConsistencyProblems(` — no `export`. Verified by grep: the only
-references anywhere are the definition, the one internal call at line 445, and
-three report files that repeat the false claim
-(`reports/test-strategy.md:612` — _"`openApiConsistencyProblems(manifest)` is
-exported for this"_, `reports/elysia-migration-verification-response.md:663` —
-_"is now real and exported"_).
-
-Failure scenario: a test author follows `reports/test-strategy.md:612` and writes
-`import { openApiConsistencyProblems } from '@/lib/http/openapi'`. It does not
-compile. The consequence is not the compile error but what it has already cost:
-the four consistency rules at `openapi.ts:405-427` have **no direct test**, and
-their only coverage is the indirect 500 in `scripts/smoke.ts:79`. The stated
-reason for exporting — asserting the rules directly rather than through a 500 —
-is exactly the coverage that is missing.
-
-CLAUDE.md, Baseline 4: _"Comment only where a reader would ask *why* and the
-answer isn't recoverable from the code."_ A comment asserting a property the code
-does not have is worse than none — it was believed by two later documents.
+The source-comment part of this finding is resolved: no code comment now
+outsources its rationale to `TODO.md`. Six non-comment references remain in
+`bench/image/README.md`, `bench/uuid/README.md`, and
+`docs/framework-migration.md`. They are outside this comment-only write scope,
+but still point tracked documentation at a file Git ignores.
 
 ### F3 — The two dev-only endpoints answer a production probe differently (Low)
 
@@ -1475,47 +996,6 @@ one… where patterns compete, adopt the dominant one and note the divergence."_
 The dominant pattern here is the documented one, and the divergence is not noted.
 The interim mitigation — block `/api/dev/` at the edge so the divergence is not
 visible from the internet — is `reports/coolify-deployment.md` §5.
-
-### F5 — Bun 1.4 invalidates the recorded measurement that justifies the after-response settle loop (Low)
-
-`server.ts:254-257` states as measured fact:
-
-> _"What survives is an ALREADY-ESTABLISHED keep-alive connection: a second
-> request written on a socket opened before the stop was still served after it
-> resolved. So requests can still arrive during the drain, which is what the
-> settle loop in `lib/http/after-response.ts` exists for."_
-
-That is no longer true on Bun 1.4, which closes idle keep-alive connections
-immediately on `stop()`. Reproduced:
-
-```
-$ bun keepalive.ts
-{ "bun": "1.4.0",
-  "firstRequestServed": true,
-  "stopResolvedInMs": 2,
-  "secondRequestWriteError": null,
-  "secondRequestServed": false,
-  "rawAfterStop": "\"<CLOSED>\"" }
-```
-
-Request 1 on the keep-alive socket was served; `stop()` resolved in 2 ms; the
-second request written on that same socket after `stop()` resolved was **not**
-served and the socket was closed.
-
-Failure scenario: this is a comment, so it misleads a reader rather than a
-client — but it is load-bearing, which is why it is worth reporting. It is the
-stated justification for the settle loop in `lib/http/after-response.ts`, and the
-next person to touch shutdown will reason from a premise the runtime no longer
-supports: either keeping a loop for a case that cannot happen, or removing it
-after discovering the premise is false without noticing that F4 introduced a
-_different_ reason to keep a bounded drain. The comment is careful to say
-"re-measured on `elysia@1.4.29`" — but `stop()` is Bun's, not Elysia's
-(the comment says so itself: _"a thin delegate to `Bun.serve`'s"_), and the Bun
-version moved underneath the measurement.
-
-CLAUDE.md, _Before claiming a defect_: _"Check the **installed** version of the
-library, not your memory of it."_ The same duty applies to a recorded measurement
-that a later runtime upgrade silently invalidates.
 
 ### F7 — `constants/index.js` is a one-constant barrel with one consumer, in the wrong language and the wrong place (Low)
 
@@ -1560,7 +1040,7 @@ Three gaps compounding in one trust boundary:
    floor, not a strength test — no regex can prove randomness"_). That reasoning
    applies verbatim here and is not applied. `SQLITE_MAINTENANCE_TOKEN=x` is
    accepted at boot.
-2. **No throttle.** `routes.ts:291-308` declares `preAuth: 'none'` for both
+2. **No throttle.** `routes.ts:288-305` declares `preAuth: 'none'` for both
    `POST /api/internal/sqlite-sweep` and `POST /api/internal/db-sweep`, and
    `app/api/health/storage/handler.ts:50-59` gates `?deep=1` on the same token
    behind `preAuth: 'none'` (`routes.ts:273-288`). Token guesses are therefore
@@ -1628,29 +1108,12 @@ Unused files (4)
 hit `RangeError: Array buffer allocation failed` in `oxc-parser` under concurrent
 memory pressure; not reproducible, so no finding is made about knip's usability.)
 
-### F11 — `knip` is a devDependency with a 95-line config that no gate ever runs (Low)
+### F11 — CI gates Knip's unused-file check but leaves its export checks advisory (Low)
 
-`knip.jsonc` is a maintained 95-line configuration and `knip` is a devDependency,
-but nothing enforces it. `.github/workflows/ci.yml:41-48` runs the scanner alone
-and says so:
-
-> _"The scanner alone, not `bun run find:unused-files`, which also runs knip. Knip
-> currently reports 85 unused exports and 34 unused exported types that predate
-> this work; gating on it would fail every build until that is cleaned up, which
-> is tracked in TODO.md."_
-
-`lefthook.yml:64` likewise runs `bun scripts/find-unused-files.ts`, not the
-`find:unused-files` script that chains knip. So `bun run find:unused-files`
-(`package.json:17`) is the only path that invokes knip, and it is invoked by no
-gate.
-
-Failure scenario: a config that no gate reads drifts silently — a `@knipignore`
-added for a file that later becomes genuinely dead keeps it invisible, and the
-85-export backlog the CI comment records has no mechanism that stops it growing.
-The deliberate exclusion is documented and reasonable as a decision; what makes
-it a finding is that there is no ratchet, so the gap can only widen. This is the
-"configured but not enforced" case the brief names, and it is the only one I found
-where the tool itself works (verified above) and the config is current.
+`.github/workflows/ci.yml` runs `bunx knip --include files`, while the full
+`bun run find:unused-files` command also checks unused exports and types. Those
+categories can therefore regress without failing CI. Widen the gate once the
+remaining export findings are resolved.
 
 ### F15 — Four exported functions in `lib/r2/client.ts` have no production caller and each is hidden from the dead-code scanner with `@knipignore` (Low)
 
@@ -1659,18 +1122,18 @@ only hits are the definitions themselves:
 
 | export              | line | `@knipignore` at | production callers |
 | ------------------- | ---- | ---------------- | ------------------ |
-| `copyFileInR2`      | 135  | 133              | none               |
-| `getPresignedUrl`   | 175  | 172              | none               |
-| `getPublicUrl`      | 246  | 240              | none               |
-| `isAllowedMimeType` | 263  | 261              | none               |
+| `copyFileInR2`      | 110  | 109              | none               |
+| `getPresignedUrl`   | 141  | 140              | none               |
+| `getPublicUrl`      | 195  | 194              | none               |
+| `isAllowedMimeType` | 207  | 206              | none               |
 
 `tests/helpers/object-store.ts:54` independently confirms one of them:
 _"`getPresignedUrl` has no production caller to vary it for."_
 
 Failure scenario: `isAllowedMimeType` is the one that matters, because it is a
 security helper with a **fail-open default** —
-`if (!allowedTypes || allowedTypes.length === 0) return true; // Allow all if no
-restrictions` (`:266-268`). It is dead today, so it protects nothing and harms
+`if (!allowedTypes || allowedTypes.length === 0) return true` (`:211-213`). It is
+dead today, so it protects nothing and harms
 nothing. The risk is the shape it leaves lying around: the next author who needs
 MIME filtering finds a ready-made helper whose empty-list case admits everything,
 and a caller that resolves its allowlist from configuration would silently accept
@@ -1679,9 +1142,8 @@ any upload if that configuration were missing. The real MIME gate lives elsewher
 divergent implementation of the same concept — the F12 pattern again.
 
 The `@knipignore` markers are what make this invisible: 20 of them across the
-repo, four in this one file. Combined with F11 (no gate runs knip at all), the
-dead-code signal is suppressed twice — once by the annotation and once by the
-absent gate.
+repo, four in this one file. CI's file-only Knip gate does not inspect exports,
+so the annotations still hide these from the gated category.
 
 Same class, worth naming because it is more dangerous than a dead function:
 `utils/validation/rules.ts:163-164` is `/** @knipignore */ export const
@@ -1698,7 +1160,7 @@ validation.
 import type { ColumnSort } from '@tanstack/react-table';
 ```
 
-used once, at `types/data-table.ts:41`:
+used once, at `types/data-table.ts:9`:
 
 ```ts
 export interface ExtendedColumnSort<TData> extends Omit<ColumnSort, 'id'> {
@@ -1709,9 +1171,7 @@ half of it — so the entire value drawn from the package is `{ desc: boolean }`
 
 There is no React in this repository: no `.tsx` file exists
 (`rg --files --glob '*.tsx'` → empty), no module imports `react`, and `react` is
-not in `dependencies` or `devDependencies`. The same file carries 25 lines of
-commented-out React module augmentation (`types/data-table.ts:5-35`) referencing
-`RowData`, `React.FC`, `SVGProps` — the leftover of a front-end that is not here.
+not in `dependencies` or `devDependencies`.
 
 Failure scenario: a React table library sits in `dependencies` (not
 `devDependencies`), so it ships. Bun 1.4's new `bun prune --production` cannot
@@ -1783,7 +1243,7 @@ tooling.
 
 ### F20 — No `unhandledRejection` / `uncaughtException` handler: an escaped async error hard-kills the process and bypasses the entire shutdown design (Low)
 
-`server.ts:356-359` registers handlers for `SIGTERM` and `SIGINT` and nothing
+`server.ts:312-315` registers handlers for `SIGTERM` and `SIGINT` and nothing
 else. Grep confirms neither `unhandledRejection` nor `uncaughtException` is
 registered anywhere in the repository:
 
@@ -1811,19 +1271,19 @@ rejection is an immediate, total outage of a single-process deployment
 
 **Stated honestly: I found no reachable trigger in application code.** I checked
 the paths that could produce one and they are all defended:
-`lib/http/after-response.ts:102-119` isolates every task in its own `try/catch`
-and its drain uses `Promise.all(inFlight).catch(() => {})` (`:198`);
+`lib/http/after-response.ts:31-59` isolates every task in its own `try/catch`
+and its drain uses `Promise.all(inFlight).catch(() => {})` (`:100`);
 `lib/auth/passwordless.ts:209` has a `.catch(() => {})`; and the single
-`void`-ed promise in application code, `server.ts:358` `void shutdown(signal)`,
-cannot reject because `shutdown` swallows everything (`:315-332`) and the store
-closes are individually wrapped (`:339-354`). So this is a resilience gap, not a
+`void`-ed promise in application code, `server.ts:314` `void shutdown(signal)`,
+cannot reject because `shutdown` catches its drain errors (`:264-282`) and the
+store closes are individually wrapped (`:295-310`). So this is a resilience gap, not a
 live defect — the same shape as F8.
 
 Failure scenario, and why it is still worth reporting: the sources that remain
 are the ones application code does not wrap — the `Bun.SQL` pool
 (`db/index.ts:48`) and `bun:sqlite` raising asynchronously outside a query
-`await`, and any future post-response caller (`enqueueAfterResponse` has, by its
-own comment at `lib/http/after-response.ts:67`, _"NO CALLER YET"_). When one
+`await`, and any future post-response caller (`enqueueAfterResponse` currently
+has no production caller). When one
 fires, the outcome is strictly worse than a normal stop: `shutdown()` never runs,
 so `closeDatabase`, `closeRateLimitStore` and `closeCacheStore` are all skipped,
 the after-response queue is dropped, and the only record is a raw multi-line
@@ -1842,20 +1302,14 @@ This codebase uses `node:crypto` (`lib/sqlite/maintenance-token.ts:10`) and
 registering only `unhandledRejection` would already be the wrong choice on 1.4.0.
 
 CLAUDE.md, Stability dimension of the brief: _"unhandled rejections,
-startup/shutdown paths, resource leaks."_ `server.ts` invests ~130 lines in a
-correct, bounded, logged shutdown; nothing guarantees that path is the one taken.
+startup/shutdown paths, resource leaks."_ `server.ts` implements a bounded,
+logged shutdown; nothing guarantees that path is the one taken.
 
-### F21 — Bun 1.4 makes the `Set-Cookie` re-append workaround unnecessary, and its stated premise is false on the pinned runtime (Low)
+### F21 — Bun 1.4 makes the `Set-Cookie` re-append workaround unnecessary (Low)
 
-This is the brief's second category — _"the code retains a workaround that Bun
-1.4 makes unnecessary."_
-
-`lib/http/response-policy.ts:56-63`:
+`lib/http/response-policy.ts`, in the immutable-header fallback:
 
 ```ts
-// `getSetCookie` is the only way to carry repeated `Set-Cookie` values
-// through a copy; `new Headers(headers)` folds them into one comma-joined
-// line, which browsers reject.
 const cookies = response.headers.getSetCookie();
 if (cookies.length > 0) {
   headers.delete('set-cookie');
@@ -1877,76 +1331,22 @@ $ bun -e '…append two set-cookie + two x-dup, then new Headers(h)…'
 }
 ```
 
-The copy carries both cookies as separate entries. The comment's premise — that
-`new Headers(headers)` _"folds them into one comma-joined line"_ — describes only
-what `.get('set-cookie')` returns, which is the documented Fetch-spec behaviour
-for `get()` on a multi-valued header and is unrelated to what goes on the wire.
-Bun 1.4's header change says so explicitly: _"Set-Cookie still comes back as
-separate values from `getSetCookie()`."_ And in Bun 1.4 the same comma-folding
-now applies to `x-dup` too (`"first, second"` above), which is the general
-behaviour change, not a `Set-Cookie` defect.
-
-Failure scenario: none at runtime — the workaround is idempotent (delete, then
-re-append the same values in the same order), so it is dead weight rather than a
-bug. The cost is the comment: it records a runtime behaviour that does not exist,
-in the one function that every response in the application passes through, and it
-is the kind of claim a later reader will trust rather than re-measure. The
-`getSetCookie()` call itself is still the correct way to enumerate the values;
-what is obsolete is the delete-and-re-append, and the reason given for it.
-
-CLAUDE.md, _Before claiming a defect_: _"A behaviour you remember from an earlier
-version is a hypothesis, not a bug report."_ Applies symmetrically to a
-workaround kept for a behaviour that is no longer there.
-
-### F23 — `MAX_REQUEST_BODY_BYTES` is 8× the largest body any route accepts, and its comment claims a derivation that does not exist (Low)
-
-`app.ts:137-138`:
-
-```ts
-/** Body big enough for the largest legitimate upload plus multipart framing. */
-export const MAX_REQUEST_BODY_BYTES = 8 * 1024 * 1024;
-```
-
-The largest legitimate upload is 1 MiB, not 8:
-`utils/validation/constants.ts:4` is `export const MAX_IMAGE_SIZE = 1; // MB`,
-`app/api/upload/image/handler.ts:21` is
-`const MAX_FILE_SIZE = MAX_IMAGE_SIZE * 1024 * 1024`, and
-`:22` is `const MAX_FILES_PER_REQUEST = 1`. So one file, 1 MiB, plus multipart
-framing — a few hundred bytes. 8 MiB is not that number.
-
-Failure scenario: the comment asserts the constant is derived from the upload
-limit, so a future change to `MAX_IMAGE_SIZE` reads as automatically covered when
-it is not. Raise `MAX_IMAGE_SIZE` to 10 and the route silently starts rejecting
-at the _framework_ layer with Bun's own 413 instead of the handler's
-`uploadMsg.fileTooLarge` envelope — the client gets a different error shape for
-the same mistake, and the handler's message is unreachable. In the other
-direction, every admitted request may currently buffer up to 8 MiB for a body
-that will be refused above 1 MiB.
-
-The proxy-side consequence — that 8 MiB is the number Cloudflare and Traefik are
-aligned to, that it may be set tighter, and that it must never be set below what
-the application accepts — is `reports/coolify-deployment.md` §5.
-
-This is worth reporting mainly because the codebase does this correctly
-elsewhere and clearly knows the pattern: `app.ts:149-152`
-(`MAX_ROUTE_TIMEOUT_SECONDS` reduced from the route table) and
-`server.ts:203-204` (`SHUTDOWN_TIMEOUT_MS` derived from two ceilings, with a
-comment explaining precisely why writing the number twice is wrong). The same
-argument applies here and was not applied. CLAUDE.md, Consistency: _"where
-patterns compete, adopt the dominant one."_
+The copy already carries both cookies as separate entries. The block is
+idempotent, so it has no runtime failure scenario; it is unnecessary work in the
+fallback path and can be removed.
 
 ### F26 — Two log sites bypass the structured-logging convention with a bracket-prefixed string (Low)
 
 Every log call in this codebase emits one JSON object — `console.error(JSON.stringify({ msg, … }))`
 or `console.error(sanitizeForLog({ msg, … }))` — with `msg` as a dotted or
 spaced key (`'otp.provider.failed'`, `'server stopping'`, `'hibp.degraded'`).
-`lib/http/after-response.ts:138-148` is the access log and defines the shape.
+`lib/http/after-response.ts:62-71` is the access log and defines the shape.
 
 Two sites do not:
 
 - `lib/captcha.ts:32` —
   `console.error('[captcha] TURNSTILE_SECRET_KEY missing — rejecting request');`
-- `lib/r2/client.ts:203-207` —
+- `lib/r2/client.ts:167-171` —
   ``console.error(`[R2] Expiry time ${expiresIn}s is out of range. Using ${validExpiry}s instead. …`)``
   (also at `error` level for a value that was successfully clamped — see F14e)
 
@@ -1966,7 +1366,7 @@ than any individual variation being slightly better."_
 
 ### F34 — `positiveInt` accepts non-canonical number spellings and substitutes a default for out-of-range, which the sibling paginator explicitly refuses (Low)
 
-`utils/index.ts:425-429`:
+`utils/index.ts:423-427`:
 
 ```ts
 export const positiveInt = (val: unknown, maxValue = MAX_ID) => {
@@ -1976,8 +1376,8 @@ export const positiveInt = (val: unknown, maxValue = MAX_ID) => {
 };
 ```
 
-`app/api/dash/users/[id]/sessions/pagination.ts:104-124` documents this exact
-defect class and fixes it locally, for the same concept:
+`app/api/dash/users/[id]/sessions/pagination.ts:96-124` rejects this exact
+input class locally, for the same concept:
 
 > _"Canonical decimal integers only. `Number()` accepts a whole family of
 > spellings a query string has no business carrying — `1e2`, `0x10`, `+1`,
@@ -2071,7 +1471,7 @@ grant at all.
 
 ### F37 — `serializeLogValue`'s `seen` set is visit-scoped, so a shared reference is reported as `[circular]` (Low)
 
-`utils/index.ts:317` and `:327`:
+`utils/index.ts:315` and `:325`:
 
 ```ts
 if (seen.has(obj)) return '[circular]';
@@ -2093,51 +1493,6 @@ reused across fields — loses the second copy and tells the reader there is a
 cycle where there is none. During an incident that is a false lead about the
 shape of the data, in the one artefact the responder has. Correct form is a
 path-scoped set (add before recursing, delete after).
-
-### F38 — The CI dead-code gate carries a named exemption for the live SVG sanitiser, justified by a directory that no longer exists (Low)
-
-`scripts/find-unused-files.ts:78-88`:
-
-```
- * `utils/images/server.ts` — a second, DIVERGENT copy of the server-side SVG
- * sanitiser/optimiser. The live one is `utils/svg/server.ts`
- * (`lib/r2/upload-helper.ts` imports it); … only this file is orphaned.
- */
-const KNOWN_UNREACHABLE = new Set(['utils/images/server.ts']);
-```
-
-Three of those claims are false today:
-
-```
-$ ls utils/svg/
-ls: cannot access 'utils/svg/': No such file or directory
-
-$ rg -n "from '@/utils/images" lib/
-lib/r2/upload-helper.ts:14:import { sanitizeSvgServer, svgOptimizerServer } from '@/utils/images/server';
-```
-
-`utils/images/server.ts` is the **live** SVG sanitiser on the image-upload path,
-not an orphaned duplicate, and the file said to be live does not exist. The
-exemption is currently inert — the gate passes without needing it:
-
-```
-$ bun scripts/find-unused-files.ts
-No unreachable files. Every file is reachable from an entry point.
-gate exit=0
-```
-
-Failure scenario: this is a real CI gate (`.github/workflows/ci.yml:49`) and the
-exemption is permanent. If `utils/images/server.ts` ever _does_ become orphaned —
-for instance if `upload-helper.ts` moves SVG handling to `Bun.Image` — the gate
-stays silent about the security-relevant sanitiser being dead, which is the one
-case the exemption most needs to stop covering. The comment says an entry here
-_"is a decision someone has to defend"_; the decision it defends is no longer the
-one in front of it.
-
-Same stale reference in the test specification:
-`reports/test-strategy.md:1268` and `:1275` require tests _"against both copies:
-`utils/svg/server.ts` and `utils/images/server.ts`"_ — half of which cannot be
-written. Same class as F13.
 
 ### F40 — The HIBP network call and the argon2 hash run before any check on the _target_ user (Low)
 
@@ -2166,13 +1521,7 @@ calls sit one statement away from the checks that would have refused.
 Distinct from `should-ignore.md` #45 (synchronous hashing as a throughput
 concern) and #52 (HIBP fail-open/timeout): the claim here is ordering.
 
-### F41 — The daily OTP spend breaker allows 2× the day's budget in one second at the UTC boundary, which its own justification does not cover (Low)
-
-`lib/rate-limit/index.ts:33-40` accepts the fixed-window 2× boundary burst and
-adds:
-
-> _"For the global daily OTP budget a fixed window is also the more faithful
-> model: it IS a calendar-day cost cap, not a rolling one."_
+### F41 — The daily OTP spend breaker allows 2× the day's budget in one second at the UTC boundary (Low)
 
 With `OTP_GLOBAL_SEND_CAP_PER_DAY = 2000` and `window = ONE_DAY_S`
 (`lib/rate-limit/api.ts:121`, `:200-206`), `windowStart = now - (now % 86_400_000)`
@@ -2180,13 +1529,8 @@ is UTC midnight.
 
 Failure scenario: 2000 charges at `23:59:59.999Z` and 2000 at `00:00:00.000Z`
 dispatch **4000 paid messages inside one second**, and leave the whole of day two
-at zero. The sustained-rate argument in that docstring holds; the _cost_ argument
-does not — a spend cap that can be doubled in a burst is not a spend cap, and
-this breaker exists specifically because _"~2000 requests naming nonexistent
-addresses exhausted a full day of delivery for the whole application at zero cost
-to the attacker"_ (`api.ts:187-195`). This is the one claim in that docstring the
-code does not support. Cheap to close (anchor the daily key on a rolling counter,
-or halve the cap across two staggered windows).
+at zero. A spend cap that can be doubled in a burst is not a strict daily cap.
+Anchor it on a rolling counter or halve the cap across staggered windows.
 
 ### F42 — `ipIdentifier`'s failure log emits present, IP-bearing headers, which is the opposite of the boundary rule the sibling module states (Low)
 
@@ -2389,47 +1733,13 @@ Same shape as the other two — a leading plain string, so the line has no `msg`
 key to match on, and here a second argument as well. It fires when the
 post-change session-cookie refresh fails, which is the moment a user's cached
 identity is known to be stale. Read F26 as covering `lib/captcha.ts:32`,
-`lib/r2/client.ts:203-207` and this site.
-
-### Correction to F5 — the stale keep-alive measurement is recorded in three places, not one
-
-F5 quotes `server.ts:254-257` and names `lib/http/after-response.ts` only as the
-consumer of the claim. It is not just the consumer — it repeats the measurement
-verbatim at `lib/http/after-response.ts:166-171`:
-
-> _"An earlier revision of this comment gave the wrong reason for that — it
-> claimed `Elysia.stop()` does not close the listening socket. It does:
-> re-measured on `elysia@1.4.29`, a new connection is refused as soon as
-> `stop()` resolves. **What survives is an ALREADY-ESTABLISHED keep-alive
-> connection, on which a further request is still served.** The hole is real…"_
-
-So the claim my probe falsified on Bun 1.4.0 is written down in three artefacts:
-`server.ts:254-257`, `lib/http/after-response.ts:166-171`, and
-`reports/test-strategy.md:817-822` (as a required assertion — F13). All three are
-one class and move together.
+`lib/r2/client.ts:167-171` and this site.
 
 ### Classes checked in pass 2 and found complete
 
-- **Comments claiming a symbol is exported when it is not.** Swept every
-  `Exported (for|so|because)` / `is exported` comment in tracked source.
-  Three others make the claim and all three are true: `utils/index.ts:374-376`
-  (`export function serializeForLog`), `lib/http/pre-auth.ts:25-29`
-  (`export function preAuthScope`), `app.ts:40-47` (`export const ROUTE_MANIFEST`).
-  `lib/http/openapi.ts:389-392` (F2) is the only false one — the class is a
-  single instance.
-- **Version-pinned "measured on" claims that Bun 1.4 could have invalidated.**
-  Swept all 25. The Bun-pinned ones (`db/index.ts:15`, `db/schema.ts:64`,
-  `lib/sqlite/database.ts:65`, `lib/sqlite/driver.ts:110`, `lib/id.ts:19`,
-  `tests/helpers/*`) all state Bun 1.4.0 and remain accurate. The Elysia-pinned
-  ones that do not touch `stop()` (`app.ts:187`, `app.ts:378`,
-  `lib/http/response-policy.ts:7`, `lib/http/route-manifest.ts:166`) concern
-  routing and header precedence, which Bun 1.4 does not change. Only the
-  `stop()`/keep-alive claim is stale, and it is the one corrected above.
-- **Two implementations of one concept.** Three candidate pairs examined.
+- **Two implementations of one concept.** Two candidate pairs examined.
   `haveIBeenPwned` plugin vs `lib/auth/check-password.ts` — real, reported as
-  **F12**. `utils/svg/*` vs `utils/images/*` — resolved in the working tree
-  (`utils/svg/` deleted); only the stale references remain, reported as **F38**.
-  `db/maintenance.ts` vs `lib/sqlite/maintenance.ts` — **not** a defect: they are
+  **F12**. `db/maintenance.ts` vs `lib/sqlite/maintenance.ts` — **not** a defect: they are
   different jobs against different stores on different schedules, and the
   directory prefix carries the distinction.
 - **Fail-open/fail-closed asymmetry across limiter call sites.** All 27 sites
@@ -2439,42 +1749,3 @@ one class and move together.
   fail-**closed** `enforcePreAuthIpLimit` ahead of the handler — so a store
   outage 503s before the fail-open limiter is reached. Not a defect. This is also
   what showed F24's premise to be false; F24 is withdrawn above.
-
-## Pass 3 — confirmation
-
-Pass 3 re-walked the worklist against the findings list looking for any unit
-where pass 1 recorded a conclusion that pass 2's cross-cutting view contradicts.
-It surfaced **nothing new** — no new findings, and no further corrections beyond
-the two above.
-
-**The run ended on pass 3**, the second consecutive pass to surface no new
-finding (pass 2 produced two corrections to existing findings and no new ones;
-pass 3 produced neither).
-
-One coverage limit worth stating rather than leaving implicit: `tests/`,
-`bench/` and `docs/` were swept for _what they assert about the application_ —
-which is where F13, F16, F18 and F38 came from — and not audited as software in
-their own right. `bench/s3/` in particular is 8 test files of untracked
-in-progress work whose own correctness I did not review; `bench/s3/README.md`
-was read and its conclusions were taken as given (see the B9 entry under
-"Deliberately swept").
-
-## Open
-
-Empty at the end of the run, as required. Both entries opened during the sweep
-were resolved:
-
-- **O1 — "the Coolify health check omits PostgreSQL".** Resolved into a finding:
-  **F47**. `should-ignore.md` #8 covers _having no health check_; this endpoint
-  exists, is used as the readiness probe, and asserts `ok` while the primary
-  datastore is unreachable — a different proposition, so it is reported at Low.
-- **O2 — "Bun 1.4 duplicate-header combining vs. header consumers".** Resolved to
-  **no finding**, and deleted rather than promoted. I inventoried every
-  `headers.get()` consumer in application code:
-  `x-maintenance-token` (3 sites), `content-type`, `x-captcha-response`,
-  `cf-connecting-ip`, `user-agent`, `x-forwarded-for`, `host`. Every one
-  either compares for equality — so a comma-joined duplicate fails the compare and
-  the request fails **closed** — or is only logged. `cf-connecting-ip` is
-  validated by `IP_SCHEMA` (`lib/audit.ts:65`) and a combined value is
-  rejected, and `getSetCookie()` is unaffected by the change (see F21). Nothing
-  is weakened.

@@ -261,11 +261,8 @@ export const ROUTES: readonly RouteDefinition[] = [
         enum: DASHBOARD_PAGE_NAMES,
       },
     ],
-    // Image processing, two parallel R2 operations and a database insert can
-    // exceed the server-wide ceiling on a small VPS, and the client then sees a
-    // dropped connection rather than an error body. NOT measured on the target
-    // host yet — see TODO.md; this is a deliberately generous ceiling, to be
-    // replaced by a measured one.
+    // Image processing may outlast the global ceiling; timing out here drops
+    // the connection without an error body.
     timeoutSeconds: 120,
   },
 

@@ -17,6 +17,8 @@
  * What it does NOT prove: anything requiring PostgreSQL or the network. No
  * endpoint touched here opens a database connection.
  */
+import { SECURITY_HEADERS } from '@/lib/http/security-headers';
+
 const PORT = Number(process.env.SMOKE_PORT ?? 3999);
 const BASE = `http://127.0.0.1:${PORT}`;
 const BOOT_TIMEOUT_MS = 30_000;
@@ -92,6 +94,13 @@ async function runChecks(health: Response): Promise<Check[]> {
       ? Object.keys(contractBody.paths).length
       : 0;
 
+  const wrongHeaders = Object.entries(SECURITY_HEADERS)
+    .filter(([name, expected]) => health.headers.get(name) !== expected)
+    .map(
+      ([name, expected]) =>
+        `${name}=${health.headers.get(name)} want ${expected}`
+    );
+
   return [
     {
       name: 'readiness reports ok',
@@ -99,11 +108,22 @@ async function runChecks(health: Response): Promise<Check[]> {
       detail: `HTTP ${health.status} status=${healthBody.status}`,
     },
     {
-      name: 'security headers present',
-      ok:
-        health.headers.get('x-content-type-options') === 'nosniff' &&
-        health.headers.get('content-security-policy') !== null,
-      detail: `csp=${health.headers.get('content-security-policy')}`,
+      // By VALUE, not by presence. This checked
+      // `content-security-policy !== null`, which a regression to
+      // `default-src *` passes — and weakening a CSP is far likelier than
+      // deleting one. Compared against the production constant rather than a
+      // copy, which would drift and keep passing.
+      //
+      // Every header, not only the CSP: `X-Frame-Options`, `Referrer-Policy`
+      // and the cross-origin trio had no assertion anywhere. The child server
+      // inherits this process's environment, so its `isProduction` — and
+      // therefore whether HSTS is in the set — matches the constant here.
+      name: 'security headers present, with their exact values',
+      ok: wrongHeaders.length === 0,
+      detail:
+        wrongHeaders.length === 0
+          ? `all ${Object.keys(SECURITY_HEADERS).length} headers match`
+          : wrongHeaders.join('; '),
     },
     {
       name: 'unknown route returns the API envelope',

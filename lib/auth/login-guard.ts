@@ -15,8 +15,17 @@ import {
   verifyPasswordDetailed,
 } from './password';
 
-const MAX_FAILED_ATTEMPTS = 5;
-const LOCK_DURATION_SECONDS = 5 * 60; // 5 minutes
+/**
+ * The lockout thresholds.
+ *
+ * Exported so a test can assert the boundary rather than restate the numbers.
+ * `tests/integration/sign-in-controls.test.ts` drives exactly
+ * `MAX_FAILED_ATTEMPTS` wrong passwords and asserts the lock engages on that
+ * attempt and not the one before; with the values mirrored in the test, a change
+ * here would move the behaviour and the assertion together and prove nothing.
+ */
+export const MAX_FAILED_ATTEMPTS = 5;
+export const LOCK_DURATION_SECONDS = 5 * 60; // 5 minutes
 
 interface AuditMeta {
   ip: string | null;

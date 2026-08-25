@@ -210,57 +210,23 @@ const { closeRateLimitStore } = await import('./lib/rate-limit/store');
 const { closeCacheStore } = await import('./lib/cache');
 const { closeDatabase } = await import('./db');
 
-/**
- * The server-wide request ceiling.
- *
- * Set explicitly rather than inherited: Elysia defaults `Bun.serve`'s
- * `idleTimeout` to 30 seconds and Node/Next had no per-request equivalent, so
- * the migration introduced a ceiling nobody chose. Measured on the pinned
- * versions: a 35-second handler had its connection dropped at 32.1 s with an
- * empty reply and no error body.
- *
- * 60 is a deliberate placeholder, not a measurement — the value that belongs
- * here depends on the target VPS, which is recorded in `TODO.md`. Routes that
- * legitimately outlast it raise their own ceiling per request; see
- * `routes.ts`.
- */
+/** Keeps the global request ceiling explicit for route and shutdown coordination. */
 const IDLE_TIMEOUT_SECONDS = 60;
 
 /**
- * How long a stop waits before it stops being polite.
- *
- * DERIVED from the longest a request may legitimately run, not a round number.
- * A forced exit below that ceiling is not a drain: it aborts precisely the long
- * request the timeout exists to permit — the upload route allows 120 s while a
- * flat 15 s bound would kill it at 15. The `+ 15 s` covers the post-response
- * queue and the store closes after the last request finishes.
- *
- * BOTH ceilings are in the max, and the second one is not decoration. Every route
- * that does not set its own `timeoutSeconds` may still run for
- * `IDLE_TIMEOUT_SECONDS`, so the per-route maximum alone is only the right answer
- * while it happens to be the larger of the two. It is today (120 > 60) — but the
- * runbook tells the operator that the lever for a shorter deploy window is the
- * upload ceiling, and taking that advice to 30 s would have produced a 45 s bound
- * against a global ceiling that still permits 60 s. That is the original defect
- * re-entering through the documented fix for it.
- *
- * The consequence is operational and belongs in the runbook: the orchestrator's
- * stop grace period must exceed this number, and it is logged at startup so the
- * operator can read it rather than infer it. Lowering EITHER ceiling lowers this
- * bound with it; lowering this bound directly silently reintroduces the abort.
+ * Covers the larger request ceiling, plus time for post-response work and store
+ * shutdown. The orchestrator's grace period must exceed this value.
  */
 const SHUTDOWN_TIMEOUT_MS =
   (Math.max(IDLE_TIMEOUT_SECONDS, MAX_ROUTE_TIMEOUT_SECONDS) + 15) * 1000;
 
-/** The post-response queue gets the tail of the window, not half of a guess. */
 const AFTER_RESPONSE_DRAIN_MS = 10_000;
 
 app.listen({ port, idleTimeout: IDLE_TIMEOUT_SECONDS }, (server) => {
   console.log(
     JSON.stringify({
       msg: 'server started',
-      // The BOUND port, not the requested one. They differ whenever the kernel
-      // assigns one, and the requested value is the number that misleads.
+      // Report the bound port because the kernel may choose it.
       port: server.port,
       hostname: server.hostname,
       env: nodeEnv,
@@ -268,70 +234,22 @@ app.listen({ port, idleTimeout: IDLE_TIMEOUT_SECONDS }, (server) => {
       idleTimeoutSeconds: IDLE_TIMEOUT_SECONDS,
       maxRouteTimeoutSeconds: MAX_ROUTE_TIMEOUT_SECONDS,
       maxRequestBodyBytes: MAX_REQUEST_BODY_BYTES,
-      // The operator has to set a stop grace period longer than this. Logged
-      // rather than documented-only, because a runbook drifts and a log line
-      // states what the running process will actually do.
+      // Logs the effective value for deployment configuration.
       shutdownTimeoutMs: SHUTDOWN_TIMEOUT_MS,
     })
   );
 });
 
-/**
- * Shutdown.
- *
- * Elysia wires only `process.on('beforeExit')`, which is not a container signal
- * handler, so nothing here previously responded to the SIGTERM that Coolify's
- * stop-first deployment sends: in-flight mutations, uploads and external calls
- * were terminated mid-flight. WAL keeps the database consistent; it does not
- * finish an application operation for the client, and an upload can reach R2
- * with no matching row.
- *
- * `app.stop()` — no argument — DRAINS in-flight requests. `app.stop(true)`
- * aborts them, which is the wrong default for a stop-first deploy. Measured on
- * the pinned versions: a request 300 ms into a 2 s handler completed with 200,
- * and `stop()` resolved only after it did.
- *
- * One measured caveat, which is why the explicit `process.exit(0)` below is not
- * optional. An earlier revision of this comment had the mechanism wrong and it is
- * worth stating the correction rather than quietly editing it, because the wrong
- * version argued for a different fix: `stop()` DOES close the listening socket —
- * a new connection is refused immediately after it resolves (re-measured on
- * `elysia@1.4.29`, whose `stop()` is a thin delegate to `Bun.serve`'s, and Bun
- * documents `stop()` as "prevent new connections from being accepted … does not
- * cancel in-flight requests").
- *
- * What survives is an ALREADY-ESTABLISHED keep-alive connection: a second request
- * written on a socket opened before the stop was still served after it resolved.
- * So requests can still arrive during the drain, which is what the settle loop in
- * `lib/http/after-response.ts` exists for — but they arrive on existing
- * connections, not through a still-open listener. The explicit exit remains, both
- * because those connections would otherwise hold the process past the grace
- * period and because it makes the outcome the same on any platform. Measured on
- * Windows; not re-measured on the Linux target.
- */
-/**
- * Held on an object so the guard can be set from inside the handler without
- * assigning a module-level binding from a function.
- */
 const shutdownState = { started: false };
 
+/** Drains in-flight requests on container signals before closing their stores. */
 async function shutdown(signal: string): Promise<void> {
   if (shutdownState.started) return;
   shutdownState.started = true;
 
   console.log(JSON.stringify({ msg: 'server stopping', signal }));
 
-  // Bounded, and armed before the drain rather than after: a drain that hangs is
-  // exactly the case this exists for.
-  //
-  // NOT `unref`'d, and that was a real defect rather than a style choice. An
-  // unref'd timer does not hold the event loop open, so in the one shape this
-  // timer exists for — `app.stop()` has resolved, the listener is closed, and
-  // something after it never settles — there was no ref'd handle left and the
-  // process exited **0** with no `forced shutdown` line and the store closes
-  // below never run. Reproduced. `clearTimeout` on the clean path already stops
-  // this from delaying a fast shutdown, which is the only thing `unref` was
-  // buying.
+  // Keep this timer referenced so a hung drain cannot appear successful.
   const forced = setTimeout(() => {
     console.error(
       JSON.stringify({
@@ -346,14 +264,8 @@ async function shutdown(signal: string): Promise<void> {
   try {
     await app.stop();
     const drained = await drainAfterResponse(AFTER_RESPONSE_DRAIN_MS);
-    // Logged, and DELIBERATELY still an exit 0 — the one place this file treats
-    // abandoned work as non-fatal. A timed-out drain means the access log lost
-    // some lines, not that a request or a transaction was dropped: `app.stop()`
-    // has already resolved, so every in-flight request completed. Exiting
-    // non-zero here would make a routine deploy's stop phase look like a crash to
-    // the orchestrator for the sake of a log line. The count is on the line so it
-    // is visible if that trade ever stops being the right one — see
-    // reports/coolify-deployment.md §12.2.
+    // Post-response loss is logged but does not turn a completed drain into a
+    // failed deployment.
     if (!drained)
       console.error(
         JSON.stringify({
@@ -369,12 +281,7 @@ async function shutdown(signal: string): Promise<void> {
       })
     );
   } finally {
-    // PostgreSQL first: it is the only one that can still be waiting on
-    // something, since `close()` lets in-flight queries finish. The SQLite
-    // helpers close only what this process actually opened — neither creates a
-    // database file in order to close it. `@/db` is different and does not need
-    // that guard: its pool is constructed at module load, and the application
-    // cannot have started without loading it.
+    // PostgreSQL may still wait for in-flight queries, so close it first.
     await closeStore('postgres', closeDatabase);
     await closeStore('rate-limit', closeRateLimitStore);
     await closeStore('cache', closeCacheStore);

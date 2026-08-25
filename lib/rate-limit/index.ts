@@ -30,20 +30,9 @@ export interface RateLimitResult {
  *
  * `identifier` should encode the scope (e.g. `users.create:<ip>`).
  *
- * Fixed window, not the approximate sliding window this used to inherit from
- * `@upstash/ratelimit`. The trade is bounded and was taken deliberately: at a
- * window boundary a caller can fit up to 2x the limit into a short burst, while
- * the sustained rate is unchanged. In exchange the check is one atomic statement
- * over one row — verified to lose no updates across four concurrent processes —
- * and `remaining` is exact rather than an approximation. For the global daily OTP
- * budget a fixed window is also the more faithful model: it IS a calendar-day
- * cost cap, not a rolling one.
- *
- * There is no retry loop. The former 2-attempt/50ms backoff was shaped for HTTP
- * against Upstash; a local SQLite failure means the disk or schema is broken, and
- * retrying twice cannot fix that. The one genuinely transient local failure —
- * `SQLITE_BUSY` under multi-process contention — is handled by `busy_timeout` in
- * the driver, which is where it belongs.
+ * One atomic SQLite statement keeps exact counters across processes. Fixed
+ * windows preserve the sustained rate but allow up to twice the limit around a
+ * boundary; `busy_timeout` handles transient writer contention.
  */
 export async function rateLimit(opts: {
   identifier: string;

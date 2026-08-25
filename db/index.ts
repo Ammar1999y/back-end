@@ -52,16 +52,7 @@ export const db = drizzle<typeof schema>({ client, schema });
 /** A transaction handle. Named for the transaction, not for the driver. */
 export type Tx = Parameters<Parameters<typeof db.transaction>[0]>[0];
 
-/**
- * Runs `fn` inside one PostgreSQL transaction, committing on return and rolling
- * back on throw.
- *
- * The old implementation built a `Pool`, ran the transaction and `end()`ed the
- * pool in a `finally` that swallowed its own errors (TODO.md items 2 and 3).
- * There is no pool to tear down now, so both are gone: this is a thin, honest
- * wrapper that exists to keep call sites from importing the driver, and to keep
- * one name for "this work is atomic" across the codebase.
- */
+/** Keeps transaction boundaries independent of the database driver at call sites. */
 export function withTransaction<T>(
   fn: (tx: Tx) => Promise<T>,
   config?: PgTransactionConfig

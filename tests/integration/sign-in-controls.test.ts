@@ -1,0 +1,592 @@
+/**
+ * Four controls on `POST /api/auth/sign-in/email` that nothing asserted.
+ *
+ * - **The per-account lockout** (`lib/auth/login-guard.ts`). The counter, the
+ *   threshold, the refusal of a *correct* password mid-lock, the release, and
+ *   the reset — each checked by ROW STATE as well as by status, because a 401
+ *   cannot tell "wrong password" from "locked" and the two leave completely
+ *   different rows behind.
+ * - **A Turnstile REFUSAL.** The egress fake answers `{ success: true }` by
+ *   default, so until now no test had ever seen the endpoint decline one.
+ * - **The bound on the outbound siteverify call** — or the absence of one; see
+ *   the `audit §3` describe below, which records what the code actually does.
+ * - **The attributes of the cookie sign-in sets.** `tests/helpers/session.ts`
+ *   has exposed `setCookie` "for assertions about attributes" with no caller.
+ *
+ * ---
+ *
+ * **This suite runs at UTC, and that is what makes the lockout observable
+ * here.** `users.locked_until` is `mode: 'string'`, and Drizzle's decoder
+ * appends the PROCESS-local offset to a UTC wall-clock, so at offset −180 an
+ * armed lock decodes three hours early and the comparison at
+ * `login-guard.ts:152` reads it as already expired — the fail-open in
+ * `reports/claude-opus-autonomous-audit.md` §1.1. `bun test` forces the process
+ * to UTC (measured: offset 0 under the runner, −180 in a plain `bun` child, and
+ * a `TZ=` prefix changes neither), and at offset 0 the value round-trips.
+ *
+ * So the lockout assertions below describe the runner, not a deployment. They
+ * cannot see that defect class at all, and a green run here is NOT evidence that
+ * the lockout holds on a server whose clock is not UTC. The first test in that
+ * describe pins the offset so this stays a measured statement.
+ */
+import {
+  afterEach,
+  beforeAll,
+  beforeEach,
+  describe,
+  expect,
+  setSystemTime,
+  test,
+} from 'bun:test';
+import type { SeededUser } from '../helpers/session';
+
+import { eq } from 'drizzle-orm';
+
+import { app } from '@/app';
+import { db } from '@/db';
+import { sessions, users } from '@/db/schema';
+import {
+  LOCK_DURATION_SECONDS,
+  MAX_FAILED_ATTEMPTS,
+} from '@/lib/auth/login-guard';
+import { PUBLIC_ORIGIN } from '@/lib/env';
+
+import { HTTP_STATUS } from '@/utils/api-messages';
+
+import { resetTables } from '../helpers/database';
+import { egressCallsTo, scriptEgress } from '../helpers/egress';
+import { baseHeaders, seedUser, signIn, TEST_IP } from '../helpers/session';
+import { resetSqliteStores } from '../helpers/sqlite';
+
+const SIGN_IN_URL = 'http://localhost/api/auth/sign-in/email';
+const TURNSTILE_HOST = 'challenges.cloudflare.com';
+
+/** `SIGN_IN_IP_LIMIT_PER_MINUTE` in `lib/auth.ts:55`, unexported for the same reason. */
+const SIGN_IN_IP_LIMIT_PER_MINUTE = 20;
+
+/** The limiter's window, from the same `enforceRateLimit` call. */
+const LIMITER_WINDOW_MS = 60_000;
+
+/**
+ * Satisfies `passwordSchema` (lower, upper, digit, symbol, length).
+ *
+ * One that does NOT would answer 422 from the `before` hook's
+ * `loginSchema.safeParse` and never reach `verifyLoginAttempt` — so a malformed
+ * password would silently stop counting failed attempts.
+ */
+const WRONG_PASSWORD = 'Harness!Wr0ngPass';
+
+/** A domain `emailSchema` accepts, belonging to nobody. */
+const UNKNOWN_EMAIL = 'harness.no.such.account@gmail.com';
+
+/**
+ * Restores the default `{ success: true }` siteverify answer for a
+ * describe-level `beforeAll`.
+ *
+ * `resetEgress` runs in the base preload's `beforeEach`, which has NOT run yet
+ * when a describe's `beforeAll` executes — so an override installed by the last
+ * test of the PREVIOUS describe is still in force there. Not hypothetical: the
+ * `{ success: false }` flood below leaked into the cookie fixture's sign-in and
+ * answered it `403 VERIFICATION_FAILED`. A fixture that signs in states the
+ * captcha answer it needs rather than inheriting one.
+ */
+function acceptCaptcha(): void {
+  scriptEgress(TURNSTILE_HOST, () => Response.json({ success: true }));
+}
+
+function attempt(email: string, password: string): Promise<Response> {
+  return app.handle(
+    new Request(SIGN_IN_URL, {
+      method: 'POST',
+      headers: baseHeaders({ 'content-type': 'application/json' }),
+      body: JSON.stringify({ email, password }),
+    })
+  );
+}
+
+interface LockRow {
+  failedLoginAttempts: number;
+  lockedUntil: string | null;
+}
+
+async function lockRow(userId: string): Promise<LockRow> {
+  const [row] = await db
+    .select({
+      failedLoginAttempts: users.failedLoginAttempts,
+      lockedUntil: users.lockedUntil,
+    })
+    .from(users)
+    .where(eq(users.id, userId));
+  if (!row) throw new Error(`no users row for ${userId}`);
+  return row;
+}
+
+async function sessionCount(userId: string): Promise<number> {
+  const rows = await db
+    .select({ id: sessions.id })
+    .from(sessions)
+    .where(eq(sessions.userId, userId));
+  return rows.length;
+}
+
+interface ParsedCookie {
+  name: string;
+  value: string;
+  /** Lower-cased attribute name → value; a boolean attribute maps to `''`. */
+  attributes: Map<string, string>;
+}
+
+/**
+ * A real parse, not a substring match.
+ *
+ * `header.includes('HttpOnly')` passes on a cookie whose VALUE contains the
+ * word, and an attribute list in a different order — or one that spells
+ * `SameSite=lax` in lower case — breaks a match written against one shape.
+ */
+function parseSetCookie(header: string): ParsedCookie {
+  const [pair = '', ...rest] = header.split(';');
+  const attributes = new Map<string, string>();
+  for (const part of rest) {
+    const trimmed = part.trim();
+    if (!trimmed) continue;
+    const at = trimmed.indexOf('=');
+    attributes.set(
+      (at === -1 ? trimmed : trimmed.slice(0, at)).toLowerCase(),
+      at === -1 ? '' : trimmed.slice(at + 1)
+    );
+  }
+  const split = pair.indexOf('=');
+  return {
+    name: split === -1 ? pair : pair.slice(0, split),
+    value: split === -1 ? '' : pair.slice(split + 1),
+    attributes,
+  };
+}
+
+beforeAll(async () => {
+  await resetTables();
+  // Files share a worker process under `--no-isolate`, so the per-IP sign-in
+  // budget can arrive already spent by an earlier file — and the describe-level
+  // `beforeAll`s below run before the first `beforeEach`.
+  resetSqliteStores();
+});
+
+beforeEach(() => {
+  // The 20/min per-IP budget lives in SQLite, is per process, and two tests here
+  // exhaust it deliberately. Sweeping does not clear a live fixed window; only
+  // deleting the file does.
+  resetSqliteStores();
+});
+
+afterEach(() => {
+  // `setSystemTime()` with no argument IS the documented reset. `useRealTimers`
+  // is not a top-level `bun:test` export (checked in `bun-types/test.d.ts`); it
+  // exists only under the `jest`/`vi` compatibility namespaces.
+  setSystemTime();
+});
+
+describe('the per-account login lockout', () => {
+  const fixture: {
+    user: SeededUser | null;
+    attempts: { status: number; row: LockRow }[];
+  } = { user: null, attempts: [] };
+
+  function actor(): SeededUser {
+    if (!fixture.user) throw new Error('fixture not seeded');
+    return fixture.user;
+  }
+
+  beforeAll(async () => {
+    acceptCaptcha();
+    fixture.user = await seedUser();
+    // Driven once, here: every wrong password costs an Argon2id verify at
+    // 64 MiB. The two tests that follow assert over the recorded row states
+    // instead of replaying the arc per test.
+    for (let n = 1; n <= MAX_FAILED_ATTEMPTS; n++) {
+      const response = await attempt(actor().email, WRONG_PASSWORD);
+      fixture.attempts.push({
+        status: response.status,
+        row: await lockRow(actor().userId),
+      });
+    }
+  });
+
+  test('the runner clock is UTC, which is why the lock below is visible', () => {
+    // If this fails, every other assertion in this describe fails with it and
+    // this one names the cause: at a non-zero offset the `mode: 'string'`
+    // decoder shifts `locked_until` and `login-guard.ts:152` reads an armed lock
+    // as expired. See the file header.
+    expect(new Date().getTimezoneOffset()).toBe(0);
+  });
+
+  test('each wrong password increments the counter, and nothing locks early', () => {
+    const belowThreshold = fixture.attempts.slice(0, -1);
+    expect(belowThreshold.length).toBe(MAX_FAILED_ATTEMPTS - 1);
+
+    for (const [index, { status, row }] of belowThreshold.entries()) {
+      expect(status).toBe(HTTP_STATUS.UNAUTHORIZED);
+      expect(row.failedLoginAttempts).toBe(index + 1);
+      expect(row.lockedUntil).toBeNull();
+    }
+  });
+
+  test('the lock engages AT the threshold, for LOCK_DURATION_SECONDS', () => {
+    const final = fixture.attempts.at(-1);
+    if (!final) throw new Error('fixture recorded no attempts');
+
+    expect(final.status).toBe(HTTP_STATUS.UNAUTHORIZED);
+    expect(final.row.failedLoginAttempts).toBe(MAX_FAILED_ATTEMPTS);
+    expect(final.row.lockedUntil).not.toBeNull();
+
+    // Parsed exactly the way `login-guard.ts:152` parses it, so this asserts the
+    // instant the production comparison reads, not the one the column holds.
+    const remaining =
+      (Date.parse(final.row.lockedUntil ?? '') - Date.now()) / 1000;
+    expect(remaining).toBeLessThanOrEqual(LOCK_DURATION_SECONDS);
+    expect(remaining).toBeGreaterThan(LOCK_DURATION_SECONDS - 60);
+  });
+
+  test('a CORRECT password during the lock is refused and changes nothing', async () => {
+    const before = await lockRow(actor().userId);
+    expect(before.lockedUntil).not.toBeNull();
+
+    const response = await attempt(actor().email, actor().password);
+
+    expect(response.status).toBe(HTTP_STATUS.UNAUTHORIZED);
+    expect(response.headers.getSetCookie()).toEqual([]);
+    expect(await sessionCount(actor().userId)).toBe(0);
+    // This is the property that matters, and only the row can show it: the
+    // locked branch returns before the password is verified, so the counter is
+    // neither incremented nor the lock extended by a valid credential.
+    expect(await lockRow(actor().userId)).toEqual(before);
+  });
+
+  test('locked, wrong-password and unknown-account refusals are identical', async () => {
+    const other = await seedUser();
+
+    const lockedResponse = await attempt(actor().email, actor().password);
+    const wrongResponse = await attempt(other.email, WRONG_PASSWORD);
+    const unknownResponse = await attempt(UNKNOWN_EMAIL, WRONG_PASSWORD);
+
+    const lockedBody = await lockedResponse.text();
+    const wrongBody = await wrongResponse.text();
+    const unknownBody = await unknownResponse.text();
+
+    expect(lockedResponse.status).toBe(HTTP_STATUS.UNAUTHORIZED);
+    expect(wrongResponse.status).toBe(HTTP_STATUS.UNAUTHORIZED);
+    expect(unknownResponse.status).toBe(HTTP_STATUS.UNAUTHORIZED);
+
+    // Three different internal states — locked, bad credential, no such row —
+    // and one indistinguishable answer. Anything else is an account-existence
+    // and account-state oracle.
+    expect(lockedBody).toBe(wrongBody);
+    expect(lockedBody).toBe(unknownBody);
+    expect(lockedBody).not.toContain(actor().email);
+    expect(lockedBody).not.toContain(actor().userId);
+    expect(lockedBody.toLowerCase()).not.toContain('lock');
+  });
+
+  test('the lock releases at locked_until and the next attempt is charged afresh', async () => {
+    const armed = await lockRow(actor().userId);
+    if (!armed.lockedUntil) throw new Error('the lock is not armed');
+
+    // The comparison at `login-guard.ts:152` is against the PROCESS clock, so
+    // this is the instrument that drives it. PostgreSQL's `NOW()` is untouched
+    // and nothing on the release path re-reads it.
+    setSystemTime(new Date(Date.parse(armed.lockedUntil) + 1000));
+
+    const response = await attempt(actor().email, WRONG_PASSWORD);
+
+    expect(response.status).toBe(HTTP_STATUS.UNAUTHORIZED);
+    // Released, then charged: the expiry branch zeroes both columns inside the
+    // same transaction, and this failure counts as the first of a fresh run.
+    // `failed_login_attempts` still at 5 would mean the lock never lifted.
+    expect(await lockRow(actor().userId)).toEqual({
+      failedLoginAttempts: 1,
+      lockedUntil: null,
+    });
+  });
+
+  test('a successful login resets the counter to 0', async () => {
+    // Back on the real clock (`afterEach`), against a row carrying one failure
+    // and no lock — which is what makes the reset visible rather than a no-op.
+    expect(await lockRow(actor().userId)).toEqual({
+      failedLoginAttempts: 1,
+      lockedUntil: null,
+    });
+
+    const response = await attempt(actor().email, actor().password);
+
+    expect(response.status).toBe(HTTP_STATUS.OK);
+    expect(response.headers.getSetCookie().length).toBeGreaterThan(0);
+    expect(await lockRow(actor().userId)).toEqual({
+      failedLoginAttempts: 0,
+      lockedUntil: null,
+    });
+  });
+});
+
+describe('a refused or unavailable Turnstile verification', () => {
+  const fixture: { user: SeededUser | null } = { user: null };
+
+  function actor(): SeededUser {
+    if (!fixture.user) throw new Error('fixture not seeded');
+    return fixture.user;
+  }
+
+  beforeAll(async () => {
+    fixture.user = await seedUser();
+  });
+
+  test('a refusal answers 403 and never reaches the credentials', async () => {
+    scriptEgress(TURNSTILE_HOST, () => Response.json({ success: false }));
+
+    const response = await attempt(actor().email, actor().password);
+    const body = await response.text();
+
+    expect(response.status).toBe(HTTP_STATUS.FORBIDDEN);
+    expect(JSON.parse(body)).toEqual({
+      message: 'Captcha verification failed',
+      code: 'VERIFICATION_FAILED',
+    });
+    expect(response.headers.getSetCookie()).toEqual([]);
+    expect(egressCallsTo(TURNSTILE_HOST).length).toBe(1);
+
+    // The credentials were CORRECT. An untouched counter and no session row are
+    // what prove the captcha plugin short-circuited upstream of
+    // `verifyLoginAttempt`, rather than a password check having failed.
+    expect(await lockRow(actor().userId)).toEqual({
+      failedLoginAttempts: 0,
+      lockedUntil: null,
+    });
+    expect(await sessionCount(actor().userId)).toBe(0);
+    expect(body).not.toContain(actor().email);
+  });
+
+  test('a 5xx from siteverify fails CLOSED, even when its body says success', async () => {
+    // Body and status disagree on purpose: only the transport failure should be
+    // consulted. A handler that read the body first would sign this user in.
+    scriptEgress(TURNSTILE_HOST, () =>
+      Response.json({ success: true }, { status: 500 })
+    );
+
+    const response = await attempt(actor().email, actor().password);
+
+    expect(response.status).toBe(HTTP_STATUS.INTERNAL_ERROR);
+    expect(await response.json()).toEqual({
+      message: 'Something went wrong',
+      code: 'UNKNOWN_ERROR',
+    });
+    expect(response.headers.getSetCookie()).toEqual([]);
+    expect(await sessionCount(actor().userId)).toBe(0);
+    expect(egressCallsTo(TURNSTILE_HOST).length).toBe(1);
+  });
+
+  test('a siteverify that never answers is bounded, and refuses', async () => {
+    // The route honours the abort rather than hanging for ever: the plugin
+    // passes its own `AbortSignal` into `fetch`, and the guard's
+    // `new Request(input, init)` carries it through (measured).
+    scriptEgress(
+      TURNSTILE_HOST,
+      (request) =>
+        new Promise<Response>((_resolve, reject) => {
+          request.signal.addEventListener('abort', () => {
+            reject(new DOMException('aborted', 'AbortError'));
+          });
+        })
+    );
+
+    const started = Date.now();
+    const response = await attempt(actor().email, actor().password);
+    const elapsed = Date.now() - started;
+
+    expect(response.status).toBe(HTTP_STATUS.INTERNAL_ERROR);
+    expect(response.headers.getSetCookie()).toEqual([]);
+    expect(await sessionCount(actor().userId)).toBe(0);
+
+    // Fail-closed is only half of it. The other half is the cost: one inbound
+    // request pins an outbound socket for the plugin's whole deadline —
+    // `CAPTCHA_VERIFY_TIMEOUT_MS = 10_000` in
+    // `better-auth/dist/plugins/captcha/constants.mjs`. NOT `lib/captcha.ts`'s
+    // 3 s bound, which this endpoint does not use.
+    expect(elapsed).toBeGreaterThanOrEqual(9000);
+    expect(elapsed).toBeLessThan(20_000);
+  }, 40_000);
+});
+
+/**
+ * `reports/claude-opus-autonomous-audit.md` §3, pinned as CURRENT BEHAVIOUR.
+ *
+ * The captcha plugin's `onRequest` runs ahead of Better Auth's own limiter and
+ * far ahead of the app's `before` hook, and `/sign-in/email` is disabled in
+ * `customRules`, so the outbound siteverify is the FIRST thing an
+ * unauthenticated request buys. These tests record what the code does today; the
+ * `test.failing` at the end states the invariant a fix has to establish and
+ * turns red the moment one lands.
+ */
+describe('audit §3 — the outbound captcha call has nothing in front of it', () => {
+  const ATTEMPTS = SIGN_IN_IP_LIMIT_PER_MINUTE + 5;
+
+  test('the control: with no captcha header, nothing goes out at all', async () => {
+    const response = await app.handle(
+      new Request(SIGN_IN_URL, {
+        method: 'POST',
+        headers: {
+          'cf-connecting-ip': TEST_IP,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          email: UNKNOWN_EMAIL,
+          password: WRONG_PASSWORD,
+        }),
+      })
+    );
+
+    expect(response.status).toBe(HTTP_STATUS.BAD_REQUEST);
+    expect(await response.json()).toEqual({
+      message: 'Missing CAPTCHA response',
+      code: 'MISSING_RESPONSE',
+    });
+    expect(egressCallsTo(TURNSTILE_HOST)).toEqual([]);
+  });
+
+  test('N refused attempts spend N siteverify calls and trip no limiter', async () => {
+    scriptEgress(TURNSTILE_HOST, () => Response.json({ success: false }));
+
+    const statuses: number[] = [];
+    for (let n = 0; n < ATTEMPTS; n++) {
+      const response = await attempt(UNKNOWN_EMAIL, WRONG_PASSWORD);
+      statuses.push(response.status);
+    }
+
+    // Every one refused by the plugin, none by a limiter — 25 attempts against a
+    // 20/min budget and not one 429, because the budget is consumed downstream
+    // of the call this counts.
+    expect(statuses.filter((s) => s !== HTTP_STATUS.FORBIDDEN)).toEqual([]);
+    expect(egressCallsTo(TURNSTILE_HOST).length).toBe(ATTEMPTS);
+  });
+
+  test('a rate-limited attempt has ALREADY spent its outbound call', async () => {
+    // Pinned to the start of a fixed 60-second window: 25 attempts straddling
+    // a rollover would re-admit the ones this asserts are denied.
+    setSystemTime(new Date(Date.now() - (Date.now() % LIMITER_WINDOW_MS)));
+
+    const statuses: number[] = [];
+    for (let n = 0; n < ATTEMPTS; n++) {
+      const response = await attempt(UNKNOWN_EMAIL, WRONG_PASSWORD);
+      statuses.push(response.status);
+    }
+
+    // The limiter is real and it does fire.
+    expect(
+      statuses.filter((s) => s === HTTP_STATUS.TOO_MANY_REQUESTS).length
+    ).toBe(ATTEMPTS - SIGN_IN_IP_LIMIT_PER_MINUTE);
+    // And it fired too late to save anything: every throttled request had
+    // already paid for a Turnstile verification.
+    expect(egressCallsTo(TURNSTILE_HOST).length).toBe(ATTEMPTS);
+  }, 120_000);
+
+  test.failing(
+    'FIXME(audit §3): outbound siteverify calls are bounded by something',
+    async () => {
+      scriptEgress(TURNSTILE_HOST, () => Response.json({ success: false }));
+
+      for (let n = 0; n < ATTEMPTS; n++)
+        await attempt(UNKNOWN_EMAIL, WRONG_PASSWORD);
+
+      // Deliberately the weakest statement of the fix, so it holds for either
+      // remedy §3 proposes: fewer calls out than requests in. It passes today
+      // BECAUSE it fails; when a bound lands, `test.failing` turns red and this
+      // becomes an ordinary assertion.
+      expect(egressCallsTo(TURNSTILE_HOST).length).toBeLessThan(ATTEMPTS);
+    }
+  );
+});
+
+describe('the cookie sign-in sets', () => {
+  const fixture: { user: SeededUser | null; cookies: ParsedCookie[] } = {
+    user: null,
+    cookies: [],
+  };
+
+  function token(): ParsedCookie {
+    const found = fixture.cookies.find((cookie) =>
+      cookie.name.endsWith('session_token')
+    );
+    if (!found)
+      throw new Error(
+        `no session cookie among: ${fixture.cookies.map((c) => c.name).join(', ')}`
+      );
+    return found;
+  }
+
+  beforeAll(async () => {
+    acceptCaptcha();
+    const session = await signIn(await seedUser());
+    fixture.user = session.user;
+    fixture.cookies = session.setCookie.map(parseSetCookie);
+  });
+
+  test('sign-in emits the session token and the cookie-cache cookie', () => {
+    // Named, so the sweep below is known to cover more than one cookie and so a
+    // NEW cookie on this response — anything carrying session state to the
+    // browser — has to be looked at rather than inherited silently.
+    const names = fixture.cookies.map((cookie) => cookie.name);
+    expect(names.toSorted((a, b) => (a === b ? 0 : a < b ? -1 : 1))).toEqual([
+      'better-auth.session_data',
+      'better-auth.session_token',
+    ]);
+  });
+
+  test('the session cookie is HttpOnly, SameSite=Lax and scoped to Path=/', () => {
+    expect(token().attributes.has('httponly')).toBe(true);
+    expect(token().attributes.get('samesite')?.toLowerCase()).toBe('lax');
+    expect(token().attributes.get('path')).toBe('/');
+  });
+
+  test('Secure is set exactly when the configured origin is https', () => {
+    // Nothing in `lib/auth.ts` sets `useSecureCookies`, so Better Auth derives
+    // it from the baseURL scheme. The rule is what deserves pinning — it stays
+    // right on a deployment that serves https — but on its own it would hold
+    // whichever way the flag went, so the scheme this tier actually runs under
+    // is recorded next to it: `PUBLIC_ORIGIN` is http, and `Secure` is ABSENT.
+    expect(token().attributes.has('secure')).toBe(
+      PUBLIC_ORIGIN.startsWith('https://')
+    );
+    expect(PUBLIC_ORIGIN.startsWith('http://')).toBe(true);
+  });
+
+  test('every cookie the sign-in sets carries the same protections', () => {
+    expect(fixture.cookies.length).toBeGreaterThan(0);
+
+    // The class, not the instance: the cookie-cache cookie is set on the same
+    // response and carries a signed copy of the session payload, so a missing
+    // `HttpOnly` there is the same defect as on the token.
+    for (const cookie of fixture.cookies)
+      expect({
+        name: cookie.name,
+        httpOnly: cookie.attributes.has('httponly'),
+        sameSite: cookie.attributes.get('samesite')?.toLowerCase(),
+        path: cookie.attributes.get('path'),
+        secure: cookie.attributes.has('secure'),
+      }).toEqual({
+        name: cookie.name,
+        httpOnly: true,
+        sameSite: 'lax',
+        path: '/',
+        secure: PUBLIC_ORIGIN.startsWith('https://'),
+      });
+  });
+
+  test('the session cookie value carries no identity of its own', () => {
+    if (!fixture.user) throw new Error('fixture not seeded');
+    const value = decodeURIComponent(token().value);
+
+    // Only the TOKEN cookie: `better-auth.session_data` is the cookie cache and
+    // legitimately carries the session payload, which includes the email. Its
+    // protection is `HttpOnly` plus the signature, asserted above.
+    expect(value).not.toContain(fixture.user.email);
+    expect(value).not.toContain(fixture.user.userId);
+    expect(value.length).toBeGreaterThan(0);
+  });
+});

@@ -22,6 +22,8 @@ import { describe, expect, test } from 'bun:test';
 import { readdirSync, readFileSync, statSync } from 'node:fs';
 import path from 'node:path';
 
+import { stripComments } from '@/scripts/strip-comments';
+
 const TESTS_ROOT = path.join(import.meta.dir, '..');
 
 /** The directories `tests/helpers/run.ts` knows how to run. */
@@ -34,6 +36,44 @@ function readFile(rel: string): string {
   // eslint-disable-next-line security/detect-non-literal-fs-filename -- a path this file produced by walking its own directory
   return readFileSync(path.join(TESTS_ROOT, rel), 'utf8');
 }
+
+/**
+ * Source with comments removed, which is what the detectors below must match
+ * against.
+ *
+ * `stripComments` is reused from `scripts/strip-comments.ts` — `find-unused-files.ts`
+ * already imports it for exactly this reason, and writing a second stripper here
+ * would be the duplicate that module's own header warns about. Its scanner
+ * handles the two cases a regex gets wrong: `//` inside a string literal is not a
+ * comment, and a quote inside a comment does not open a string.
+ *
+ * Without it the guard detector matched its own trigger words inside prose. A
+ * file whose only mention of `resetTables()` was a comment saying it is NOT
+ * called counted as guarded.
+ */
+function readCode(rel: string): string {
+  return stripComments(readFile(rel));
+}
+
+/**
+ * Every way this codebase reaches the raw Drizzle client.
+ *
+ * Three spellings, because the first version of this matched only
+ * `from '@/db'` and let two real ones through:
+ *
+ * - `from '@/db/index'` — the same module by its explicit path.
+ * - `await import('@/db')` — already idiomatic in this suite
+ *   (`tests/integration/harness.test.ts` uses it in three places), which makes it
+ *   the bypass most likely to be written by accident rather than deliberately.
+ *
+ * Both quote styles are accepted even though prettier enforces single quotes:
+ * the gate should not depend on a formatter having run.
+ */
+const IMPORTS_DB = /(?:from|import)\s*\(?\s*['"]@\/db(?:\/index)?['"]/;
+
+/** Reaching any of these means the ownership assertion runs before a write. */
+const REACHES_GUARD =
+  /\b(?:resetTables|seedUser|signedInUser|assertHarnessDatabase)\s*\(/;
 
 function walk(dir: string, base = ''): string[] {
   const out: string[] = [];
@@ -117,18 +157,94 @@ describe('tests/ layout', () => {
    * using the real client, which is most of what an integration test is for.
    */
   test('every file that imports @/db directly reaches the ownership guard', () => {
-    const IMPORTS_DB = /from\s+'@\/db'/;
-    const REACHES_GUARD =
-      /(resetTables|seedUser|signedInUser|assertHarnessDatabase)\s*\(/;
-
     const unguarded = everyFile
-      .filter((rel) => isTestFile(rel) && IMPORTS_DB.test(readFile(rel)))
-      .filter((rel) => !REACHES_GUARD.test(readFile(rel)));
+      .filter((rel) => isTestFile(rel) && IMPORTS_DB.test(readCode(rel)))
+      .filter((rel) => !REACHES_GUARD.test(readCode(rel)));
 
     expect(
       unguarded,
       'these files hold the real client and can write without asserting the harness owns the database'
     ).toEqual([]);
+  });
+
+  /**
+   * The detector, asserted against synthetic sources.
+   *
+   * This is the part that was missing, and its absence is why three bypasses
+   * shipped: the walk above only ever proved a VERDICT about the files that exist
+   * today, never that the rule can distinguish a guarded file from an unguarded
+   * one. A detector with no test of its own is a gate that reports "all clear"
+   * for whatever it cannot see.
+   *
+   * Each case below was a real bypass before `stripComments` and the widened
+   * import pattern landed.
+   */
+  describe('the guard detector itself', () => {
+    const flagged = (source: string) => {
+      const code = stripComments(source);
+      return IMPORTS_DB.test(code) && !REACHES_GUARD.test(code);
+    };
+
+    const GUARDED = `import { db } from '@/db';
+await resetTables();
+await db.execute(q);`;
+
+    const NO_DB = `import { app } from '@/app';
+await app.handle(r);`;
+
+    const DIRECT_UNGUARDED = `import { db } from '@/db';
+await db.execute(q);`;
+
+    const INDEX_PATH = `import { db } from '@/db/index';
+await db.execute(q);`;
+
+    const DYNAMIC = `const { db } = await import('@/db');
+await db.execute(q);`;
+
+    const DOUBLE_QUOTED = `import { db } from "@/db";
+await db.execute(q);`;
+
+    const GUARD_IN_LINE_COMMENT = `import { db } from '@/db';
+// resetTables() is deliberately not called
+await db.execute(q);`;
+
+    const GUARD_IN_BLOCK_COMMENT = `import { db } from '@/db';
+/* seedUser() belongs here */
+await db.execute(q);`;
+
+    const URL_WITH_SLASHES = `import { db } from '@/db';
+const u = 'https://example.test';
+await resetTables();`;
+
+    test.each([
+      ['a guarded file is not flagged', GUARDED, false],
+      ['a file that never touches @/db is not flagged', NO_DB, false],
+      ['an unguarded direct import IS flagged', DIRECT_UNGUARDED, true],
+      ['the explicit /index path IS flagged', INDEX_PATH, true],
+      ['a dynamic import IS flagged', DYNAMIC, true],
+      [
+        'double quotes are flagged, so the gate does not need prettier',
+        DOUBLE_QUOTED,
+        true,
+      ],
+      [
+        'a guard named only in a line comment does not count',
+        GUARD_IN_LINE_COMMENT,
+        true,
+      ],
+      [
+        'a guard named only in a block comment does not count',
+        GUARD_IN_BLOCK_COMMENT,
+        true,
+      ],
+      [
+        'a URL containing // does not break the stripper',
+        URL_WITH_SLASHES,
+        false,
+      ],
+    ])('%s', (_label, source, expected) => {
+      expect(flagged(source)).toBe(expected);
+    });
   });
 
   test('each tier has at least one test file', () => {

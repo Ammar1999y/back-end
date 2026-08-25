@@ -132,12 +132,29 @@ beforeEach(() => {
 });
 
 /**
- * The negative half of the egress boundary. Registered here so it covers every
- * test in every tier: a path that makes an unexpected outbound call is a defect
- * whether or not the file that ran it thought to look.
+ * The negative half of the egress boundary, and the reset that has to pair with
+ * it.
+ *
+ * **`resetEgress` runs in BOTH hooks, and the `afterEach` half is not
+ * redundant.** With the reset only in `beforeEach`, an override installed by the
+ * last test of one `describe` was still in force during the NEXT `describe`'s
+ * `beforeAll` — Bun runs a describe's `beforeAll` after the previous describe's
+ * tests and before any `beforeEach`. That is not theoretical: a
+ * `scriptEgress('challenges.cloudflare.com', … {success:false})` flood leaked
+ * into a later fixture's `signIn()` and answered it `403 VERIFICATION_FAILED`,
+ * which reads as a broken sign-in rather than as a leaked stub.
+ *
+ * The assertion runs first: it consumes the violations it reports, and resetting
+ * before it would throw the evidence away.
  */
 afterEach(() => {
-  assertNoEgressViolations();
+  try {
+    assertNoEgressViolations();
+  } finally {
+    resetEgress();
+    resetMailbox();
+    resetObjectStore();
+  }
 });
 
 process.on('exit', () => {

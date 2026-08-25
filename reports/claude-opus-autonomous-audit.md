@@ -1,103 +1,10 @@
 # Autonomous Audit — Claude Opus
 
-**Date:** 2026-08-22
-**Target:** working tree at `D:\apps\job-app\soft-house-dash-3` (branch `main`, uncommitted changes included)
-**Runtime verified:** Bun 1.4.0, PostgreSQL 18.6, Elysia 1.4.29, drizzle-orm 0.45.2, better-auth 1.7.1, zod 4.4.3, svgo 4, DOMPurify via isomorphic-dompurify
-**Excluded by instruction:** every item in `reports/should-ignore.md`, including its "Known Issues — Will Be Fixed Later" section. Nothing below restates, renames or rephrases one of those.
-
----
-
-## Method
-
-This was not a read-through. The decisive evidence here comes from running the
-application:
-
-- **A scratch PostgreSQL database** (`audit_probe_tmp`) was created, migrated with the
-  project's own `scripts/migrate.ts`, and seeded with a role, a permission matrix, a user
-  and a credential account. It was dropped at the end.
-- **The Elysia app was driven in-process** (`app.handle(new Request(...))`) so real routes —
-  including Better Auth's — executed against that database with real middleware, real
-  limiters and real security headers. Where the framework's own request parsing was the
-  question, a real listener was driven over **raw TCP sockets** instead, because that is the
-  only way to control the `Host` header.
-- **`globalThis.fetch` was stubbed** for `challenges.cloudflare.com` and
-  `pwnedpasswords.com` so nothing left the machine.
-- **Counterfactuals were run** wherever a claim depended on the environment. All of
-  Finding 1 is established by running the same probe under two values of `TZ`.
-- Library behaviour was read from `node_modules` at the installed version, never from
-  memory.
-- Nine parallel read-only shards covered the rest of the tree. **Every finding they
-  returned was re-verified here before inclusion**; their unproven hypotheses were dropped.
-  Where a measurement could not be reproduced in the time available, the finding says so
-  explicitly.
-
-Nothing in the application was modified. Probe scripts were written outside the repository
-and deleted.
-
-### The project's own gates, run
-
-| Gate                                     | Exit  | Result                                                                           |
-| ---------------------------------------- | ----- | -------------------------------------------------------------------------------- |
-| `bunx tsc --noEmit`                      | 0     | clean                                                                            |
-| `bun run lint`                           | 0     | clean today — **but see Finding 5: it cannot fail on a security rule**           |
-| `bun run format:check`                   | **1** | 2 untracked files unformatted (`docs/bun-s3.md`, `reports/claude-opus-audit.md`) |
-| `bun audit`                              | 0     | no vulnerabilities, 573 packages                                                 |
-| `bunx knip`                              | 1     | 1 unused export (see Low findings)                                               |
-| `bun dedupe --check`                     | 0     | 3 duplicate versions removable                                                   |
-| `bun run scan:secrets` (gitleaks 8.30.1) | 0     | 20 commits, no leaks                                                             |
-| `bun run scan:sast` (semgrep 1.173.0)    | 0     | 257 files, 111 rules, 0 findings                                                 |
-| `bun run test` (unit)                    | 0     | 239 pass / 0 fail                                                                |
-| `bun run test:integration`               | 0     | 105 pass / 0 fail                                                                |
-| `bun run test:process`                   | 0     | 3 pass / 1 skip (Windows-gated)                                                  |
-| `bun run smoke`                          | 0     | all 9 checks pass                                                                |
-
-The codebase is unusually disciplined: dense and accurate rationale comments, one helper per
-job, explicit policy fields on every route, and a genuinely hardened filter DSL. Almost
-everything below was found by **executing** it rather than reading it — which is the point,
-because the two heaviest findings are invisible to type-checking, linting and the entire
-existing test suite.
-
----
-
-## Findings at a glance
-
-| #     | Severity     | Finding                                                                                                                                                                                                                                                    |
-| ----- | ------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 1     | **Critical** | `mode: 'string'` timestamps decode with the host UTC offset — this silently disables the login lockout, both OTP blocks and the OTP resend cooldown, and breaks session-list pagination                                                                    |
-| 2     | **Critical** | A 27 KB SVG upload freezes the whole process for 3.8 s via quadratic XML entity expansion                                                                                                                                                                  |
-| 3     | **High**     | `POST /api/auth/sign-in/email` makes an unbounded outbound captcha call before any rate limiter                                                                                                                                                            |
-| 4     | **High**     | `validID` preserves letter case, so three `===` self-guards on path UUIDs are bypassable — defeating re-authentication on self-credential change                                                                                                           |
-| 5     | **High**     | The CI lint step cannot fail on any `eslint-plugin-security` finding, and is strictly weaker than the local hook                                                                                                                                           |
-| 6     | **High**     | `/openapi.json` is unauthenticated, uncached, rebuilt per request at ~96× the cost of a 404, and advertises the internal and dev surfaces                                                                                                                  |
-| 7     | **High**     | `optimizeImage` re-decodes the full source once per iteration — a 59 KB PNG burns 22 s of CPU, 20 per window per account                                                                                                                                   |
-| 8     | Medium       | Elysia's 11-character path offset lets a prepended junk segment reach any route when the `Host` header is ≤3 characters                                                                                                                                    |
-| 9     | Medium       | Unlimited unauthenticated guessing of `SQLITE_MAINTENANCE_TOKEN`, which has no length floor                                                                                                                                                                |
-| 10    | Medium       | The read path authorizes a deactivated **and soft-deleted** user for the session's full 28-day life                                                                                                                                                        |
-| 11    | Medium       | Hash-envelope and keyring errors escape sign-in as an empty 500, rolling back the lockout counter and creating a 500-vs-401 account oracle                                                                                                                 |
-| 12    | Medium       | External references survive SVG sanitisation, on objects stored `image/svg+xml` + `inline`                                                                                                                                                                 |
-| 13    | Medium       | The sanitiser and DOMPurify use different parsers, so `isValid: true` is returned for output with content outside the SVG root                                                                                                                             |
-| 14    | Medium       | `<use>` is stripped, so every sprite/symbol SVG is stored blank with HTTP 200 and no error                                                                                                                                                                 |
-| 15    | Medium       | Every malformed or over-pixel raster upload answers 500 — including the decompression-bomb guard itself                                                                                                                                                    |
-| 16    | Medium       | A NUL byte in any filter value or in `?search=` is a deterministic 500                                                                                                                                                                                     |
-| 17    | Medium       | `PUT /api/dash/permissions/:id` silently ignores an omitted `description` and writes a contradictory audit row                                                                                                                                             |
-| 18    | Medium       | Wrong-typed `password` / `description` values are coerced to "no change" and answered 200                                                                                                                                                                  |
-| 19    | Medium       | Six unauthenticated requests deny a victim's password recovery for six hours                                                                                                                                                                               |
-| 20    | Medium       | Delivery latency defeats `ensureMinDelay`, making the send endpoints an account-existence oracle                                                                                                                                                           |
-| 21    | Medium       | Any second writer on `rate-limit.db` stalls the process for 2.3 s and then trips every fail-closed limiter to 503                                                                                                                                          |
-| 22    | Medium       | `find-unused-files.ts` permanently exempts the live SVG sanitiser from the reachability gate                                                                                                                                                               |
-| 23    | Medium       | The destructive-write guard's enforcement half has three regex bypasses                                                                                                                                                                                    |
-| 24    | Medium       | `actions/checkout` leaves `GITHUB_TOKEN` in `.git/config` in six jobs, three of which then execute code from PyPI                                                                                                                                          |
-| 25–36 | Low          | Grouped below: `toCalendarDate` epoch coercion, log-redaction gaps, keyring downgrade, unmapped captcha error, missing verify quota, sweep ceiling, cache coupling, budget inside a transaction, data-table edges, a vacuous test, dead code, repo hygiene |
-
-Test-coverage gaps and the Bun 1.4 assessment follow the findings.
-
----
-
 ## 1. Critical — `mode: 'string'` timestamps decode with the host UTC offset, disabling four abuse controls
 
 ### Root cause
 
-`db/schema.ts:120-136` — the shared `timestamps` helper, and every other timestamp column in
+`db/schema.ts:119-135` — the shared `timestamps` helper, and every other timestamp column in
 the schema, declares `mode: 'string'` with `withTimezone: true`:
 
 ```ts
@@ -233,7 +140,7 @@ more than it otherwise would.
 
 ### 1.4 Session-list pagination silently skips rows
 
-`app/api/dash/users/[id]/sessions/pagination.ts:48` builds the cursor from the mangled string,
+`app/api/dash/users/[id]/sessions/pagination.ts:41` builds the cursor from the mangled string,
 and `.../sessions/handler.ts:196-231` feeds the parsed instant back into
 `(created_at, id) < ($1, $2::uuid)` against real column values. Three sessions one minute
 apart, `limit=1`, running the handler's exact query:
@@ -346,13 +253,13 @@ a ceiling of 500; and `validateMagicBytes` exempts SVG (`lib/r2/upload-helper.ts
 sanitiser returns `isValid: true`, so the expanded string flows on to
 `svgOptimizerServer(...)` and then to R2 (`upload-helper.ts:218-220`).
 
-**Impact.** Bun runs one JavaScript thread per process, and `app.ts:216` sets
+**Impact.** Bun runs one JavaScript thread per process, and `app.ts:203` sets
 `reusePort: false`, so this is the whole server: every other in-flight request — including
 `/api/health/storage`, which is what the orchestrator uses to decide whether the container is
 alive — is stalled for the duration, and RSS climbs toward the container limit. (The health-check
 tuning that survives a 3.8 s stall is `reports/coolify-deployment.md` §7; the measured stall is
 carried there as capacity input, not as a substitute for this fix.) The budget is
-`limit: 20` per window (`app/api/upload/image/handler.ts:78-83`) and `routes.ts:269` grants the
+`limit: 20` per window (`app/api/upload/image/handler.ts:78-83`) and `routes.ts:266` grants the
 route a 120 s timeout, so 20 requests per minute at ~4 s each keeps the process wedged. Under
 the effective 0.4 MiB input budget the arithmetic maximum is roughly
 `(0.4 MiB / 2) × (0.4 MiB / 6)` characters — an unconditional OOM (derived from the measured
@@ -399,12 +306,12 @@ impossible (verified: one level only), so the one-level quadratic case is the wh
 ## 3. High — `POST /api/auth/sign-in/email` performs an unbounded outbound captcha call before any rate limiter
 
 **Location** `lib/auth.ts:414-423` (`customRules['/sign-in/email']: false`), `lib/auth.ts:156-168`
-(the limiter, in a `before` hook), `app.ts:387-403` (the Better Auth prefix is registered
+(the limiter, in a `before` hook), `app.ts:374-395` (the Better Auth prefix is registered
 without `toElysiaHandler`, so it gets no pre-auth limit).
 
 **Evidence.** Three facts compose:
 
-1. `app.ts:387-403` registers `/api/auth/*` directly on the Elysia instance rather than through
+1. `app.ts:374-395` registers `/api/auth/*` directly on the Elysia instance rather than through
    `toElysiaHandler`, so `enforcePreAuthIpLimit` — which every other authenticated surface gets
    from `routes.ts` — never runs for any Better Auth path.
 2. Better Auth's own limiter runs first in its router
@@ -464,7 +371,7 @@ plugin's is 10 s).
 
 ## 4. High — `validID` preserves letter case, so `===` self-guards on path UUIDs are bypassable
 
-**Location** root cause `utils/index.ts:503-515`; exploitable guards at
+**Location** root cause `utils/index.ts:501-513`; exploitable guards at
 `app/api/dash/users/[id]/handler.ts:719`, `:771`, and
 `app/api/dash/permissions/[id]/handler.ts:158`.
 
@@ -550,7 +457,7 @@ all three guards at once and cannot break a comparison that works today.
 
 ## 5. High — the CI lint step cannot fail on any `eslint-plugin-security` finding
 
-**Location** `package.json:8`, `.github/workflows/ci.yml:25`, versus `lefthook.yml:35,48`.
+**Location** `package.json:8`, `.github/workflows/ci.yml:25`, versus `lefthook.yml:19,32`.
 
 **Evidence.**
 
@@ -559,8 +466,8 @@ all three guards at once and cannot break a comparison that works today.
 ```
 
 CI runs `bun run lint` (`ci.yml:25`). The local hooks run the stricter form:
-`bunx eslint --max-warnings 0 --no-warn-ignored {staged_files}` (`lefthook.yml:35`) and
-`bunx eslint . --max-warnings 0` (`lefthook.yml:48`).
+`bunx eslint --max-warnings 0 --no-warn-ignored {staged_files}` (`lefthook.yml:19`) and
+`bunx eslint . --max-warnings 0` (`lefthook.yml:32`).
 
 `plugin:security/recommended-legacy` (`eslint.config.mjs:57`) registers all of its rules at
 **warn**, and nothing upgrades them. Measured exit codes on this tree, with a warning forced to
@@ -588,9 +495,8 @@ EXIT=0
 argument, a non-literal `fs` path (path traversal), a ReDoS-shaped regex, or a `==` timing
 comparison on a secret **passes the CI lint step**. The only thing that catches it is
 `lefthook`, which `git push --no-verify` skips and which a clone that never ran `bun install`
-does not have. `lefthook.yml:1-2` states the opposite as its design rationale — "GitHub Actions
-re-runs the same checks, so a skipped hook … is still caught." For the lint gate that sentence
-is false. semgrep's `p/typescript` overlaps partially but has no equivalent of
+does not have. The misleading hook comment has been corrected; the gate mismatch remains.
+semgrep's `p/typescript` overlaps partially but has no equivalent of
 `detect-possible-timing-attacks`, `detect-non-literal-fs-filename` or `detect-unsafe-regex`.
 
 **Fix.** One flag: `"lint": "tsc --noEmit && eslint . --max-warnings 0"`. That makes the three
@@ -601,7 +507,7 @@ invocations agree. If the 20 warn-level rules produce noise, promote the securit
 
 ## 6. High — `/openapi.json` is unauthenticated, uncached and rebuilt per request
 
-**Location** `routes.ts:333-339` (`preAuth: 'none'`), `lib/http/openapi.ts:556-561` (the
+**Location** `routes.ts:330-336` (`preAuth: 'none'`), `lib/http/openapi.ts:509-513` (the
 document is built inside the handler, per request).
 
 **Evidence.** Measured in-process, 100 requests each after warm-up:
@@ -613,7 +519,7 @@ cost ratio        : 96×
 ```
 
 Every request re-runs `z.toJSONSchema` over ~20 schemas plus a `safeParse(undefined)` per
-object field (`lib/http/openapi.ts:182-184`), and `lib/http/response.ts:14` stamps
+object field (`lib/http/openapi.ts:151-153`), and `lib/http/response.ts:14` stamps
 `cache-control: no-store`, so neither a browser nor Cloudflare will cache it. A sweep of every
 other `preAuth: 'none'` surface shows this is the sole outlier — the rest reject early and
 cheaply:
@@ -694,7 +600,7 @@ width/quality ladder against a single decode and accept the first result under t
 
 ## 8. Medium — Elysia's 11-character path offset lets a prepended junk segment reach any route
 
-**Location** `app.ts:203` (the `Elysia` constructor sets no `handler.standardHostname`);
+**Location** `app.ts:195` (the `Elysia` constructor sets no `handler.standardHostname`);
 `node_modules/elysia/dist/adapter/web-standard/index.js:133`;
 `node_modules/elysia/dist/adapter/bun/compose.js:27`. Consumers of the divergence:
 `lib/http/pre-auth.ts:29-37` (`preAuthScope`), `lib/http/request.ts:34` (`apiPath`).
@@ -758,7 +664,7 @@ static routes and `:id` dynamic routes both matched correctly with `Host: x` —
 exception: `GET /api/auth/get-session` returns **405** instead of 200 when the Host is ≤3
 characters, because the Better Auth wildcard prefix is the one registration that falls through
 to the composed handler. (That 405 rather than 404 is itself the tell that Elysia's router and
-the route manifest disagreed on the path: `routeMiss` in `app.ts:192-201` returns 405 whenever
+the route manifest disagreed on the path: `routeMiss` in `app.ts:184-193` returns 405 whenever
 the manifest knows the path, without re-checking the method.)
 
 **Reachability is conditional and I could not test the deployed ingress.** The attacker must
@@ -779,7 +685,7 @@ length.
 
 ## 9. Medium — unlimited unauthenticated guessing of `SQLITE_MAINTENANCE_TOKEN`, which has no length floor
 
-**Location** `routes.ts:291-308` (both internal routes declare `preAuth: 'none'`),
+**Location** `routes.ts:288-305` (both internal routes declare `preAuth: 'none'`),
 `lib/sqlite/maintenance-token.ts:20-26`, `lib/env.server.ts:192-193`
 (`SQLITE_MAINTENANCE_TOKEN = process.env.SQLITE_MAINTENANCE_TOKEN ?? ''`).
 
@@ -1075,7 +981,7 @@ filter iLike value with NUL-> THREW Error  isCustomError=false  errno=22021
 filter eq    value with NUL-> THREW Error  isCustomError=false  errno=22021
 ```
 
-`utils/index.ts:480,485` map only `23505` and `23503`, so `22021` is not a `CustomError` and
+`utils/index.ts:477,482` map only `23505` and `23503`, so `22021` is not a `CustomError` and
 becomes a 500.
 
 **Impact.** Any caller holding `users:view` or `permissions:view` turns the request into a 500
@@ -1275,9 +1181,9 @@ response path, but did not re-run the timing sweep.
 ## 21. Medium — any second writer on `rate-limit.db` stalls the process for 2.3 s, then trips every fail-closed limiter to 503
 
 **Location** `lib/sqlite/database.ts:76` (`BUSY_TIMEOUT_MS = 2000`),
-`lib/rate-limit/index.ts:95-104` (every store error becomes `degraded`),
-`lib/rate-limit/api.ts:266-273` (`degraded && failClosed` → 503), `app.ts:209-216`
-(`reusePort: false` and its rationale).
+`lib/rate-limit/index.ts:84-93` (every store error becomes `degraded`),
+`lib/rate-limit/api.ts:266-273` (`degraded && failClosed` → 503), `app.ts:201-206`
+(`reusePort: false` and the request body ceiling).
 
 **Evidence.** One external process held `BEGIN IMMEDIATE` on `rate-limit.db` for 4 s; a
 concurrent `rateLimit()` in the app process blocked for **2 282 ms** and then returned
@@ -1299,13 +1205,6 @@ _container_ sharing the volume, against `bun test` or `scripts/*` (which open th
 `PRAGMA wal_checkpoint(TRUNCATE)` or a file-level backup — all of which
 `reports/coolify-deployment.md` contemplates.
 
-Separately, the rationale at `app.ts:213-215` — "Each process opens its own SQLite files, so the
-rate-limit counters silently halve during an accidental double-start" — does not describe the
-accidental-double-start case. With a shared `SQLITE_DIR` the counters are **shared and exact**:
-measured across 4 processes, one key, limit 200, 250 attempts each — `admitted 200 / denied 800
-/ degraded 0`, stored `count: 200`. The halving claim holds only for replicas with _separate_
-volumes.
-
 **Impact.** With the PostgreSQL-side abuse controls currently inert (Finding 1), these SQLite
 limiters are the only surviving layer for sign-in, OTP send and OTP verify — and the failure mode
 is bimodal: for ~2.3 s per contended statement the process serves nothing at all, and then every
@@ -1323,87 +1222,6 @@ a decision rather than a replica count — is now `reports/coolify-deployment.md
 
 _Evidence provenance:_ measured by the rate-limit shard; I verified the `degraded` → 503 path and
 `BUSY_TIMEOUT_MS` statically but did not re-run the lock-contention timing.
-
----
-
-## 22. Medium — `find-unused-files.ts` permanently exempts the live SVG sanitiser from the reachability gate
-
-**Location** `scripts/find-unused-files.ts:79-87`.
-
-**Evidence.** The allowlist names the file it exempts as a "second, DIVERGENT copy", and says
-the live one is elsewhere:
-
-```ts
- * `utils/images/server.ts` — a second, DIVERGENT copy of the server-side SVG
- * sanitiser/optimiser. The live one is `utils/svg/server.ts`
- * (`lib/r2/upload-helper.ts` imports it); …
-const KNOWN_UNREACHABLE = new Set(['utils/images/server.ts']);
-```
-
-Both halves are now false:
-
-```
-$ ls utils/svg
-ls: cannot access 'utils/svg': No such file or directory
-
-$ grep -rn "sanitizeSvgServer" lib/
-lib/r2/upload-helper.ts:14:import { sanitizeSvgServer, svgOptimizerServer } from '@/utils/images/server';
-```
-
-`git status` confirms the direction of the move (`D utils/svg/config.ts`). The gate itself is
-real and currently green (`bun scripts/find-unused-files.ts` → "No unreachable files").
-
-**Impact.** `utils/images/server.ts` — which holds `sanitizeSvgServer`, the boundary between an
-uploaded SVG and a public R2 bucket fronted by a CDN — is exempt from the one CI check
-(`ci.yml:49`) that would notice it becoming dead code. If a future refactor drops the
-`upload-helper.ts:14` import, exactly the kind of edit that just happened to `utils/svg/`, CI
-still prints "Every file is reachable from an entry point" and the sanitiser is silently
-unwired. The allowlist is documented as "a NAMED list with a reason each … an entry here is a
-decision someone has to defend"; the reason recorded is wrong in both halves. Removing the entry
-has no effect on today's output, which is the test that it is stale.
-
----
-
-## 23. Medium — the destructive-write guard's enforcement half has three regex bypasses
-
-**Location** `tests/unit/harness-layout.test.ts:120-133`.
-
-**Evidence.** The detector:
-
-```ts
-const IMPORTS_DB = /from\s+'@\/db'/;
-const REACHES_GUARD =
-  /(resetTables|seedUser|signedInUser|assertHarnessDatabase)\s*\(/;
-```
-
-`readFile` (`:34-37`) does **not** strip comments — unlike `scripts/find-unused-files.ts:184`,
-which calls `stripComments()` for precisely this reason. Both regexes run against synthetic
-sources:
-
-```
-A: honest guarded file                    importsDb=true  reachesGuard=true  -> passes (correct)
-B: import { db } from '@/db/index'        importsDb=false                    -> PASSES THE GATE
-C: double quotes                          importsDb=false                    -> passes (unreachable; prettier enforces single quotes)
-D: const { db } = await import('@/db')    importsDb=false                    -> PASSES THE GATE
-E: guard named only in a comment          importsDb=true  reachesGuard=true  -> PASSES THE GATE
-```
-
-B, D and E are real bypasses. D matters most: dynamic `await import('@/…')` is already idiomatic
-in this suite (`tests/integration/harness.test.ts:268`, `:294`, `:314`).
-
-**Impact.** `tests/helpers/database.ts:41-56` calls `assertHarnessDatabase()` "the load-bearing
-safety guard", and this test is "the enforcement half". A test file can hold the raw Drizzle
-client and write with a bare `db.execute(...)` without the layout gate ever requiring it to
-reach the guard. The failure sequence: author `tests/integration/foo.test.ts` with
-`const { db } = await import('@/db')` and a truncating statement; `bun run test` passes; then run
-that file the way the docs say must be safe — a bare `bun test tests/integration/foo.test.ts`
-with no tier runner. `bunfig.toml:23` loads only `preload-base.ts`, which deliberately does not
-rewrite `DATABASE_URL`, and `bun test` auto-loads `.env` — the repo's own measured claim at
-`tests/helpers/preload-database.ts:44-58`. The write lands on the developer's real database.
-
-_Not executed end to end:_ doing so requires pointing a truncating statement at a live
-database. The regex behaviour is measured; the consequence is derived from the repo's own
-documented `.env` auto-load.
 
 ---
 
@@ -1451,19 +1269,18 @@ module were checked separately and are **correct** across spring-forward, fall-b
 rollover.
 
 **26. Log redaction misses `\p{Cf}`, and one throwing getter discards a whole log line.**
-`utils/index.ts:117-123`, `:317`, `:386-387`. `LOG_CONTROL_CHARS = /[\p{Cc}\p{Zl}\p{Zp}]+/gu`
+`utils/index.ts:117-127`, `:315-325`, `:384-387`. `LOG_CONTROL_CHARS = /[\p{Cc}\p{Zl}\p{Zp}]+/gu`
 neutralises CRLF and U+2028 correctly, but bidi overrides (U+202E/U+202C) and zero-width
-characters survive — so the docstring's "a log line can't be forged" claim does not hold for
-that class. Separately, `seen` is added to but never removed from, so a diamond reference
+characters survive. Separately, `seen` is added to but never removed from, so a diamond reference
 (`{ before: state, after: state }`) reports the second arm as `[circular]`; and a single `try`
 around the whole payload means one awkward accessor replaces the entire diagnostic with
 `[unserializable log payload]` — at exactly the moment diagnostics matter, since
 `utils/api-response.ts:146` is the only record of an unexpected 500. Redaction _coverage_ held
 up under every hostile shape tried (nested objects, arrays, `Map`/`Set`, `Error.cause` chains,
 getters, symbol keys, `__proto__` from `JSON.parse`, `AggregateError`, better-auth `APIError`
-bodies) — this is about the two edges only. Reachability of the `\p{Cf}` case is a hypothesis,
-reported as an implementation-versus-docstring gap; note that the access log at
-`lib/http/after-response.ts:139-147` writes a client-controlled `summary.path` through bare
+bodies) — this is about the two edges only. Reachability of the `\p{Cf}` case is a hypothesis;
+note that the access log at
+`lib/http/after-response.ts:62-70` writes a client-controlled `summary.path` through bare
 `JSON.stringify`, which escapes below 0x20 but not `\p{Cf}`.
 
 **27. The keyring accepts an active key that is not the newest generation.**
@@ -1509,7 +1326,7 @@ still bound guessing — so this is a contract violation rather than a bypass.
 
 **30. The SQLite sweep's per-run ceiling is below the reachable insertion rate.**
 `lib/sqlite/sweep.ts:30-37` (`BATCH_SIZE = 500`, `MAX_BATCHES = 200`),
-`lib/sqlite/maintenance.ts:40-71`. 400 000 expired rows swept in one run removed exactly
+`lib/sqlite/maintenance.ts:12-43`. 400 000 expired rows swept in one run removed exactly
 100 000 and returned `hasMore: true`; four runs were needed. At 263 bytes/row and an hourly
 schedule, sustained creation of more than ~28 new expired keys per second outruns it
 permanently. `hasMore: true` is returned with HTTP 200 by design, so a bare `curl -fsS` cannot
@@ -1520,7 +1337,7 @@ high-cardinality vectors are captcha-gated. Finding 8 removes that mitigation fo
 `preauth.*` keyspace.
 
 **31. The disposable cache database is coupled into the maintenance sweep with no error
-containment.** `lib/cache/index.ts:246-253`, `lib/sqlite/maintenance.ts:43-69`.
+containment.** `lib/cache/index.ts:246-253`, `lib/sqlite/maintenance.ts:15-41`.
 `cacheGet`/`cacheSet`/`cacheDelete` each swallow store failures ("A cache that throws is worse
 than a cache that misses"), but `cacheSweepExpired` and `cacheHasExpiredRows` call `getStore()`
 directly, which throws. `runMaintenanceSweep` awaits the limiter sweep first, so a corrupt
@@ -1549,7 +1366,7 @@ non-atomicity are code-evident.
 **33. Data-table edges.** Three small ones in the same module, all proven, none a privilege
 issue. (a) `safeNumber` (`lib/data-table/filter-columns.ts:67-70`) accepts `"0x10" → 16` and
 `"1e3" → 1000`, the exact class the sibling parser at
-`app/api/dash/users/[id]/sessions/pagination.ts:108-119` already fixed and documented —
+`app/api/dash/users/[id]/sessions/pagination.ts:96-116` already rejects —
 **latent**, since no live descriptor registers a `number` column. (b) A reversed `isBetween`
 range is accepted and answered 200 with an empty table (`:228-248`); `filter.value.length !== 2`
 is rejected but `from <= to` is never checked, and the comment on the length guard describes
@@ -1584,7 +1401,7 @@ client/server source of truth. `utils/otp.ts:371-374,573-578,613`
 callers, and the `as ProcessOtpSendResult` cast is what keeps the return contract from being
 type-checked. `app/api/auth/otp/messages.ts:15-16` `otpMsg.identifierNotFound` is the
 pre-privacy-collapse message and would be an enumeration oracle if rewired.
-`bunx knip` reports 1 unused export: `lib/r2/client.ts:389` `getR2ConfigStatus`. (It reported a
+`bunx knip` reports 1 unused export: `lib/r2/client.ts:302` `getR2ConfigStatus`. (It reported a
 second, `tests/helpers/object-store.ts:91` `failObjectStoreKey`, earlier in this audit — a live
 coverage gap rather than dead code, being the documented fixture for the retention sweep's
 partial-failure branch. It was wired up by concurrent work while the audit was running.)
@@ -1600,12 +1417,10 @@ nothing stops the next one: the pattern belongs in `.gitignore`.
 import (`types/data-table.ts:3` `import type { ColumnSort }`) — installed by a production
 install of a headless API server with no React. `bun dedupe --check` reports three removable
 duplicate versions (`@types/node` 26.2.0→24.13.3, `get-tsconfig`, `undici-types`) even though
-`package.json` pins `"@types/node": "24"`. The CI JUnit report (`ci.yml:150-164`) is written and
+`package.json` pins `"@types/node": "24"`. The CI JUnit report (`ci.yml:142-147`) is written and
 thrown away — no step uploads or parses it, GitHub does not read JUnit XML on its own, and
-`.gitignore:14` keeps it out of the repo, so the comment's claim that "a failure becomes a check
-annotation" does not hold. `knip` is excluded from CI on the recorded grounds that it "reports
-85 unused exports"; it now reports 2, so `package.json:17`'s `find:unused-files` fails today
-while the CI step passes — two commands with almost the same name giving opposite verdicts.
+`.gitignore:14` keeps it out of the repo. CI now gates `knip --include files`, while unused
+exports and types remain advisory.
 `scripts/find-non-null-assertions.ts:148-161` creates a `/g` regex once outside the loop and
 calls `.test()` per line, so `lastIndex` carries across lines and roughly half of all
 `@ts-ignore` / `@ts-expect-error` comments are missed — a false negative, contained because the
@@ -1618,71 +1433,6 @@ correctly a devDependency (only `bench/**` imports it) and `jsdom` correctly a r
 
 ---
 
-## Test coverage gaps that matter
-
-Only gaps where a _security-critical invariant_ is currently unverified. Established by reading
-all 14 unit, 7 integration and 1 process file, then grepping `tests/` for each symbol.
-
-1. **No test covers the login account lockout.** The only matches for
-   `lockedUntil|locked_until|failedLoginAttempts|MAX_FAILED_ATTEMPTS` under `tests/` are
-   `verificationSessions.blockedUntil` (OTP), not the login counter. Finding 1.1 — a completely
-   inert brute-force control — would have been caught by one test.
-2. **No test covers `formatCursor` / `parseCursor`.** Zero matches repo-wide outside the three
-   application files. This matters twice: Finding 1.4 would have been caught, and the comment at
-   `app/api/dash/users/[id]/sessions/pagination.ts:46` — "the round trip is asserted in the
-   tests" — is **false**.
-3. **No test pins the process timezone.** The entire class in Finding 1 is invisible on a UTC
-   host. A regression test must force a non-UTC `TZ`, or CI (almost certainly UTC) will keep
-   passing while production is broken.
-4. **Hostile SVG sanitisation is untested.** `upload-auth-gate.test.ts:197-207` uploads a benign
-   `<svg><rect/></svg>` and asserts 200, explicitly deferring the pipeline. Nothing feeds
-   `<script>`, `onload=`, `<foreignObject>`, an XML entity or a `javascript:` href. Findings 2,
-   12, 13 and 14 all live in that gap, and the output lands in a public bucket behind a CDN.
-5. **`validateMagicBytes` has zero coverage.** No test declares `image/png` over non-PNG bytes.
-   The SVG fixture was chosen _because_ it is exempt from the check.
-6. **`own`-scope row filtering is untested at the SQL level.** `resolveActionScope` is well
-   covered as a pure function; no test asserts that an actor holding only `viewOwn` receives
-   _only_ rows whose `created_by` is themselves. `tests/helpers/session.ts:80` exposes
-   `createdBy` for exactly this and no test passes it.
-7. **`validID` has no test** — yet `should-ignore.md` #50 and #51 both accept a real risk on the
-   grounds that "`validID` always matches session ID format". Finding 4 is what that unasserted
-   property costs.
-8. **`ipIdentifier` / `ipBucket` have no test.** `should-ignore.md` #64 declares the manual IPv6
-   `/64` expansion "verified correct" and rules out _changing_ it; it does not rule out testing
-   it. A `/64` collapse that stops collapsing turns every per-IP limiter into no limiter for an
-   IPv6 client with a routed prefix.
-9. **`getClientIp` / `TRUSTED_IP_HEADERS` have no test.** Nothing asserts that
-   `x-forwarded-for` is ignored, nor the fail-closed 503 when the trusted header is absent — and
-   the harness always sends the trusted header, so the branch is structurally unreachable from
-   the current suite.
-10. **Turnstile rejection is untested.** No test asserts that a `{ success: false }` siteverify
-    answer blocks a request; the fake defaults to `{ success: true }`.
-11. **Cookie attributes are unasserted.** `tests/helpers/session.ts:185` documents `setCookie` as
-    "for assertions about attributes", and no test makes one — `HttpOnly`, `Secure`, `SameSite`
-    and `Path` on the session cookie are all unchecked.
-12. **`maintenanceTokenMatches`' accept path is untested, and `timingSafeEqual` is never
-    executed by any test** — the single wrong-token test sends a 13-character value against a
-    25-character configured token, so the length short-circuit fires first.
-    `tests/helpers/preload-base.ts:117-127` was added to make the authorised path reachable and
-    nothing uses it.
-13. **The CSP _value_ is unasserted.** `scripts/smoke.ts:104-107` checks only
-    `content-security-policy !== null`; a regression to `default-src *` passes. Nothing touches
-    `access-control-allow-origin`, HSTS, `X-Frame-Options` or `Referrer-Policy`.
-14. **No test asserts an audit row is written by an actual route mutation.** Existing tests call
-    `auditLog()` directly or insert rows by hand.
-15. **Nothing in CI can see rot inside `tests/`.** `scripts/find-unused-files.ts:65` treats
-    `tests/` as an entry directory, so no file under it can ever be reported unreachable, and
-    knip — the tool that would see it — is excluded from CI.
-16. **No test asserts that the sign-in path bounds its outbound captcha call.** The four handlers
-    that get the ordering right state the invariant in comments only. A test counting outbound
-    siteverify calls for N unauthenticated sign-in attempts would lock Finding 3 shut.
-
-Items 1–5, 8, 9 and 10 are each a single-line regression away from a real bypass, and each is
-invisible to the current suite by construction rather than by oversight — the fixtures were
-chosen to route around them.
-
----
-
 ## Bun 1.4 assessment
 
 Every item was checked against the installed runtime (`Bun.version === '1.4.0'`), not against
@@ -1691,13 +1441,10 @@ worth adopting _here_.
 
 ### Worth adopting
 
-**`Bun.cron` retires the recorded objection to an in-process sweep.**
-`lib/sqlite/maintenance.ts:9-27` records the decision _not_ to adopt an in-process cron, with
-three reasons. Reason 1 is load-bearing: "It is another Elysia coupling while the
-Elysia-versus-Hono question is open, and the trigger would have to be rewritten with the
-framework" — written about `@elysia/cron`. `Bun.cron` is a _runtime_ API, so that reason no
-longer applies. Reason 2 (the single-process assumption) is already resolved by
-`reusePort: false`. Reason 3 was about a specific defect, already fixed. Verified on 1.4.0:
+**`Bun.cron` is a viable trigger for the framework-independent sweep.**
+`runMaintenanceSweep` is independent of HTTP and Elysia (`lib/sqlite/maintenance.ts:12-43`),
+and `reusePort: false` enforces the single-process assumption. Bun's runtime-level cron API
+therefore avoids coupling the job to the web framework. Verified on 1.4.0:
 
 ```
 Bun.cron.parse("*/15 * * * *") -> 2026-08-21T18:00:00.000Z
@@ -1733,11 +1480,10 @@ and doubles as a slow-test report), and `--changed` for the lefthook pre-commit 
 verified present. Speed, not correctness.
 
 **`--cpu-prof-md` / `--heap-prof-md`.** Several values in this codebase are explicitly
-unmeasured placeholders — `IDLE_TIMEOUT_SECONDS = 60` ("a deliberate placeholder, not a
-measurement", `server.ts:178`), the upload route's `timeoutSeconds: 120` ("NOT measured on the
-target host yet", `routes.ts:266-268`), and `TODO.md` PG-1, which blocks `statement_timeout` on
+unmeasured ceilings — `IDLE_TIMEOUT_SECONDS = 60`, the upload route's
+`timeoutSeconds: 120`, and `TODO.md` PG-1, which blocks `statement_timeout` on
 "a measured p99 for the slowest legitimate query". These flags produce grep-friendly Markdown
-profiles directly on the target host, which is what those three TODOs are waiting for. Finding 7
+profiles directly on the target host, which is what those measurements need. Finding 7
 is also a profiling target.
 
 **`bun dedupe --check` in CI.** Verified: currently reports three removable duplicates. One line
@@ -1789,19 +1535,6 @@ grandchildren.
   source than observed.
 - **Native streams, zlib-ng, the RegExp and `new URL()` speedups, the 13–48 % HTTP-server memory
   reduction** — free on the pinned version, no code change.
-
-### Already correct, no change needed
-
-`bun:sql` transaction isolation is the reason `server.ts:102-123` refuses a Bun _minor_
-mismatch, and the recorded reason is accurate: Bun #32772 (a simple-protocol query concurrent
-with a not-yet-prepared parameterized query on one connection could cross rows, and
-`BEGIN`/`COMMIT`/`ROLLBACK` are simple-protocol) was fixed in 1.4.0. `lib/id.ts` already
-migrated to `Bun.randomUUIDv7()` on the strength of the 1.4.0 counter-exhaustion change, with
-the measurement recorded. `package.json` already uses the 1.4 `ignoreScripts` field alongside
-`trustedDependencies`. `tests/helpers/run.ts` already uses `--no-env-file`, `--isolate` and
-`--parallel`. This part of the codebase is up to date.
-
----
 
 ## Verified correct (checked, and reported so it is not re-checked)
 
@@ -1951,7 +1684,7 @@ Recorded so the next reader does not spend the time again.
   amplification through this door — `zodIssueMessage` reflecting an unbounded list of
   unrecognized key names into the 422 body (100 000 keys → 176 ms and an ~889 KB message) — is
   gated behind a session and a 10–20/min limiter. A nuisance, not a lever.
-- **`positiveInt` truncating with `| 0`** (`utils/index.ts:425-429`): wraps negative above 2³¹
+- **`positiveInt` truncating with `| 0`** (`utils/index.ts:423-427`): wraps negative above 2³¹
   (`positiveInt(2**31+5, 2**32) === -2147483643`). Its only callers pass `MAX_PER_PAGE = 100` and
   `MAX_PAGE = 10 000`, so it is unreachable. Worth knowing, not a defect.
 - **Extended Arabic-Indic digits rejected as a _missing_ phone number.**
@@ -1962,11 +1695,10 @@ Recorded so the next reader does not spend the time again.
   the repo's phone policy is explicitly scoped to a Saudi launch (`should-ignore.md` #56).
 - **OPTIONS requests produce no access-log line.** Both OPTIONS answers short-circuit in an
   `onRequest` hook, so preflight volume and OPTIONS-based path scanning are invisible in the log.
-  The code documents this accurately at `lib/http/after-response.ts:129-136` — a stated
-  limitation, not a defect.
-- **`lib/http/after-response.ts`'s queue and settle loop** have no caller and no test. The file
-  says so itself. Insurance, not a defect.
-- **`routeMiss` returning 405 without re-checking the method** (`app.ts:192-201`). Unreachable
+  This is an observability limitation, not a correctness defect.
+- **`lib/http/after-response.ts`'s queue and settle loop** have no caller and no test, by code
+  search. Insurance, not a defect.
+- **`routeMiss` returning 405 without re-checking the method** (`app.ts:184-193`). Unreachable
   except through Finding 8, where it is the useful tell that the router and the manifest
   disagreed. Folded into that finding rather than reported separately.
 - **Whether mass session revocation should emit its own `sessions` audit row.** The cause is

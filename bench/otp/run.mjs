@@ -1,21 +1,8 @@
-// Entry point. `bun bench/otp/run.mjs [--flags]` from the repo root.
+// Compares the application's password-based OTP hashing path with a keyed-MAC
+// alternative without importing OTP infrastructure that initializes services.
 //
-// Answers ONE question, the one TODO.md gates the OTP-hashing change on: is the
-// 64 MiB Argon2id profile a measurable latency or memory problem for OTP codes
-// at the concurrency this application's own limiters permit?
-//
-// It measures the APPLICATION's primitives — `hashPassword` / `verifyPassword`
-// from `lib/auth/password.ts`, which is exactly what `hashOtpCode` /
-// `verifyOtpCode` in `utils/otp.ts` delegate to, one-line aliases with no
-// parameters of their own. Importing `utils/otp.ts` itself would drag in the
-// database pool and nodemailer for no gain.
-//
-// The HMAC-SHA-256 column is the proposed replacement, not a general "fast hash"
-// straw man: a keyed MAC over the code with a dedicated versioned secret,
-// compared in constant time. It is here to size the gap, not to win a race —
-// nobody doubts which is faster.
-//
-// See README.md for flags and the numbers from the last recorded run.
+// The keyed-MAC comparison uses constant-time verification so the benchmark
+// compares viable constructions rather than generic fast and slow hashes.
 
 import crypto from 'node:crypto';
 import { arch, cpus, platform, totalmem } from 'node:os';
@@ -40,32 +27,20 @@ import {
 const HARNESS_VERSION = 1;
 
 /**
- * The Argon2id profile under test, restated from `lib/auth/password.ts` so the
- * report says what was measured. Asserted against the real module below rather
- * than trusted — a copied constant that silently drifts is worse than no
- * constant, because the output keeps claiming the old number.
+ * Mirrors the application profile only to label results; a runtime assertion
+ * prevents the benchmark from silently measuring a different configuration.
  */
 const EXPECTED_PROFILE = { memoryCost: 65_536, timeCost: 3, parallelism: 4 };
 
 /**
- * Concurrency levels, chosen from what the limiters actually admit rather than
- * round numbers.
- *
- * `PRE_AUTH_LIMIT` is 120 requests/minute per IP per surface, and the
- * per-destination OTP caps bound a RATE, not a simultaneous working set — which
- * is precisely the gap TODO.md describes. So the interesting levels are the ones
- * a single admitted burst can reach: 1 (the floor), 4 (a plausible steady load),
- * 10 (`MAX_POOL_CONNECTIONS`, the process's own transaction ceiling), and 32
- * (a burst well inside a single minute's per-IP allowance).
+ * Exercises sustained and burst loads that the application's request limits
+ * can admit concurrently.
  */
 const CONCURRENCY_LEVELS = [1, 4, 10, 32];
 
 const SIX_DIGIT = () => crypto.randomInt(100_000, 1_000_000).toString();
 
-// ── HMAC candidate ───────────────────────────────────────────────────────────
-// Deliberately NOT imported from application code: it does not exist there yet.
-// This is the construction the fix would introduce, written out so the numbers
-// belong to something specific.
+// Kept benchmark-local so application code does not expose an unused alternative.
 const HMAC_KEY = crypto.randomBytes(32);
 const HMAC_KEY_ID = 'k1';
 
@@ -110,13 +85,8 @@ const ALGORITHMS = {
 // ── Measurement ──────────────────────────────────────────────────────────────
 
 /**
- * Runs `count` operations at a fixed in-flight `concurrency`, recording per-
- * operation latency, peak RSS and event-loop lag for the whole window.
- *
- * A worker pool, not `Promise.all` over everything: `Promise.all` on 32 promises
- * launches 32 at once and then tails off, so the reported peak belongs to a
- * moment of 32 and the reported latency to a mixture. A pool holds the level
- * steady, which is what "N concurrent OTP verifies" means.
+ * Uses a worker pool to hold the requested concurrency steady while measuring
+ * latency, memory, and event-loop lag.
  */
 async function measure({ op, count, concurrency }) {
   const latencies = new Array(count);

@@ -33,16 +33,7 @@ export interface ResponsePolicyOptions {
   durationMs?: number;
 }
 
-/**
- * Writes the response policy onto `response`, returning a response that carries
- * it.
- *
- * Mutates in place where the header guard allows it (verified: a `Response`
- * built with `new Response()` / `Response.json()` accepts `headers.set`, and
- * repeated `Set-Cookie` values survive). A response whose headers are immutable
- * — `Response.redirect()` produces one — is rebuilt instead of being silently
- * left unpoliced.
- */
+/** Rebuilds responses whose headers are immutable, such as redirects. */
 export function applyResponsePolicy(
   response: Response,
   options: ResponsePolicyOptions = {}
@@ -53,9 +44,6 @@ export function applyResponsePolicy(
   } catch {
     const headers = new Headers(response.headers);
     write(headers, options);
-    // `getSetCookie` is the only way to carry repeated `Set-Cookie` values
-    // through a copy; `new Headers(headers)` folds them into one comma-joined
-    // line, which browsers reject.
     const cookies = response.headers.getSetCookie();
     if (cookies.length > 0) {
       headers.delete('set-cookie');
@@ -73,9 +61,7 @@ function write(headers: Headers, options: ResponsePolicyOptions): void {
   for (const [key, value] of Object.entries(SECURITY_HEADERS))
     headers.set(key, value);
 
-  // Fill in, don't overwrite: a handler that deliberately serves a cacheable
-  // body sets its own directive, and `toWebResponse` has already applied the
-  // same default to everything on the envelope path.
+  // Preserve an explicit cache policy from the handler.
   if (!headers.has('cache-control'))
     headers.set('cache-control', DEFAULT_CACHE_CONTROL);
 

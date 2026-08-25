@@ -1,38 +1,7 @@
 /**
- * The API contract, generated from the two things that already define it: the
- * route manifest and the Zod schemas the handlers validate with.
- *
- * ============================================================================
- * WHY NOT `@elysia/openapi`
- * ============================================================================
- * The plugin exists, is compatible with the pinned `elysia@1.4.29`, and does
- * support Zod — through `openapi({ mapJsonSchema: { zod: z.toJSONSchema } })`.
- * It is still the wrong fit here, for two reasons that are properties of THIS
- * codebase rather than of the plugin:
- *
- * 1. It reads schemas that are ATTACHED TO ELYSIA ROUTES. Every route in this
- *    application registers with `parse: 'none'` and validates inside the
- *    handler, so there is nothing for the plugin to read. Attaching the schemas
- *    to the route definitions would make Elysia validate them too — a second
- *    validation pass, rejecting with Elysia's error shape instead of this API's
- *    envelope, on a body the framework was told not to parse.
- * 2. It would put the contract behind the framework, which is the one thing the
- *    route table is deliberately kept out of.
- *
- * Zod 4 emits JSON Schema natively (`z.toJSONSchema`, verified on the installed
- * `zod@4.4.3`), so the plugin buys nothing except a Scalar UI. That trade is
- * recorded in `TODO.md`.
- *
- * ============================================================================
- * WHY BETTER AUTH'S OWN DOCUMENT IS NOT MERGED
- * ============================================================================
- * `better-auth` ships an `openAPI()` plugin whose generator would describe its
- * whole route table. This deployment does not expose that route table: the
- * `before` hook in `lib/auth.ts` answers 404 for every path outside
- * `BETTER_AUTH_ALLOWED_PATHS`. Merging the generated document would advertise dozens of
- * endpoints that this server rejects — a contract that is worse than an
- * incomplete one, because it is wrong. The four paths that ARE reachable are
- * listed below, derived from that same set so the two cannot drift.
+ * Generates a framework-independent contract from the route manifest and the
+ * Zod schemas used by handlers. Route-attached Elysia schemas would duplicate
+ * validation, while Better Auth's document would advertise blocked routes.
  */
 import type { Handler } from './contract';
 import type { RouteManifestEntry } from './route-manifest';
@@ -376,19 +345,6 @@ function commonResponses(entry: RouteManifestEntry): JsonSchema {
   return responses;
 }
 
-/**
- * Every way the three hand-maintained maps above can disagree with the manifest.
- *
- * This is the CLASS of the defect that shipped, not the two instances of it.
- * `DELETE /api/dash/users/:id/sessions` and `POST /api/dev/sign-up` both declared
- * `body: 'json'` and had no `REQUEST_BODIES` entry, so both appeared in the
- * document with no request body at all. Adding the two schemas fixed those two
- * routes; it did nothing about the next one, and the comment on `REQUEST_BODIES`
- * claimed a check that was never written. This is that check.
- *
- * Exported so it can be asserted directly, rather than only through the 500 that
- * `openApiDocument` raises.
- */
 function openApiConsistencyProblems(
   manifest: readonly RouteManifestEntry[]
 ): string[] {
@@ -399,9 +355,7 @@ function openApiConsistencyProblems(
 
   for (const entry of manifest) {
     const key = `${entry.method} ${entry.path}`;
-    // `multipart` is generated inline from the policy, so only `json` needs a
-    // schema. A route that declares one and supplies none documents a body-less
-    // endpoint that rejects a body-less request.
+    // Multipart schemas come from route policy; JSON schemas are explicit.
     if (entry.body === 'json' && !(key in REQUEST_BODIES))
       problems.push(
         `${key} declares body: 'json' but has no REQUEST_BODIES entry`
@@ -412,8 +366,7 @@ function openApiConsistencyProblems(
       );
   }
 
-  // The other direction: a renamed or deleted path leaves its entry behind, and
-  // a dead key is silently skipped because lookups are driven by the manifest.
+  // Catch schemas left behind after a route is renamed or removed.
   for (const key of Object.keys(REQUEST_BODIES))
     if (!keys.has(key))
       problems.push(`REQUEST_BODIES has '${key}', which is not a route`);
