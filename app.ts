@@ -41,6 +41,8 @@ import { apiError } from '@/utils/api-response';
  * every one of them was previously hand-maintained or absent: the 405 boundary
  * below, the OpenAPI document, and the registration check in
  * `scripts/find-unused-files.ts`.
+ *
+ * @knipignore
  */
 export const ROUTE_MANIFEST = toManifest(ROUTES);
 

@@ -8,6 +8,7 @@ export function normalizeArabicDigits(input: string): string {
   return input.replaceAll(/[٠-٩]/g, (n) => String(ARNums.indexOf(n)));
 }
 
+/** @knipignore */
 export const humanReadableNumber = (
   value: number | string,
   numberOfDigits = 2
@@ -420,12 +421,6 @@ const returnNumber = (value: string | undefined | number | null) => {
   const num = Number(value);
   return Number.isNaN(num) ? 0 : num;
 };
-export const returnNumberOrNull = (
-  value: string | undefined | number | null
-) => {
-  const num = Number(value);
-  return Number.isNaN(num) ? null : num;
-};
 
 export const positiveInt = (val: unknown, maxValue = MAX_ID) => {
   const num = Number(val);
@@ -495,6 +490,7 @@ export function getConstraintName(e: unknown): string {
   return err?.constraint ?? err?.cause?.constraint ?? '';
 }
 
+/** @knipignore */
 export const formatDate = (date: string) =>
   new Date(date).toLocaleDateString('ar-EG', {
     day: 'numeric',
@@ -521,6 +517,7 @@ export const validID = (val: unknown): string => {
 /**
  * Extracts EntityID from the end of a URL path
  * Supports UUID v7 format and numeric IDs
+ * @knipignore
  * @param url - The URL to extract ID from
  * @returns The extracted ID string, or null if not found
  */

@@ -51,9 +51,8 @@
  * silently make the rollback to better-sqlite3 impossible.
  */
 
-import type { SQLQueryBindings } from 'bun:sqlite';
-
 import { Database } from 'bun:sqlite';
+import type { SQLQueryBindings } from 'bun:sqlite';
 
 export interface SqliteStatement {
   /** `null`, not `undefined`, when no row matched — see the driver notes. */

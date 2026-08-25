@@ -1,8 +1,5 @@
 import { MSG_INVALID_CREDENTIALS } from '@/utils/api-messages';
 
-export const MSG_ACCOUNT_LOCKED = (secondsLeft: number) =>
-  `تم حظر الحساب مؤقتًا. حاول مرة أخرى بعد ${secondsLeft} ثانية.`;
-
 const MSG_UNTRUSTED_ORIGIN =
   'تعذر إكمال الطلب من هذا الموقع. أعد تحميل الصفحة من الرابط الرسمي ثم حاول مرة أخرى.';
 

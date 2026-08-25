@@ -266,9 +266,17 @@ async function handleSelfEdit(
     // the pre-update value. FOR UPDATE is unnecessary — a user can't race
     // themselves meaningfully, and the WHERE filter blocks updates against
     // a concurrently deactivated/soft-deleted row.
+    // `updated_at` is a `Date`, not a string, and the distinction is earned rather
+    // than assumed: raw `tx.execute` bypasses Drizzle's column mapper, so the
+    // schema's `mode: 'string'` does not apply here and `bun:sql` decodes
+    // `timestamptz` to a `Date`. Asserted in
+    // `tests/integration/driver-contract.test.ts`. It reaches the client as the
+    // same ISO string either way — `JSON.stringify` serialises both — but the
+    // declared `string` type-checked any `.slice()` or comparison a future caller
+    // wrote against it, which would have thrown at run time.
     const updated = await tx.execute<{
       old_name: string;
-      updated_at: string;
+      updated_at: Date;
     }>(sql`
       WITH prev AS (
         SELECT id, name FROM users WHERE id = ${targetId}

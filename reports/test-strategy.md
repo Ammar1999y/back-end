@@ -123,6 +123,17 @@ writes the result into `process.env.DATABASE_URL` **inside the preload**, before
 `DATABASE_URL`, so the rewrite must happen earlier than any application import,
 and `--preload` is the only hook that reliably is.
 
+**Only the rewrite belongs in the preload — not the provisioning.** A preload
+runs once per worker, and once per FILE under `--isolate`, so a
+`CREATE DATABASE … TEMPLATE` there is N processes racing to clone one template,
+which PostgreSQL refuses outright while any connection to the template is open.
+Teardown is worse: a preload's `afterAll` fires more than once per worker and not
+at all when a worker is killed, so a drop registered there is both premature and
+unreliable. Provisioning and dropping therefore sit in a runner **upstream** of
+`bun test` — one sequential provisioner, then a `finally` around the child
+process — and the workers only ever open a database that is already waiting for
+them.
+
 **b. Four guards, because `.env` auto-loads.** This is the sharpest hazard in
 the plan. `bun test` reads `.env`, so the development `DATABASE_URL` — pointing
 at `app`, with the developer's real data — is in every test process by default.
@@ -218,8 +229,19 @@ unreachable `/api/auth/*` path would have spent Turnstile quota. Where a real
 socket is wanted (timeouts, 5xx, a slow provider), point the router at a
 `Bun.serve` instance instead of returning a synthetic `Response`.
 
-SMTP is the exception: not HTTP, so `mock.module('nodemailer', …)` returning a
-transport that records `sendMail` calls.
+**Two boundaries the `fetch` router cannot see, so it is not one guard but
+three.** SMTP is not HTTP: `mock.module('nodemailer', …)` returning a transport
+that records `sendMail` calls. R2 **is** HTTP and still escapes, because the AWS
+SDK resolves `NodeHttpHandler` — `node:http`, not `fetch` — so an S3 call never
+reaches a router installed on `globalThis.fetch`:
+`mock.module('@aws-sdk/client-s3', …)` and
+`mock.module('@aws-sdk/s3-request-presigner', …)` are the seams, and the test that
+proves the boundary holds must assert the **absence** of `fetch` traffic to
+`*.r2.cloudflarestorage.com`, not merely that the stub was called.
+
+Both replacements are process-wide and `mock.restore()` does not undo a
+`mock.module`, so install them in the shared preload rather than per file —
+uniformity is what makes them safe.
 
 **Rule on `mock.module`:** third-party modules at the process boundary only.
 Mocking a first-party module means the test proves the mock. `--isolate` clears
@@ -266,13 +288,29 @@ Two hygiene items the move must fix, both of which have already bitten:
 
 ### 5.2 Scripts
 
-| Script             | Command                                               | Needs       |
-| ------------------ | ----------------------------------------------------- | ----------- |
-| `test`             | `bun test tests/unit`                                 | nothing     |
-| `test:integration` | `NODE_ENV=test bun test tests/integration --parallel` | PostgreSQL  |
-| `test:process`     | `NODE_ENV=test bun test tests/process`                | a free port |
-| `test:all`         | the three in sequence                                 | PostgreSQL  |
-| `test:db:reset`    | `bun tests/helpers/reset.ts`                          | PostgreSQL  |
+| Script             | Command                                | Needs       |
+| ------------------ | -------------------------------------- | ----------- |
+| `test`             | `bun tests/helpers/run.ts unit`        | nothing     |
+| `test:integration` | `bun tests/helpers/run.ts integration` | PostgreSQL  |
+| `test:process`     | `bun tests/helpers/run.ts process`     | a free port |
+| `test:all`         | the three in sequence                  | PostgreSQL  |
+| `test:db:reset`    | `bun tests/helpers/reset.ts`           | PostgreSQL  |
+
+Each tier goes through one runner rather than calling `bun test` directly, and
+the reason is a trap worth knowing before writing any script here: **`bun test
+<path>` treats its positional arguments as filename FILTERS, not paths.** A test
+file outside the filter is skipped and the run still exits 0, which is how
+`bun test scripts/probe/local` came to report success while a whole directory had
+never executed. `bunfig.toml`'s `[test] root` fixes the bare `bun test` case; the
+runner fixes the per-tier case, and `tests/unit/harness-layout.test.ts` asserts
+from the other side that no file under `tests/` sits in no tier.
+
+The runner also owns the two jobs a preload cannot do: provision once and
+sequentially (a preload runs per worker, and per file under `--isolate`, so
+`CREATE DATABASE` there is N processes racing to clone one template), and drop
+once at the end whatever happened (a `finally` around the child process, since a
+preload's `afterAll` fires more than once per worker and never at all when a
+worker is killed).
 
 `test` stays the cheap one deliberately: it is what `lefthook` runs pre-commit,
 and a pre-commit hook that needs a database is a pre-commit hook that gets
@@ -995,6 +1033,57 @@ correct under `prepare: false` and wrong under `prepare: true`. Any future move
 to `prepare: false` (which the runbook prescribes if a transaction pooler is ever
 introduced) must not be read as making the helper unnecessary.
 
+**Corrections to this section, from porting it (2026-08-21).** Each was found by
+writing the assertions against the real driver, and each is a place the entry as
+written would have accepted a weaker test:
+
+- **`changed_fields` must be `'array'`, not `'object'`.** §7.4g prescribes
+  `jsonb_typeof = 'object'` "for every jsonb column" and notes a few lines earlier
+  that `changed_fields` stores an array — it contradicts itself. The invariant that
+  generalises is: **`jsonb_typeof` matches the kind of the JS value written, and is
+  never `'string'`.** `'string'` is what the double encode produced, so that is the
+  half worth asserting explicitly.
+- **The `cause` branch is not "half" — it is all of it.** For anything thrown
+  through Drizzle the TOP level carries neither `errno` nor `constraint`. So every
+  real-error path depends on the `cause` branch, and the top-level spellings are
+  defensive only: `Bun.SQL` is module-private in `db/index.ts`, so no reachable
+  code can produce a bare driver error. Say that, rather than implying the two are
+  comparable.
+- **The advisory-lock assertion asks for the wrong property.** Visibility in
+  `pg_locks` would also be satisfied by a lock leaked to another session or by a
+  key derivation that collided. What `processOtpSend` needs is **mutual
+  exclusion**: two overlapping transactions on the same key, the second blocked
+  until the first commits. Release-at-commit is likewise unasked, and the `xact`
+  in `pg_advisory_xact_lock` is a promise about exactly that. Both are still
+  unproven — `pg_locks` is cluster-wide, so an unscoped post-commit count is flaky
+  when several harness runs share the server.
+- **"The row count is unchanged" is satisfiable by an insert that never ran.** The
+  rollback case needs a read INSIDE the transaction before the throw.
+- **The zero-row cases are the security-relevant ones.** §7.4c names only the
+  positive counts, but the role `DELETE … RETURNING` returning **0** is what
+  raises the 400 that keeps a role with users undeletable, and the locking
+  `SELECT` returning **0** is what raises the 404 protecting a system role. Those
+  are precisely the branches `deleted.rows.length === 0` (`undefined === 0`,
+  false) silently disabled.
+- **There is a fixture rule but no statement rule.** "Never a hand-authored error"
+  is repeated per item; nothing forbids a hand-copied SQL string, which is the
+  obvious way to satisfy §7.4c and produces a test that passes forever against a
+  statement nobody runs. Extract the statement from the source at run time and
+  fail hard when the extraction misses.
+- **`sanitizeForLog` has two branches keyed on `NODE_ENV`, and this section does
+  not say which one it means.** The database tiers must run
+  `NODE_ENV=development` (for `/api/dev/sign-up`), so every live-database
+  assertion lands on the development path. The PRODUCTION branch paired with a
+  real driver error is currently uncovered by anything —
+  `tests/unit/log-serializer.test.ts` covers it with a constructed error.
+- **Eight assertions was the wrong size.** The probe had no cross-check that the
+  predicates can return false, no in-transaction read before the rollback, no
+  proof the compared PID was not a constant, no completeness check on the jsonb
+  column inventory, and it read the merge result back through the ORM — whose
+  `fromDriver` is a pass-through, so that read was one refactor away from being
+  unable to see the defect it existed for. Twenty tests is the honest size of
+  a/b/c/d/g.
+
 **h. The migration runner.** `bun run db:migrate` is `scripts/migrate.ts` and
 applies both phases: `db/drizzle/` through the ORM's own migrator, then the
 idempotent hand-written SQL in `db/migrations/`. `drizzle-kit migrate` cannot run
@@ -1025,6 +1114,19 @@ is where the highest value per line is, and none of it is blocked on anything.
 
 **`lib/permissions/checker.ts` — `resolveActionScope`.** Highest value in the
 repository: a bug here is an authorization bypass and the function is pure.
+
+**It is not exported.** Verified at `HEAD`: `lib/permissions/checker.ts:41` reads
+`function resolveActionScope(`, and an import fails with
+`Export named 'resolveActionScope' not found`. Its own doc comment claims the
+opposite ("the function is exported to every future call site"), which is how the
+discrepancy went unnoticed. Export it before writing the matrix below — it is a
+pure function guarding authorization and the case for testing it directly is the
+strongest in this document. Expect `knip` to report the new export as unused,
+since a test will be its only consumer; that is the expected cost, not a reason
+to revert it. The alternative — leaving it private and reaching it through
+`checkUserPermission` — pays a session and a database round trip per case and
+belongs to §7.6 instead.
+
 Assert the full matrix over `DASHBOARD_PAGES × PERMISSION_ACTIONS` with
 `test.each` — an empty matrix denies; the exact grant allows with `scope: 'all'`;
 the `Own` variant alone allows with `scope: 'own'`. Plus the two cases the
@@ -1324,9 +1426,32 @@ broken — fail-closed is the entire purpose of `enforcePreAuthIpLimit`, and a
 passing 429 test does not prove it.
 
 **`app/api/upload/image/handler.ts`.** The per-file byte ceiling, the magic-byte
-rejection, and that the route is still **unauthenticated** (`TODO.md` item 1).
-Write that last one as the current contract with a comment naming the open
-decision, so changing it is deliberate rather than accidental.
+rejection, and the authorization gate. **Corrected 2026-08-21: this entry used to
+say the route is "still **unauthenticated** (`TODO.md` item 1)" and that was
+wrong on both halves.** `app/api/upload/image/handler.ts` calls
+`requireAnyPermission(ctx, { resource, actions: ['create', 'edit'] })`, and
+`TODO.md` item 1 is the stale-login-proof race — nothing in `TODO.md` records this
+route as unauthenticated. So the gate is the contract: anonymous is 401, a session
+holding every OTHER action on the same page is 403, and a grant on one dashboard
+resource does not authorise another.
+
+Two properties worth naming because a status code cannot show either. **The
+`resource` query parameter is validated before the multipart body is parsed** —
+every rejection is a 400 or a 401 whether the body was buffered first or not, so
+the assertion has to observe the body accessors rather than the response.
+**And an `editOwn`-only grant is currently admitted**: `resolveActionScope`
+answers `allowed: true, scope: 'own'`, `requireAnyPermission` reads the boolean
+and drops the scope, and a temporary upload has no record to scope against. Pin it
+as current behaviour rather than as an endorsement — it is written down nowhere
+else, and if `create`/`edit` were meant as strictly unrestricted here it is a gap.
+
+**The documented enumeration oracle is real:** an anonymous caller gets 400 for an
+unknown `resource` and 401 for a known one, so valid page names are
+distinguishable without a session. The handler accepts this because
+`DASHBOARD_PAGE_NAMES` is already published in `/openapi.json` — which means the
+safety of this route depends on that document staying public, and nothing links
+them but a comment. Assert it in both directions, so hardening it fails loudly as
+a deliberate change.
 
 **The upload pipeline runs on `Bun.Image`, not `sharp`** (as of 2026-08-21 —
 `bench/image/` holds the measurement). Four assertions follow from that change,
@@ -1395,6 +1520,69 @@ scanning from the start.
 user role change (the same user moving off the role as it is renamed) converges
 to a consistent final state — no orphan sessions, no stale `roleName` in
 `session.metadata`.
+
+**Which clock a boundary is on, before reaching for `setSystemTime`.** Added
+2026-08-21, and it corrects guidance this document and the harness brief both got
+wrong. `verification_sessions` carries BOTH kinds on one row, so the question is
+per-column, not per-module:
+
+- **Process clock — `setSystemTime` works.** Code expiry
+  (`gt(expiresAt, new Date().toISOString())` builds the cutoff in JS and binds
+  it), block expiry on the verify path (`new Date(session.blockedUntil) > new
+Date()`), block stamping (`Date.now() + OTP_BLOCK_DURATION_HOURS`), and the
+  send path's resend wait.
+- **Server clock — `setSystemTime` is a silent NO-OP.** The 24-hour verify-failure
+  window in all three places it appears (the `NOW() - verify_attempt_window_start
+  > INTERVAL '24 hours'`predicate, the`SUM(CASE WHEN …)`read over it, and the
+re-anchor write),`verified_at`/`consumed_at`, every `db/maintenance.ts`
+cutoff (`now() - $1::interval`), and **every column default in this schema** —
+  `defaultNow()` and `$onUpdate(() => sql\`now()\`)` never reach the JS clock.
+
+The textual discriminator: `NOW()` or `sql\`now()\``**in the predicate** means
+server clock;`new Date()`or`Date.now()` **at the call site** means process
+clock. Drive a server-clock boundary by writing the row's timestamp
+(`now() - <n> * interval '1 hour'`), never by moving the process clock.
+
+**Why getting this wrong looks like a pass rather than a failure.**
+`setSystemTime(+25h)` against the OTP budget expires the seeded CODE in JS terms,
+so the verify returns `400 no-code` **without charging** — and an assertion of
+"not 429" then reads as "the window reopened" when nothing of the sort happened.
+A test written that way passes for the wrong reason forever.
+
+Note also that §7.6's "anchored-window honesty, with `setSystemTime`: 2000 sends
+at 23:59 plus 2000 at 00:01" bullet is about the SQLite global send breaker, a
+different store with a different clock. The phrase "anchored fixed window"
+describing two clocks is how this guidance came to be wrong in the first place.
+
+**`db/maintenance.ts` — the retention sweep behind `/api/internal/db-sweep`.**
+Added 2026-08-21. This document had no entry for it at all — `grep -c retention`
+returned 0 — while eleven assertions for it already existed in
+`scripts/probe/dev-live/database/retention-sweep.dev-probe.ts`. That probe is the
+specification; this entry exists so the port has somewhere to land instead of
+being deleted as uncatalogued.
+
+**Every assertion is PAIRED: one row that must go, and one adjacent row that must
+stay.** That is the whole discipline of the entry. A sweep is only correct if it
+is also narrow, and a `WHERE` clause that deletes too much passes any test that
+only checks the target vanished — which is the shape of a data-loss incident that
+looks like a passing suite.
+
+The pairs:
+
+- an expired session past the grace window is removed; one inside the window stays
+- a consumed proof row is removed, and its live code goes with it by cascade
+- a proof row past its TTL is removed; a fresh unconsumed one stays
+- an expired code is removed **without** taking its still-live session
+- a recent temporary file is untouched, and a non-temporary file is untouched
+  however old
+- a temporary file's row **survives** a FAILED R2 delete, so the object is never
+  orphaned — the one case where not deleting is the correct behaviour
+
+_Seam:_ integration, and it is the entry that most needs the disposable database.
+The sweep deletes every qualifying row in the database rather than only the rows
+the test seeded, which is why it could never be asserted against the developer's
+`.env` database and why it is safe to assert now. `hasMore` under a real backlog
+(§7.2f) belongs with it.
 
 ### 7.7 The Better Auth sign-in contract
 

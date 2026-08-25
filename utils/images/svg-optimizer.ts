@@ -252,7 +252,7 @@ export function sanitizeSvg(
     };
   }
 }
-// svg - optimizer;
+/** @knipignore */
 export function validateSvgFile(file: File): string | null {
   if (!file) return 'لم يتم اختيار ملف';
 

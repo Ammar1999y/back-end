@@ -158,14 +158,18 @@ export const optionalPhoneSchema = z.preprocess(
   phoneSchema.nullable()
 );
 
+/** @knipignore */
 export const trimed = (v: string) => (typeof v === 'string' ? v.trim() : '');
+/** @knipignore */
 export const richTextSchema = z.any();
+/** @knipignore */
 export const datePreprocess = (val: unknown) => {
   const accepted =
     typeof val === 'string' || typeof val === 'number' || val instanceof Date;
   const date = accepted ? safeDate(val) : null;
   return date ? date.toISOString() : null;
 };
+/** @knipignore */
 export const fileUploadSchema = ({
   max,
   withPdf = false,
@@ -184,6 +188,7 @@ export const fileUploadSchema = ({
 const colorRegex = /^#[0-9A-Fa-f]{6}([0-9A-Fa-f]{2})?$/;
 const colorError = 'قم بادخال لون صحيح';
 
+/** @knipignore */
 export const getColorSchema = (
   props: {
     optional?: boolean;
@@ -204,6 +209,7 @@ export const getColorSchema = (
   );
 };
 
+/** @knipignore */
 export const slugPreprocess = (v: string) => {
   if (typeof v !== 'string') return '';
 
@@ -215,6 +221,7 @@ export const slugPreprocess = (v: string) => {
     .replaceAll(/^-+|-+$/g, '');
 };
 
+/** @knipignore */
 export const slugSchema = z.preprocess(
   slugPreprocess,
   z
@@ -229,6 +236,7 @@ export const slugSchema = z.preprocess(
       'الـ slug لا يمكن أن يكون أرقام فقط'
     )
 );
+/** @knipignore */
 export const SVGIconSchema = z
   .string()
   .min(1, 'الأيقونه مطلوبه')

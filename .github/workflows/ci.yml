@@ -25,12 +25,17 @@ jobs:
         run: bun run lint
       - name: Format check
         run: bun run format:check
-      - name: Probe tests
-        # These cover the SQLite rate-limit and cache invariants. The SQLite
-        # probes spawn a Bun child so a failed case cannot leak an open file
-        # handle into the rest of the suite; the driver is `bun:sqlite`, so no
-        # Node runtime is involved any more. `bun test` exits non-zero on
-        # failure, so no extra guard is needed.
+      - name: Unit tests
+        # The cheap tier: no database, no port. `bun run test` is
+        # `bun tests/helpers/run.ts unit`, which runs `bun test --isolate
+        # tests/unit`.
+        #
+        # It used to be `bun test scripts/probe/local`, and that was a silent
+        # hole: `bun test <path>` treats its arguments as filename FILTERS, so a
+        # test file outside that directory was skipped and the run still exited
+        # 0. `bunfig.toml`'s `[test] root` and
+        # `tests/unit/harness-layout.test.ts` close it from both ends — the
+        # latter fails if any file under `tests/` is in no tier.
         run: bun run test
       - name: Unreachable files and unregistered handlers
         # The scanner alone, not `bun run find:unused-files`, which also runs
@@ -77,6 +82,91 @@ jobs:
           PASSWORD_PEPPER_ACTIVE_ID: ci
           PASSWORD_PEPPER_KEYRING: '{"ci":{"generation":1,"secret":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}}'
         run: bun run smoke
+
+  # The database-backed tiers. Their own job because they need a PostgreSQL
+  # service container, and because keeping them out of `verify` means a lint
+  # failure and an integration failure are two separate signals.
+  #
+  # Nothing here is preserved between runs: the container dies with the runner
+  # VM, so a destructive suite has nothing to damage and needs no cleanup logic.
+  # The harness still provisions and drops its own databases, because the same
+  # command has to be safe on a developer machine where that is not true.
+  tests:
+    runs-on: ubuntu-24.04
+    services:
+      postgres:
+        # Pinned to the VPS's major. A different major trades one fidelity gap
+        # for a smaller one rather than closing it.
+        image: postgres:18-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      # The harness reads this and derives every database name from it; the
+      # database component is ignored (it connects to `postgres` for DDL).
+      TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+      # `DATABASE_URL` is overwritten per worker by the preload. It is set here
+      # only because `lib/env.server.ts` requires it to be PRESENT at module
+      # load, and the value must not be the one the tests end up using.
+      DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+      PUBLIC_URL: http://localhost:3000
+      # `email,sms,whatsapp`, not `phone`. The channels are exactly those three
+      # (`utils/validation/otp.ts`), and unrecognised values are filtered out
+      # SILENTLY — so `phone` was dropped with no error and the phone surface was
+      # only half exercised. The `.env` comment calling WhatsApp "phone" is what
+      # this copied; `phone` is the CONTACT KIND the OTP quotas key on, not a
+      # delivery channel.
+      NEXT_PUBLIC_ENABLED_OTP_CHANNELS: email,sms,whatsapp
+      NEXT_PUBLIC_TURNSTILE_SITE_KEY: 1x00000000000000000000AA
+      TURNSTILE_SECRET_KEY: 1x0000000000000000000000000000000AA
+      BETTER_AUTH_SECRET: ci-placeholder-better-auth-secret-000000
+      SQLITE_DIR: /tmp/ci-sqlite
+      SQLITE_MAINTENANCE_TOKEN: ci-maintenance-token
+      PASSWORD_PEPPER_ACTIVE_ID: ci
+      PASSWORD_PEPPER_KEYRING: '{"ci":{"generation":1,"secret":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}}'
+      OTP_HMAC_ACTIVE_ID: ci
+      OTP_HMAC_KEYRING: '{"ci":{"generation":1,"secret":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}}'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+      # Its own step, deliberately. `package.json` was once edited without
+      # regenerating `bun.lock`, so every CI install would have failed while
+      # every local command passed, because `node_modules` was already
+      # populated. No test that assumes an installed tree can detect that.
+      - run: bun install --frozen-lockfile
+      - name: Integration tests
+        # The harness creates the migrated template on first use, so there is no
+        # separate `db:migrate` step: the migration runner IS what builds the
+        # template, which is also what keeps the template's schema identical to
+        # production's.
+        #
+        # `--reporter=junit` so a failure becomes a check annotation instead of
+        # something to find in the log, and `--coverage` because §8 of the plan
+        # reports coverage everywhere and gates almost nowhere. Both are forwarded
+        # to `bun test` by the tier runner.
+        #
+        # `--shard`/`--timings` are deliberately NOT here yet: with one
+        # integration file they would split one file across three jobs and record
+        # timings for nothing. They go in when there are enough files to balance,
+        # and that is the point at which the timings artefact starts paying for
+        # itself.
+        run: >-
+          bun run test:integration --
+          --reporter=junit --reporter-outfile=reports/junit-integration.xml
+          --coverage --coverage-reporter=text
+      - name: Process tests
+        # Its own step for the same reason `bun run smoke` is separate: every
+        # test here owns a real socket, a real child process or a real signal.
+        # It is also the tier where the win32-skipped cases actually run.
+        run: bun run test:process
 
   workflows:
     runs-on: ubuntu-24.04

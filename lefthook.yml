@@ -50,9 +50,22 @@ pre-push: &full_verify
       run: bunx prettier --check .
     audit:
       run: bun audit
-    # The probe suite and the route-registration gate. Both are CI steps
+    # The half of the Bun-only guard that a skipped `preinstall` cannot hide.
+    # `--ignore-scripts` (flag, bunfig, or .npmrc) silences the preinstall hook
+    # silently, so a foreign lockfile can reach the tree with no install-time
+    # complaint at all. Run here it costs nothing and catches that state before
+    # it is pushed.
+    runtime:
+      run: bun scripts/require-bun.mjs
+      fail_text: 'wrong package manager, an outdated Bun, or a foreign lockfile'
+    # The unit tier and the route-registration gate. Both are CI steps
     # (.github/workflows/ci.yml) and neither needs any environment, so there was
     # no reason for a push to reach CI before finding out.
+    #
+    # Deliberately the CHEAP tier and not `test:all`: the integration tiers need
+    # a PostgreSQL server, and a pre-push hook that needs a database is a
+    # pre-push hook that gets disabled. Run `bun run test:all` by hand, or let
+    # the `tests` CI job do it.
     test:
       run: bun run test
     routes:

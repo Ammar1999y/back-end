@@ -62,7 +62,7 @@ const BASE_PRAGMAS = [
  *
  * NOT a reduction from a driver default, which is what the previous version of
  * this comment claimed: a fresh `bun:sqlite` connection reads back
- * `PRAGMA busy_timeout = 0` (measured on Bun 1.3.14), so without this line
+ * `PRAGMA busy_timeout = 0` (measured on Bun), so without this line
  * every lock conflict fails instantly. `better-sqlite3` is the driver that
  * defaults to 5000ms, and it is not the driver in use.
  *

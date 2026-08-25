@@ -1,0 +1,53 @@
+# `bun test` configuration.
+#
+# `root` is the fix for the selection hole. `bun test <path>` treats its
+# positional arguments as filename FILTERS, not paths: with `bun test
+# scripts/probe/local`, a test file outside that directory was skipped silently
+# and the run still exited 0 — so `bun run test`, `ci.yml` and `lefthook.yml` all
+# believed they were running the suite while a whole tier could sit unexecuted.
+# With `root`, a bare `bun test` walks every tier, and `tests/helpers/run.ts`
+# selects one deliberately.
+#
+# Use `bun run test`, `test:integration` or `test:process` — not a bare
+# `bun test`. `root` below makes a bare invocation walk all three tiers, and the
+# database tiers then run without the provisioning and the four safety guards
+# that `tests/helpers/run.ts` supplies; `assertHarnessDatabase()` stops them
+# writing anywhere real, but the failure is a refusal rather than a test result.
+[test]
+root = "tests"
+
+# Every tier gets this one. The per-tier preload that provisions PostgreSQL is
+# added on the command line by `tests/helpers/run.ts`, because bunfig is resolved
+# once per working directory and cannot vary by tier — and a unit test must not
+# pay for a database connection.
+preload = ["./tests/helpers/preload-base.ts"]
+
+coverageSkipTestFiles = true
+coverageReporter = ["text"]
+
+# Bun runs the tooling too, so nothing in this project needs a Node installation.
+#
+# `tsc`, `eslint`, `prettier`, `drizzle-kit`, `knip` and `lefthook` all ship a
+# `#!/usr/bin/env node` shebang and `bun run` RESPECTS it, substituting itself
+# only when `node` is absent from `$PATH`. Without this line, which runtime
+# compiled and linted the project depended on what else the developer happened
+# to have installed, and a Node-less container ran a different combination than
+# any developer machine. Verified: all six run correctly under Bun with Node
+# removed from `$PATH` (typescript 6.0.3, eslint 10.8.1, prettier 3.9.6,
+# drizzle-kit 0.31.10, knip 6.32.2, lefthook 2.1.10).
+#
+# This could not be switched on until `prettier.config.js` was fixed. The
+# import-sort plugin derived its builtin group from the RUNNING runtime's
+# `builtinModules`, so `bun:*` imports sorted differently under Bun than under
+# Node — 36 files. The explicit `^bun$` / `^bun:` groups there make the output
+# runtime-independent; see the comment on `importOrder`. Turning this on before
+# that fix would have made every developer fail `format:check` instead of only
+# the ones without Node.
+#
+# `bench/sqlite/better-sqlite3` is unaffected, and that matters: it is a
+# deliberate Node-vs-Bun comparison whose `node run.mjs` scripts would be
+# meaningless run under Bun. Bunfig is resolved from the working directory and is
+# NOT inherited by subdirectories (measured), so a benchmark run from its own
+# directory never sees this.
+[run]
+bun = true

@@ -16,6 +16,8 @@
 import { version as bunVersion } from 'bun';
 import { Database } from 'bun:sqlite';
 
+import packageManifest from './package.json';
+
 /**
  * The three modes this application recognises.
  *
@@ -32,8 +34,25 @@ import { Database } from 'bun:sqlite';
  */
 const VALID_NODE_ENV = new Set(['development', 'test', 'production']);
 
-/** Bun's own pin, so the expected version has exactly one home. */
-const EXPECTED_BUN_VERSION = '1.4.0';
+/**
+ * The tested Bun version, read from the one place it is written.
+ *
+ * This does not breach the rule at the top of the file: `package.json` is data,
+ * not application code — importing it evaluates no module and reads no
+ * environment. The literal `'1.4.0'` that used to sit here breached something
+ * else, which is why it is gone: it was a third copy of the pin, alongside
+ * `packageManager` and `scripts/require-bun.mjs`, and all three had to be
+ * remembered together or the deployed runtime and the installed one silently
+ * disagreed.
+ *
+ * `''` when the field is malformed — `assertBunVersion` treats that as fatal
+ * rather than as "no pin", because an unparsed pin is not the same as no pin.
+ */
+const EXPECTED_BUN_VERSION =
+  /^bun@(\d+\.\d+\.\d+)$/.exec(packageManifest.packageManager)?.[1] ?? '';
+
+/** Leading `major.minor.patch`, ignoring any `-canary.…` tail. */
+const VERSION_PATTERN = /^(\d+)\.(\d+)\.(\d+)/;
 
 /**
  * The conservative floor for the WAL-reset race — see the SQLite notice linked
@@ -82,42 +101,72 @@ function requirePort(): number {
   return port;
 }
 
+/** `true` when `running` is at or above `floor`, compared field by field. */
+function atLeast(running: number[], floor: number[]): boolean {
+  for (const [index, value] of floor.entries()) {
+    const actual = running[index] ?? 0;
+    if (actual > value) return true;
+    if (actual < value) return false;
+  }
+  return true;
+}
+
 /**
- * Refuses a runtime whose Bun minor differs from the tested one.
+ * Refuses a Bun OLDER than the tested pin, and warns about anything newer.
  *
- * Minor, not patch: BOTH database drivers are compiled into the binary, so their
- * transaction semantics travel with the Bun version rather than with a lockfile
- * entry — and that is a minor-version concern. `bun:sqlite` is the older reason.
- * `bun:sql` is the sharper one: through 1.3.x a simple-protocol query running
- * concurrently with a not-yet-prepared parameterized query on the same
- * connection could deliver one query's rows to the other, and the `BEGIN`,
+ * A FLOOR, not an equality check, and the difference is deliberate. BOTH
+ * database drivers are compiled into the binary, so their transaction semantics
+ * travel with the Bun version rather than with a lockfile entry. `bun:sqlite` is
+ * the older reason. `bun:sql` is the sharper one: through 1.3.x a simple-protocol
+ * query running concurrently with a not-yet-prepared parameterized query on the
+ * same connection could deliver one query's rows to the other, and the `BEGIN`,
  * `COMMIT` and `ROLLBACK` that `db.transaction()` issues ARE simple-protocol
- * queries (Bun #32772, fixed in 1.4.0). Below this pin, every transaction in the
- * application is exposed to that.
+ * queries (Bun #32772, fixed in 1.4.0). Below the pin, every transaction in the
+ * application is exposed to that — so below the pin is fatal.
  *
- * A patch difference is logged loudly instead of being fatal, because deployment
- * images move on patch releases routinely and refusing to boot for one would
- * trade a real outage for a theoretical drift.
+ * Above the pin is a warning. That is a deliberate relaxation of what this
+ * function used to do, which was to refuse any differing MINOR in either
+ * direction: a developer who had upgraded Bun could not boot the project, and an
+ * image that moved forward turned a routine bump into an outage. Newer is
+ * untested, not known-broken, and the whole install path
+ * (`scripts/require-bun.mjs`) now treats the pin as a floor too — a boot check
+ * that disagreed with the install check would just be a second, contradictory
+ * policy. The drift is logged so the operator can read what is actually running
+ * rather than infer it.
  */
 function assertBunVersion(): void {
+  if (!EXPECTED_BUN_VERSION)
+    fail(
+      `package.json declares packageManager "${packageManifest.packageManager}". ` +
+        'It must read exactly bun@<major>.<minor>.<patch> — it is the only source ' +
+        'for the tested runtime version, read here and by scripts/require-bun.mjs.'
+    );
+
   if (bunVersion === EXPECTED_BUN_VERSION) return;
 
-  const [major, minor] = bunVersion.split('.', 2);
-  const [expectedMajor, expectedMinor] = EXPECTED_BUN_VERSION.split('.', 2);
-
-  if (major !== expectedMajor || minor !== expectedMinor)
+  const running = VERSION_PATTERN.exec(bunVersion);
+  if (!running)
     fail(
-      `Bun ${bunVersion} does not match the tested ${EXPECTED_BUN_VERSION}. ` +
-        'bun:sqlite is compiled into the runtime, so this changes database ' +
-        'semantics. Pin the image, or update packageManager, bun.lock and ' +
-        'EXPECTED_BUN_VERSION together after re-running the suite.'
+      `Bun reports version "${bunVersion}", which is not major.minor.patch. ` +
+        `The tested version is ${EXPECTED_BUN_VERSION} and this cannot be compared to it.`
+    );
+
+  const parts = [Number(running[1]), Number(running[2]), Number(running[3])];
+  const floor = EXPECTED_BUN_VERSION.split('.').map(Number);
+
+  if (!atLeast(parts, floor))
+    fail(
+      `Bun ${bunVersion} is older than the tested ${EXPECTED_BUN_VERSION}. ` +
+        'Both database drivers are compiled into the runtime, so this is a ' +
+        'transaction-correctness floor and not a preference — see Bun #32772. ' +
+        `Upgrade the image, or run: bun run check:runtime`
     );
 
   console.warn(
     JSON.stringify({
-      msg: 'bun patch version drift',
+      msg: 'bun version ahead of the tested pin',
       running: bunVersion,
-      expected: EXPECTED_BUN_VERSION,
+      tested: EXPECTED_BUN_VERSION,
     })
   );
 }

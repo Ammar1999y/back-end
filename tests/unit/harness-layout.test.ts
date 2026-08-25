@@ -1,0 +1,145 @@
+/**
+ * The guard that closes the selection hole for good.
+ *
+ * `bun test <path>` treats its positional arguments as filename FILTERS, not
+ * paths. Measured: with `bun test scripts/probe/local`, a failing test file
+ * outside that directory was skipped and the run still exited 0 — so `bun run
+ * test`, `ci.yml:34` and `lefthook.yml:57` all reported success while a whole
+ * directory of tests had never executed. `bunfig.toml`'s `root` fixes the bare
+ * `bun test` case; this fixes the case the tier scripts create, where a file in
+ * `tests/` that is in no tier is silently in no run.
+ *
+ * Two more traps this covers, both from the strategy's own list:
+ *
+ * - A non-test file under a tier directory would be imported by nothing. The rule
+ *   is that everything under `tests/` is either matched by the test glob or lives
+ *   in `helpers/` or `fixtures/`.
+ * - A `_`-prefixed child script is never matched by the glob, which is the point —
+ *   `bun test` executing a CLI-style probe that calls `process.exit()` ends the
+ *   whole run and silently skips every file after it. They belong in `fixtures/`.
+ */
+import { describe, expect, test } from 'bun:test';
+import { readdirSync, readFileSync, statSync } from 'node:fs';
+import path from 'node:path';
+
+const TESTS_ROOT = path.join(import.meta.dir, '..');
+
+/** The directories `tests/helpers/run.ts` knows how to run. */
+const TIERS = ['unit', 'integration', 'process'] as const;
+
+/** Directories that hold code the tiers import rather than tests. */
+const SUPPORT = ['helpers', 'fixtures'] as const;
+
+function readFile(rel: string): string {
+  // eslint-disable-next-line security/detect-non-literal-fs-filename -- a path this file produced by walking its own directory
+  return readFileSync(path.join(TESTS_ROOT, rel), 'utf8');
+}
+
+function walk(dir: string, base = ''): string[] {
+  const out: string[] = [];
+  // eslint-disable-next-line security/detect-non-literal-fs-filename -- a fixed path relative to this file
+  for (const entry of readdirSync(dir)) {
+    const full = path.join(dir, entry);
+    const rel = base ? `${base}/${entry}` : entry;
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- same
+    if (statSync(full).isDirectory()) out.push(...walk(full, rel));
+    else out.push(rel);
+  }
+  return out;
+}
+
+const everyFile = walk(TESTS_ROOT);
+
+/** What `bun test` will actually pick up. */
+function isTestFile(rel: string): boolean {
+  return /\.(test|spec)\.[cm]?[jt]sx?$/.test(rel) || /_(test|spec)_/.test(rel);
+}
+
+describe('tests/ layout', () => {
+  test('every file is in a tier or in a support directory', () => {
+    const stray = everyFile.filter((rel) => {
+      const top = rel.split('/', 1)[0] ?? '';
+      return (
+        !TIERS.includes(top as (typeof TIERS)[number]) &&
+        !SUPPORT.includes(top as (typeof SUPPORT)[number])
+      );
+    });
+    expect(stray).toEqual([]);
+  });
+
+  test('every test file is inside a tier a script runs', () => {
+    const orphaned = everyFile.filter(
+      (rel) =>
+        isTestFile(rel) &&
+        !TIERS.includes((rel.split('/', 1)[0] ?? '') as (typeof TIERS)[number])
+    );
+    expect(orphaned).toEqual([]);
+  });
+
+  test('no tier directory holds a file the test glob will not match', () => {
+    const unmatched = everyFile.filter(
+      (rel) =>
+        TIERS.includes(
+          (rel.split('/', 1)[0] ?? '') as (typeof TIERS)[number]
+        ) && !isTestFile(rel)
+    );
+    expect(unmatched).toEqual([]);
+  });
+
+  test('every support file that is not a helper is `_`-prefixed', () => {
+    // `fixtures/` holds child scripts a test spawns. A file there without the
+    // underscore reads as a test that never runs.
+    const wrong = everyFile.filter(
+      (rel) =>
+        rel.startsWith('fixtures/') && !path.basename(rel).startsWith('_')
+    );
+    expect(wrong).toEqual([]);
+  });
+
+  /**
+   * The enforcement half of `assertHarnessDatabase()`.
+   *
+   * That guard is called by `resetTables` and `seedUser`, so any test reaching a
+   * database THROUGH a helper is protected — which is every test today. What it
+   * does not protect is a test that writes with a bare `db.insert(...)` or
+   * `db.execute(...)`, and "write only through the helpers" as an unwritten
+   * convention is not enforcement.
+   *
+   * So the rule is scoped to exactly that hazard: **a file that imports `@/db`
+   * directly must also reach the guard.** A file that only uses the helpers is
+   * guarded by construction, and a file that touches no database at all —
+   * `tests/process/sqlite-migration-race.test.ts` spawns SQLite children and
+   * never opens PostgreSQL — is not in scope. An earlier version of this test
+   * required the guard of every database-TIER file and flagged that one, which is
+   * the difference between a tier and a capability.
+   *
+   * A wrapper around `db` was the alternative and is worse: tests would stop
+   * using the real client, which is most of what an integration test is for.
+   */
+  test('every file that imports @/db directly reaches the ownership guard', () => {
+    const IMPORTS_DB = /from\s+'@\/db'/;
+    const REACHES_GUARD =
+      /(resetTables|seedUser|signedInUser|assertHarnessDatabase)\s*\(/;
+
+    const unguarded = everyFile
+      .filter((rel) => isTestFile(rel) && IMPORTS_DB.test(readFile(rel)))
+      .filter((rel) => !REACHES_GUARD.test(readFile(rel)));
+
+    expect(
+      unguarded,
+      'these files hold the real client and can write without asserting the harness owns the database'
+    ).toEqual([]);
+  });
+
+  test('each tier has at least one test file', () => {
+    for (const tier of TIERS) {
+      const count = everyFile.filter(
+        (rel) => rel.startsWith(`${tier}/`) && isTestFile(rel)
+      ).length;
+      expect(
+        count,
+        `tier "${tier}" is empty, so its script would run nothing`
+      ).toBeGreaterThan(0);
+    }
+  });
+});

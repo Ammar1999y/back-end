@@ -69,6 +69,8 @@ const inFlight = new Set<Promise<void>>();
  * `inFlight` is empty on every request and the drain below always returns on its
  * first check. The queue and the settle loop are insurance for the first real
  * caller — they are not currently load-bearing, and no test exercises them.
+ *
+ * @knipignore
  */
 export function enqueueAfterResponse(
   request: Request,

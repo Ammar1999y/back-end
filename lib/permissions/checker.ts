@@ -37,8 +37,15 @@ const READ_ACTIONS = new Set<PermissionAction>(['view', 'viewOwn']);
  * - An own-scoped action (`viewOwn`/`editOwn`/`deleteOwn`): the superseding
  *   unrestricted grant first, then the own grant itself.
  * - Anything else: exact match only.
+ *
+ * Exported, which its own comment below already assumed ("exported to every
+ * future call site") while the keyword was missing. It is the highest-value pure
+ * function in the repository — a bug here is an authorization bypass — and while
+ * it was private every case in its matrix cost a session and a database round
+ * trip, which is a materially weaker test of it. See
+ * `tests/unit/permission-scope.test.ts`.
  */
-function resolveActionScope(
+export function resolveActionScope(
   permissions:
     | Record<string, Record<string, boolean>>
     | Partial<Record<DashboardPage, Record<PermissionAction, boolean>>>,

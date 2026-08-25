@@ -16,38 +16,20 @@
  * a `db.transaction()` block runs on one backend PID, and
  * `pg_advisory_xact_lock` is visible in `pg_locks` for that PID.
  */
+import { SQL } from 'bun';
 import type { PgTransactionConfig } from 'drizzle-orm/pg-core';
 
 import { drizzle } from 'drizzle-orm/bun-sql';
 
-import { SQL } from 'bun';
 import { DATABASE_URL } from '@/lib/env.server';
 
+import { MAX_POOL_CONNECTIONS } from './limits';
 import * as schema from './schema';
-
-/**
- * Pool ceiling, and it is load-bearing rather than decorative.
- *
- * `withTransaction` reserves one connection for the whole block, so this is the
- * number of concurrent transactions the process supports before callers queue
- * behind `connectionTimeout` (Bun's default, 30 s) rather than a throughput knob.
- *
- * Nothing here may hold a block open across a network call to a third party.
- * `processOtpSend` used to, and ten concurrent sends against a hanging SMTP
- * server exhausted this pool and stalled every other transactional path;
- * delivery now runs after the commit (see `utils/otp.ts`).
- *
- * 10 is Bun's own default, restated here because it has to be read against the
- * server's `max_connections` — one process must not be able to exhaust it, and
- * a second process (a migration run, a `psql` session) needs headroom.
- */
-const MAX_POOL_CONNECTIONS = 10;
 
 /**
  * Module-private on purpose: one pool per process, reachable only through `db`,
  * `withTransaction` and `closeDatabase`, so nothing can open a second one.
- */
-/**
+ *
  * No `statement_timeout`, and that is a standing decision rather than an
  * oversight.
  *

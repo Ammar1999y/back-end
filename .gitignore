@@ -10,6 +10,8 @@
 
 # testing
 /coverage
+# Written by the CI reporter flags; never committed.
+reports/junit-*.xml
 TODO*.md
 # next.js
 /.next/
@@ -54,7 +56,6 @@ CLAUDE.md
 .agents
 
 
-/tests/**
 /prompt-*.md
 
 lefthook-local.yml
@@ -68,3 +69,4 @@ data/
 
 
 read.txt
+AGENTS.md

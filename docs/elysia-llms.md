@@ -47,6 +47,7 @@
 ### Plugins
 
 - [CORS Plugin - ElysiaJS](https://elysiajs.com/plugins/cors.md)
+- [Cron Plugin - ElysiaJS](https://elysiajs.com/plugins/cron.md)
 - [OpenAPI Plugin - ElysiaJS](https://elysiajs.com/plugins/openapi.md)
 - [Server Timing Plugin - ElysiaJS](https://elysiajs.com/plugins/server-timing.md)
 
@@ -54,5 +55,7 @@
 
 - [Better Auth - ElysiaJS](https://elysiajs.com/integrations/better-auth.md)
 - [Integration with Drizzle - ElysiaJS](https://elysiajs.com/integrations/drizzle.md)
-- [Integration with Nextjs - ElysiaJS](https://elysiajs.com/integrations/nextjs.md)
-- [Deploy Elysia on Vercel - ElysiaJS](https://elysiajs.com/integrations/vercel.md)
+
+### Internal
+
+- [JIT Compiler - ElysiaJS Internal](https://elysiajs.com/internal/jit-compiler.md)

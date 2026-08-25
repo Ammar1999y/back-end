@@ -20,8 +20,6 @@ export const ROLE_SCOPE = {
   CUSTOM: CUSTOM_ROLE_VALUE,
 } as const;
 
-export type RoleScope = (typeof ROLE_SCOPE)[keyof typeof ROLE_SCOPE];
-
 export const DASHBOARD_PAGES = {
   home: 'الرئيسية',
   users: 'المستخدمين',
@@ -63,8 +61,6 @@ export const PERMISSION_ACTIONS = {
 
 export type DashboardPage = keyof typeof DASHBOARD_PAGES;
 export type PermissionAction = keyof typeof PERMISSION_ACTIONS;
-export type DashboardPageValues =
-  (typeof DASHBOARD_PAGES)[keyof typeof DASHBOARD_PAGES];
 export type PermissionObject = Record<
   DashboardPage,
   Record<PermissionAction, boolean>
@@ -81,7 +77,6 @@ export const OWN_ACTION_MAP = {
 } as const satisfies Partial<Record<PermissionAction, PermissionAction>>;
 
 export type AllScopedAction = keyof typeof OWN_ACTION_MAP;
-export type OwnScopedAction = (typeof OWN_ACTION_MAP)[AllScopedAction];
 
 /**
  * Own-scoped action → the all-scoped action that supersedes it. Derived from

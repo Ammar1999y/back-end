@@ -159,12 +159,6 @@ export interface AuthConsumeRow {
   window_start: number;
 }
 
-export interface AuthEntryRow {
-  key: string;
-  count: number;
-  last_request: number;
-}
-
 interface RateLimitStore {
   readonly db: SqliteConnection;
   readonly consume: SqliteStatement;

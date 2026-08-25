@@ -29,7 +29,9 @@ const filterVariants = [
   'multiSelect',
 ] as const;
 
+/** @knipignore */
 export type JoinOperator = (typeof joinOperators)[number];
+/** @knipignore */
 export type FilterVariant = (typeof filterVariants)[number];
 type Operator = (typeof operators)[number];
 

@@ -179,51 +179,46 @@
 
 # Known Issues — Will Be Fixed Later
 
-42. **Unauthenticated Upload** — `app/api/upload/image/route.ts` — No auth or
-    rate limiting on upload endpoint
-43. ~~**Pool-Per-Transaction**~~ — **FIXED 2026-08-20.** `db/ws.ts` is deleted
-    with the Neon drivers; `withTransaction` runs on the one pooled `bun:sql`
-    client in `db/index.ts`. See `TODO.md` item 2.
-44. ~~**Swallowed Pool Cleanup Errors**~~ — **FIXED 2026-08-20.** No
-    per-transaction pool is created, so there is none to tear down.
+1. **Race Condition: Stale Login / OTP Proof Can Issue Session After Credential Rotation**
+   - **Locations:** `lib/auth.ts`, `lib/auth/passwordless.ts`, `app/api/auth/forgot-password/reset/handler.ts`, `utils/otp.ts`
+   - **Summary:** Proof validation (password / OTP) and session insertion do not share an atomic validity check (`authVersion`). If credentials are rotated concurrently, a pre-verified proof can still create an active session or execute a password reset immediately after existing sessions were revoked. Planned fix introduces an incremental `authVersion` check across rotation boundaries.
 
-45. **No Request Size Limit** — All POST/PUT handlers
-46. **No Session, Audit Log, Deleted Users, Temp Files Cleanup** — No cron jobs
-    for stale data
-47. **No CSRF Protection** — All POST/PUT/DELETE endpoints
-48. **Email Provider Allowlist Restrictive** — `utils/validation/rules.ts` —
-    Blocks corporate/custom domain emails
-49. **No Optimistic Locking on Updates** — All PUT endpoints — Last write wins
-    with no conflict detection
-50. **Bulk Session Operations Inside Transaction Hold Role Lock** —
-    `app/api/dash/permissions/[id]/route.ts` — Blocks concurrent requests at
-    scale
-51. **Login Lock Counters on Users Table** — `db/schema.ts` — `FOR UPDATE`
-    contention; should move to Redis
-52. **Session Revocation Gaps After Deactivation** — `lib/auth.ts`,
-    `lib/permissions/checker.ts` — Cookie cache stale window + concurrent login
-    race
-53. **GIN Indexes Built Without `CONCURRENTLY`** —
-    `db/migrations/001_add_trgm_indexes.sql` — Blocking on live tables
-54. **External OTP Delivery Inside DB Transaction** — `utils/otp.ts:306` —
-    `sendOtp()` runs inside `withTransaction`, holding a DB connection and row
-    lock during the full external HTTP call; needs benchmarking before splitting
-55. **OTP Verify Budget Uses Per-Proof Anchored Windows** — `utils/otp.ts`,
-    `db/schema.ts` — the 15-failure budget is the sum of independently anchored
-    counters stored on proof rows, not a literal rolling 24-hour window, so two
-    full budgets can fall inside one moving 24 hours; and deleting a proof row
-    on successful verification or credential rotation forgives its earlier
-    failures. Kept for now — see `TODO.md` item 12. Revisit if a strict
-    identity-wide any-24-hours guarantee is needed, or if the six-hour block is
-    shortened.
-56. **Generic `Error.message` Is Retained in Server Logs** — `utils/index.ts`,
-    `utils/api-response.ts` — the serializer keeps free-text messages so an
-    unexpected library failure stays diagnosable; clients never receive them
-    raw, only a fixed generic 500. Every source demonstrated to embed sensitive
-    data in a message is filtered where it is thrown — Drizzle bound parameters,
-    OTP provider payloads, and both Redis store boundaries — and no
-    project-authored error interpolates a credential. The residual risk is a
-    future dependency doing the same in text nobody has audited yet. Accepted
-    for the development stage with restricted log access and periodic deletion;
-    audit each new integration, and settle access and retention before
-    production hardening.
+2. **No Explicit Database `statement_timeout` Configured**
+   - **Locations:** `db/index.ts` / connection settings
+   - **Summary:** PostgreSQL connections do not enforce a runtime `statement_timeout`. Runaway or unindexed queries under heavy load could hold pooled connections indefinitely. Deferred until p99 production query durations are measured to set an appropriate ceiling.
+
+3. **No Optimistic Locking on Concurrent Entity Updates**
+   - **Locations:** All admin update endpoints (`PUT /api/dash/*`)
+   - **Summary:** Entity updates lack version/timestamp checks (`updatedAt`). If two administrators concurrently modify the same user or role, the last write silently overwrites the previous write without conflict detection.
+
+4. **Bulk Session Invalidation Inside Transaction Holds Role Lock**
+   - **Locations:** `app/api/dash/permissions/[id]/route.ts`, `lib/permissions/utils.ts`
+   - **Summary:** Role deactivation and permission metadata updates run bulk session deletions/updates inside the main transaction while holding an exclusive `FOR UPDATE` lock on the role row. At scale, this increases lock contention; planned mitigation moves bulk session operations post-commit or adopts timestamp-based staleness checks.
+
+5. **Stale Cookie Cache Extends Read Access Post-Deactivation**
+   - **Locations:** `lib/auth.ts`, `lib/permissions/checker.ts`
+   - **Summary:** Better Auth caches session cookies for up to 5 minutes (`maxAge: 300`). While write/mutation paths strictly verify live database sessions (`assertLiveSession`), read-only endpoints evaluate against the cookie cache, allowing deactivated users up to 5 minutes of read access until cache expiration.
+
+6. **Missing Out-of-Band Security Alert on Credential Rotation**
+   - **Locations:** `app/api/dash/users/me/change-password/handler.ts`, `app/api/dash/users/me/change-email/handler.ts`
+   - **Summary:** Changing passwords or primary email addresses does not send an out-of-band security notice to the previous email address. In a session hijack scenario, the legitimate owner is not alerted when credentials change.
+
+7. **Audit Logs Stored Exclusively in Primary Application Database**
+   - **Locations:** `lib/audit.ts`, `db/schema.ts`
+   - **Summary:** Audit logs reside solely in the application PostgreSQL database under the same database role with no secondary append-only sink (e.g. S3 Object Lock, CloudWatch). An attacker with direct database access could tamper with logs without an off-host immutable audit record. Planned asynchronous export via scheduled maintenance tasks.
+
+8. **Third-Party `Error.message` Retained Verbatim in Internal Server Logs**
+   - **Locations:** `utils/index.ts` (`serializeErrorLike`), `utils/api-response.ts`
+   - **Summary:** The log serializer strips sensitive fields from structured objects but keeps raw `error.message` text from third-party libraries (e.g., S3 SDK, fetch calls). While logs are strictly internal and known libraries do not leak secrets in messages, unmapped future errors could theoretically expose un-sanitized context.
+
+9. **Soft-Deleted Users Accumulate Without Automated Cleanup**
+   - **Locations:** `db/schema.ts`
+   - **Summary:** Soft-deleted user records (`deletedAt IS NOT NULL`) are retained indefinitely in the database without an automated maintenance cron job to archive or purge them after a defined retention window.
+
+10. **Email Validation Provider Allowlist Restricts Custom Domains**
+    - **Locations:** `utils/validation/rules.ts`
+    - **Summary:** The validation schema enforces an allowlist of consumer email domains (e.g. Gmail, Outlook), blocking business and custom domain email addresses until domain policy requirements are finalized for general launch.
+
+11. **Audit Logs Missing Dedicated Forensic Query Indexes**
+    - **Locations:** `db/schema.ts`
+    - **Summary:** The `audit_logs` table currently lacks composite indexes for specialized forensic queries (e.g., filtering all historical actions by a specific user across time ranges), to be added when log volume warrants optimization.

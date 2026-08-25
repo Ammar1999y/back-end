@@ -35,14 +35,13 @@
  * `@/lib/env.server`: migrating a database must not require a password pepper
  * keyring, a Turnstile secret or a session signing key to be configured.
  */
+import { SQL } from 'bun';
 import { readdir, readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { drizzle } from 'drizzle-orm/bun-sql';
 import { migrate } from 'drizzle-orm/bun-sql/migrator';
-
-import { SQL } from 'bun';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const DRIZZLE_DIR = path.join(HERE, '..', 'db', 'drizzle');

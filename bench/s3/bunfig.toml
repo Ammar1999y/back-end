@@ -1,0 +1,23 @@
+# `bun test` configuration for this benchmark only.
+#
+# It exists because a bunfig is resolved from the WORKING DIRECTORY and is not
+# inherited from a parent (measured on Bun 1.4.0), which is the whole reason
+# `run.ts` runs `bun test` from this directory. Two things must not reach these
+# tests, and both come from the repo root:
+#
+#   1. The root bunfig's `preload = ["./tests/helpers/preload-base.ts"]`, which
+#      installs `mock.module('@aws-sdk/client-s3', …)` process-wide. Comparing a
+#      mocked aws-sdk against the real Bun client would measure the mock.
+#   2. The root `.env`. Bun loads it from the working directory, so from here it
+#      is not loaded at all. That covers a bare `bun test` in this directory but
+#      NOT `run.ts` invoked from the repository root, where the parent process
+#      loads `.env` and the child inherits its environment — so `run.ts` deletes
+#      every `S3_*`, `AWS_*` and `R2_*` name before spawning. Between the two, no
+#      ambient credential can reach a client and `Bun.s3`'s environment-derived
+#      singleton stays unable to resolve an endpoint. `errors.test.ts` asserts it,
+#      and is what caught the gap.
+#
+# The root bunfig's `root = "tests"` is also left behind, which is what makes
+# these files discoverable at all.
+[test]
+root = "."

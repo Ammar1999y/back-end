@@ -39,9 +39,9 @@
  * Under `bun:sqlite` that identifier is `SQLiteError` — capital L, capital E.
  * `better-sqlite3` spelled it `SqliteError`, and this comment named the old
  * spelling after the driver had already changed. Nothing in production compares
- * against either string (audited), so the drift was documentary only; the probe
- * suite still manufactures the Node spelling, which is a test defect recorded in
- * reports/test-strategy.md.
+ * against either string (audited), so the drift was documentary only. The suite
+ * now asserts it against an error the real driver threw rather than a
+ * hand-authored one, so a further rename cannot pass unnoticed.
  */
 function errorClassOf(error: unknown): string {
   const name = (error as { name?: unknown } | null)?.name;
@@ -60,12 +60,15 @@ export interface StoreFailureLog {
  * `scope` is the identifier's prefix. That is safe rather than merely
  * convenient: `enforceRateLimit` is the only caller of `rateLimit`, it builds
  * `${scope}:${identifier}`, and every scope in the codebase is a compile-time
- * constant or an interpolation of a closed union. Enumerating all 14 routes that
- * enable `preAuthIpLimit` — the one request-derived producer — yields exactly
- * five static values (`preauth.auth.forgot-password`, `preauth.auth.passwordless`,
- * `preauth.dash.{permissions,roles,users}`); dynamic path segments never survive
- * its two-segment slice, and no scope contains a colon. There is deliberately no
- * runtime validation here, because no reachable path needs one.
+ * constant or an interpolation of a closed union. The 22 routes that declare
+ * `preAuth: 'ip-limit'` — the one request-derived producer — collapse to exactly
+ * six static values (`preauth.auth.forgot-password`, `preauth.auth.passwordless`,
+ * `preauth.dash.{permissions,roles,users}`, `preauth.upload.image`); dynamic path
+ * segments never survive `preAuthScope`'s two-segment slice, and no scope
+ * contains a colon. There is deliberately no runtime validation here, because no
+ * reachable path needs one — and the counts above are no longer maintained by
+ * hand: `tests/unit/rate-limit-log-boundary.test.ts` derives the set from
+ * `ROUTES` and asserts the property over every member.
  *
  * There is no `attempt` field any more: the retry loop it counted was shaped for
  * transient HTTP failures. A local store failure means a broken disk or schema,

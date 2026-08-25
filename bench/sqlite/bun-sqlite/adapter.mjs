@@ -1,10 +1,9 @@
 // bun:sqlite adapter. db.query() returns a cached compiled statement (Bun caches
 // up to 20 by SQL string); db.prepare() always compiles a fresh one.
 
+import { Database } from 'bun:sqlite';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-
-import { Database } from 'bun:sqlite';
 
 import { PROFILES } from '../shared/pragmas.mjs';
 import { ddlFor } from '../shared/schema.mjs';

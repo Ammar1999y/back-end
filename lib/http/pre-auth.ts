@@ -21,8 +21,12 @@ const PRE_AUTH_SEGMENT_MAX = 40;
  * `/api/auth/forgot-password/send` -> `preauth.auth.forgot-password`) — narrow
  * enough to isolate surfaces, coarse enough that dynamic ids don't explode the
  * keyspace.
+ *
+ * Exported for the suite, which derives the complete set of scopes the route
+ * table can produce by walking `ROUTES` through this function rather than
+ * keeping a second copy of the list — a copy that had already drifted.
  */
-function preAuthScope(pathname: string): string {
+export function preAuthScope(pathname: string): string {
   const segments = pathname
     .split('/')
     .filter(Boolean)

@@ -153,6 +153,8 @@ const MAX_VALUE_BYTES = 512 * 1024;
  * A cache that throws is worse than a cache that misses: every call site would
  * need a try/catch to preserve behaviour the cache was supposed to be invisible
  * to. Losing this data costs one rebuild, which is the definition of this tier.
+ *
+ * @knipignore
  */
 export function cacheGet<Value>(key: string): Value | null {
   try {
@@ -164,7 +166,11 @@ export function cacheGet<Value>(key: string): Value | null {
   }
 }
 
-/** `ttlSeconds` is required: an entry with no expiry is not a cache entry. */
+/**
+ * `ttlSeconds` is required: an entry with no expiry is not a cache entry.
+ *
+ * @knipignore
+ */
 export function cacheSet(
   key: string,
   value: unknown,
@@ -192,6 +198,7 @@ export function cacheSet(
   }
 }
 
+/** @knipignore */
 export function cacheDelete(key: string): void {
   try {
     getStore().del.run(key);
@@ -206,6 +213,8 @@ export function cacheDelete(key: string): void {
  * An empty prefix is rejected rather than treated as "everything": a caller that
  * accidentally passes an unset variable would otherwise flush the entire cache,
  * which looks like a performance problem rather than a bug.
+ *
+ * @knipignore
  */
 export function cacheDeletePrefix(prefix: string): void {
   if (prefix.length === 0)

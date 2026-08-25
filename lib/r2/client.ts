@@ -129,6 +129,8 @@ export async function deleteFromR2(params: {
 /**
  * Copy a file to a new location in R2
  * Does NOT delete the original - orphan cleanup is handled by cron job
+ *
+ * @knipignore
  */
 export async function copyFileInR2(params: {
   sourceKey: string;
@@ -167,6 +169,7 @@ export async function copyFileInR2(params: {
  * - Maximum expiry: 7 days (604,800 seconds)
  * - URLs are signed and cannot be tampered with
  *
+ * @knipignore
  * @param expiresIn - Expiration time in seconds (default: 300 = 5 minutes)
  */
 export async function getPresignedUrl(params: {
@@ -234,6 +237,7 @@ export async function getPresignedUrl(params: {
  * 2. Update R2_PUBLIC_URL in .env (e.g., https://cdn.yoursite.com)
  * 3. Redeploy - No code changes needed!
  *
+ * @knipignore
  * @param key - R2 object key (e.g., "projects/5/project/uuid.jpg")
  * @returns Public URL (e.g., "https://pub-xxxxx.r2.dev/projects/5/project/uuid.jpg")
  *
@@ -253,6 +257,8 @@ export function getPublicUrl(key: string): string {
 /**
  * MIME type validation
  * Returns true if MIME type is allowed
+ *
+ * @knipignore
  */
 export function isAllowedMimeType(
   mimeType: string,
@@ -313,7 +319,59 @@ export function getCacheControlHeader(params: {
 }
 
 /**
- * Get content disposition header for downloads
+ * RFC 5987 `ext-value` percent-encoding for the `filename*` parameter.
+ *
+ * Not `encodeURIComponent`, which leaves `!'()*` unescaped — none of those is an
+ * RFC 5987 `attr-char`, and `(` and `)` are reachable here because
+ * `sanitizeFilename` keeps them.
+ */
+const ATTR_CHARS = new Set(
+  [
+    ...'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!#$&+-.^_`|~',
+  ].map((character) => character.codePointAt(0))
+);
+
+function encodeExtValue(filename: string): string {
+  const bytes = new TextEncoder().encode(filename);
+  let out = '';
+  for (const byte of bytes)
+    out += ATTR_CHARS.has(byte)
+      ? String.fromCodePoint(byte)
+      : `%${byte.toString(16).toUpperCase().padStart(2, '0')}`;
+  return out;
+}
+
+/**
+ * The ASCII half of the header.
+ *
+ * A header value is transmitted as Latin-1, so a non-ASCII code point here does
+ * not survive: `@aws-sdk/client-s3` replaces each one with `U+FFFD` and Bun's S3
+ * client sends the raw UTF-8 bytes, so the same filename produces two different
+ * stored headers and neither is the name. Non-ASCII therefore belongs only in
+ * `filename*`, and this parameter carries a transliteration-free `_` placeholder
+ * — which is what RFC 6266 §4.3 intends the ASCII parameter to be.
+ *
+ * `"` and `\` are dropped rather than escaped: a `quoted-string` can escape them,
+ * but parsers disagree about how, and no filename needs them. Control characters
+ * are dropped for the reason that outranks tidiness — CR and LF in a header value
+ * are request splitting, and this value is built from a caller-supplied string.
+ */
+function asciiFallback(filename: string): string {
+  let out = '';
+  for (const character of filename) {
+    const code = character.codePointAt(0) ?? 0;
+    if (code === 0x7f || code < 0x20) continue;
+    if (character === '"' || character === '\\') continue;
+    out += code > 0x7f ? '_' : character;
+  }
+  return out || 'download';
+}
+
+/**
+ * Get content disposition header for downloads.
+ *
+ * Both parameters are emitted per RFC 6266: `filename` for parsers that read
+ * only that, `filename*` for the real name. Browsers prefer `filename*`.
  */
 export function getContentDisposition(params: {
   filename: string;
@@ -322,9 +380,10 @@ export function getContentDisposition(params: {
   const { filename, inline = false } = params;
   const disposition = inline ? 'inline' : 'attachment';
 
-  const encodedFilename = encodeURIComponent(filename);
-
-  return `${disposition}; filename="${filename}"; filename*=UTF-8''${encodedFilename}`;
+  return (
+    `${disposition}; filename="${asciiFallback(filename)}"; ` +
+    `filename*=UTF-8''${encodeExtValue(filename)}`
+  );
 }
 
 export function getR2ConfigStatus() {
