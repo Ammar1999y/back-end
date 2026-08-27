@@ -34,6 +34,7 @@ jobs:
         # which made the endpoint 500 in production while every development
         # check passed.
         env:
+          PUBLIC_URL: http://localhost:3000
           DATABASE_URL: postgres://ci:ci@db.example.com/ci?sslmode=require
           PASSWORD_PEPPER_ACTIVE_ID: ci
           PASSWORD_PEPPER_KEYRING: '{"ci":{"generation":1,"secret":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}}'
@@ -140,13 +141,10 @@ jobs:
       # load, and the value must not be the one the tests end up using.
       DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
       PUBLIC_URL: http://localhost:3000
-      # `email,sms,whatsapp`, not `phone`. The channels are exactly those three
-      # (`utils/validation/otp.ts`), and unrecognised values are filtered out
-      # SILENTLY — so `phone` was dropped with no error and the phone surface was
-      # only half exercised. The `.env` comment calling WhatsApp "phone" is what
-      # this copied; `phone` is the CONTACT KIND the OTP quotas key on, not a
-      # delivery channel.
-      NEXT_PUBLIC_ENABLED_OTP_CHANNELS: email,sms,whatsapp
+      # Email is the enabled OTP channel for this tier; the integration suite
+      # (tests/integration/self-service-credentials.test.ts) asserts phone OTP
+      # channels are disabled to test rejection and refusal boundaries.
+      NEXT_PUBLIC_ENABLED_OTP_CHANNELS: email
       NEXT_PUBLIC_TURNSTILE_SITE_KEY: 1x00000000000000000000AA
       TURNSTILE_SECRET_KEY: 1x0000000000000000000000000000000AA
       BETTER_AUTH_SECRET: ci-placeholder-better-auth-secret-000000
