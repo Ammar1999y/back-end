@@ -34,7 +34,7 @@ export interface HandlerRequestMeta {
   method: string;
   /** Client IP resolved by the adapter. Empty string when unknown. */
   ip: string;
-  /** User-Agent header (trimmed to reasonable length by the adapter). */
+  /** User-Agent header; persistence boundaries apply their own length caps. */
   userAgent: string | null;
   /** API path (pathname only, no host/query). Used for audit logging. */
   apiPath: string;

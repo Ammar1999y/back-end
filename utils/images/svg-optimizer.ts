@@ -12,7 +12,7 @@ import {
   SVG_MAX_ELEMENTS,
 } from './config';
 
-// 🟥 اذا مستقبلا قررت اسمح للانميشن انه يتم تمريره، اقوم بفك التعليق الخاص بالانميشن، واخلي المكتبه تسمح بمرور الانميشن
+// Supporting animation would require updating both the sanitizer and SVGO policy.
 
 const REFERENCE_ATTRIBUTES = ['href', 'xlink:href'] as const;
 

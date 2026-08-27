@@ -1,47 +1,10 @@
 /**
- * How a six-digit OTP is stored and checked: HMAC-SHA-256 under a dedicated
- * versioned server key, compared in constant time.
+ * Six-digit OTPs use HMAC-SHA-256 under a dedicated versioned key. The online
+ * attempt budget stops guessing; the key prevents database-only enumeration.
+ * Argon2 added memory and row-lock time without improving either boundary.
  *
- * **Why not the password KDF, which is what this replaced.** OTPs used to go
- * through `hashPassword` — Argon2id at 64 MiB, t=3, p=4, plus the password
- * pepper. A slow KDF exists to make offline enumeration of a high-entropy secret
- * expensive. It buys nothing here and costs a great deal:
- *
- * - **It buys nothing.** The guess space is 10^6 and online guessing is already
- *   capped hard (`OTP_MAX_VERIFY_ATTEMPTS` per cycle, `verifyAttemptDaily` per
- *   day, plus per-destination and per-IP limiters), so the attempt budget — not
- *   the hash cost — is what stops guessing. Against a stolen database the key is
- *   what stops the attacker, exactly as the pepper was; and even with the key,
- *   enumerating 10^6 candidates is trivial against ANY unkeyed-speed primitive
- *   while the code expires in `OTP_EXPIRY_MINUTES`. Argon2id changes neither
- *   case.
- * - **It cost measurably.** Argon2id charges its 64 MiB per CONCURRENT
- *   operation, and the limiters bound request RATE, not simultaneous working set.
- *   Measured (`bench/otp`, Bun 1.4.0, 8 cores, four runs): 4 concurrent
- *   operations held ~257 MiB above baseline and 10 or more held ~513 MiB — the
- *   same figure every run, plateauing at the libuv threadpool ceiling. Throughput
- *   did not scale with concurrency at all (12–22 ops/s from 1 to 32), so p99
- *   latency reached 0.8–1.4 s. HMAC-SHA-256 over the same runs: 0.02–0.2 ms and
- *   no measurable RSS delta.
- *
- *   Event-loop lag is NOT part of this argument, though an earlier draft said it
- *   was. argon2 runs on the threadpool, so lag stayed at 6–25 ms p99; a single
- *   589 ms observation did not reproduce across three further runs and was an
- *   outlier, not a finding.
- * - **It was also lock-hold time.** `processOtpVerify` calls `verifyOtpCode`
- *   inside `withTransaction`, after taking `FOR UPDATE` on both the user row and
- *   the proof row. So every verify held two row locks and one of ten pool
- *   connections across the whole hash — ~65 ms measured, per attempt. That is the
- *   same defect class as the OTP delivery that used to sit inside the same kind of
- *   transaction; this one just happened to be fixed by changing the primitive
- *   rather than by moving the call.
- *
- * **Not a fast UNKEYED hash.** A bare SHA-256 of a six-digit code is a 10^6
- * rainbow table. The key is what makes this safe, which is why it lives in its
- * own keyring with its own retirement rule (`./otp-key.ts`).
- *
- * Envelope: `o1:<keyId>:<base64url mac>`. The key id travels with the value so a
- * key can be rotated without invalidating codes already in flight.
+ * Envelope: `o1:<keyId>:<base64url mac>` so retained keys keep live codes valid
+ * during rotation.
  */
 import crypto from 'node:crypto';
 

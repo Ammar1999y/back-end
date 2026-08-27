@@ -199,6 +199,12 @@
     to record requests that carry no application semantics is not a trade worth
     making at this size.
 
+67. **Benchmark Dependencies (`uuid`, `sharp`) Removed from Root Manifest** —
+    `bench/uuid/`, `bench/image/`, `knip.jsonc` — Benchmark-only comparison
+    packages were removed to avoid root dependency bloat. Key decision
+    measurements are already recorded; if benchmarks need to be re-run,
+    dependencies can be installed on-demand and removed.
+
 # Known Issues — Will Be Fixed Later
 
 1. **Race Condition: Stale Login / OTP Proof Can Issue Session After Credential Rotation**
@@ -252,3 +258,7 @@
 13. **The Global OTP Budget Is Charged From Inside the PostgreSQL Transaction**
     - **Locations:** `utils/otp.ts` (`processOtpSend`), `lib/rate-limit/api.ts`
     - **Summary:** `enforceOtpGlobalSendBudget` is the last statement inside `withTransaction`, so a synchronous `bun:sqlite` write happens while holding a `FOR UPDATE` row lock, an advisory lock and one of `MAX_POOL_CONNECTIONS` (10). Under SQLite writer contention that statement was measured blocking for 2 282 ms. It is the one limiter call in the codebase made while holding PostgreSQL locks, and the comment directly below it explains why `sendOtp` was moved OUT of the transaction for exactly this reason. Secondarily, the charge is not atomic with the commit: a successful charge followed by a failed COMMIT permanently burns one unit of the daily budget with nothing sent, and there is deliberately no refund primitive. Deferred: moving it out needs a decision about what happens between the charge and the commit, which is the same problem the absent refund primitive describes. See `TODO.md`.
+
+14. **`@knipignore` Masks Dead Exports and Unused Helpers**
+    - **Locations:** `app.ts`, `lib/data-table/config.ts`, `utils/validation/rules.ts`, `utils/index.ts`, `knip.jsonc`
+    - **Summary:** `@knipignore` tags mask several unused exports and dormant helpers. Dead export cleanup and knip suppression pruning will be handled upon project completion.

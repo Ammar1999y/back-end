@@ -389,7 +389,7 @@ interface ProcessOtpSendOptions {
   targetIdentifier?: string | null;
   /** The actual phone number or email to deliver the OTP to */
   sendTo: string;
-  /** Human-readable label for error messages (e.g. "رقم الهاتف") */
+  /** Localized entity label used in error messages */
   entityName: string;
   /** Optional custom SMS message. Receives the OTP code as argument */
   smsMessage?: (code: string) => string;
@@ -676,39 +676,11 @@ export async function processOtpSend({
   // that path.
   if (deferredError) throw deferredError;
 
-  // ── Delivery, AFTER the commit ──
-  //
-  // `sendOtp` is an SMTP session or a provider HTTPS call, so it can take
-  // seconds — an SMTP timeout, tens. Inside the transaction it held a reserved
-  // connection out of `MAX_POOL_CONNECTIONS` (10, the process's entire
-  // transaction capacity) plus the `FOR UPDATE` row lock and the advisory lock
-  // for that whole time. Ten concurrent sends against a hanging provider
-  // exhausted the pool, and every other transactional path in the process then
-  // queued behind Bun's 30 s `connectionTimeout`. A provider outage became a
-  // full-application outage.
-  //
-  // What moving it out costs, accepted deliberately: a failed delivery no longer
-  // rolls back, so it spends one of the user's OTP_MAX_ATTEMPTS and leaves a
-  // code that nobody received. Bounded — the code expires in
-  // OTP_EXPIRY_MINUTES, and the next send overwrites it in the one-row-per-
-  // session slot. NOT compensated by decrementing the counter afterwards: that
-  // write cannot be atomic with the failure that triggers it, so every dropped
-  // compensation silently overcharges a real user, and a caller able to force
-  // delivery failures would get its attempts refunded. Same reasoning as the
-  // absent refund primitive in `lib/rate-limit/index.ts`.
-  //
-  // The reverse order is not an option: delivering first would hand out a code
-  // that a subsequent rollback erases, so the user holds a valid-looking code
-  // the database has no record of.
-  //
-  // Deferred when the caller supplied a way to defer, awaited otherwise.
-  //
-  // Only the three ANONYMOUS surfaces defer, and only because a provider's
-  // latency on the response path is an account-existence oracle there; their own
-  // catch blocks already swallowed the failure for the same reason, so
-  // `runAfterResponse` logging it costs them nothing. An authenticated caller is
-  // told the truth instead: it awaits, and a rejected send reaches it as an
-  // error rather than as `otpSent: true`.
+  // Delivery follows the commit so provider latency cannot hold row locks and a
+  // pool connection. A failed delivery removes and refunds only the matching
+  // code, so it cannot erase or refund a newer send. Anonymous callers defer the
+  // provider call to keep its latency from revealing that the account exists;
+  // authenticated callers await it and receive the delivery failure.
   if (!result)
     throw new CustomError(MSG_OTP_SEND_FAILED, HTTP_STATUS.INTERNAL_ERROR);
   const deliver = async () => {

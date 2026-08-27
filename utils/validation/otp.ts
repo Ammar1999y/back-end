@@ -26,11 +26,8 @@ export type OtpChannel = (typeof OTP_CHANNELS)[number];
 export type PhoneOtpChannel = (typeof PHONE_OTP_CHANNELS)[number];
 
 // ── OTP Purpose ──
-// Every verification session is bound to exactly one purpose so an OTP proven
-// for one reason can never authorize a different sensitive action. Wired today:
-// 'verify_contact' (public ownership proof) and 'change_email' / 'change_phone'
-// (authenticated, pending-until-verified). The remaining values are reserved
-// for future flows and are not produced by any endpoint yet.
+// Every verification session is purpose-bound so a proof cannot authorize a
+// different action. All values are wired except the reserved 'change_password'.
 // ⚠️ Changing this list requires a DB migration (otp_purpose pgEnum).
 export const OTP_PURPOSES = [
   'verify_contact',

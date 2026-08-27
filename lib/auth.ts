@@ -354,29 +354,8 @@ export const auth = betterAuth({
   user: {
     modelName: 'users',
     additionalFields: {
-      /**
-       * **No `fieldName`, and that is the fix rather than an omission.**
-       *
-       * `fieldName` tells Better Auth which key to read off the row the adapter
-       * returned. The adapter is `drizzleAdapter(db, { provider: 'pg', schema })`
-       * and Drizzle returns its own TypeScript keys — `roleId` — not the database
-       * column names. With `fieldName: 'role_id'` Better Auth read
-       * `row['role_id']`, got `undefined`, and `filterOutputFields` dropped the
-       * key: `session.user.roleId` was ALWAYS undefined.
-       *
-       * The consequence was a production outage nothing typed or tested could
-       * see: `checkUserPermission`'s cache path reads this field, so every
-       * read-action dashboard route answered 403 for a user holding every
-       * permission, while writes kept working because they resolve `roleId` from
-       * their own SQL join. Measured before and after — 403 with the mapping, 200
-       * without it.
-       *
-       * The sibling field is the confirmation: `sessions.metadata` declares no
-       * `fieldName`, because its Drizzle key and column name coincide, and it is
-       * the one that always worked. Any future additional field whose column name
-       * differs from its Drizzle key has the same trap: name it after the DRIZZLE
-       * key, not the column.
-       */
+      // Better Auth reads the Drizzle result key (`roleId`), not the SQL column
+      // name. Setting `fieldName: 'role_id'` drops the value from the session.
       roleId: {
         type: 'string',
         required: false,

@@ -1,7 +1,5 @@
-// All OTP responses must take at least this long to prevent timing-based
-// user enumeration. The floor needs to sit above the p99.9 of the real
-// path (DB lookup + argon2 + SMS/email delivery). Tune after measuring
-// real p99 delivery in production.
+// Anonymous OTP handlers use this floor to reduce lookup/proof timing signals.
+// Provider delivery is deferred on anonymous send paths and is not part of it.
 // TODO: Measure the real `processOtpSend` latency distribution and tune this value if needed.
 const MINIMUM_RESPONSE_MS = 1500;
 

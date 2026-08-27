@@ -473,7 +473,7 @@ export const auditLogs = pgTable(
 
 // ================================
 // Roles Table (defined first for FK reference)
-// في حال اردت ان يتم تحديث جميع المستخدمين في حال تغير اي شي في الدور، يتم اضافه عامود الاصدار، وفي كل طلب يتم التحقق من الاصدار
+// A future role-version column could invalidate assigned users after role changes.
 // ================================
 export const roles = pgTable(
   'roles',
@@ -671,7 +671,7 @@ export const verificationCodes = pgTable(
     sessionId: uuid('session_id')
       .notNull()
       .references(() => verificationSessions.id, { onDelete: 'cascade' }),
-    // Stored as an Argon2id hash via hashOtpCode, never plaintext.
+    // Stored as a keyed HMAC envelope via hashOtpCode, never plaintext.
     code: varchar('code', { length: 255 }).notNull(),
     expiresAt: timestamp('expires_at', {
       withTimezone: true,

@@ -229,8 +229,7 @@ export async function checkUserPermission(params: {
 }
 
 /**
- * التحقق من عدة صلاحيات دفعة واحدة
- * @returns { permissions, session }
+ * Checks several permissions in one call.
  */
 export async function checkMultiplePermissions(params: {
   headers: Headers;

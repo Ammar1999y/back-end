@@ -16,19 +16,16 @@
  *
  * ## A live defect this suite reproduced, and what it means for these assertions
  *
- * Measured on Windows, Bun 1.4.0: with 8 processes cold-opening one file, roughly
- * 1 child open in 200 fails at `PRAGMA journal_mode = WAL` with
- * `SQLITE_IOERR_TRUNCATE` (errno 1546) — at the pragma, not at the migration.
- * Converting a rollback journal to WAL deletes and truncates the `-journal` file,
- * and on Windows a concurrent handle on it turns that into a hard I/O error
- * rather than a lock error, so `busy_timeout` never retries it.
+ * On Windows with Bun 1.4.0, concurrent cold opens can fail at
+ * `PRAGMA journal_mode = WAL`. Both `SQLITE_IOERR_TRUNCATE` and `SQLITE_BUSY`
+ * have been reproduced there; the latter remains a test failure below.
  *
  * That is a real gap in `openDatabase`, not a test artefact, and these tests are
  * shaped so they cannot hide it:
  *
- * - The unconditional test allows a `SQLITE_IOERR_TRUNCATE` failure and **fails
- *   on any other class**, so the migration-lock regression it exists for still
- *   turns it red.
+ * - The unconditional test allows the historically accepted
+ *   `SQLITE_IOERR_TRUNCATE` failure and fails on any other class, so a new
+ *   failure mode or migration-lock regression still turns it red.
  * - The strict "every process opens" test is `skipIf(win32)`, so Linux CI — the
  *   deployment target — enforces zero failures, and the local run says out loud
  *   that it did not.
@@ -52,9 +49,7 @@ const CHILD = path.join(
 const RACERS = 8;
 
 /**
- * The one failure class this suite has reproduced and accepts, on win32 only.
- * Anything else — and in particular anything from the migration stage — is a
- * regression.
+ * The historical failure class accepted on win32. Other classes remain failures.
  */
 const ACCEPTED_ON_WIN32 = 'SQLITE_IOERR_TRUNCATE';
 
@@ -146,10 +141,8 @@ describe('concurrent first-open of the rate-limit store', () => {
   test.skipIf(ON_WINDOWS)(
     'every racing process opens successfully',
     async () => {
-      // Skipped on win32 because `PRAGMA journal_mode = WAL` there fails ~1 open
-      // in 200 with SQLITE_IOERR_TRUNCATE (see the header). Linux is the
-      // deployment target and the platform CI runs, so this is where zero
-      // failures is enforced.
+      // Skipped on win32 because concurrent `journal_mode = WAL` cold opens are
+      // not reliable there (see the header). Linux CI enforces zero failures.
       const { reports, failures } = await raceOpens(RACERS);
       expect(
         failures.map((failure) => firstLines(failure.stderr)),

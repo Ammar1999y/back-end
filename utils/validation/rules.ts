@@ -207,7 +207,8 @@ export const fileUploadSchema = ({
   z
     .file(`قم برفع صور ${withPdf ? 'أو ملف PDF' : ''} صحيحة`)
     .min(1000, `حجم الصورة  ${withPdf ? 'أو ملف PDF' : ''} صغير للغايه`)
-    .max(max, `حجم الصورة  ${withPdf ? 'أو ملف PDF' : ''} كبير للغايه`) // في الواجهه نسمح للمستخدم انه يرفع ملف اكبر عادي لاكن سوف نقوم بتصغيره قبل ارساله الى السيرفر
+    // A client may accept larger files only if it downsizes them before upload.
+    .max(max, `حجم الصورة  ${withPdf ? 'أو ملف PDF' : ''} كبير للغايه`)
     .mime(['image/png', 'image/webp', ...(withPdf ? ['application/pdf'] : [])]);
 
 // eslint-disable-next-line security/detect-unsafe-regex

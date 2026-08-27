@@ -383,9 +383,8 @@ describe('entity expansion', () => {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // GAP 4 — external references. These were live defects (`test.failing`) until
-// `DANGEROUS_CSS_PATTERNS` grew whole-directive `@import` / `@font-face` entries
-// and `EXTERNAL_URL_FUNCTION`, and the reference guard was extended from `use`
-// to `image`. They assert the fix now.
+// CSS reference checks were extended to cover directives and URL functions,
+// and the element guard was extended from `use` to `image`. They assert the fix.
 // ─────────────────────────────────────────────────────────────────────────────
 
 const EXTERNAL_REFERENCES: ReadonlyArray<readonly [string, string]> = [
@@ -474,7 +473,7 @@ const LOCAL_REFERENCES: ReadonlyArray<readonly [string, string]> = [
 
 describe('external references in SVG', () => {
   test.each([...EXTERNAL_REFERENCES])('%s is stripped', (_name, markup) => {
-    // The invariant `DANGEROUS_CSS_PATTERNS` states by existing: external CSS is
+    // The sanitizer's external-reference invariant is that external CSS is
     // refused. Each of these is otherwise stored verbatim on the public bucket
     // as `image/svg+xml` + `inline`, so it renders as a DOCUMENT and the
     // reference is fetched at VIEW time — a beacon for every future viewer's IP,
@@ -1170,8 +1169,8 @@ describe('validateMagicBytes — the animated-WebP branch', () => {
       // `isAnimatedWebp` bails the walk on the first `size <= 0` chunk, so one
       // empty (and legal) chunk ahead of VP8X makes the animation flag
       // unreachable and the file is accepted as a still. It then reaches
-      // `optimizeImage`, which `Bun.Image` cannot decode — the 500 the branch
-      // exists to prevent, turned back on by eight bytes.
+      // `optimizeImage`, which rejects it as corrupt with a generic 422 instead
+      // of the animation-specific 400 this branch exists to provide.
       //
       // Fix shape: skip a zero-length chunk (`offset += 8`) instead of returning.
       expect(

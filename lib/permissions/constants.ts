@@ -41,13 +41,13 @@ export const DASHBOARD_PAGE_NAMES = Object.keys(
 ) as readonly DashboardPage[];
 
 /**
- * الصلاحيات المتاحة لكل صفحة.
- * - view/edit/delete: تطبق على كل السجلات.
- * - viewOwn/editOwn/deleteOwn: تطبق فقط على السجلات التي أنشأها المستخدم نفسه.
- * - create: إنشاء سجل جديد.
+ * Permissions available on each page.
+ * - view/edit/delete apply to every record.
+ * - viewOwn/editOwn/deleteOwn apply only to records the user created.
+ * - create permits a new record.
  *
- * قاعدة الـ supersession: إذا كان المستخدم يملك view فإن viewOwn مُتجاهل
- * (لا حاجة لفحصه)، وكذلك edit ↔ editOwn و delete ↔ deleteOwn.
+ * Broader actions supersede their own-record variants: view supersedes viewOwn,
+ * as edit supersedes editOwn and delete supersedes deleteOwn.
  */
 export const PERMISSION_ACTIONS = {
   view: 'عرض الكل',
@@ -67,8 +67,7 @@ export type PermissionObject = Record<
 >;
 
 /**
- * خريطه الـ action العام إلى نسخة "own" المقابلة.
- * تستخدم لتطبيق قاعدة supersession ولفحص "view OR viewOwn" بشكل موحد.
+ * Maps each broad action to its own-record variant for scope resolution.
  */
 export const OWN_ACTION_MAP = {
   view: 'viewOwn',
@@ -137,7 +136,7 @@ export const DEFAULT_PAGE_PERMISSIONS: Array<{
 ];
 
 /**
- * دالة للحصول على الصلاحيات المتاحة لصفحة معينة
+ * Returns the permissions available on a page.
  */
 export function getAvailablePermissions(
   pageName: DashboardPage
