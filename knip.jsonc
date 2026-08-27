@@ -60,6 +60,7 @@
     "eslint-plugin-no-unsanitized",
     "eslint-plugin-security",
     // Optional dependencies used only by manually run benchmarks.
+    "better-sqlite3",
     "sharp",
     "uuid",
   ],
