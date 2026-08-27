@@ -11,6 +11,7 @@ import {
   checkMultiplePermissions,
   checkUserPermission,
 } from '@/lib/permissions/checker';
+import { DASHBOARD_PAGE_NAMES } from '@/lib/permissions/constants';
 
 import {
   HTTP_STATUS,
@@ -66,6 +67,20 @@ export async function requireSession(ctx: HandlerInput) {
     userId,
     sessionId,
   };
+}
+
+export async function requireDashboardAccess(ctx: HandlerInput): Promise<void> {
+  const { permissions } = await checkMultiplePermissions({
+    headers: ctx.headers,
+    checks: DASHBOARD_PAGE_NAMES.map((resource) => ({
+      resource,
+      action: 'view' as const,
+    })),
+    forceDB: true,
+  });
+
+  if (!Object.values(permissions).some(Boolean))
+    throw new CustomError(MSG_INSUFFICIENT_PERMISSIONS, HTTP_STATUS.FORBIDDEN);
 }
 
 /**

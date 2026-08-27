@@ -69,7 +69,7 @@ export const POST: Handler = async (ctx) => {
     const identifier =
       channel === 'email' ? parsed.data.email : parsed.data.phoneNumber;
 
-    await enforceOtpVerifyQuota({ channel, identifier });
+    await enforceOtpVerifyQuota({ channel, identifier, surface: 'recovery' });
 
     // Breach screen + hash BEFORE the transaction (account-independent, so it
     // leaks nothing about whether the identifier exists) and so we never hold a

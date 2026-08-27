@@ -158,7 +158,8 @@ async function assertTargetReachable(
     await validateRolePermissionScope(
       opts.actorPermissions,
       targetUser.roleId,
-      executor
+      executor,
+      'reachability'
     );
 }
 

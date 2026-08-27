@@ -116,18 +116,17 @@ export type PermissionActions = Record<PermissionAction, boolean>;
 // Common Fields Helpers
 // ================================
 
+// bun:sql returns `timestamptz` as Date; string mode would reapply host offset.
 const timestamps = {
   createdAt: timestamp('created_at', {
     withTimezone: true,
     precision: 2,
-    mode: 'string',
   })
     .defaultNow()
     .notNull(),
   updatedAt: timestamp('updated_at', {
     withTimezone: true,
     precision: 2,
-    mode: 'string',
   })
     .defaultNow()
     .$onUpdate(() => sql`now()`)
@@ -209,7 +208,6 @@ export const users = pgTable(
     lockedUntil: timestamp('locked_until', {
       withTimezone: true,
       precision: 2,
-      mode: 'string',
     }),
     // Soft delete, and it stays soft. There is deliberately NO sweep that hard-
     // deletes these rows: `auditLogs.userId` is `onDelete: 'restrict'`, so a
@@ -222,7 +220,6 @@ export const users = pgTable(
     deletedAt: timestamp('deleted_at', {
       withTimezone: true,
       precision: 2,
-      mode: 'string',
     }),
     ...timestamps,
   },
@@ -298,7 +295,6 @@ export const sessions = pgTable(
     expiresAt: timestamp('expires_at', {
       withTimezone: true,
       precision: 2,
-      mode: 'string',
     }).notNull(),
     token: varchar('token', { length: 500 }).notNull(),
     ipAddress: varchar('ip_address', { length: 45 }),
@@ -468,7 +464,6 @@ export const auditLogs = pgTable(
     createdAt: timestamp('created_at', {
       withTimezone: true,
       precision: 2,
-      mode: 'string',
     })
       .defaultNow()
       .notNull(),
@@ -525,7 +520,6 @@ export const rolePermissions = pgTable(
     createdAt: timestamp('created_at', {
       withTimezone: true,
       precision: 2,
-      mode: 'string',
     })
       .defaultNow()
       .notNull(),
@@ -582,25 +576,21 @@ export const verificationSessions = pgTable(
     verifyAttemptWindowStart: timestamp('verify_attempt_window_start', {
       withTimezone: true,
       precision: 2,
-      mode: 'string',
     })
       .notNull()
       .defaultNow(),
     lastSentAt: timestamp('last_sent_at', {
       withTimezone: true,
       precision: 2,
-      mode: 'string',
     }),
     nextAllowedAt: timestamp('next_allowed_at', {
       withTimezone: true,
       precision: 2,
-      mode: 'string',
     }),
     isBlocked: boolean('is_blocked').notNull().default(false),
     blockedUntil: timestamp('blocked_until', {
       withTimezone: true,
       precision: 2,
-      mode: 'string',
     }),
     // Single-use proof lifecycle for sensitive-action OTPs (change_email/phone).
     // `verifiedAt` is stamped when the code matches; `consumedAt` when the proof
@@ -609,12 +599,10 @@ export const verificationSessions = pgTable(
     verifiedAt: timestamp('verified_at', {
       withTimezone: true,
       precision: 2,
-      mode: 'string',
     }),
     consumedAt: timestamp('consumed_at', {
       withTimezone: true,
       precision: 2,
-      mode: 'string',
     }),
     ...timestamps,
   },
@@ -688,12 +676,10 @@ export const verificationCodes = pgTable(
     expiresAt: timestamp('expires_at', {
       withTimezone: true,
       precision: 2,
-      mode: 'string',
     }).notNull(),
     createdAt: timestamp('created_at', {
       withTimezone: true,
       precision: 2,
-      mode: 'string',
     })
       .defaultNow()
       .notNull(),

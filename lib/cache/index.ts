@@ -168,8 +168,6 @@ export function cacheGet<Value>(key: string): Value | null {
 
 /**
  * `ttlSeconds` is required: an entry with no expiry is not a cache entry.
- *
- * @knipignore
  */
 export function cacheSet(
   key: string,

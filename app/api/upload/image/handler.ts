@@ -1,7 +1,7 @@
 import type { Handler } from '@/lib/http/contract';
 import type { DashboardPage } from '@/lib/permissions/constants';
 
-import { requireAnyPermission } from '@/lib/http/session';
+import { requireAnyPermission, requireSession } from '@/lib/http/session';
 import { DASHBOARD_PAGES } from '@/lib/permissions/constants';
 import {
   isAllowedImageType,
@@ -38,18 +38,24 @@ const UPLOAD_ACTIONS = ['create', 'edit'] as const;
  * `Object.hasOwn` against the page map, so the value is one of the enum's own
  * keys — a bare `in` would accept `__proto__` and `toString`.
  *
- * **Runs BEFORE the session check, which inverts the order every other handler
- * here uses** (`requirePermission` first, input validation after). Unavoidable:
- * the resource IS the subject of the permission check, so it has to be parsed to
- * know what to check. The visible consequence is that an unauthenticated caller
- * gets 400 for an unknown resource and 401 for a known one (measured), which
- * distinguishes valid page names.
+ * **Runs AFTER a session check, unlike the naive ordering the shape suggests.**
+ * The resource IS the subject of the permission check, so it must be parsed
+ * before `requireAnyPermission` can be called — which used to mean parsing it
+ * before ANY authentication, and that made the route an enumeration oracle: an
+ * unauthenticated caller got 400 for an unknown resource and 401 for a real page
+ * name (measured), which is an exact, unauthenticated test for membership of
+ * `DASHBOARD_PAGES`.
  *
- * That is not a leak today, for a specific reason: the valid names are published
- * in `/openapi.json`, which is a public route. It WOULD become an enumeration
- * oracle if `DASHBOARD_PAGES` ever gained a name that is not public, or if the
- * OpenAPI route were closed. Either change means moving the session check ahead
- * of this — at the cost of a second session lookup.
+ * That was defensible only while `/openapi.json` published the same names to
+ * anyone. It no longer does — the document is authenticated now — so the two are
+ * coupled and had to move together: closing the document without this turns a
+ * harmless divergence into a working oracle, and this without the document
+ * closes nothing.
+ *
+ * The cost is a second session lookup on the authenticated path
+ * (`requireSession` here, then `requireAnyPermission` below). Deliberate: the
+ * unauthenticated path now answers 401 for every value of `resource`, valid or
+ * not, and pays no parse at all.
  */
 function requireUploadResource(query: URLSearchParams): DashboardPage {
   const requested = query.get('resource');
@@ -60,6 +66,8 @@ function requireUploadResource(query: URLSearchParams): DashboardPage {
 
 export const POST: Handler = async (ctx) => {
   try {
+    await requireSession(ctx);
+
     const resource = requireUploadResource(ctx.query);
     const { userId } = await requireAnyPermission(ctx, {
       resource,

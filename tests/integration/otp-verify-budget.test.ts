@@ -127,9 +127,7 @@ async function seedProof(options: ProofOptions): Promise<string> {
     // would satisfy `verifyOtpCode` only by accident and would stop the day the
     // envelope or the keyring moves.
     code: hashOtpCode(RIGHT_CODE),
-    expiresAt: new Date(
-      Date.now() + OTP_EXPIRY_MINUTES * 60 * 1000
-    ).toISOString(),
+    expiresAt: new Date(Date.now() + OTP_EXPIRY_MINUTES * 60 * 1000),
   });
 
   return sessionId;
@@ -302,7 +300,7 @@ afterEach(() => {
 });
 
 describe('one budget per identity', () => {
-  test('it spans PURPOSES: a second flow does not buy a second allowance', async () => {
+  test('each purpose has its own daily allowance', async () => {
     const { userId } = await freshIdentity();
 
     // One row per purpose, all against the SAME phone. `purpose` is still part
@@ -361,14 +359,11 @@ describe('one budget per identity', () => {
 
     expect(observed).toEqual(expected);
     expect(spent).toBe(OTP_MAX_DAILY_VERIFY_ATTEMPTS);
-    // The bound is the SUM across the identity's rows, which is what makes the
-    // three separate flows one allowance.
     expect(await storedBudget(userId, 'phone')).toBe(
       OTP_MAX_DAILY_VERIFY_ATTEMPTS
     );
 
-    // The pristine row: never guessed against, live code, full per-cycle
-    // allowance — and refused.
+    // A sibling purpose retains its own allowance.
     const before = await proofRow(pristine);
     expect(before?.verifyAttemptDaily).toBe(0);
     expect(before?.verifyAttemptNumber).toBe(0);
@@ -381,19 +376,15 @@ describe('one budget per identity', () => {
       identifier: PHONE,
       code: WRONG_CODE,
     });
-    expect(denied.status).toBe(HTTP_STATUS.TOO_MANY_REQUESTS);
+    expect(denied.status).toBe(HTTP_STATUS.BAD_REQUEST);
 
-    // The discriminator a status cannot carry: the counters did not move, so
-    // this request never reached a code comparison. It was refused by the
-    // identity's spent budget, not by a wrong code and not by its own cycle.
     const after = await proofRow(pristine);
-    expect(after?.verifyAttemptDaily).toBe(0);
-    expect(after?.verifyAttemptNumber).toBe(0);
-    // ...and the refusal armed the block on the row it was made against.
-    expect(after?.isBlocked).toBe(true);
-    expect(after?.blockedUntil).not.toBeNull();
+    expect(after?.verifyAttemptDaily).toBe(1);
+    expect(after?.verifyAttemptNumber).toBe(1);
+    expect(after?.isBlocked).toBe(false);
+    expect(after?.blockedUntil).toBeNull();
     expect(await storedBudget(userId, 'phone')).toBe(
-      OTP_MAX_DAILY_VERIFY_ATTEMPTS
+      OTP_MAX_DAILY_VERIFY_ATTEMPTS + 1
     );
   }, 30_000);
 
@@ -466,7 +457,9 @@ describe('one budget per identity', () => {
       // Nothing was charged and the block was not re-stamped: an already-blocked
       // session is refused before the code is looked at, so a switching attacker
       // cannot extend the penalty either.
-      expect(afterSwitch?.blockedUntil).toBe(blocked?.blockedUntil ?? null);
+      // `toEqual`, not `toBe`: the column decodes to a `Date`, so two reads of
+      // one stored instant are distinct objects.
+      expect(afterSwitch?.blockedUntil).toEqual(blocked?.blockedUntil ?? null);
     },
     30_000
   );
@@ -513,9 +506,9 @@ describe('one budget per identity', () => {
       identifier: PHONE,
       code: WRONG_CODE,
     });
-    expect(phoneDenied.status).toBe(HTTP_STATUS.TOO_MANY_REQUESTS);
+    expect(phoneDenied.status).toBe(HTTP_STATUS.BAD_REQUEST);
     const phoneRow = await proofRow(phonePristine);
-    expect(phoneRow?.verifyAttemptDaily).toBe(0);
+    expect(phoneRow?.verifyAttemptDaily).toBe(1);
 
     // The email side is untouched by any of it. The proof is that the wrong
     // code is CHARGED: the request reached a comparison, so email had budget.
@@ -539,7 +532,7 @@ describe('one budget per identity', () => {
 
     // And the phone ledger did not absorb the email charge.
     expect(await storedBudget(userId, 'phone')).toBe(
-      OTP_MAX_DAILY_VERIFY_ATTEMPTS
+      OTP_MAX_DAILY_VERIFY_ATTEMPTS + 1
     );
 
     // A correct code still works on the email side while phone is locked out.
@@ -578,8 +571,8 @@ describe('only an attempt that COMPARES a code is charged', () => {
     expect(charged?.verifyAttemptDaily).toBe(1);
 
     // The code-expiry boundary, and `setSystemTime` is the right instrument for
-    // it: the active-code lookup compares `expires_at` against
-    // `new Date().toISOString()`, built from the PROCESS clock.
+    // it: the active-code lookup compares `expires_at` against `new Date()`,
+    // built from the PROCESS clock.
     setSystemTime(new Date(Date.now() + (OTP_EXPIRY_MINUTES + 1) * 60 * 1000));
 
     const expired = await verify({
@@ -924,7 +917,7 @@ describe('the ANCHORED fixed 24-hour window', () => {
     expect(reanchored?.anchorAgeSeconds).toBeLessThan(60);
   }, 30_000);
 
-  test('the bound is the SUM of independently-anchored counters', async () => {
+  test('independently anchored purpose counters do not block a sibling purpose', async () => {
     const { userId } = await freshIdentity();
     const [older, newer] = [
       await seedProof({
@@ -1003,9 +996,9 @@ describe('the ANCHORED fixed 24-hour window', () => {
       identifier: PHONE,
       code: WRONG_CODE,
     });
-    expect(denied.status).toBe(HTTP_STATUS.TOO_MANY_REQUESTS);
+    expect(denied.status).toBe(HTTP_STATUS.BAD_REQUEST);
     const row5 = await proofRow(pristine);
-    expect(row5?.verifyAttemptDaily).toBe(0);
+    expect(row5?.verifyAttemptDaily).toBe(1);
   }, 60_000);
 
   test('a served block returns the cycle but not the day', async () => {
@@ -1041,9 +1034,7 @@ describe('the ANCHORED fixed 24-hour window', () => {
     await db
       .update(verificationCodes)
       .set({
-        expiresAt: new Date(
-          Date.now() + OTP_EXPIRY_MINUTES * 60 * 1000
-        ).toISOString(),
+        expiresAt: new Date(Date.now() + OTP_EXPIRY_MINUTES * 60 * 1000),
       })
       .where(eq(verificationCodes.sessionId, sessionId));
 

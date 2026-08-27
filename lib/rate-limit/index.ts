@@ -7,7 +7,7 @@ import { describeStoreFailure } from './store-failure';
 
 export {
   enforceOtpGlobalSendBudget,
-  enforceOtpSendQuota,
+  enforceOtpSurfaceSendQuota,
   enforceOtpVerifyQuota,
   enforceRateLimit,
   ipIdentifier,

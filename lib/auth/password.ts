@@ -73,6 +73,13 @@ function parsePasswordHash(hash: string): ParsedPasswordHash | null {
   return { pepperId, phc };
 }
 
+export function assertPasswordHashEvaluable(hash: string): void {
+  const parsed = parsePasswordHash(hash);
+  if (!parsed)
+    throw new PasswordHashFormatError('Stored password hash has no envelope');
+  getPasswordPepper(parsed.pepperId);
+}
+
 export async function hashPassword(password: string): Promise<string> {
   const pepper = getActivePasswordPepper();
   const phc = await argon2.hash(normalizePassword(password), {
@@ -82,6 +89,28 @@ export async function hashPassword(password: string): Promise<string> {
   return `${HASH_ENVELOPE_VERSION}:${pepper.id}:${phc}`;
 }
 
+/**
+ * The single credential-verification entry point, and therefore the only place
+ * that can decide what an UNEVALUATABLE stored hash means.
+ *
+ * Two of its steps throw rather than returning a result: `parsePasswordHash` on
+ * a malformed or unsupported envelope, and `getPasswordPepper` on an envelope
+ * naming a generation the current keyring no longer holds. Both are server-state
+ * faults — an operator retiring a generation too early, or a
+ * `PASSWORD_PEPPER_KEYRING` revert — and neither used to be converted anywhere:
+ * they escaped Better Call as a **bodyless, content-type-less 500** while an
+ * unknown email answered `401` with the JSON envelope. That difference was an
+ * unauthenticated account-existence oracle, sharpest mid-rotation, when it also
+ * revealed which addresses had not signed in since the rotation.
+ *
+ * They are converted here, not at the four `verifyLoginAttempt` call sites, for
+ * the reason AGENTS.md gives: fix at a shared boundary. The result is a plain
+ * `valid: false`, indistinguishable from a wrong password on every path, and the
+ * fault reaches the operator through the log instead of through the response.
+ *
+ * `costPaid: false` is correct for both: no Argon2 work was done, so the caller
+ * still owes the timing guard.
+ */
 export async function verifyPasswordDetailed({
   hash,
   password,
@@ -89,12 +118,28 @@ export async function verifyPasswordDetailed({
   hash: string;
   password: string;
 }): Promise<PasswordVerificationResult> {
-  const parsed = parsePasswordHash(hash);
-  if (!parsed) {
+  let parsed: ParsedPasswordHash | null;
+  let pepper: ReturnType<typeof getPasswordPepper>;
+  try {
+    parsed = parsePasswordHash(hash);
+    if (!parsed) {
+      return { valid: false, needsRehash: false, costPaid: false };
+    }
+    pepper = getPasswordPepper(parsed.pepperId);
+  } catch (error) {
+    console.error(
+      JSON.stringify({
+        msg: 'auth.password.hash unevaluatable',
+        errorClass: error instanceof Error ? error.name : 'UnknownError',
+        // The message names the envelope defect or the missing generation. It
+        // carries no secret: `KeyringConfigurationError` reports the env var and
+        // the rule, never a key, and `PasswordHashFormatError` reports the shape.
+        detail: error instanceof Error ? error.message : null,
+      })
+    );
     return { valid: false, needsRehash: false, costPaid: false };
   }
 
-  const pepper = getPasswordPepper(parsed.pepperId);
   const valid = await argon2.verify(parsed.phc, normalizePassword(password), {
     secret: pepper.secret,
   });

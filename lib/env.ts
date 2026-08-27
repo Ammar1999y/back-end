@@ -1,6 +1,15 @@
 /**
  * The single parse of the public origin.
  *
+ * TypeScript, not JavaScript. It was `.js` so `next.config.js` could import it,
+ * and Next is gone — but `tsconfig.json` sets `allowJs` WITHOUT `checkJs` and
+ * this file carried no `// @ts-check`, so being in the program was not being
+ * checked: `bun run lint` and `bun run build` both stayed green with an
+ * arbitrary type error in it. The `@param`/`@returns` annotations it used to
+ * carry were decorative, which is the worst state for the module that parses
+ * `PUBLIC_ORIGIN` — the CORS allowlist, Better Auth's `baseURL`, and therefore
+ * the origin cookies are signed against.
+ *
  * One value, one parse, one canonical form — read by BOTH consumers that used
  * to disagree: `@elysia/cors` in `app.ts` and Better Auth's `baseURL` in
  * `lib/auth.ts`. Before this, CORS received a value canonicalised down to
@@ -21,23 +30,15 @@
 const LOCAL_HOSTNAMES = new Set(['localhost', '127.0.0.1', '[::1]']);
 
 /** Accepted names, in precedence order. `NEXT_PUBLIC_URL` is the legacy name. */
-const ORIGIN_ENV_NAMES = /** @type {const} */ ([
-  'PUBLIC_URL',
-  'NEXT_PUBLIC_URL',
-]);
+const ORIGIN_ENV_NAMES = ['PUBLIC_URL', 'NEXT_PUBLIC_URL'] as const;
 
-/**
- * Resolve the configured value and the name it came from.
- *
- * Both names set to DIFFERENT values is rejected rather than resolved by
- * precedence: that state is always an incomplete rename, and picking a winner
- * silently would deploy the origin the operator did not mean.
- *
- * @returns {{ name: string, value: string }}
- */
-function readOriginEnv() {
-  /** @type {{ name: string, value: string }[]} */
-  const present = [];
+interface ConfiguredOrigin {
+  name: string;
+  value: string;
+}
+
+function readOriginEnv(): ConfiguredOrigin {
+  const present: ConfiguredOrigin[] = [];
   for (const name of ORIGIN_ENV_NAMES) {
     const value = process.env[name]?.trim();
     if (value) present.push({ name, value });
@@ -50,6 +51,8 @@ function readOriginEnv() {
     );
 
   const [first, ...rest] = present;
+  // `present.length === 0` is rejected above, so this only narrows the type.
+  if (!first) throw new Error('unreachable: no configured origin');
   for (const other of rest)
     if (other.value !== first.value)
       throw new Error(
@@ -68,14 +71,9 @@ function readOriginEnv() {
  * host and then forced the scheme to `https` regardless of what was written,
  * so `http://localhost:3000` silently became `https://localhost` — a value no
  * browser would ever match. An explicit scheme is required instead.
- *
- * @param {string} raw
- * @param {string} name
- * @returns {string}
  */
-function parseOrigin(raw, name) {
-  /** @type {URL} */
-  let url;
+function parseOrigin(raw: string, name: string): string {
+  let url: URL;
   try {
     url = new URL(raw);
   } catch {

@@ -74,6 +74,14 @@ const SATISFYING_VALUE: Record<string, string> = {
   OTP_HMAC_ACTIVE_ID: '1',
   OTP_HMAC_KEYRING: `{"1":{"generation":1,"secret":"${PEPPER_SECRET}"}}`,
   TURNSTILE_SECRET_KEY: 'turnstile',
+  // R2 joined `REQUIRED_IN_PRODUCTION`: it was the one env group with no
+  // boot-time validation, so a deploy missing it booted green and failed on the
+  // first upload.
+  R2_ACCOUNT_ID: 'r2-account',
+  R2_ACCESS_KEY_ID: 'r2-access-key',
+  R2_SECRET_ACCESS_KEY: 'r2-secret-key',
+  R2_PUBLIC_BUCKET: 'r2-public',
+  R2_PRIVATE_BUCKET: 'r2-private',
 };
 
 /**
@@ -85,7 +93,9 @@ const SATISFYING_VALUE: Record<string, string> = {
  */
 const ALSO_NEEDED_IN_PRODUCTION = {
   SQLITE_DIR: '/tmp/env-secret-probe',
-  SQLITE_MAINTENANCE_TOKEN: 'probe-token',
+  // 32+ characters; `resolveMaintenanceToken` rejects a shorter configured
+  // value at module load.
+  SQLITE_MAINTENANCE_TOKEN: 'probe-token-0123456789012345678901',
 };
 
 /**
@@ -126,6 +136,16 @@ test('a valid environment plus a valid secret loads, so the base is honest', asy
   const r = await run({ BETTER_AUTH_SECRET: VALID });
   expect(r.message).toBe('LOADED');
 }, 30_000);
+
+test.each(['R2_PUBLIC_BUCKET', 'R2_PRIVATE_BUCKET'])(
+  '%s is independently required in production',
+  async (name) => {
+    const result = await run({ BETTER_AUTH_SECRET: VALID, [name]: '' });
+    expect(result.ok).toBe(false);
+    expect(result.message).toContain(name);
+  },
+  30_000
+);
 
 async function run(
   secretEnv: Record<string, string>

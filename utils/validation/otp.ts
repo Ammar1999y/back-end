@@ -80,6 +80,25 @@ const ENABLED_OTP_CHANNELS: readonly OtpChannel[] = [
 
 export const OTP_ENABLED = ENABLED_OTP_CHANNELS.length > 0;
 
+/**
+ * Logged ONCE, at module load, because it is a DEPLOY fault and not a request
+ * event.
+ *
+ * It has to be logged somewhere: with OTP off, every recovery and passwordless
+ * request answers 404, and a 404 from a misconfiguration is indistinguishable in
+ * an access log from a 404 on an unrouted path. It must not be logged PER
+ * REQUEST — the three send handlers did that ahead of their own IP limiter, so
+ * anyone could inflate the error stream at will whenever OTP was intentionally
+ * off.
+ */
+if (!OTP_ENABLED)
+  console.error(
+    JSON.stringify({
+      msg: 'otp.disabled no channel configured',
+      effect: 'every OTP send and verify surface answers 404',
+    })
+  );
+
 /** Narrows unvalidated input to a channel that is enabled right now. */
 export function isChannelEnabled(channel: string): channel is OtpChannel {
   return (ENABLED_OTP_CHANNELS as readonly string[]).includes(channel);

@@ -1,0 +1,3 @@
+{
+  "source": "import { assertLiveSession } from '@/lib/auth/live-session';\n\n/**\n * The defect `no-floating-promises` exists to catch: the admission check runs,\n * its promise is discarded, and the handler continues as though it passed.\n */\nexport function guard(sessionId: string, userId: string): string {\n  assertLiveSession(sessionId, userId);\n  return 'allowed';\n}\n"
+}

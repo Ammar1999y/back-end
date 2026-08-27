@@ -139,6 +139,37 @@ export function toManifest(
   }));
 }
 
+const UNDOCUMENTED_PREFIXES = ['/api/dev/'] as const;
+
+/**
+ * Is this path deliberately absent from the published document?
+ *
+ * Exported for the document builder's own consistency check, which otherwise
+ * reads "declared but not a route" for every schema belonging to a route that
+ * merely isn't PUBLISHED. That mismatch made `openApiDocument` throw under
+ * production filtering — measured, the endpoint returned 500 for every
+ * authorised caller in a deployment while passing in development.
+ */
+export function isUndocumentedPath(path: string): boolean {
+  return UNDOCUMENTED_PREFIXES.some((prefix) => path.startsWith(prefix));
+}
+
+/**
+ * `production` is a parameter rather than a read of `NODE_ENV` alone because the
+ * build generates the DEPLOYED document on a machine that is not the deployment:
+ * an artefact built on a developer box must contain exactly what production
+ * serves, and forcing `NODE_ENV=production` to get that would also trip
+ * `assertEnv` into demanding production secrets to write a static file.
+ */
+export function toPublishedManifest(
+  routes: readonly RouteDefinition[],
+  production = process.env.NODE_ENV === 'production'
+): RouteManifestEntry[] {
+  const manifest = toManifest(routes);
+  if (!production) return manifest;
+  return manifest.filter((entry) => !isUndocumentedPath(entry.path));
+}
+
 /**
  * Compiles a `:param` path into an anchored matcher.
  *

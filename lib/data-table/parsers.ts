@@ -6,7 +6,7 @@ import type {
   JoinOperator,
 } from '@/types/data-table';
 
-import { positiveInt } from '@/utils';
+import { OUT_OF_RANGE, positiveInt } from '@/utils';
 
 import { dataTableConfig } from './config';
 
@@ -35,10 +35,12 @@ const validVariants = new Set<string>(dataTableConfig.filterVariants);
 /** Operators that are complete without a value. */
 const VALUELESS_OPERATORS = new Set<string>(['isEmpty', 'isNotEmpty']);
 
+const CONTROL_CHARACTERS = /\p{Cc}/gu;
+
 /** Coerce any value to a trimmed string, or null if invalid/empty */
 function safeString(v: unknown, maxLen: number): string | null {
   if (typeof v === 'string') {
-    const trimmed = v.trim();
+    const trimmed = v.replaceAll(CONTROL_CHARACTERS, '').trim();
     return trimmed.length > 0 && trimmed.length <= maxLen ? trimmed : null;
   }
   if (typeof v === 'number' && Number.isFinite(v)) {
@@ -301,16 +303,28 @@ function safeParam(value: string | string[] | undefined): string | null {
   return typeof value === 'string' ? value : null;
 }
 
+/**
+ * Every top-level key this parser reads.
+ *
+ * Exported so the caller that owns the URL can refuse the ones it does NOT
+ * read. A misspelled `filtres` was accepted and ignored, and the response was a
+ * broad 200 that looked like a filtered result — the same failure the
+ * `onFilterDropped` contract exists to prevent, arriving one layer earlier.
+ */
+export const DATA_TABLE_PARAM_KEYS = new Set([
+  'maxPerPage',
+  'page',
+  'perPage',
+  'sort',
+  'filters',
+  'joinOperator',
+]);
+
 export function parseSearchParams<T = Record<string, unknown>>(
   params: Record<string, string | string[] | undefined>,
   defaultSort?: ExtendedColumnSort<T>,
   onFilterDropped?: () => void
 ): GetDataSchema<T> {
-  const maxPerPage =
-    positiveInt(params.maxPerPage, MAX_PER_PAGE) || MAX_PER_PAGE;
-  const page = positiveInt(params.page, MAX_PAGE) || 1;
-  const perPage = positiveInt(params.perPage, maxPerPage) || 10;
-
   // Reported at most once per request. A throwing handler exits on the first
   // call anyway, but a counting or logging one was invoked several times for a
   // single malformed parameter.
@@ -322,6 +336,28 @@ export function parseSearchParams<T = Record<string, unknown>>(
         onFilterDropped();
       }
     : undefined;
+
+  // Absent and unreadable are different answers. `positiveInt` returns 0 for
+  // both, so `?perPage=abc` and `?page=` used to serve the DEFAULT page size
+  // with a 200 — indistinguishable from a request that asked for no page size
+  // at all, and a caller who mistyped a bound got rows they never asked for.
+  const boundedInt = (
+    raw: string | string[] | undefined,
+    maxValue: number,
+    fallback: number
+  ): number => {
+    const supplied = safeParam(raw);
+    const parsed = positiveInt(supplied, maxValue);
+    if (parsed === OUT_OF_RANGE || (supplied !== null && parsed === 0)) {
+      reportOnce?.();
+      return fallback;
+    }
+    return parsed || fallback;
+  };
+
+  const maxPerPage = boundedInt(params.maxPerPage, MAX_PER_PAGE, MAX_PER_PAGE);
+  const page = boundedInt(params.page, MAX_PAGE, 1);
+  const perPage = boundedInt(params.perPage, maxPerPage, 10);
 
   const sort = parseSortingState<T>(
     safeParam(params.sort),

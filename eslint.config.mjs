@@ -1,5 +1,6 @@
 import { FlatCompat } from '@eslint/eslintrc';
 import eslintPluginDrizzle from 'eslint-plugin-drizzle';
+import * as eslintPluginImportX from 'eslint-plugin-import-x';
 import eslintPluginPrettier from 'eslint-plugin-prettier';
 import eslintPluginUnicorn from 'eslint-plugin-unicorn';
 import globals from 'globals';
@@ -53,12 +54,12 @@ const eslintConfig = [
   ...tseslintConfigs.recommended,
   eslintPluginUnicorn.configs.recommended,
   ...compat.extends(
-    'plugin:import/typescript',
     'plugin:security/recommended-legacy',
     'plugin:no-unsanitized/recommended-legacy',
-    'plugin:import/recommended',
     'prettier'
   ),
+  eslintPluginImportX.flatConfigs.recommended,
+  eslintPluginImportX.flatConfigs.typescript,
   {
     languageOptions: {
       // `eslint-config-next` used to declare these. Without them `unicorn`
@@ -69,7 +70,7 @@ const eslintConfig = [
       globals: { ...globals.node, ...globals.builtin, Bun: 'readonly' },
     },
     settings: {
-      'import/resolver': {
+      'import-x/resolver': {
         typescript: {
           alwaysTryTypes: true,
           project: './tsconfig.json',
@@ -78,9 +79,10 @@ const eslintConfig = [
       },
     },
     rules: {
-      // The one non-JSX rule `eslint-config-next` added on top of the plugin
-      // recommended sets. `plugin:import/recommended` does not carry it.
-      'import/no-anonymous-default-export': 'warn',
+      'import-x/no-anonymous-default-export': 'warn',
+
+      // CommonJS default imports legitimately expose named members.
+      // 'import-x/no-named-as-default-member': 'off',
 
       '@typescript-eslint/no-unused-vars': [
         'warn',
@@ -114,6 +116,36 @@ const eslintConfig = [
       'unicorn/no-for-each': 'off',
       'unicorn/no-negated-array-predicate': 'off',
       'unicorn/no-computed-property-existence-check': 'off',
+
+      // Schema and action values follow the same verb-based naming as handlers.
+      'unicorn/no-non-function-verb-prefix': 'off',
+      // Explicit comparisons preserve narrowing for optional permission flags.
+      'unicorn/no-unnecessary-boolean-comparison': 'off',
+    },
+  },
+  {
+    // Catch ignored or misrouted promises in security and persistence paths.
+    files: [
+      'app/**/*.ts',
+      'lib/**/*.ts',
+      'db/**/*.ts',
+      'utils/**/*.ts',
+      'types/**/*.ts',
+      'tests/**/*.ts',
+      'scripts/**/*.ts',
+      'routes.ts',
+      'app.ts',
+      'server.ts',
+    ],
+    languageOptions: {
+      parserOptions: {
+        projectService: true,
+        tsconfigRootDir: import.meta.dirname,
+      },
+    },
+    rules: {
+      '@typescript-eslint/no-floating-promises': 'error',
+      '@typescript-eslint/no-misused-promises': 'error',
     },
   },
   {
@@ -122,7 +154,7 @@ const eslintConfig = [
     // `node:*` — which the resolver already knows about by name.
     files: ['**/*.{ts,mts,cjs}'],
     rules: {
-      'import/no-unresolved': ['error', { ignore: ['^bun:'] }],
+      'import-x/no-unresolved': ['error', { ignore: ['^bun:'] }],
     },
   },
   {

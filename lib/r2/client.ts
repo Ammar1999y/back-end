@@ -18,6 +18,9 @@ const MAX_PRESIGNED_URL_EXPIRY = 604_800;
 const MIN_PRESIGNED_URL_EXPIRY = 1;
 const DEFAULT_PRESIGNED_URL_EXPIRY = 300;
 
+const R2_NOT_CONFIGURED =
+  'R2 is not configured. Please check environment variables.';
+
 const validateR2Config = !!(
   R2_ACCOUNT_ID &&
   R2_ACCESS_KEY_ID &&
@@ -36,8 +39,25 @@ const r2Client = new S3Client({
 
 export type BucketType = 'public' | 'private';
 
-const getBucketName = (bucketType: BucketType) =>
-  bucketType === 'public' ? R2_PUBLIC_BUCKET : R2_PRIVATE_BUCKET;
+/**
+ * Resolves a bucket, or refuses.
+ *
+ * It used to return `R2_PUBLIC_BUCKET`/`R2_PRIVATE_BUCKET` unchecked, so an
+ * unset variable reached the AWS SDK as `Bucket: undefined` and failed with an
+ * opaque error. The `validateR2Config` guard above does NOT cover this: it
+ * checks the three credential variables only, which is exactly why a
+ * production-shaped process boots fine and then fails on the first upload.
+ */
+const getBucketName = (bucketType: BucketType): string => {
+  const bucket = bucketType === 'public' ? R2_PUBLIC_BUCKET : R2_PRIVATE_BUCKET;
+  if (!bucket)
+    throw new Error(
+      `R2 is not configured: ${
+        bucketType === 'public' ? 'R2_PUBLIC_BUCKET' : 'R2_PRIVATE_BUCKET'
+      } is unset.`
+    );
+  return bucket;
+};
 
 export async function uploadToR2(params: {
   file: Buffer;
@@ -58,30 +78,23 @@ export async function uploadToR2(params: {
     metadata,
   } = params;
 
-  if (!validateR2Config)
-    throw new Error(
-      'R2 is not configured. Please check environment variables.'
-    );
+  if (!validateR2Config) throw new Error(R2_NOT_CONFIGURED);
 
-  try {
-    const bucket = getBucketName(bucketType);
+  const bucket = getBucketName(bucketType);
 
-    await r2Client.send(
-      new PutObjectCommand({
-        Bucket: bucket,
-        Key: key,
-        Body: file,
-        ContentType: contentType,
-        CacheControl: cacheControl,
-        ContentDisposition: contentDisposition,
-        Metadata: metadata,
-      })
-    );
+  await r2Client.send(
+    new PutObjectCommand({
+      Bucket: bucket,
+      Key: key,
+      Body: file,
+      ContentType: contentType,
+      CacheControl: cacheControl,
+      ContentDisposition: contentDisposition,
+      Metadata: metadata,
+    })
+  );
 
-    return { success: true, key };
-  } catch (error) {
-    throw error;
-  }
+  return { success: true, key };
 }
 
 export async function deleteFromR2(params: {
@@ -90,20 +103,21 @@ export async function deleteFromR2(params: {
 }): Promise<{ success: boolean }> {
   const { key, bucketType } = params;
 
-  try {
-    const bucket = getBucketName(bucketType);
+  // The guard the other three functions already had. Its production caller is
+  // the retention sweep (`db/maintenance.ts`), so with `R2_*` unset it sent a
+  // DeleteObject to `https://undefined.r2.cloudflarestorage.com` on every run.
+  if (!validateR2Config) throw new Error(R2_NOT_CONFIGURED);
 
-    await r2Client.send(
-      new DeleteObjectCommand({
-        Bucket: bucket,
-        Key: key,
-      })
-    );
+  const bucket = getBucketName(bucketType);
 
-    return { success: true };
-  } catch (error) {
-    throw error;
-  }
+  await r2Client.send(
+    new DeleteObjectCommand({
+      Bucket: bucket,
+      Key: key,
+    })
+  );
+
+  return { success: true };
 }
 
 /** @knipignore */
@@ -114,27 +128,19 @@ export async function copyFileInR2(params: {
 }): Promise<{ success: boolean; newKey: string }> {
   const { sourceKey, destinationKey, bucketType } = params;
 
-  if (!validateR2Config) {
-    throw new Error(
-      'R2 is not configured. Please check environment variables.'
-    );
-  }
+  if (!validateR2Config) throw new Error(R2_NOT_CONFIGURED);
 
-  try {
-    const bucket = getBucketName(bucketType);
+  const bucket = getBucketName(bucketType);
 
-    await r2Client.send(
-      new CopyObjectCommand({
-        Bucket: bucket,
-        CopySource: `${bucket}/${sourceKey}`,
-        Key: destinationKey,
-      })
-    );
+  await r2Client.send(
+    new CopyObjectCommand({
+      Bucket: bucket,
+      CopySource: `${bucket}/${sourceKey}`,
+      Key: destinationKey,
+    })
+  );
 
-    return { success: true, newKey: destinationKey };
-  } catch (error) {
-    throw error;
-  }
+  return { success: true, newKey: destinationKey };
 }
 
 /** @knipignore */
@@ -153,11 +159,7 @@ export async function getPresignedUrl(params: {
     responseContentType,
   } = params;
 
-  if (!validateR2Config) {
-    throw new Error(
-      'R2 is not configured. Please check environment variables.'
-    );
-  }
+  if (!validateR2Config) throw new Error(R2_NOT_CONFIGURED);
 
   const validExpiry = Math.max(
     MIN_PRESIGNED_URL_EXPIRY,
@@ -165,30 +167,36 @@ export async function getPresignedUrl(params: {
   );
 
   if (validExpiry !== expiresIn) {
-    console.error(
-      `[R2] Expiry time ${expiresIn}s is out of range. Using ${validExpiry}s instead. ` +
-        `Valid range: ${MIN_PRESIGNED_URL_EXPIRY}-${MAX_PRESIGNED_URL_EXPIRY} seconds`
+    // One JSON object with a dotted `msg`, like every other log call here —
+    // `lib/http/after-response.ts` defines the shape. A bracket-prefixed
+    // interpolated string does not parse in a JSON log pipeline and carries no
+    // key an alerting rule can match on. `warn`, not `error`: the value was
+    // successfully clamped and the request proceeds.
+    console.warn(
+      JSON.stringify({
+        msg: 'r2.presign expiry clamped',
+        requested: expiresIn,
+        used: validExpiry,
+        min: MIN_PRESIGNED_URL_EXPIRY,
+        max: MAX_PRESIGNED_URL_EXPIRY,
+      })
     );
   }
 
-  try {
-    const bucket = getBucketName(bucketType);
+  const bucket = getBucketName(bucketType);
 
-    const command = new GetObjectCommand({
-      Bucket: bucket,
-      Key: key,
-      ResponseContentDisposition: responseContentDisposition,
-      ResponseContentType: responseContentType,
-    });
+  const command = new GetObjectCommand({
+    Bucket: bucket,
+    Key: key,
+    ResponseContentDisposition: responseContentDisposition,
+    ResponseContentType: responseContentType,
+  });
 
-    const url = await getSignedUrl(r2Client, command, {
-      expiresIn: validExpiry,
-    });
+  const url = await getSignedUrl(r2Client, command, {
+    expiresIn: validExpiry,
+  });
 
-    return url;
-  } catch (error) {
-    throw error;
-  }
+  return url;
 }
 
 /** @knipignore */
@@ -298,15 +306,27 @@ export function getContentDisposition(params: {
     `filename*=UTF-8''${encodeExtValue(filename)}`
   );
 }
-/** @knipignore */
+/**
+ * PRESENCE only, for every field.
+ *
+ * Three of these used to report their actual values — the two bucket names and
+ * the public URL — while the credential fields next to them reported booleans.
+ * No HTTP caller reaches it today (a dev probe is the only consumer), so this
+ * was latent; `app/api/health/storage/handler.ts` states the rule for this
+ * codebase one directory away: _"The body reports status only: no paths, schema
+ * contents, or row counts."_ A status function that is safe only because nothing
+ * calls it is one route away from not being safe.
+ *
+ * @knipignore
+ */
 export function getR2ConfigStatus() {
   return {
     configured: validateR2Config,
     accountId: !!R2_ACCOUNT_ID,
     accessKeyId: !!R2_ACCESS_KEY_ID,
     secretAccessKey: !!R2_SECRET_ACCESS_KEY,
-    publicBucket: R2_PUBLIC_BUCKET,
-    privateBucket: R2_PRIVATE_BUCKET,
-    publicUrl: R2_PUBLIC_URL || null,
+    publicBucket: !!R2_PUBLIC_BUCKET,
+    privateBucket: !!R2_PRIVATE_BUCKET,
+    publicUrl: !!R2_PUBLIC_URL,
   };
 }

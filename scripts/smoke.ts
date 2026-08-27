@@ -8,14 +8,17 @@
  * request in production would be what discovers a broken import, a missing
  * variable, or an unmounted volume.
  *
- * What it proves: the process starts, the route table builds, the readiness
- * endpoint answers `ok` (so the SQLite volume opened, migrated, and reported the
+ * What it proves: the process starts, the route table builds, every SQLite
+ * readiness check passes (so the volume opened, migrated, and reported the
  * PRAGMAs this build expects), the security headers are attached, an unrouted
  * path produces the API envelope rather than a framework default, Better Auth is
- * mounted, and the maintenance surface fails closed without a token.
+ * mounted, and both authenticated surfaces refuse an anonymous caller.
  *
- * What it does NOT prove: anything requiring PostgreSQL or the network. No
- * endpoint touched here opens a database connection.
+ * What it does NOT prove: that PostgreSQL is reachable. Readiness now includes a
+ * bounded `SELECT 1`, and CI runs this against a deliberately unreachable host —
+ * so the SQLite checks are asserted individually and the aggregate `status` is
+ * asserted to be CONSISTENT with `checks` rather than pinned to `ok`. Pinning it
+ * would make this a database test, which is what the tiered suites are for.
  */
 import { SECURITY_HEADERS } from '@/lib/http/security-headers';
 
@@ -51,16 +54,28 @@ async function waitForBoot(): Promise<Response | null> {
 }
 
 async function runChecks(health: Response): Promise<Check[]> {
-  const healthBody = (await health.json()) as { status?: string };
+  const healthBody = (await health.json()) as {
+    status?: string;
+    checks?: Record<string, boolean>;
+  };
+  const checks = healthBody.checks ?? {};
+  // Everything except `postgres`, which this environment may deliberately lack.
+  const storageChecks = Object.entries(checks).filter(
+    ([name]) => name !== 'postgres'
+  );
+  const failedStorage = storageChecks
+    .filter(([, passed]) => !passed)
+    .map(([name]) => name);
+  const expectedStatus = Object.values(checks).every(Boolean)
+    ? 'ok'
+    : 'degraded';
   const missing = await fetch(`${BASE}/api/definitely-not-a-route`);
   const missingBody = (await missing.json()) as { success?: boolean };
   // Rejected by Better Auth's own path allowlist, so 404 is the expected
   // answer. A 500 or a connection error is the failure this catches.
   const authProbe = await fetch(`${BASE}/api/auth/not-an-endpoint`);
-  const sweep = await fetch(`${BASE}/api/internal/sqlite-sweep`, {
-    method: 'POST',
-  });
-  const dbSweep = await fetch(`${BASE}/api/internal/db-sweep`, {
+  // The `/api/internal/*` prefix must be unrouted, not merely guarded.
+  const internal = await fetch(`${BASE}/api/internal/sqlite-sweep`, {
     method: 'POST',
   });
   // The upload route's authentication gate, checked here because it is the only
@@ -78,21 +93,14 @@ async function runChecks(health: Response): Promise<Check[]> {
     method: 'POST',
     body: uploadForm,
   });
-  // `openApiDocument` THROWS when the route table and its three hand-maintained
-  // maps disagree, which surfaces here as a 500. That is the point: a route that
-  // declares `body: 'json'` with no schema, or a stale key left behind by a
-  // rename, is a wrong contract, and this is the CI gate that catches it. Two
-  // routes shipped with a missing request body before the check existed.
+  // The CONSISTENCY gate moved to `tests/unit/openapi-contract.test.ts` when this
+  // route became authenticated — it needed no server, so it was always the
+  // stronger place for it. What is left to check here is the access boundary,
+  // which only a real request can show: the document maps every path, method,
+  // status code and query parameter this server serves, and an anonymous caller
+  // must not receive it.
   const contract = await fetch(`${BASE}/openapi.json`);
-  const contractBody: unknown = contract.ok ? await contract.json() : null;
-  const paths =
-    typeof contractBody === 'object' &&
-    contractBody !== null &&
-    'paths' in contractBody &&
-    typeof contractBody.paths === 'object' &&
-    contractBody.paths !== null
-      ? Object.keys(contractBody.paths).length
-      : 0;
+  const contractText = await contract.text();
 
   const wrongHeaders = Object.entries(SECURITY_HEADERS)
     .filter(([name, expected]) => health.headers.get(name) !== expected)
@@ -103,9 +111,28 @@ async function runChecks(health: Response): Promise<Check[]> {
 
   return [
     {
-      name: 'readiness reports ok',
-      ok: health.status === 200 && healthBody.status === 'ok',
-      detail: `HTTP ${health.status} status=${healthBody.status}`,
+      // Every SQLite check individually, because that is what a BOOT test can
+      // actually prove: the volume opened, migrated, and reported the PRAGMAs
+      // this build expects.
+      name: 'every storage readiness check passes',
+      ok: storageChecks.length > 0 && failedStorage.length === 0,
+      detail:
+        storageChecks.length === 0
+          ? 'readiness reported no checks at all'
+          : `${storageChecks.length} checked, failed=[${failedStorage.join(', ')}]`,
+    },
+    {
+      // Consistency, not a pinned value. CI points `DATABASE_URL` at an
+      // unreachable host on purpose, so `postgres: false` is the CORRECT answer
+      // there and `degraded` is the correct aggregate — while a deployment with
+      // a real database must still report `ok`. Pinning `ok` would either make
+      // this a database test or force readiness to ignore PostgreSQL, and the
+      // second is the defect that put `SELECT 1` there.
+      name: 'readiness status agrees with its own checks',
+      ok:
+        healthBody.status === expectedStatus &&
+        health.status === (expectedStatus === 'ok' ? 200 : 503),
+      detail: `HTTP ${health.status} status=${healthBody.status} expected=${expectedStatus} postgres=${String(checks.postgres)}`,
     },
     {
       // By VALUE, not by presence. This checked
@@ -136,14 +163,12 @@ async function runChecks(health: Response): Promise<Check[]> {
       detail: `HTTP ${authProbe.status}`,
     },
     {
-      name: 'sqlite sweep rejects a missing maintenance token',
-      ok: sweep.status === 401,
-      detail: `HTTP ${sweep.status}`,
-    },
-    {
-      name: 'db sweep rejects a missing maintenance token',
-      ok: dbSweep.status === 401,
-      detail: `HTTP ${dbSweep.status}`,
+      // The routes this used to probe are gone: both sweeps run in-process
+      // (`lib/schedule.ts`). What replaces the assertion is that the prefix is
+      // no longer served at all.
+      name: 'no /api/internal route is served',
+      ok: internal.status === 404,
+      detail: `HTTP ${internal.status}`,
     },
     {
       name: 'image upload rejects an unauthenticated request',
@@ -151,9 +176,10 @@ async function runChecks(health: Response): Promise<Check[]> {
       detail: `HTTP ${upload.status}`,
     },
     {
-      name: 'the OpenAPI contract builds and agrees with the route table',
-      ok: contract.status === 200 && paths > 0,
-      detail: `HTTP ${contract.status} paths=${paths}`,
+      name: 'the OpenAPI contract is not served to an anonymous caller',
+      // 401, and no path names in the body whatever the status was.
+      ok: contract.status === 401 && !contractText.includes('"paths"'),
+      detail: `HTTP ${contract.status} bodyLen=${contractText.length}`,
     },
   ];
 }

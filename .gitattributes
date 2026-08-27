@@ -1,0 +1,19 @@
+# Working trees are LF everywhere, including on Windows.
+#
+# Without this, `core.autocrlf=true` rewrites every file git touches to CRLF on
+# checkout, and Prettier — whose `endOfLine` default is `lf` — then fails the
+# format gate on the entire changed set. That is a checkout artefact, not a
+# source defect, so it is fixed here rather than by relaxing the gate.
+* text=auto eol=lf
+
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.webp binary
+*.avif binary
+*.gif binary
+*.ico binary
+*.pdf binary
+*.woff binary
+*.woff2 binary
+*.db binary

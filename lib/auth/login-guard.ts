@@ -158,7 +158,7 @@ export async function verifyLoginAttempt(
 
     // Account locked and lock not yet expired
     if (user.lockedUntil) {
-      const lockTime = new Date(user.lockedUntil).getTime();
+      const lockTime = user.lockedUntil.getTime();
       if (lockTime > Date.now()) {
         return { outcome: 'reject_locked', passwordCostPaid: false };
       }
@@ -332,9 +332,15 @@ export async function verifyLoginAttempt(
           auditMeta,
         });
       } catch (error) {
+        // Structured, like every other log call in this codebase: a
+        // two-argument `console.error` emits two values, and the second never
+        // reaches a JSON log pipeline as part of the first.
         console.error(
-          'Automatic password hash upgrade failed; it will be retried after a later successful verification',
-          { errorName: error instanceof Error ? error.name : 'UnknownError' }
+          JSON.stringify({
+            msg: 'auth.passwordHashUpgrade failed',
+            // Retried after the next successful verification; nothing is lost.
+            errorClass: error instanceof Error ? error.name : 'UnknownError',
+          })
         );
       }
     }

@@ -95,13 +95,22 @@ export function userIdentifier(userId: EntityID): string {
 }
 
 // ── OTP quotas ──────────────────────────────────────────────────────
-// Hierarchical, not flat. Each layer bounds a different thing:
-//   global    -> total outbound provider spend (circuit breaker)
-//   destination -> total messages any one victim can be sent
-//   surface   -> how much of that destination budget ONE surface may take,
-//                which is what keeps capacity reserved for recovery
+// Two layers, each bounding a different thing:
+//   global  -> total outbound provider spend (circuit breaker)
+//   surface -> messages to ONE destination from ONE surface
 // Per-IP limits stay as an additional layer at the call sites; they bound a
 // single caller, not aggregate cost.
+//
+// There is deliberately no budget SHARED across surfaces. A cross-surface
+// per-destination cap has only two placements and both are defects: charged
+// pre-lookup, unproductive requests naming a victim's address spend the
+// victim's allowance on every other surface at zero cost to the attacker;
+// charged post-lookup, whether it was spent is observable from another
+// surface, which is an account-state oracle — measured, five `verify_contact`
+// requests then two `passwordless` ones returned [200x6, 429] for a real
+// unverified address and [200x7] for an unknown one. Per-surface budgets
+// charged pre-lookup have neither property; per-destination aggregate is then
+// bounded by surface count x cap, under the global daily breaker.
 
 export type OtpContactKind = 'email' | 'phone';
 
@@ -120,19 +129,10 @@ export type OtpSendSurface =
 /** Aggregate outbound send ATTEMPTS per contact kind per day. */
 const OTP_GLOBAL_SEND_CAP_PER_DAY = 2000;
 /**
- * Send attempts to one destination per hour, shared by every NON-recovery
- * surface. Recovery is excluded on purpose — see below.
+ * Send attempts to one destination per hour from a single surface.
+ *
+ * Sized for a real user who resends: below ~5 a legitimate retry hits the cap.
  */
-const OTP_DESTINATION_SEND_CAP_PER_HOUR = 6;
-/**
- * Recovery's own destination budget. A separate key, not a slice of the
- * shared one: with a single shared pool two non-recovery surfaces could fill
- * it between them and leave password recovery with nothing, which is a
- * targeted account-recovery denial. Reserved capacity only counts as reserved
- * if nothing else can spend it.
- */
-const OTP_RECOVERY_SEND_CAP_PER_HOUR = 5;
-/** Send attempts to one destination per hour from a single surface. */
 const OTP_SURFACE_SEND_CAP_PER_HOUR = 5;
 /** Verify attempts against one destination, across every purpose. */
 const OTP_DESTINATION_VERIFY_CAP = 10;
@@ -142,40 +142,28 @@ const ONE_HOUR_S = 3600;
 const ONE_DAY_S = 86_400;
 
 /**
- * Pre-lookup send quotas: per surface, then per destination. Fails closed —
- * losing the limiter on a paid-delivery path is a cost/abuse event.
+ * The send quota. Charged pre-lookup, on every request, from every surface.
  *
- * Runs BEFORE the account lookup on purpose: applying it afterwards would cap
- * real accounts and not fake ones, which is an existence oracle. Both layers
- * are keyed by destination, so naming addresses nobody owns only exhausts
- * budget for those addresses. The app-wide breaker is deliberately NOT here.
+ * Pre-lookup on purpose: applying it after the account lookup would cap real
+ * accounts and not fake ones, which is an existence oracle. Keyed by
+ * destination, so naming addresses nobody owns only exhausts budget for those
+ * addresses — and keyed by SURFACE, so exhausting it costs the victim nothing
+ * on any other surface, and recovery keeps its own reserved capacity. That
+ * combination is what makes it safe to charge unconditionally.
+ *
+ * Fails closed: losing the limiter on a paid-delivery path is a cost/abuse
+ * event. The app-wide breaker is deliberately NOT here.
  */
-export async function enforceOtpSendQuota(opts: {
+export async function enforceOtpSurfaceSendQuota(opts: {
   channel: OtpChannel;
   /** Normalized destination (email address / phone number). */
   destination: string;
   surface: OtpSendSurface;
 }): Promise<void> {
-  const kind = otpContactKind(opts.channel);
-  const destination = opts.destination.toLowerCase();
-  const isRecovery = opts.surface === 'recovery';
-
   await enforceRateLimit({
-    scope: `otp.send.surface.${opts.surface}.${kind}`,
-    identifier: destination,
+    scope: `otp.send.surface.${opts.surface}.${otpContactKind(opts.channel)}`,
+    identifier: opts.destination.toLowerCase(),
     limit: OTP_SURFACE_SEND_CAP_PER_HOUR,
-    window: ONE_HOUR_S,
-    failClosed: true,
-  });
-
-  await enforceRateLimit({
-    scope: isRecovery
-      ? `otp.send.dest.recovery.${kind}`
-      : `otp.send.dest.${kind}`,
-    identifier: destination,
-    limit: isRecovery
-      ? OTP_RECOVERY_SEND_CAP_PER_HOUR
-      : OTP_DESTINATION_SEND_CAP_PER_HOUR,
     window: ONE_HOUR_S,
     failClosed: true,
   });
@@ -206,15 +194,37 @@ export async function enforceOtpGlobalSendBudget(opts: {
 }
 
 /**
- * Verify-side quota against one destination, shared across every purpose so
- * rotating the purpose can't multiply the per-identifier attempt budget.
+ * Verify-side quota against one destination.
+ *
+ * **Recovery gets its own key, for the reason the send side already states.**
+ * One shared key across every purpose looked like the stricter design — "rotating
+ * the purpose can't multiply the per-identifier attempt budget" — but it made
+ * password recovery deniable for the price of ten HTTP requests: an attacker who
+ * knows an address POSTs `/api/auth/otp/verify` ten times with a junk code, the
+ * 10/600 s budget is spent, and for the rest of the window the victim's
+ * `/api/auth/forgot-password/reset` throws 429 BEFORE the account lookup, so a
+ * CORRECT recovery code cannot be redeemed. Sustained cost: one request per
+ * minute per victim; one IP's 60/min covers sixty victims at once.
+ *
+ * Splitting it costs nothing in brute-force resistance, because this limiter was
+ * never the authority on that. The authority is the per-proof database counter
+ * `OTP_MAX_VERIFY_ATTEMPTS` plus `verification_sessions.verifyAttemptDaily`,
+ * both per-user, both transactional, and both reached AFTER this.
+ *
+ * `surface` is required rather than defaulted: a new verify entry point must
+ * decide which budget it spends, not inherit one.
  */
 export async function enforceOtpVerifyQuota(opts: {
   channel: OtpChannel;
   identifier: string;
+  surface: OtpSendSurface;
 }): Promise<void> {
+  const kind = otpContactKind(opts.channel);
   await enforceRateLimit({
-    scope: `otp.verify.dest.${otpContactKind(opts.channel)}`,
+    scope:
+      opts.surface === 'recovery'
+        ? `otp.verify.dest.recovery.${kind}`
+        : `otp.verify.dest.${kind}`,
     identifier: opts.identifier.toLowerCase(),
     limit: OTP_DESTINATION_VERIFY_CAP,
     window: OTP_DESTINATION_VERIFY_WINDOW_S,

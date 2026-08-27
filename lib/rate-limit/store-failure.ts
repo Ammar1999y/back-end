@@ -32,9 +32,11 @@
  * and the accompanying probes assert the property rather than reproducing a
  * specific client's message format.
  */
+import { errorClassOf } from '@/utils';
 
 /**
- * `name` on an Error is a fixed identifier, not formatted text.
+ * `name` on an Error is a fixed identifier, not formatted text — which is why
+ * `errorClassOf` reports it verbatim.
  *
  * Under `bun:sqlite` that identifier is `SQLiteError` — capital L, capital E.
  * `better-sqlite3` spelled it `SqliteError`, and this comment named the old
@@ -43,11 +45,6 @@
  * now asserts it against an error the real driver threw rather than a
  * hand-authored one, so a further rename cannot pass unnoticed.
  */
-function errorClassOf(error: unknown): string {
-  const name = (error as { name?: unknown } | null)?.name;
-  return typeof name === 'string' ? name : 'Unknown';
-}
-
 export interface StoreFailureLog {
   msg: 'rate-limit store error';
   scope: string;
@@ -81,33 +78,6 @@ export function describeStoreFailure(
   return {
     msg: 'rate-limit store error',
     scope: opts.identifier.split(':', 1)[0] ?? '',
-    errorClass: errorClassOf(error),
-  };
-}
-
-export interface AuthStoreFailureLog {
-  msg: 'auth rate-limit store error';
-  op: 'get' | 'set' | 'consume';
-  errorClass: string;
-}
-
-/**
- * Summarize a Better Auth limiter-storage failure.
- *
- * No key, deliberately. Better Auth builds it with `createRateLimitKey(ip, path)`
- * = `` `${ip}|${path}` `` (`@better-auth/core` `utils/ip`), so logging the key
- * would put the requester's IP address in the log on every failing request.
- *
- * Which operation failed and the error's class are what an outage actually
- * needs, and neither is derived from the key.
- */
-export function describeAuthStoreFailure(
-  error: unknown,
-  op: 'get' | 'set' | 'consume'
-): AuthStoreFailureLog {
-  return {
-    msg: 'auth rate-limit store error',
-    op,
     errorClass: errorClassOf(error),
   };
 }

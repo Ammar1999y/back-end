@@ -5,6 +5,7 @@
     "preinstall": "bun scripts/require-bun.mjs",
     "dev": "NODE_ENV=development bun --watch --bun server.ts",
     "start": "NODE_ENV=production bun --bun server.ts",
+    "build": "bun scripts/build-openapi.ts && tsc --noEmit",
     "lint": "tsc --noEmit && eslint . --max-warnings 0",
     "test": "bun tests/helpers/run.ts unit",
     "test:integration": "bun tests/helpers/run.ts integration",
@@ -25,7 +26,8 @@
     "db:generate": "drizzle-kit generate",
     "db:migrate": "bun scripts/migrate.ts",
     "smoke": "bun scripts/smoke.ts",
-    "check:runtime": "bun scripts/require-bun.mjs"
+    "check:runtime": "bun scripts/require-bun.mjs",
+    "preflight:credentials": "bun scripts/check-password-peppers.ts"
   },
   "packageManager": "bun@1.4.0",
   "engines": {
@@ -39,12 +41,9 @@
   "dependencies": {
     "@aws-sdk/client-s3": "^3",
     "@aws-sdk/s3-request-presigner": "^3",
-    "@better-auth/core": "^1.7",
-    "@better-auth/utils": "0.4.2",
     "@better-fetch/fetch": "^1.3",
     "better-auth": "^1.7",
     "@elysia/cors": "^1.4",
-    "@tanstack/react-table": "^9",
     "argon2": "^0.45",
     "blurhash": "^2",
     "drizzle-orm": "^0.45",
@@ -67,7 +66,7 @@
     "eslint-config-prettier": "^10",
     "eslint-import-resolver-typescript": "^4",
     "eslint-plugin-drizzle": "^0.2",
-    "eslint-plugin-import": "^2",
+    "eslint-plugin-import-x": "^4.17.1",
     "eslint-plugin-no-unsanitized": "^4",
     "eslint-plugin-prettier": "^5",
     "eslint-plugin-security": "^4",
@@ -80,10 +79,11 @@
     "typescript-eslint": "^8"
   },
   "ignoreScripts": [
-    "unrs-resolver"
+    "unrs-resolver",
+    "lefthook",
+    "esbuild"
   ],
   "trustedDependencies": [
-    "argon2",
-    "unrs-resolver"
+    "argon2"
   ]
 }

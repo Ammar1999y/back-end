@@ -5,7 +5,11 @@ import { withTransaction } from '@/db';
 import { getAuditMeta } from '@/lib/audit';
 import { verifyTurnstileRequest } from '@/lib/captcha';
 import { requireSession } from '@/lib/http/session';
-import { enforceRateLimit, userIdentifier } from '@/lib/rate-limit';
+import {
+  enforceOtpVerifyQuota,
+  enforceRateLimit,
+  userIdentifier,
+} from '@/lib/rate-limit';
 
 import {
   HTTP_STATUS,
@@ -60,6 +64,12 @@ export const POST: Handler = async (ctx) => {
 
     const { newPhoneNumber, channel } = parsed.data;
     const auditMeta = getAuditMeta(ctx);
+
+    await enforceOtpVerifyQuota({
+      channel,
+      identifier: newPhoneNumber,
+      surface: 'contact_change',
+    });
 
     await (OTP_AUTO_VERIFY
       ? withTransaction((tx) =>

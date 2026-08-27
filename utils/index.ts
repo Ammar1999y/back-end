@@ -1,11 +1,21 @@
-/* eslint-disable unicorn/prefer-math-trunc */
 import type { SQL } from 'bun';
 
 import { MAX_ID } from '@/constants';
 
+const ARABIC_INDIC_DIGITS = /[٠-٩۰-۹]/g;
+
+const ARABIC_INDIC_BASE = 0x06_60;
+const EXTENDED_ARABIC_INDIC_BASE = 0x06_f0;
+
 export function normalizeArabicDigits(input: string): string {
-  const ARNums = ['٠', '١', '٢', '٣', '٤', '٥', '٦', '٧', '٨', '٩'];
-  return input.replaceAll(/[٠-٩]/g, (n) => String(ARNums.indexOf(n)));
+  return input.replaceAll(ARABIC_INDIC_DIGITS, (digit) => {
+    const code = digit.codePointAt(0) ?? 0;
+    const base =
+      code >= EXTENDED_ARABIC_INDIC_BASE
+        ? EXTENDED_ARABIC_INDIC_BASE
+        : ARABIC_INDIC_BASE;
+    return String(code - base);
+  });
 }
 
 /** @knipignore */
@@ -394,6 +404,17 @@ export function serializeForLog(input: unknown, maxLength = 1024): string {
     : out.slice(0, maxLength - 3) + '...';
 }
 
+/**
+ * The class of a thrown value, for a log line.
+ *
+ * Takes `unknown` and narrows, rather than asserting a shape: `throw` accepts
+ * any value, so `(error as { name?: string }).name` is an assumption the
+ * language does not back. Seven copies of that assertion preceded this one.
+ */
+export function errorClassOf(error: unknown): string {
+  return error instanceof Error ? error.name : 'Unknown';
+}
+
 export function sanitizeForLog(input: unknown, maxLength = 1024) {
   // Development still gets an expandable structure rather than a JSON string —
   // but a REDACTED one. Returning the raw value meant local, preview, and
@@ -420,10 +441,37 @@ const returnNumber = (value: string | undefined | number | null) => {
   return Number.isNaN(num) ? 0 : num;
 };
 
+/**
+ * Canonical decimal integers only — the same shape
+ * `app/api/dash/users/[id]/sessions/pagination.ts` enforces, and for the reason
+ * stated there: bare `Number()` accepts a whole family of spellings a query
+ * string has no business carrying. Measured against `maxValue = 100`:
+ * `"1e2"` -> 100, `"0x10"` -> 16, `"+1"` -> 1, `" 5 "` -> 5, `"05"` -> 5,
+ * `"10.9"` -> 10. Two spelling policies for one concept in one API — and the
+ * over-cap rejection was bypassable by spelling the number differently.
+ *
+ * **Over the maximum returns `OUT_OF_RANGE`, not `0`.** Both used to be `0`, and
+ * the caller cannot tell them apart: `lib/data-table/parsers.ts` writes
+ * `positiveInt(params.perPage, maxPerPage) || 10`, so `?perPage=101` served TEN
+ * rows rather than 100 or a 422, and `?page=10001` silently returned page one.
+ *
+ * `Math.trunc`, not `| 0`: the bitwise form is a 32-bit signed truncation, so a
+ * `maxValue` above 2³¹−1 returned a NEGATIVE result for an in-range input. No
+ * current caller passes one; the trap is removed rather than documented.
+ */
+const CANONICAL_INTEGER = /^(?:0|[1-9]\d*)$/;
+
+/** Distinguishes "over the cap" from "not a number at all". */
+export const OUT_OF_RANGE = -1;
+
 export const positiveInt = (val: unknown, maxValue = MAX_ID) => {
-  const num = Number(val);
-  if (!Number.isFinite(num) || num <= 0 || num > maxValue) return 0;
-  return num | 0;
+  const raw =
+    typeof val === 'number' ? String(val) : typeof val === 'string' ? val : '';
+  if (!CANONICAL_INTEGER.test(raw)) return 0;
+  const num = Number(raw);
+  if (!Number.isFinite(num) || num <= 0) return 0;
+  if (num > maxValue) return OUT_OF_RANGE;
+  return Math.trunc(num);
 };
 
 /**
@@ -457,19 +505,22 @@ export const positiveInt = (val: unknown, maxValue = MAX_ID) => {
  * `lib/data-table/parsers.ts` reach it from the browser.
  */
 type PgErrorFields = Pick<SQL.PostgresError, 'code' | 'errno' | 'constraint'>;
-type ThrownDbError = Partial<PgErrorFields> & {
-  cause?: Partial<PgErrorFields>;
-};
-
-const asDbError = (e: unknown) => e as ThrownDbError | null | undefined;
+function dbErrorField<K extends keyof PgErrorFields>(
+  error: unknown,
+  key: K
+): unknown {
+  if (!error || typeof error !== 'object') return undefined;
+  return key in error ? Reflect.get(error, key) : undefined;
+}
 
 function hasSqlState(e: unknown, sqlState: string): boolean {
-  const err = asDbError(e);
+  const cause =
+    e && typeof e === 'object' && 'cause' in e ? e.cause : undefined;
   return (
-    err?.errno === sqlState ||
-    err?.code === sqlState ||
-    err?.cause?.errno === sqlState ||
-    err?.cause?.code === sqlState
+    dbErrorField(e, 'errno') === sqlState ||
+    dbErrorField(e, 'code') === sqlState ||
+    dbErrorField(cause, 'errno') === sqlState ||
+    dbErrorField(cause, 'code') === sqlState
   );
 }
 
@@ -483,9 +534,27 @@ export function isForeignKeyViolation(e: unknown): boolean {
   return hasSqlState(e, '23503');
 }
 
+/**
+ * PostgreSQL `character_not_in_repertoire` — a NUL byte reaching a text
+ * parameter.
+ *
+ * Mapped so the class cannot resurface as a 500 from a path that forgets to
+ * filter. The read path is filtered at its entry points now
+ * (`lib/data-table/parsers.ts`, `db/queries/data-table.ts`), but this is the
+ * boundary that makes a MISSED site a 422 instead of an unhandled fault whose
+ * log line embeds the SQL and its parameters.
+ */
+export function isInvalidTextEncoding(e: unknown): boolean {
+  return hasSqlState(e, '22021');
+}
+
 export function getConstraintName(e: unknown): string {
-  const err = asDbError(e);
-  return err?.constraint ?? err?.cause?.constraint ?? '';
+  const direct = dbErrorField(e, 'constraint');
+  if (typeof direct === 'string') return direct;
+  const cause =
+    e && typeof e === 'object' && 'cause' in e ? e.cause : undefined;
+  const nested = dbErrorField(cause, 'constraint');
+  return typeof nested === 'string' ? nested : '';
 }
 
 /** @knipignore */

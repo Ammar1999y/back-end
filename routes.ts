@@ -40,12 +40,10 @@ import * as meChangePhoneVerify from '@/app/api/dash/users/me/change-phone/verif
 import * as devEmailTestFixed from '@/app/api/dev/email-test/fixed/handler';
 import * as devSignUp from '@/app/api/dev/sign-up/handler';
 import * as healthStorage from '@/app/api/health/storage/handler';
-import * as internalDbSweep from '@/app/api/internal/db-sweep/handler';
-import * as internalSqliteSweep from '@/app/api/internal/sqlite-sweep/handler';
 import * as uploadImage from '@/app/api/upload/image/handler';
 import { BETTER_AUTH_ALLOWED_PATHS } from '@/lib/auth/allowed-paths';
 import { openApiRouteHandler } from '@/lib/http/openapi';
-import { toManifest } from '@/lib/http/route-manifest';
+import { toPublishedManifest } from '@/lib/http/route-manifest';
 // A plain frozen object of page keys — no server library, so the framework-free
 // property above holds.
 import { DASHBOARD_PAGE_NAMES } from '@/lib/permissions/constants';
@@ -277,31 +275,10 @@ export const ROUTES: readonly RouteDefinition[] = [
       {
         name: 'deep',
         required: false,
-        description:
-          'Set to 1 to probe the object store, not just process state.',
+        description: 'Set to 1 to run SQLite integrity and write probes.',
         enum: ['1'],
       },
     ],
-  },
-  // `body: 'none'` is load-bearing on both: the token check runs against a
-  // request whose body was never touched.
-  {
-    method: 'POST',
-    path: '/api/internal/sqlite-sweep',
-    handler: internalSqliteSweep.POST,
-    preAuth: 'none',
-    body: 'none',
-  },
-  {
-    method: 'POST',
-    path: '/api/internal/db-sweep',
-    handler: internalDbSweep.POST,
-    preAuth: 'none',
-    body: 'none',
-    // Retention over four tables, batched, plus one R2 delete per abandoned
-    // upload. The default ceiling is for request/response work, not for a
-    // scheduled job that walks a backlog.
-    timeoutSeconds: 120,
   },
 
   // ---- dev-only -----------------------------------------------------------
@@ -330,8 +307,8 @@ export const ROUTES: readonly RouteDefinition[] = [
   {
     method: 'GET',
     path: '/openapi.json',
-    handler: openApiRouteHandler(() => toManifest(ROUTES)),
-    preAuth: 'none',
+    handler: openApiRouteHandler(() => toPublishedManifest(ROUTES)),
+    preAuth: 'ip-limit',
     body: 'none',
   },
 ];

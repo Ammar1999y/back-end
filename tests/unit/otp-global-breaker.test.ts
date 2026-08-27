@@ -75,25 +75,24 @@ beforeEach(() => {
 });
 
 describe('the pre-lookup send chain', () => {
-  test('does NOT charge the shared provider breaker', async () => {
-    const { enforceOtpSendQuota } = await import('@/lib/rate-limit/api');
+  test('charges the per-surface key and NOT the shared provider breaker', async () => {
+    const { enforceOtpSurfaceSendQuota } = await import('@/lib/rate-limit/api');
 
     // Exactly what a public send handler runs before it knows whether the
     // destination belongs to anyone: an address nobody owns.
-    await enforceOtpSendQuota({
+    await enforceOtpSurfaceSendQuota({
       channel: 'email',
       destination: 'does-not-exist@example.test',
       surface: 'verify_contact',
     });
 
-    // The per-surface and per-destination layers are what make the endpoint
-    // enumeration-resistant, so they must still be charged.
     expect(keyNames()).toContain(
       'otp.send.surface.verify_contact.email:does-not-exist@example.test'
     );
-    expect(keyNames()).toContain(
-      'otp.send.dest.email:does-not-exist@example.test'
-    );
+
+    // No key SHARED with another surface: spending this one must not reduce
+    // what the same address can still receive from `passwordless` or recovery.
+    expect(keyNames()).toHaveLength(1);
 
     // The shared breaker must not be: 2000 requests naming random nonexistent
     // addresses would otherwise exhaust OTP delivery for every real user for a
@@ -102,32 +101,60 @@ describe('the pre-lookup send chain', () => {
     expect(keyNames()).not.toContain(GLOBAL_PHONE);
   });
 
-  test('recovery keeps its reserved destination budget', async () => {
-    const { enforceOtpSendQuota } = await import('@/lib/rate-limit/api');
+  test('recovery keeps its reserved send budget', async () => {
+    const { enforceOtpSurfaceSendQuota } = await import('@/lib/rate-limit/api');
 
-    await enforceOtpSendQuota({
+    await enforceOtpSurfaceSendQuota({
       channel: 'email',
       destination: 'someone@example.test',
       surface: 'recovery',
     });
 
-    // A separate key, not a slice of the shared one: reserved capacity only
-    // counts as reserved if nothing else can spend it, so a refactor collapsing
-    // these two silently reintroduces a targeted account-recovery denial.
+    // Recovery's budget is its OWN key, never a slice of a shared pool:
+    // reserved capacity only counts as reserved if no other surface can spend
+    // it, so a refactor reintroducing a cross-surface destination budget
+    // silently reintroduces a targeted account-recovery denial.
     expect(keyNames()).toContain(
-      'otp.send.dest.recovery.email:someone@example.test'
+      'otp.send.surface.recovery.email:someone@example.test'
     );
     expect(keyNames()).not.toContain(
-      'otp.send.dest.email:someone@example.test'
+      'otp.send.surface.verify_contact.email:someone@example.test'
     );
     expect(keyNames()).not.toContain(GLOBAL_EMAIL);
+  });
+
+  test('exhausting one surface leaves every other surface untouched', async () => {
+    const { enforceOtpSurfaceSendQuota } = await import('@/lib/rate-limit/api');
+    const destination = 'victim@example.test';
+
+    const charge = (surface: (typeof SEND_SURFACES)[number]) =>
+      enforceOtpSurfaceSendQuota({ channel: 'email', destination, surface });
+
+    // Past the point of refusal on one surface...
+    let refusals = 0;
+    for (let i = 0; i < 20; i++)
+      await charge('verify_contact').catch(() => {
+        refusals++;
+      });
+    expect(refusals).toBeGreaterThan(0);
+
+    // ...every other surface still admits its own full budget. This is the
+    // property that lets the quota be charged BEFORE the account lookup: if
+    // surfaces shared a budget, the choice would be between spending a victim's
+    // cross-surface allowance for free (pre-lookup) and making the spend
+    // observable from another surface (post-lookup, an account-state oracle).
+    for (const surface of SEND_SURFACES) {
+      if (surface === 'verify_contact') continue;
+      await expect(charge(surface)).resolves.toBeUndefined();
+    }
   });
 
   test.each([...SEND_SURFACES])(
     'surface %s never charges the breaker',
     async (surface) => {
-      const { enforceOtpSendQuota } = await import('@/lib/rate-limit/api');
-      await enforceOtpSendQuota({
+      const { enforceOtpSurfaceSendQuota } =
+        await import('@/lib/rate-limit/api');
+      await enforceOtpSurfaceSendQuota({
         channel: 'sms',
         destination: '966500000001',
         surface,

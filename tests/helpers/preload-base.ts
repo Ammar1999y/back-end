@@ -16,6 +16,8 @@ import { existsSync, mkdirSync, rmSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
+import { drainAfterResponse } from '@/lib/http/after-response';
+
 import {
   assertNoEgressViolations,
   installEgressGuard,
@@ -117,15 +119,20 @@ process.env.R2_PUBLIC_URL ??= 'https://cdn.example.invalid';
  * The maintenance token, for the same reason as the R2 block above: it is read at
  * module load in `lib/env.server.ts`, so a test file setting it changes nothing —
  * and with it unset, `maintenanceTokenMatches` fails closed and the AUTHORIZED
- * path of `/api/internal/db-sweep`, `/api/internal/sqlite-sweep` and
- * `/api/health/storage?deep=1` is unreachable. Only the 401 shapes were
- * assertable, which cannot distinguish "guarded" from "guarded and broken".
+ * path of `/api/health/storage?deep=1` is unreachable. Only the 401 shape would
+ * be assertable, which cannot distinguish "guarded" from "guarded and broken".
+ * (The two `/api/internal/*` sweep routes it also used to gate are gone — the
+ * sweeps run in-process, see `lib/schedule.ts`.)
  *
  * `??=` so a run that sets a real one keeps it.
  */
-process.env.SQLITE_MAINTENANCE_TOKEN ??= 'harness-maintenance-token';
 
-beforeEach(() => {
+process.env.SQLITE_MAINTENANCE_TOKEN ??= 'harness-maintenance-token-0123456789';
+
+const DEFERRED_WORK_DRAIN_MS = 5000;
+
+beforeEach(async () => {
+  await drainAfterResponse(DEFERRED_WORK_DRAIN_MS);
   resetEgress();
   resetMailbox();
   resetObjectStore();
@@ -147,7 +154,8 @@ beforeEach(() => {
  * The assertion runs first: it consumes the violations it reports, and resetting
  * before it would throw the evidence away.
  */
-afterEach(() => {
+afterEach(async () => {
+  await drainAfterResponse(DEFERRED_WORK_DRAIN_MS);
   try {
     assertNoEgressViolations();
   } finally {

@@ -177,6 +177,28 @@
     proposed remedy adds the `ip-address` dependency — supply-chain/maintenance
     risk with no real defect fixed. Leave as-is.
 
+65. **`ipIdentifier`'s Failure Log Emits Present, IP-Bearing Headers** —
+    `lib/rate-limit/api.ts` — When `cf-connecting-ip` is absent or fails
+    `IP_SCHEMA`, the failure log includes the VALUES of `x-forwarded-for`,
+    `host` and `user-agent`, which in exactly that case is the header most
+    likely to carry the real client address. The one-line alternative is to log
+    the header NAMES that were absent instead of their values. Not applied: the
+    logs are internal, the branch is unreachable in production
+    (`cf-connecting-ip` is always injected by the edge), and the diagnostic
+    value of seeing what the proxy actually sent is worth more here than the
+    theoretical exposure. Revisit if logs ever leave the host — the same trigger
+    as #8.
+
+66. **OPTIONS Requests Produce No Access-Log Line** — `app.ts` — Both OPTIONS
+    answers short-circuit in an `onRequest` hook before `onAfterResponse`, so
+    preflight volume and OPTIONS-based path scanning are invisible in the log.
+    An observability gap, not a correctness defect: nothing is mis-handled, and
+    the scanning it would reveal is already bounded by the per-IP admission gate
+    and, for path-prefix tricks, by the hostname floor in `app.ts`. Adding a log
+    call to a hook that runs before every request — including every preflight —
+    to record requests that carry no application semantics is not a trade worth
+    making at this size.
+
 # Known Issues — Will Be Fixed Later
 
 1. **Race Condition: Stale Login / OTP Proof Can Issue Session After Credential Rotation**
@@ -222,3 +244,11 @@
 11. **Audit Logs Missing Dedicated Forensic Query Indexes**
     - **Locations:** `db/schema.ts`
     - **Summary:** The `audit_logs` table currently lacks composite indexes for specialized forensic queries (e.g., filtering all historical actions by a specific user across time ranges), to be added when log volume warrants optimization.
+
+12. **Daily OTP Spend Breaker Allows 2x the Budget Across a Window Boundary**
+    - **Locations:** `lib/rate-limit/api.ts` (`enforceOtpGlobalSendBudget`), `lib/rate-limit/index.ts`
+    - **Summary:** `OTP_GLOBAL_SEND_CAP_PER_DAY` uses a FIXED 24h window anchored on UTC midnight (`windowStart = now - (now % windowMs)`), so 2000 charges at `23:59:59.999Z` and 2000 more at `00:00:00.000Z` dispatch 4000 paid messages inside one second and leave the whole of day two at zero. A cap that can be doubled in a burst is not a strict daily cap. Deferred: the fix is a sliding window, which is a change to the shared limiter primitive rather than to this one budget. See `TODO.md`.
+
+13. **The Global OTP Budget Is Charged From Inside the PostgreSQL Transaction**
+    - **Locations:** `utils/otp.ts` (`processOtpSend`), `lib/rate-limit/api.ts`
+    - **Summary:** `enforceOtpGlobalSendBudget` is the last statement inside `withTransaction`, so a synchronous `bun:sqlite` write happens while holding a `FOR UPDATE` row lock, an advisory lock and one of `MAX_POOL_CONNECTIONS` (10). Under SQLite writer contention that statement was measured blocking for 2 282 ms. It is the one limiter call in the codebase made while holding PostgreSQL locks, and the comment directly below it explains why `sendOtp` was moved OUT of the transaction for exactly this reason. Secondarily, the charge is not atomic with the commit: a successful charge followed by a failed COMMIT permanently burns one unit of the daily budget with nothing sent, and there is deliberately no refund primitive. Deferred: moving it out needs a decision about what happens between the charge and the commit, which is the same problem the absent refund primitive describes. See `TODO.md`.

@@ -52,14 +52,48 @@ export function preAuthScope(pathname: string): string {
  * Takes only the head of the request, deliberately: this is an ADMISSION check,
  * so it has to be callable before the body is parsed.
  */
+export interface PreAuthLimitOptions {
+  /**
+   * Overrides `PRE_AUTH_LIMIT` for one path. Only the Better Auth prefix uses
+   * it: those four paths need budgets an order of magnitude apart (a session
+   * read on every dashboard navigation versus a credential submission), and
+   * routing them through this function rather than a second limiter is what
+   * keeps auth admission in ONE place — see `AUTH_PATH_LIMITS` in `app.ts`.
+   */
+  limit?: number;
+  /**
+   * Replaces the path-derived scope with a FIXED one.
+   *
+   * `preAuthScope` builds the key out of the request path, which is correct
+   * only while the set of paths is bounded by the route table. It is not on a
+   * wildcard prefix: an unauthenticated client rotating `/api/auth/<random>`
+   * minted a NEW limiter key per request — measured, three invented paths gave
+   * three distinct keys from one IP — so the limiter aggregated nothing and
+   * every request wrote another row into `rate_limit`. That is the same
+   * unbounded-keyspace failure the sweep ceiling is sized against.
+   *
+   * A caller serving a wildcard must therefore pass one fixed scope for
+   * everything outside its own allowlist.
+   */
+  scope?: string;
+}
+
 export function enforcePreAuthIpLimit(
-  ctx: Pick<HandlerRequestMeta, 'apiPath' | 'headers'>
+  ctx: Pick<HandlerRequestMeta, 'apiPath' | 'headers'>,
+  options: PreAuthLimitOptions = {}
 ): Promise<void> {
   return enforceRateLimit({
-    scope: preAuthScope(ctx.apiPath),
+    scope: options.scope ?? preAuthScope(ctx.apiPath),
     identifier: ipIdentifier(ctx.headers),
-    limit: PRE_AUTH_LIMIT,
+    limit: options.limit ?? PRE_AUTH_LIMIT,
     window: PRE_AUTH_WINDOW_S,
     failClosed: true,
   });
 }
+
+/**
+ * The single bucket every unrecognised path under a wildcard prefix shares.
+ *
+ * Fixed, so path rotation cannot multiply either the budget or the keyspace.
+ */
+export const UNKNOWN_PREFIX_SCOPE = 'preauth.auth.unknown';

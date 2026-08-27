@@ -1,4 +1,3 @@
-/** The production timestamptz string codec must preserve instants in every TZ. */
 import { describe, expect, test } from 'bun:test';
 import path from 'node:path';
 
@@ -19,6 +18,7 @@ interface Report {
   tz: string | null;
   offsetMinutes: number;
   columnType: string;
+  decodedIsDate: boolean;
   truth: string;
   decoded: string;
   reparsed: string;
@@ -46,20 +46,29 @@ async function roundTripUnder(timeZone: string): Promise<Report> {
 }
 
 describe('the schema-wide timestamp boundary', () => {
-  test('every timestamptz column uses the timezone-stable custom codec', () => {
+  test('every timestamptz column decodes in date mode', () => {
+    // Schema-wide, not a sample: the defect was in the SHARED `timestamps`
+    // helper and in twelve individual declarations, so one column added with
+    // `mode: 'string'` reopens it for whatever that column governs.
     const timestampKinds: string[] = [];
 
     for (const value of Object.values(schema)) {
       if (!is(value, PgTable)) continue;
       const columns = Object.values(getTableColumns(value));
       for (const column of columns) {
-        if (column.getSQLType() === 'timestamp(2) with time zone')
+        // Matched on substance, not on the exact rendering: drizzle's two
+        // timestamp builders emit the precision differently — `timestamp (2)`
+        // for date mode against `timestamp(2)` for string mode — so an equality
+        // test on one spelling silently matches nothing once the mode changes,
+        // which is the failure this whole file exists to catch.
+        if (/^timestamp\s*\(\d+\) with time zone$/.test(column.getSQLType()))
           timestampKinds.push(column.constructor.name);
       }
     }
 
     expect(timestampKinds.length).toBeGreaterThanOrEqual(25);
-    expect(new Set(timestampKinds)).toEqual(new Set(['PgCustomColumn']));
+    // `PgTimestampString` is the one that must never appear.
+    expect(new Set(timestampKinds)).toEqual(new Set(['PgTimestamp']));
   });
 });
 
@@ -70,9 +79,11 @@ describe('the production decoder round trip', () => {
       const report = await roundTripUnder(timeZone);
 
       expect(report.tz).toBe(timeZone);
-      expect(report.columnType).toBe('PgCustomColumn');
+      expect(report.columnType).toBe('PgTimestamp');
       if (timeZone === NON_UTC_ZONE) expect(report.offsetMinutes).not.toBe(0);
-      expect(report.decoded).toEndWith('+00');
+      // The driver's own `Date`, not a re-rendered string: there is no
+      // formatting step left in which an offset could be applied.
+      expect(report.decodedIsDate).toBe(true);
       expect(report.sameInstant).toBe(true);
       expect(report.errorHours).toBe(0);
       expect(report.reparsed).toBe(report.truth);

@@ -19,9 +19,13 @@ import { generateUuidV7 } from '@/lib/id';
 import { HTTP_STATUS } from '@/utils/api-messages';
 import { CustomError } from '@/utils/error-class';
 import { hashOtpCode, processOtpSend, processOtpVerify } from '@/utils/otp';
+import {
+  OTP_MAX_ATTEMPTS,
+  OTP_MAX_VERIFY_ATTEMPTS,
+} from '@/utils/validation/constants';
 
 import { resetTables } from '../helpers/database';
-import { sentMail } from '../helpers/mailbox';
+import { sentMail, settleDelivery } from '../helpers/mailbox';
 import {
   authedRequest,
   baseHeaders,
@@ -60,6 +64,7 @@ async function otpState(id: string) {
     .select({
       attemptNumber: verificationSessions.attemptNumber,
       verifyAttemptNumber: verificationSessions.verifyAttemptNumber,
+      verifyAttemptDaily: verificationSessions.verifyAttemptDaily,
       isBlocked: verificationSessions.isBlocked,
       blockedUntil: verificationSessions.blockedUntil,
       nextAllowedAt: verificationSessions.nextAllowedAt,
@@ -87,7 +92,7 @@ test('CI executes these gates in an explicit non-UTC timezone', () => {
 
 describe('future timestamps remain future outside UTC', () => {
   test('an armed account lock refuses a correct password', async () => {
-    const lockedUntil = new Date(Date.now() + FIVE_MINUTES).toISOString();
+    const lockedUntil = new Date(Date.now() + FIVE_MINUTES);
     await db
       .update(users)
       .set({ failedLoginAttempts: MAX_FAILED_ATTEMPTS, lockedUntil })
@@ -100,7 +105,7 @@ describe('future timestamps remain future outside UTC', () => {
       })
       .from(users)
       .where(eq(users.id, fx().locked.userId));
-    expect(Date.parse(before?.lockedUntil ?? '')).toBeGreaterThan(Date.now());
+    expect(before?.lockedUntil?.getTime() ?? 0).toBeGreaterThan(Date.now());
 
     const response = await app.handle(
       new Request('http://localhost/api/auth/sign-in/email', {
@@ -130,7 +135,7 @@ describe('future timestamps remain future outside UTC', () => {
     ).toEqual([]);
   });
 
-  test('a blocked verification row refuses send without delivery or mutation', async () => {
+  test('a SEND-capped row refuses send without delivery', async () => {
     const [session] = await db
       .insert(verificationSessions)
       .values({
@@ -138,13 +143,12 @@ describe('future timestamps remain future outside UTC', () => {
         channel: 'email',
         identifier: fx().otp.email,
         purpose: 'verify_contact',
-        attemptNumber: 1,
+        attemptNumber: OTP_MAX_ATTEMPTS,
         isBlocked: true,
-        blockedUntil: new Date(Date.now() + FIVE_MINUTES).toISOString(),
+        blockedUntil: new Date(Date.now() + FIVE_MINUTES),
       })
       .returning({ id: verificationSessions.id });
     if (!session) throw new Error('blocked send fixture was not inserted');
-    const before = await otpState(session.id);
 
     const error = await rejected(
       processOtpSend({
@@ -158,8 +162,46 @@ describe('future timestamps remain future outside UTC', () => {
     );
 
     expect(error.status).toBe(HTTP_STATUS.TOO_MANY_REQUESTS);
-    expect(await otpState(session.id)).toEqual(before);
+
+    const after = await otpState(session.id);
+    expect(after?.isBlocked).toBe(true);
+    expect(after?.blockedUntil?.getTime() ?? 0).toBeGreaterThan(Date.now());
+    await settleDelivery();
     expect(sentMail()).toEqual([]);
+  });
+
+  test('a VERIFY-blocked row does NOT refuse a resend, and keeps the daily budget', async () => {
+    const [session] = await db
+      .insert(verificationSessions)
+      .values({
+        userId: fx().otp.userId,
+        channel: 'sms',
+        identifier: '+966500000111',
+        purpose: 'passwordless_login',
+
+        attemptNumber: 1,
+        verifyAttemptNumber: OTP_MAX_VERIFY_ATTEMPTS,
+        verifyAttemptDaily: 3,
+        isBlocked: true,
+        blockedUntil: new Date(Date.now() + FIVE_MINUTES),
+      })
+      .returning({ id: verificationSessions.id });
+    if (!session) throw new Error('verify-blocked fixture was not inserted');
+
+    await processOtpSend({
+      userId: fx().otp.userId,
+      identifier: '+966500000111',
+      channel: 'sms',
+      purpose: 'passwordless_login',
+      sendTo: '+966500000111',
+      entityName: 'phone',
+    });
+
+    const after = await otpState(session.id);
+    expect(after?.isBlocked).toBe(false);
+    expect(after?.blockedUntil).toBeNull();
+
+    expect(after?.verifyAttemptDaily).toBe(3);
   });
 
   test('a blocked verification row refuses a correct code without consuming it', async () => {
@@ -172,14 +214,14 @@ describe('future timestamps remain future outside UTC', () => {
         purpose: 'forgot_password',
         attemptNumber: 1,
         isBlocked: true,
-        blockedUntil: new Date(Date.now() + FIVE_MINUTES).toISOString(),
+        blockedUntil: new Date(Date.now() + FIVE_MINUTES),
       })
       .returning({ id: verificationSessions.id });
     if (!session) throw new Error('blocked verify fixture was not inserted');
     await db.insert(verificationCodes).values({
       sessionId: session.id,
       code: hashOtpCode(RIGHT_CODE),
-      expiresAt: new Date(Date.now() + FIVE_MINUTES * 2).toISOString(),
+      expiresAt: new Date(Date.now() + FIVE_MINUTES * 2),
     });
     const before = await otpState(session.id);
 
@@ -212,7 +254,7 @@ describe('future timestamps remain future outside UTC', () => {
         identifier: fx().otp.email,
         purpose: 'passwordless_login',
         attemptNumber: 1,
-        nextAllowedAt: new Date(Date.now() + FIVE_MINUTES).toISOString(),
+        nextAllowedAt: new Date(Date.now() + FIVE_MINUTES),
       })
       .returning({ id: verificationSessions.id });
     if (!session) throw new Error('cooldown fixture was not inserted');
@@ -231,6 +273,7 @@ describe('future timestamps remain future outside UTC', () => {
 
     expect(error.status).toBe(HTTP_STATUS.TOO_MANY_REQUESTS);
     expect(await otpState(session.id)).toEqual(before);
+    await settleDelivery();
     expect(sentMail()).toEqual([]);
   });
 
@@ -242,7 +285,7 @@ describe('future timestamps remain future outside UTC', () => {
       .where(eq(sessions.userId, actor.user.userId));
     if (!current) throw new Error('signed-in fixture has no session');
 
-    const currentCreatedAt = new Date(Date.now() - 60_000).toISOString();
+    const currentCreatedAt = new Date(Date.now() - 60_000);
     await db
       .update(sessions)
       .set({ createdAt: currentCreatedAt })
@@ -252,8 +295,8 @@ describe('future timestamps remain future outside UTC', () => {
       id: olderId,
       userId: actor.user.userId,
       token: `timezone-cursor-${olderId}`,
-      createdAt: new Date(Date.now() - 120_000).toISOString(),
-      expiresAt: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+      createdAt: new Date(Date.now() - 120_000),
+      expiresAt: new Date(Date.now() + 60 * 60 * 1000),
     });
 
     const first = await app.handle(

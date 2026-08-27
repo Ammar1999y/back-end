@@ -44,11 +44,6 @@ export function applyResponsePolicy(
   } catch {
     const headers = new Headers(response.headers);
     write(headers, options);
-    const cookies = response.headers.getSetCookie();
-    if (cookies.length > 0) {
-      headers.delete('set-cookie');
-      for (const cookie of cookies) headers.append('set-cookie', cookie);
-    }
     return new Response(response.body, {
       status: response.status,
       statusText: response.statusText,

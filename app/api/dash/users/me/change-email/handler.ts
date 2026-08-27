@@ -10,7 +10,7 @@ import { LoginRejected, verifyLoginAttempt } from '@/lib/auth/login-guard';
 import { verifyTurnstileRequest } from '@/lib/captcha';
 import { requireSession } from '@/lib/http/session';
 import {
-  enforceOtpSendQuota,
+  enforceOtpSurfaceSendQuota,
   enforceRateLimit,
   userIdentifier,
 } from '@/lib/rate-limit';
@@ -146,15 +146,20 @@ export const POST: Handler = async (ctx) => {
       });
     }
 
-    // Aggregate per-destination cap (shared with every other send surface) so
-    // the same address can't be targeted repeatedly across actors/endpoints.
-    await enforceOtpSendQuota({
+    await enforceOtpSurfaceSendQuota({
       channel: 'email',
       destination: newEmail,
       surface: 'contact_change',
     });
-
-    // Normal flow: send the code to the NEW address bound to change_email.
+    // Delivery is AWAITED here, unlike the three anonymous surfaces.
+    //
+    // Deferring it is what makes their generic 200 constant-time, and their
+    // callers are told nothing either way. This caller is authenticated, owns
+    // the address and is about to wait for a code, so `otpSent: true` returned
+    // before the provider was even called was simply false — a rejected send
+    // reported success and left the user throttled, waiting for a code that was
+    // never dispatched. The provider calls are bounded at PROVIDER_TIMEOUT_MS,
+    // so the cost of awaiting is bounded too.
     await processOtpSend({
       userId,
       identifier: newEmail,

@@ -27,6 +27,20 @@
   },
   "packageRules": [
     {
+      "description": "Require manual approval for TypeScript toolchain majors.",
+      "matchPackageNames": ["typescript", "@types/node"],
+      "matchUpdateTypes": ["major"],
+      "dependencyDashboardApproval": true,
+      "groupName": "typescript toolchain (major)",
+      "labels": ["dependencies", "needs-migration"]
+    },
+    {
+      "description": "Upgrade Bun types with the pinned Bun runtime.",
+      "matchPackageNames": ["@types/bun", "bun-types"],
+      "dependencyDashboardApproval": true,
+      "groupName": "bun types"
+    },
+    {
       "description": "Group all non-major dev tooling into a single PR instead of flooding.",
       "matchDepTypes": ["devDependencies"],
       "matchUpdateTypes": ["minor", "patch", "pin", "digest"],

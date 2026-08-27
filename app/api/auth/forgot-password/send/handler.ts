@@ -7,8 +7,9 @@ import { userContactColumn } from '@/db/queries';
 import { users } from '@/db/schema';
 import { sanitizeForLog } from '@/utils';
 import { verifyTurnstileRequest } from '@/lib/captcha';
+import { enqueueAfterResponse } from '@/lib/http/after-response';
 import {
-  enforceOtpSendQuota,
+  enforceOtpSurfaceSendQuota,
   enforceRateLimit,
   ipIdentifier,
 } from '@/lib/rate-limit';
@@ -66,10 +67,7 @@ export const POST: Handler = async (ctx) => {
       channel === 'email' ? parsed.data.email : parsed.data.phoneNumber;
     const entityName = channel === 'email' ? 'البريد الإلكتروني' : 'رقم الهاتف';
 
-    // Recovery gets its own surface slice of the destination budget, so it
-    // stays available even when contact-verification traffic is being sprayed
-    // at the same address.
-    await enforceOtpSendQuota({
+    await enforceOtpSurfaceSendQuota({
       channel,
       destination: identifier,
       surface: 'recovery',
@@ -103,6 +101,8 @@ export const POST: Handler = async (ctx) => {
         purpose: 'forgot_password',
         sendTo: identifier,
         entityName,
+
+        deferDelivery: (task) => enqueueAfterResponse(ctx.rawRequest, task),
       });
     } catch (error) {
       // Swallow delivery/throttle failures so they can't be used as an
@@ -114,18 +114,7 @@ export const POST: Handler = async (ctx) => {
     return genericResponse();
   } catch (error) {
     await ensureMinDelay(Date.now() - start);
-    // 429 is not collapsed: the throttles reaching here are the pre-lookup IP
-    // and per-identifier limiter caps, which leak nothing about account existence.
-    if (
-      error instanceof CustomError &&
-      (error.status === HTTP_STATUS.BAD_REQUEST ||
-        error.status === HTTP_STATUS.NOT_FOUND)
-    ) {
-      return apiSuccess({
-        message: otpMsg.sendSuccess,
-        data: GENERIC_SEND_DATA,
-      });
-    }
+
     return handleApiError(error, otpMsg.sendError);
   }
 };

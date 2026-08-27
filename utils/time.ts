@@ -213,8 +213,27 @@ export function toCalendarDate(
 ): string | null {
   if (typeof raw === 'string' && CALENDAR_DATE_PATTERN.test(raw)) return raw;
 
-  const numeric = Number(raw);
-  if (numeric === 0 || !Number.isFinite(numeric)) return null;
-  const instant = safeDate(numeric);
+  // Only a REAL number, and only a plausible epoch. `Number(raw)` was applied to
+  // arbitrary client JSON, so a malformed filter resolved to 1970 and the query
+  // ran — `"2026"` -> 1970-01-01, `1700000000` (seconds, not ms) -> 1970-01-20,
+  // `"0x10"` -> 1970-01-01, `[1700000000000]` -> 2023-11-15. `dayBounds` raises
+  // a 422 only on `null`, so every one of those answered `200` with an empty
+  // table and no signal, from generated SQL reading
+  // `created_at >= '1969-12-31T21:00Z'`. A bare year is the realistic trigger.
+  //
+  // The floor is what makes a bare year fail: `2026` as epoch milliseconds is
+  // two seconds after 1970-01-01, and no bookmarked URL this compatibility path
+  // exists for carries a timestamp from that era.
+  if (typeof raw !== 'number' || !Number.isFinite(raw)) return null;
+  if (Math.abs(raw) < EPOCH_MS_FLOOR) return null;
+  const instant = safeDate(raw);
   return instant ? calendarDayInZone(instant, timeZone) : null;
 }
+
+/**
+ * Below this, an "epoch milliseconds" value is a malformed filter rather than a
+ * date. 1971-01-01, chosen because it is comfortably above every small integer a
+ * client could send by mistake (a bare year, a count, an index) and comfortably
+ * below any timestamp a real bookmark carries.
+ */
+const EPOCH_MS_FLOOR = 31_536_000_000;

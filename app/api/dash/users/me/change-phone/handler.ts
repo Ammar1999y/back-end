@@ -10,7 +10,7 @@ import { LoginRejected, verifyLoginAttempt } from '@/lib/auth/login-guard';
 import { verifyTurnstileRequest } from '@/lib/captcha';
 import { requireSession } from '@/lib/http/session';
 import {
-  enforceOtpSendQuota,
+  enforceOtpSurfaceSendQuota,
   enforceRateLimit,
   userIdentifier,
 } from '@/lib/rate-limit';
@@ -138,15 +138,14 @@ export const POST: Handler = async (ctx) => {
       });
     }
 
-    // Aggregate per-destination cap. `sms` and `whatsapp` collapse onto one
-    // phone budget, so switching transport no longer doubles the number of
-    // paid messages a single number can be sent.
-    await enforceOtpSendQuota({
+    await enforceOtpSurfaceSendQuota({
       channel,
       destination: newPhoneNumber,
       surface: 'contact_change',
     });
-
+    // Aggregate per-destination cap. `sms` and `whatsapp` collapse onto one
+    // phone budget, so switching transport no longer doubles the number of
+    // paid messages a single number can be sent.
     await processOtpSend({
       userId,
       identifier: newPhoneNumber,

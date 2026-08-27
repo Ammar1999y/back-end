@@ -97,7 +97,7 @@ import {
 
 import { resetTables } from '../helpers/database';
 import { scriptEgress } from '../helpers/egress';
-import { sentMail } from '../helpers/mailbox';
+import { sentMail, settleDelivery } from '../helpers/mailbox';
 import {
   authedRequest,
   baseHeaders,
@@ -312,7 +312,10 @@ function auditRows(userId: string, tableName: string) {
  * `verification_codes.code` is an HMAC envelope, so this is the only place the
  * plaintext exists — see the note at the top of the file.
  */
-function delivered(): { to: string; code: string } {
+async function delivered(): Promise<{ to: string; code: string }> {
+  // Delivery is deferred to post-response work, so the message is not in the
+  // mailbox when `app.handle()` resolves.
+  await settleDelivery();
   const mail = sentMail().at(-1);
   if (!mail) throw new Error('nothing was delivered');
   const match = /\b(\d{6})\b/.exec(mail.text ?? '');
@@ -786,6 +789,7 @@ describe('POST /api/dash/users/me/change-email — refusals', () => {
     expect(await emailOf(userId)).toBe(before.email);
     // No code went to the address the caller named, so a stolen session cannot
     // be used to mail an arbitrary address without the password.
+    await settleDelivery();
     expect(sentMail()).toEqual([]);
     expect(await proofRows(userId)).toEqual([]);
   });
@@ -802,6 +806,7 @@ describe('POST /api/dash/users/me/change-email — refusals', () => {
 
     expect(response.status).toBe(HTTP_STATUS.BAD_REQUEST);
     expect(await messageOf(response)).toBe(userMsg.newEmailSameAsCurrent);
+    await settleDelivery();
     expect(sentMail()).toEqual([]);
     expect(await proofRows(userId)).toEqual([]);
   });
@@ -879,8 +884,9 @@ describe('POST /api/dash/users/me/change-email — the two-step change', () => {
     expect(after.emailVerified).toBe(before.emailVerified);
 
     // Exactly one message, to the NEW address and to nothing else.
+    await settleDelivery();
     expect(sentMail()).toHaveLength(1);
-    const mail = delivered();
+    const mail = await delivered();
     expect(mail.to).toBe(target);
     expect(mail.to).not.toBe(before.email);
 
@@ -1012,6 +1018,7 @@ describe('POST /api/auth/forgot-password/send — the enumeration boundary', () 
     );
     const unknownElapsed = Date.now() - unknownStarted;
     const unknownBody = await bodyOf(unknownResponse);
+    await settleDelivery();
     const unknownMail = [...sentMail()];
 
     const knownStarted = Date.now();
@@ -1041,7 +1048,9 @@ describe('POST /api/auth/forgot-password/send — the enumeration boundary', () 
     // And the difference that must stay invisible to the client is real: only
     // the known address was mailed, and only it grew a proof row.
     expect(unknownMail).toEqual([]);
+    await settleDelivery();
     expect(sentMail()).toHaveLength(1);
+    await settleDelivery();
     expect(sentMail()[0]?.to).toBe(subject('enumKnown').email);
     const rows = await proofRows(subject('enumKnown').userId);
     expect(rows).toHaveLength(1);
@@ -1061,7 +1070,7 @@ describe('POST /api/auth/forgot-password/reset', () => {
       })
     );
     expect(sent.status).toBe(HTTP_STATUS.OK);
-    const issued = delivered();
+    const issued = await delivered();
 
     const wrongCode = await app.handle(
       anonPost(FORGOT_RESET, {
@@ -1116,7 +1125,7 @@ describe('POST /api/auth/forgot-password/reset', () => {
       })
     );
     expect(sent.status).toBe(HTTP_STATUS.OK);
-    const issued = delivered();
+    const issued = await delivered();
     expect(issued.to).toBe(subject('forgot').email);
 
     const reset = await app.handle(
@@ -1184,6 +1193,7 @@ describe('POST /api/auth/passwordless/send — the enumeration boundary', () => 
     );
     const unknownElapsed = Date.now() - unknownStarted;
     const unknownBody = await bodyOf(unknownResponse);
+    await settleDelivery();
     const unknownMail = [...sentMail()];
 
     const knownResponse = await app.handle(
@@ -1205,7 +1215,9 @@ describe('POST /api/auth/passwordless/send — the enumeration boundary', () => 
     expect(unknownElapsed).toBeGreaterThanOrEqual(1500);
 
     expect(unknownMail).toEqual([]);
+    await settleDelivery();
     expect(sentMail()).toHaveLength(1);
+    await settleDelivery();
     expect(sentMail()[0]?.to).toBe(subject('enumKnown').email);
 
     // A DIFFERENT proof row from the recovery one this address grew earlier: the
@@ -1232,6 +1244,7 @@ describe('POST /api/auth/passwordless/send — the enumeration boundary', () => 
 
     expect(response.status).toBe(HTTP_STATUS.UNPROCESSABLE);
     expect(await messageOf(response)).toBe(otpMsg.invalidInput);
+    await settleDelivery();
     expect(sentMail()).toEqual([]);
   });
 });
@@ -1275,6 +1288,7 @@ describe('POST /api/dash/users/me/change-phone', () => {
     expect(after.phoneNumber).toBe(before.phoneNumber);
     // The availability check precedes re-auth, so nothing was charged.
     expect(after.failedLoginAttempts).toBe(before.failedLoginAttempts);
+    await settleDelivery();
     expect(sentMail()).toEqual([]);
   });
 

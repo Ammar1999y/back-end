@@ -59,8 +59,12 @@
   "ignoreDependencies": [
     "eslint-plugin-no-unsanitized",
     "eslint-plugin-security",
+    // Optional dependencies used only by manually run benchmarks.
+    "sharp",
+    "uuid",
   ],
   // `mise` is invoked by the `scan:*` scripts and installed by `mise.toml`
   // rather than by `bun install`, so it is deliberately not a dependency.
-  "ignoreBinaries": ["mise"],
+  // `dedupe` is a Bun subcommand rather than a PATH binary.
+  "ignoreBinaries": ["mise", "dedupe"],
 }

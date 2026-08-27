@@ -29,6 +29,12 @@ const SCOPED_ACTIONS = new Set<PermissionAction>(
 );
 const READ_ACTIONS = new Set<PermissionAction>(['view', 'viewOwn']);
 
+function hasSessionCookieCache(headers: Headers): boolean {
+  return /(?:^|;\s*)better-auth\.session_data=/.test(
+    headers.get('cookie') ?? ''
+  );
+}
+
 /**
  * Resolve allowed/scope for a given action against a permissions matrix.
  *
@@ -98,7 +104,8 @@ export async function checkUserPermission(params: {
     throw new CustomError(MSG_LOGIN_REQUIRED, HTTP_STATUS.UNAUTHORIZED);
 
   // Write/mutation actions always verify from DB; read actions use cache
-  const shouldForceDB = forceDB || !READ_ACTIONS.has(action);
+  const shouldForceDB =
+    forceDB || !READ_ACTIONS.has(action) || !hasSessionCookieCache(headers);
 
   if (shouldForceDB) {
     // The session ROW is verified here, not just the user and role.
@@ -188,7 +195,12 @@ export async function checkUserPermission(params: {
     };
   }
 
-  // Cache path (read operations)
+  // Read routes accept Better Auth's configured cookie-cache revocation window.
+  // Sensitive mutations take the forceDB branch above.
+  const sessionId = validID(session.session.id);
+  if (!sessionId)
+    throw new CustomError(MSG_LOGIN_REQUIRED, HTTP_STATUS.UNAUTHORIZED);
+
   const roleId = validID(session?.user.roleId) ?? null;
 
   if (!roleId)
@@ -210,7 +222,7 @@ export async function checkUserPermission(params: {
     source: 'cache' as const,
     session,
     userId,
-    sessionId: validID(session.session.id),
+    sessionId,
     roleId,
     permissions,
   };
@@ -238,15 +250,19 @@ export async function checkMultiplePermissions(params: {
     throw new CustomError(MSG_LOGIN_REQUIRED, HTTP_STATUS.UNAUTHORIZED);
 
   const hasWriteAction = checks.some((c) => !READ_ACTIONS.has(c.action));
-  const shouldForceDB = forceDB || hasWriteAction;
+  const shouldForceDB =
+    forceDB || hasWriteAction || !hasSessionCookieCache(headers);
 
   let roleId: EntityID | null = validID(session?.user.roleId) ?? null;
 
-  if (shouldForceDB) {
-    // Same revocation check as `checkUserPermission` — this path authorizes
-    // writes too, so a revoked session must not survive here either.
-    await assertLiveSession(session?.session.id, userId);
+  const cachedSessionId = validID(session.session.id);
+  if (!cachedSessionId)
+    throw new CustomError(MSG_LOGIN_REQUIRED, HTTP_STATUS.UNAUTHORIZED);
+  const sessionId = shouldForceDB
+    ? await assertLiveSession(cachedSessionId, userId)
+    : cachedSessionId;
 
+  if (shouldForceDB) {
     const [userData] = await db
       .select({
         roleId: users.roleId,
@@ -306,6 +322,6 @@ export async function checkMultiplePermissions(params: {
     permissions,
     session,
     userId,
-    sessionId: validID(session.session.id),
+    sessionId,
   };
 }

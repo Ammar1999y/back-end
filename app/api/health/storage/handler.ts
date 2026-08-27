@@ -9,8 +9,10 @@
  * Two costs, deliberately separated:
  *
  * - **Cheap (default).** Opens the store (cached after the first call) and reads
- *   back its PRAGMAs. Enough to catch a missing binary, an unopenable file, a
- *   wrong `journal_mode`, or a schema version this build cannot use. Safe to poll.
+ *   back its PRAGMAs, and runs a bounded `SELECT 1` against PostgreSQL. Enough
+ *   to catch a missing binary, an unopenable file, a wrong `journal_mode`, a
+ *   schema version this build cannot use, or an unreachable primary database.
+ *   Safe to poll.
  * - **Deep (`?deep=1`, token required).** Adds `quick_check` and a real write
  *   probe. Both take real work and a write lock, so they must not run on every
  *   poll — that would put the health check itself in contention with the limiter.
@@ -28,7 +30,8 @@
  */
 import type { Handler } from '@/lib/http/contract';
 
-import { SQLITE_MAINTENANCE_TOKEN } from '@/lib/env.server';
+import { pingDatabase } from '@/db';
+import { errorClassOf } from '@/utils';
 import {
   getRateLimitStore,
   RATE_LIMIT_SCHEMA_VERSION,
@@ -45,6 +48,23 @@ import { HTTP_STATUS } from '@/utils/api-messages';
 import { apiRaw } from '@/utils/api-response';
 
 const PROBE_KEY = 'health:write-probe';
+
+const POSTGRES_PROBE_TIMEOUT_MS = 2000;
+
+async function postgresReachable(): Promise<boolean> {
+  try {
+    return await pingDatabase(POSTGRES_PROBE_TIMEOUT_MS);
+  } catch (error) {
+    // Driver errors can include connection details, so log only their class.
+    console.error(
+      JSON.stringify({
+        msg: 'health.postgres unreachable',
+        errorClass: errorClassOf(error),
+      })
+    );
+    return false;
+  }
+}
 
 export const GET: Handler = async (ctx) => {
   const deepRequested = ctx.query.get('deep') === '1';
@@ -72,12 +92,7 @@ export const GET: Handler = async (ctx) => {
       busyTimeout: Number(pragmas.busyTimeout) === BUSY_TIMEOUT_MS,
       synchronousNormal:
         Number(pragmas.synchronous) === SYNCHRONOUS_VALUE['process-crash-safe'],
-      // Not a storage property, but this is where a deploy that forgot the token
-      // becomes visible: without it the scheduled sweep 401s forever and the
-      // databases grow unbounded, with nothing else to signal it.
-      maintenanceTokenSet:
-        process.env.NODE_ENV !== 'production' ||
-        SQLITE_MAINTENANCE_TOKEN.length > 0,
+      postgres: await postgresReachable(),
     };
 
     if (deep) {
@@ -106,7 +121,7 @@ export const GET: Handler = async (ctx) => {
     console.error(
       JSON.stringify({
         msg: 'storage readiness failed',
-        errorClass: (error as { name?: string })?.name ?? 'Unknown',
+        errorClass: errorClassOf(error),
       })
     );
     return apiRaw({

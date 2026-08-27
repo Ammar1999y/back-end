@@ -10,6 +10,7 @@ import { channelEnabledRefine, otpCodeSchema, PHONE_OTP_CHANNELS } from './otp';
 import { permissionsArraySchema } from './permissions';
 import {
   emailSchema,
+  idRequired,
   idSchema,
   optionalPhoneSchema,
   passwordSchema,
@@ -37,7 +38,14 @@ const userRoleSchema = z.object({
       .max(NAME_MAX, `الاسم يجب أن لا يتجاوز ${NAME_MAX} حرفاً`)
   ),
   isActive: z.boolean().default(true),
-  roleId: z.union([z.literal(CUSTOM_ROLE_VALUE), idSchema]),
+  // The `error` param is not optional decoration. A union failure carries Zod's
+  // own `invalid_union` message — the English string `"Invalid input"` — and
+  // NEITHER branch's message survives, so this one field answered a malformed
+  // value with the only non-Arabic string this API emits, defeating the reason
+  // `zodIssueMessage` exists. It is the only union in the validation layer.
+  roleId: z.union([z.literal(CUSTOM_ROLE_VALUE), idSchema], {
+    error: idRequired,
+  }),
   permissions: permissionsArraySchema.optional(),
   // Always parsed (so the type is stable); the mode-specific rules below reject
   // it when phone is disabled and require it when phone is mandatory. Handlers
@@ -154,11 +162,31 @@ export const createUserSchema = userRoleSchema.superRefine(refineUserPayload);
 const updateUserObject = userRoleSchema.omit({ password: true }).extend({
   id: idSchema,
   isActive: z.boolean(),
+  /**
+   * A non-string is a TYPE ERROR, not "no change".
+   *
+   * The preprocess used to map every non-string to `null`, which this handler
+   * reads as "field not supplied": `{"password": 12345678}` — a JSON number,
+   * the single most likely client mistake for a numeric password — parsed to
+   * `null`, so no hash was written, the `accounts` UPDATE never ran,
+   * `failedLoginAttempts` / `lockedUntil` were not cleared, no sessions were
+   * revoked, and the handler answered `200 {"success":true}`. An operator
+   * resetting the credential of a compromised account was told it worked while
+   * the old password still authenticated. `true` and `["Passw0rd!"]` did the
+   * same.
+   *
+   * `.strict()` closes the misspelled-KEY case for exactly this reason
+   * (`passwrod` must not read as "not supplied"); the wrong-TYPE case walked
+   * through the same door. Only the two forms that genuinely mean "leave it
+   * alone" are normalised now — absent, and an empty/whitespace string from a
+   * form that always submits the field.
+   */
   password: z
-    .preprocess(
-      (e) => (typeof e === 'string' && e.trim().length > 0 ? e : null),
-      passwordSchema.optional().nullish()
-    )
+    .preprocess((e) => {
+      if (e === undefined || e === null) return null;
+      if (typeof e === 'string') return e.trim().length > 0 ? e : null;
+      return e;
+    }, passwordSchema.optional().nullish())
     .optional()
     .nullish(),
 });

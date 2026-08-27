@@ -87,7 +87,7 @@ beforeAll(async () => {
     'contact_change',
   ] as const)
     for (const channel of ['email', 'sms', 'whatsapp'] as const)
-      await api.enforceOtpSendQuota({
+      await api.enforceOtpSurfaceSendQuota({
         channel,
         destination: channel === 'email' ? EMAIL_SENTINEL : PHONE_SENTINEL,
         surface,
@@ -95,10 +95,19 @@ beforeAll(async () => {
 
   for (const channel of ['email', 'sms', 'whatsapp'] as const) {
     await api.enforceOtpGlobalSendBudget({ channel });
-    await api.enforceOtpVerifyQuota({
-      channel,
-      identifier: channel === 'email' ? EMAIL_SENTINEL : PHONE_SENTINEL,
-    });
+    // Every verify surface, because recovery now has its own key: a sentinel
+    // missing from one of them would leave that key space unchecked.
+    for (const surface of [
+      'verify_contact',
+      'recovery',
+      'passwordless',
+      'contact_change',
+    ] as const)
+      await api.enforceOtpVerifyQuota({
+        channel,
+        identifier: channel === 'email' ? EMAIL_SENTINEL : PHONE_SENTINEL,
+        surface,
+      });
   }
 
   realKeys.push(
@@ -111,7 +120,7 @@ beforeAll(async () => {
 
 describe('the raw store message never reaches the log', () => {
   test('an email destination is withheld', () => {
-    const key = `otp.send.dest.email:${EMAIL_SENTINEL}`;
+    const key = `otp.send.surface.recovery.email:${EMAIL_SENTINEL}`;
     const line = serializeForLog(
       describeStoreFailure(leakyError(key), { identifier: key })
     );
@@ -123,7 +132,7 @@ describe('the raw store message never reaches the log', () => {
   });
 
   test('a phone destination is withheld', () => {
-    const key = `otp.send.dest.phone:${PHONE_SENTINEL}`;
+    const key = `otp.send.surface.recovery.phone:${PHONE_SENTINEL}`;
     const line = serializeForLog(
       describeStoreFailure(leakyError(key), { identifier: key })
     );
@@ -133,11 +142,11 @@ describe('the raw store message never reaches the log', () => {
   });
 
   test('the fields an outage actually needs survive', () => {
-    const key = `otp.send.dest.email:${EMAIL_SENTINEL}`;
+    const key = `otp.send.surface.recovery.email:${EMAIL_SENTINEL}`;
     const d = describeStoreFailure(leakyError(key), { identifier: key });
 
     expect(d.msg).toBe('rate-limit store error');
-    expect(d.scope).toBe('otp.send.dest.email');
+    expect(d.scope).toBe('otp.send.surface.recovery.email');
     // No field carries the message or the identifier. `attempt` is gone with the
     // retry loop: a local failure means a broken disk or schema, and SQLITE_BUSY
     // is absorbed by `busy_timeout` rather than retried in application code.
@@ -151,7 +160,7 @@ describe('the raw store message never reaches the log', () => {
 
 describe('the error class comes from the real driver', () => {
   test('a genuine UNIQUE violation is classified, and its key is not echoed', () => {
-    const key = `otp.send.dest.email:${EMAIL_SENTINEL}`;
+    const key = `otp.send.surface.recovery.email:${EMAIL_SENTINEL}`;
     const real = realUniqueViolation(key);
 
     // The assertion the manufactured fixture could not make: the string is read

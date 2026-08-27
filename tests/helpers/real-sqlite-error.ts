@@ -37,7 +37,7 @@ export const REAL_SQLITE_ERROR_NAME = realUniqueViolation().name;
  * guess.
  */
 export function realUniqueViolation(
-  key = 'otp.send.dest.email:victim-sentinel@example.com'
+  key = 'otp.send.surface.recovery.email:victim-sentinel@example.com'
 ): Error {
   const db = new Database(':memory:');
   try {
@@ -45,21 +45,6 @@ export function realUniqueViolation(
     db.run('INSERT INTO t VALUES (?)', [key]);
     db.run('INSERT INTO t VALUES (?)', [key]);
     throw new Error('expected a UNIQUE violation and did not get one');
-  } catch (error) {
-    if (error instanceof Error && error.message.startsWith('expected a'))
-      throw error;
-    return error as Error;
-  } finally {
-    db.close();
-  }
-}
-
-/** A genuine `no such table`, i.e. a schema failure rather than a constraint. */
-export function realMissingTableError(): Error {
-  const db = new Database(':memory:');
-  try {
-    db.run('SELECT * FROM does_not_exist');
-    throw new Error('expected a missing-table error and did not get one');
   } catch (error) {
     if (error instanceof Error && error.message.startsWith('expected a'))
       throw error;

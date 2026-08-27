@@ -16,6 +16,8 @@
  * deterministically, and no file can be surprised by another file's mock.
  */
 
+import { drainAfterResponse } from '@/lib/http/after-response';
+
 /** One captured message, in the shape `sendMail` was called with. */
 export interface SentMail {
   from?: string;
@@ -34,7 +36,10 @@ const sent: SentMail[] = [];
  * functions, and reassigning a module-level binding from inside one is the shape
  * that makes reset order invisible at the call site.
  */
-const state: { failure: Error | null } = { failure: null };
+const state: { failure: Error | null; delayMs: number } = {
+  failure: null,
+  delayMs: 0,
+};
 
 export function sentMail(): readonly SentMail[] {
   return sent;
@@ -43,6 +48,11 @@ export function sentMail(): readonly SentMail[] {
 export function resetMailbox(): void {
   sent.length = 0;
   state.failure = null;
+  state.delayMs = 0;
+}
+
+export function delayMail(ms: number): void {
+  state.delayMs = ms;
 }
 
 /**
@@ -57,17 +67,15 @@ export function failNextMail(error: Error): void {
 }
 
 /**
- * The replacement module.
- *
- * `default` only: `utils/otp.ts` does `import nodemailer from 'nodemailer'`, so
- * that is the binding that has to exist. `createTransport` returns a fresh
- * recorder each call rather than a shared one, because the production code
- * memoises its transport and a shared object would hide a second
- * `createTransport` call if one were ever added.
+ * `utils/otp.ts` imports `createTransport` from `'nodemailer'`.
+ * `createTransport` returns a fresh recorder each call rather than a shared
+ * one, because the production code memoises its transport and a shared object
+ * would hide a second `createTransport` call if one were ever added.
  */
 export function nodemailerStub(): Record<string, unknown> {
   const transport = {
     sendMail: async (message: SentMail) => {
+      if (state.delayMs > 0) await Bun.sleep(state.delayMs);
       if (state.failure) throw state.failure;
       sent.push(message);
       return { messageId: `stub-${sent.length}`, accepted: [message.to] };
@@ -79,3 +87,21 @@ export function nodemailerStub(): Record<string, unknown> {
   const api = { createTransport: () => transport };
   return { ...api, default: api };
 }
+
+/**
+ * Waits for post-response work — the deferred OTP delivery — to finish.
+ *
+ * Delivery is enqueued rather than awaited (`processOtpSend`'s `deferDelivery`),
+ * so `app.handle()` resolves BEFORE the provider is called. Any assertion about
+ * what was or was not sent has to run after this, or it reads a mailbox the
+ * request has not finished filling.
+ *
+ * Named for the mailbox because that is the only thing a test observes through
+ * it today; it drains the whole queue, which is what makes it correct rather
+ * than a sleep.
+ */
+export async function settleDelivery(): Promise<void> {
+  await drainAfterResponse(SETTLE_TIMEOUT_MS);
+}
+
+const SETTLE_TIMEOUT_MS = 5000;

@@ -12,7 +12,6 @@
  *   Auth plugins, so request N+1 cannot buy siteverify call N+1.
  * - **The attributes of the cookie sign-in sets.** `tests/helpers/session.ts`
  *   has exposed `setCookie` "for assertions about attributes" with no caller.
- *
  */
 import {
   afterEach,
@@ -27,9 +26,10 @@ import type { SeededUser } from '../helpers/session';
 
 import { eq } from 'drizzle-orm';
 
-import { app } from '@/app';
+import { app, AUTH_PATH_LIMITS } from '@/app';
 import { db } from '@/db';
 import { sessions, users } from '@/db/schema';
+import { BASE_ERROR_CODES } from '@/lib/auth/code-errors';
 import {
   LOCK_DURATION_SECONDS,
   MAX_FAILED_ATTEMPTS,
@@ -37,7 +37,7 @@ import {
 import { PUBLIC_ORIGIN } from '@/lib/env';
 import { PRE_AUTH_LIMIT } from '@/lib/http/pre-auth';
 
-import { HTTP_STATUS } from '@/utils/api-messages';
+import { CUSTOM_AUTH_CODE, HTTP_STATUS } from '@/utils/api-messages';
 
 import { resetTables } from '../helpers/database';
 import { egressCallsTo, scriptEgress } from '../helpers/egress';
@@ -86,7 +86,7 @@ function attempt(email: string, password: string): Promise<Response> {
 
 interface LockRow {
   failedLoginAttempts: number;
-  lockedUntil: string | null;
+  lockedUntil: Date | null;
 }
 
 async function lockRow(userId: string): Promise<LockRow> {
@@ -210,10 +210,10 @@ describe('the per-account login lockout', () => {
     expect(final.row.failedLoginAttempts).toBe(MAX_FAILED_ATTEMPTS);
     expect(final.row.lockedUntil).not.toBeNull();
 
-    // Parsed exactly the way `login-guard.ts:152` parses it, so this asserts the
-    // instant the production comparison reads, not the one the column holds.
+    // The instant the production comparison reads, not a re-parse of it:
+    // `login-guard.ts` compares this `Date` directly.
     const remaining =
-      (Date.parse(final.row.lockedUntil ?? '') - Date.now()) / 1000;
+      ((final.row.lockedUntil?.getTime() ?? 0) - Date.now()) / 1000;
     expect(remaining).toBeLessThanOrEqual(LOCK_DURATION_SECONDS);
     expect(remaining).toBeGreaterThan(LOCK_DURATION_SECONDS - 60);
   });
@@ -265,7 +265,7 @@ describe('the per-account login lockout', () => {
     // The comparison at `login-guard.ts:152` is against the PROCESS clock, so
     // this is the instrument that drives it. PostgreSQL's `NOW()` is untouched
     // and nothing on the release path re-reads it.
-    setSystemTime(new Date(Date.parse(armed.lockedUntil) + 1000));
+    setSystemTime(new Date(armed.lockedUntil.getTime() + 1000));
 
     const response = await attempt(actor().email, WRONG_PASSWORD);
 
@@ -317,10 +317,17 @@ describe('a refused or unavailable Turnstile verification', () => {
     const body = await response.text();
 
     expect(response.status).toBe(HTTP_STATUS.FORBIDDEN);
+    // The captcha plugin answers from `onRequest`, upstream of every Better Auth
+    // hook, so its raw English body and framework code used to reach the client
+    // untranslated. `localiseAuthError` in `app.ts` is the only position
+    // downstream of the whole plugin chain, and it maps them there.
     expect(JSON.parse(body)).toEqual({
-      message: 'Captcha verification failed',
-      code: 'VERIFICATION_FAILED',
+      message: BASE_ERROR_CODES.VERIFICATION_FAILED,
+      code: CUSTOM_AUTH_CODE,
     });
+    expect(response.headers.get('content-type')).toStartWith(
+      'application/json'
+    );
     expect(response.headers.getSetCookie()).toEqual([]);
     expect(egressCallsTo(TURNSTILE_HOST).length).toBe(1);
 
@@ -345,9 +352,11 @@ describe('a refused or unavailable Turnstile verification', () => {
     const response = await attempt(actor().email, actor().password);
 
     expect(response.status).toBe(HTTP_STATUS.INTERNAL_ERROR);
+    // Translated at the prefix handler like the other two captcha outcomes; the
+    // STATUS is the fail-closed assertion and it is unchanged.
     expect(await response.json()).toEqual({
-      message: 'Something went wrong',
-      code: 'UNKNOWN_ERROR',
+      message: BASE_ERROR_CODES.UNKNOWN_ERROR,
+      code: CUSTOM_AUTH_CODE,
     });
     expect(response.headers.getSetCookie()).toEqual([]);
     expect(await sessionCount(actor().userId)).toBe(0);
@@ -403,9 +412,15 @@ describe('outbound captcha admission', () => {
     );
 
     expect(response.status).toBe(HTTP_STATUS.BAD_REQUEST);
+    // The most common client error on this endpoint — a stale page, a blocked
+    // `challenges.cloudflare.com`, a native client. It used to answer in English
+    // with a raw framework code and NO `content-type`.
+    expect(response.headers.get('content-type')).toStartWith(
+      'application/json'
+    );
     expect(await response.json()).toEqual({
-      message: 'Missing CAPTCHA response',
-      code: 'MISSING_RESPONSE',
+      message: BASE_ERROR_CODES.MISSING_RESPONSE,
+      code: CUSTOM_AUTH_CODE,
     });
     expect(egressCallsTo(TURNSTILE_HOST)).toEqual([]);
   });
@@ -413,17 +428,24 @@ describe('outbound captcha admission', () => {
   test('N+1 requests produce at most N siteverify calls', async () => {
     scriptEgress(TURNSTILE_HOST, () => Response.json({ success: false }));
 
+    // The sign-in budget, not `PRE_AUTH_LIMIT`: admission for this path is
+    // `AUTH_PATH_LIMITS['/sign-in/email']`, applied in the prefix handler ahead
+    // of the captcha plugin's `onRequest`. That ordering is the whole assertion
+    // — the plugin's outbound `siteverify` carries a 10 s timeout and had no
+    // bound of any kind while Better Auth's own rule for this path was `false`.
+    const limit = AUTH_PATH_LIMITS['/sign-in/email'] ?? PRE_AUTH_LIMIT;
+
     const statuses: number[] = [];
-    for (let n = 0; n <= PRE_AUTH_LIMIT; n++) {
+    for (let n = 0; n <= limit; n++) {
       const response = await attempt(UNKNOWN_EMAIL, WRONG_PASSWORD);
       statuses.push(response.status);
     }
 
-    expect(statuses.slice(0, PRE_AUTH_LIMIT)).toEqual(
-      Array.from({ length: PRE_AUTH_LIMIT }, () => HTTP_STATUS.FORBIDDEN)
+    expect(statuses.slice(0, limit)).toEqual(
+      Array.from({ length: limit }, () => HTTP_STATUS.FORBIDDEN)
     );
     expect(statuses.at(-1)).toBe(HTTP_STATUS.TOO_MANY_REQUESTS);
-    expect(egressCallsTo(TURNSTILE_HOST).length).toBe(PRE_AUTH_LIMIT);
+    expect(egressCallsTo(TURNSTILE_HOST).length).toBe(limit);
   }, 120_000);
 });
 
@@ -445,6 +467,10 @@ describe('the cookie sign-in sets', () => {
   }
 
   beforeAll(async () => {
+    // The describe above deliberately exhausts `/sign-in/email`'s per-IP budget,
+    // and a describe-level `beforeAll` runs before the file's first `beforeEach`
+    // — so this reset has to be here, not inherited.
+    resetSqliteStores();
     acceptCaptcha();
     const session = await signIn(await seedUser());
     fixture.user = session.user;

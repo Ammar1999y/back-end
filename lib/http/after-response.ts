@@ -2,6 +2,7 @@
  * Framework-independent post-response work. Audit writes remain transactional
  * because losing them after a committed mutation would break the audit trail.
  */
+import { errorClassOf } from '@/utils';
 
 type AfterResponseTask = () => void | Promise<void>;
 
@@ -17,7 +18,6 @@ const queues = new WeakMap<Request, AfterResponseTask[]>();
 
 const inFlight = new Set<Promise<void>>();
 
-/** @knipignore Framework-independent entry point for deferred work. */
 export function enqueueAfterResponse(
   request: Request,
   task: AfterResponseTask
@@ -47,7 +47,7 @@ export function runAfterResponse(
           JSON.stringify({
             msg: 'after-response task failed',
             path: summary.path,
-            errorClass: (error as { name?: string })?.name ?? 'Unknown',
+            errorClass: errorClassOf(error),
           })
         );
       }

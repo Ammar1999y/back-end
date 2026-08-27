@@ -221,9 +221,7 @@ async function insertSession(
     .values({
       userId,
       token: `driver-contract-${generateUuidV7()}`,
-      // `expires_at` is declared `mode: 'string'`, so a Date would only fail the
-      // typecheck — the column's value is an ISO string.
-      expiresAt: new Date(Date.now() + 86_400_000).toISOString(),
+      expiresAt: new Date(Date.now() + 86_400_000),
       metadata,
     })
     .returning({ id: sessions.id });

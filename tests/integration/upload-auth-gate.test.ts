@@ -528,28 +528,35 @@ describe('the resource parameter is checked before the body is parsed', () => {
     expect(result.text).not.toContain('script');
   });
 
-  test('an anonymous caller can still tell a real page from an unknown one', async () => {
-    // The handler's own comment records this and accepts it: `resource` is
-    // parsed BEFORE the session check, so an unauthenticated caller gets 400 for
-    // a name that is not a page and 401 for one that is. It is accepted only
-    // because `DASHBOARD_PAGE_NAMES` is already published in the public
-    // `/openapi.json` — pinned here so that closing that route, or adding a page
-    // name that is not public, fails a test instead of quietly becoming an
-    // enumeration oracle.
+  test('an anonymous caller cannot tell a real page from an unknown one', async () => {
+    // `resource` used to be parsed BEFORE the session check, so an
+    // unauthenticated caller got 400 for a name that is not a page and 401 for
+    // one that is — an exact, unauthenticated membership test for
+    // `DASHBOARD_PAGE_NAMES`. It was accepted only while `/openapi.json`
+    // published those names to anyone; the document is authenticated now, so the
+    // divergence had to go with it.
+    //
+    // Both answers must be byte-identical, and neither may read the body.
     const unknown = await attempt({
       query: '?resource=nope',
       body: imageForm(),
     });
-    expect(unknown.status).toBe(HTTP_STATUS.BAD_REQUEST);
-    expect(unknown.body).toEqual(failure(uploadMsg.invalidResource));
-
     const real = await attempt({ query: '?resource=users', body: imageForm() });
+
+    expect(unknown.status).toBe(HTTP_STATUS.UNAUTHORIZED);
     expect(real.status).toBe(HTTP_STATUS.UNAUTHORIZED);
-    expect(real.body).toEqual(failure(MSG_LOGIN_REQUIRED));
+    expect(unknown.body).toEqual(failure(MSG_LOGIN_REQUIRED));
+    expect(real.body).toEqual(unknown.body);
 
     expect(unknown.reads).toEqual([]);
     expect(real.reads).toEqual([]);
   });
+
+  test('a missing resource is also indistinguishable to an anonymous caller', () =>
+    attempt({ body: imageForm() }).then((result) => {
+      expect(result.status).toBe(HTTP_STATUS.UNAUTHORIZED);
+      expect(result.body).toEqual(failure(MSG_LOGIN_REQUIRED));
+    }));
 });
 
 describe('the body policy on the way past the gate', () => {

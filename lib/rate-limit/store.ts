@@ -23,7 +23,7 @@ import { sweepInBatches } from '@/lib/sqlite/sweep';
  * Both measured faster than the alternatives, and both were verified enforced.
  */
 /** Readiness compares the file's `user_version` against this. */
-export const RATE_LIMIT_SCHEMA_VERSION = 1;
+export const RATE_LIMIT_SCHEMA_VERSION = 2;
 
 const MIGRATIONS: readonly Migration[] = [
   (db) => {
@@ -48,6 +48,10 @@ const MIGRATIONS: readonly Migration[] = [
     db.exec(
       `CREATE INDEX auth_rate_limit_expires_at ON auth_rate_limit (expires_at)`
     );
+  },
+
+  (db) => {
+    db.exec(`DROP TABLE IF EXISTS auth_rate_limit`);
   },
 ];
 
@@ -104,25 +108,6 @@ const SQL_CONSUME = `
  */
 
 /**
- * Max-aware for the same reason as `SQL_CONSUME`: the login limiter is precisely
- * where a rejected request must not buy the attacker a write.
- *
- * Binds, in order: key, windowStart, now, expiresAt, max.
- */
-const SQL_AUTH_CONSUME = `
-  INSERT INTO auth_rate_limit (key, count, window_start, last_request, expires_at)
-  VALUES (?, 1, ?, ?, ?)
-  ON CONFLICT(key) DO UPDATE SET
-    count        = CASE WHEN auth_rate_limit.window_start = excluded.window_start
-                        THEN auth_rate_limit.count + 1 ELSE 1 END,
-    window_start = excluded.window_start,
-    last_request = excluded.last_request,
-    expires_at   = excluded.expires_at
-  WHERE auth_rate_limit.window_start <> excluded.window_start
-     OR auth_rate_limit.count < ?
-  RETURNING count, window_start`;
-
-/**
  * Bounded, not a single unbounded DELETE. After a missed run or a
  * high-cardinality attack the backlog can be large, and one DELETE would hold the
  * sole writer lock for its whole duration — making the security path wait on
@@ -130,31 +115,19 @@ const SQL_AUTH_CONSUME = `
  * both current builds have; see the driver's swap notes.
  */
 const SQL_SWEEP_RATE_LIMIT = `DELETE FROM rate_limit WHERE expires_at <= ? LIMIT ?`;
-const SQL_SWEEP_AUTH = `DELETE FROM auth_rate_limit WHERE expires_at <= ? LIMIT ?`;
 /**
- * Cheap existence probe over BOTH limiter tables; avoids a COUNT over either.
- *
- * Both, not just `rate_limit`: a per-table `hasMore` only reports that the sweep
- * hit its own ceiling, so an `auth_rate_limit` backlog under that ceiling — rows
- * that expired while the run was in progress, for instance — would otherwise be
- * invisible while the equivalent cache backlog was reported.
+ * Cheap existence probe; avoids a COUNT over the table.
  *
  * `EXISTS` short-circuits on the first matching row and uses the `expires_at`
- * index on each table. One row is ALWAYS returned, so the caller must read
- * `present` rather than test the row for existence.
+ * index. One row is ALWAYS returned, so the caller must read `present` rather
+ * than test the row for existence.
  *
- * Binds, in order: cutoff, cutoff.
+ * Binds: cutoff.
  */
 const SQL_ANY_EXPIRED = `
-  SELECT (EXISTS(SELECT 1 FROM rate_limit      WHERE expires_at <= ?)
-       OR EXISTS(SELECT 1 FROM auth_rate_limit WHERE expires_at <= ?)) AS present`;
+  SELECT EXISTS(SELECT 1 FROM rate_limit WHERE expires_at <= ?) AS present`;
 
 export interface ConsumeRow {
-  count: number;
-  window_start: number;
-}
-
-export interface AuthConsumeRow {
   count: number;
   window_start: number;
 }
@@ -162,20 +135,10 @@ export interface AuthConsumeRow {
 interface RateLimitStore {
   readonly db: SqliteConnection;
   readonly consume: SqliteStatement;
-  readonly authConsume: SqliteStatement;
   readonly sweepRateLimit: SqliteStatement;
-  readonly sweepAuth: SqliteStatement;
   readonly anyExpired: SqliteStatement;
 }
 
-/**
- * Opened on first use, not at import. Module-scope side effects at import time
- * would run during `next build`, which has no writable data volume.
- *
- * Statements are prepared once and reused: better-sqlite3 caches nothing, and
- * re-preparing on every call measured meaningfully slower. (bun:sqlite's
- * `query()` caches by SQL string, so this stays correct after the driver swap.)
- */
 /**
  * Held on an object rather than in a bare `let`: the getter and the closer are
  * both functions, and assigning a module-level binding from inside one is what
@@ -184,6 +147,14 @@ interface RateLimitStore {
  */
 const singleton: { store: RateLimitStore | null } = { store: null };
 
+/**
+ * Opened on first use, not at import: a build step that evaluates the module
+ * graph has no writable data volume, so opening at import time would fail it.
+ *
+ * Statements are prepared once and reused: better-sqlite3 caches nothing, and
+ * re-preparing on every call measured meaningfully slower. (bun:sqlite's
+ * `query()` caches by SQL string, so this stays correct after the driver swap.)
+ */
 export const getRateLimitStore: () => RateLimitStore = (() => {
   return () => {
     if (singleton.store) return singleton.store;
@@ -204,9 +175,7 @@ export const getRateLimitStore: () => RateLimitStore = (() => {
       const candidate: RateLimitStore = {
         db,
         consume: db.prepare(SQL_CONSUME),
-        authConsume: db.prepare(SQL_AUTH_CONSUME),
         sweepRateLimit: db.prepare(SQL_SWEEP_RATE_LIMIT),
-        sweepAuth: db.prepare(SQL_SWEEP_AUTH),
         anyExpired: db.prepare(SQL_ANY_EXPIRED),
       };
       singleton.store = candidate;
@@ -243,19 +212,15 @@ export function closeRateLimitStore(): void {
  * Not a correctness boundary. Expiry is filtered on every read, so a delayed or
  * failed sweep can never make an expired row readable — it only reclaims disk.
  */
-export async function sweepExpired(now = Date.now()): Promise<{
-  rateLimit: SweepResult;
-  auth: SweepResult;
-}> {
-  const { sweepRateLimit, sweepAuth } = getRateLimitStore();
-  return {
-    rateLimit: await sweepInBatches(sweepRateLimit, now),
-    auth: await sweepInBatches(sweepAuth, now),
-  };
+export async function sweepExpired(
+  now = Date.now()
+): Promise<{ rateLimit: SweepResult }> {
+  const { sweepRateLimit } = getRateLimitStore();
+  return { rateLimit: await sweepInBatches(sweepRateLimit, now) };
 }
 
 /** Cheap backlog probe for readiness/monitoring; no full-table scan. */
 export function hasExpiredRows(now = Date.now()): boolean {
-  const row = getRateLimitStore().anyExpired.get<{ present: number }>(now, now);
+  const row = getRateLimitStore().anyExpired.get<{ present: number }>(now);
   return Boolean(row?.present);
 }

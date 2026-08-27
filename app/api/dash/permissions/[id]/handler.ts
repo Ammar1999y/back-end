@@ -196,7 +196,14 @@ export const PUT: Handler = async (ctx) => {
         throw new CustomError(MSG_NOT_FOUND, HTTP_STATUS.NOT_FOUND);
 
       if (actorPermissions) {
-        await validateRolePermissionScope(actorPermissions, roleId, tx);
+        // Reachability: this is the role being EDITED, and 403-vs-404 here
+        // told an actor without `permissions.view` which roles outrank them.
+        await validateRolePermissionScope(
+          actorPermissions,
+          roleId,
+          tx,
+          'reachability'
+        );
       }
 
       const canDeactivate =

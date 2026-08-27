@@ -8,8 +8,9 @@ import { users } from '@/db/schema';
 import { sanitizeForLog } from '@/utils';
 import { getAuditMeta } from '@/lib/audit';
 import { verifyTurnstileRequest } from '@/lib/captcha';
+import { enqueueAfterResponse } from '@/lib/http/after-response';
 import {
-  enforceOtpSendQuota,
+  enforceOtpSurfaceSendQuota,
   enforceRateLimit,
   ipIdentifier,
 } from '@/lib/rate-limit';
@@ -76,11 +77,7 @@ export const POST: Handler = async (ctx) => {
       channel === 'email' ? parsed.data.email : parsed.data.phoneNumber;
     const entityName = channel === 'email' ? 'البريد الإلكتروني' : 'رقم الهاتف';
 
-    // Per-destination quota chain, applied after privacy unification so real
-    // and fake paths are capped the same way. The `verify_contact` surface has
-    // its own slice of the destination budget, so public verification traffic
-    // can no longer drain a victim's password-recovery delivery allowance.
-    await enforceOtpSendQuota({
+    await enforceOtpSurfaceSendQuota({
       channel,
       destination: identifier,
       surface: 'verify_contact',
@@ -155,6 +152,8 @@ export const POST: Handler = async (ctx) => {
           purpose: 'verify_contact',
           sendTo: identifier,
           entityName,
+
+          deferDelivery: (task) => enqueueAfterResponse(ctx.rawRequest, task),
         });
       } catch (error) {
         // Delivery / internal failures must NOT distinguish real accounts
@@ -173,23 +172,6 @@ export const POST: Handler = async (ctx) => {
     return genericResponse();
   } catch (error) {
     await ensureMinDelay(Date.now() - start);
-
-    // Collapse unknown-identifier / already-verified to the generic success so
-    // existence can't be probed. 429 is NOT collapsed: the only throttles that
-    // reach here are the pre-lookup IP and per-identifier limiter caps, which are
-    // independent of the user lookup; the existence-revealing OTP block is
-    // swallowed in the inner try/catch above. Propagating 429 avoids a fake 200
-    // under throttling and returns a real Retry-After.
-    if (
-      error instanceof CustomError &&
-      (error.status === HTTP_STATUS.BAD_REQUEST ||
-        error.status === HTTP_STATUS.NOT_FOUND)
-    ) {
-      return apiSuccess({
-        message: otpMsg.sendSuccess,
-        data: GENERIC_SEND_DATA,
-      });
-    }
 
     return handleApiError(error, otpMsg.sendError);
   }

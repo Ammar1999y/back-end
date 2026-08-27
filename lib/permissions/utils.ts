@@ -405,11 +405,6 @@ export async function getUserPermissions({
 }
 
 /**
- * Validate that the acting user holds all permissions they are trying to grant.
- * Compares each `true` permission in `targetPermissions` against the acting user's own permissions.
- * Throws if any granted permission is not held by the acting user.
- */
-/**
  * Does the actor hold `action`, directly or through supersession?
  *
  * `PERMISSION_ACTIONS` states the rule the rest of the system follows: holding
@@ -449,14 +444,34 @@ export function validatePermissionScope(
 }
 
 /**
- * Validate that the acting user holds all permissions of a standard role.
- * Fetches the role's permissions from DB and compares against the actor's permissions.
- * Acquires FOR SHARE lock on rolePermissions rows to prevent concurrent modification.
+ * `reachability` — "may this caller act on this target at all", answered 404.
+ * `grant` — "may this caller confer these permissions", answered 403.
+ *
+ * The distinction is a disclosure boundary, not a style choice. Every
+ * neighbouring unreachable-target gate answers **404 `MSG_NOT_FOUND`**: the
+ * protected-system-role check, the out-of-scope-owner check, and all three
+ * checks in `app/api/dash/users/[id]/target-user.ts`. This function answered
+ * **403 `MSG_CANNOT_GRANT_UNOWNED_PERMISSIONS`** for both meanings, and
+ * `handleApiError` passes a `CustomError`'s status through verbatim — so an
+ * actor holding `users.view` + `users.edit` but NOT `permissions.view` could
+ * list users (which per `should-ignore.md` #39 shows every non-system user) and
+ * send a minimal valid `PUT` at each id: 404 means nonexistent / system-role /
+ * not-mine, 403 means "this account exists and its role holds a permission I do
+ * not". That reconstructs the relative privilege ranking of every account
+ * without ever granting `permissions.view` — the grant that is supposed to gate
+ * exactly that knowledge.
+ *
+ * Required rather than defaulted: a new call site must decide which question it
+ * is asking, because getting it wrong is silent in both directions.
  */
+export type RoleScopeCheck = 'reachability' | 'grant';
+
+/** `FOR SHARE` so the role cannot be re-permissioned between this read and the caller's write. */
 export async function validateRolePermissionScope(
   actorPermissions: Partial<PermissionObject>,
   roleId: EntityID,
-  executor: DbOrTx
+  executor: DbOrTx,
+  check: RoleScopeCheck
 ): Promise<void> {
   const perms = await executor
     .select({
@@ -474,7 +489,14 @@ export async function validateRolePermissionScope(
     permissions: (p.permissions || {}) as Record<string, boolean>,
   }));
 
-  validatePermissionScope(actorPermissions, targetPerms);
+  try {
+    validatePermissionScope(actorPermissions, targetPerms);
+  } catch (error) {
+    if (check === 'grant' || !(error instanceof CustomError)) throw error;
+    // Collapsed into the answer every other reachability gate gives, so a
+    // caller cannot tell "outranks me" from "does not exist".
+    throw new CustomError(MSG_NOT_FOUND, HTTP_STATUS.NOT_FOUND);
+  }
 }
 
 /**

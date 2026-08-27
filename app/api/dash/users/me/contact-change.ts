@@ -38,7 +38,9 @@ export async function refreshSessionCookies(
     const cookies = parseSetCookieHeaders(refreshed.headers.getSetCookie());
     return cookies.length > 0 ? cookies : undefined;
   } catch (e) {
-    console.error('cookie cache refresh failed:', sanitizeForLog(e));
+    console.error(
+      sanitizeForLog({ msg: 'session.cookieRefresh failed', error: e })
+    );
     return undefined;
   }
 }

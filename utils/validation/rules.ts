@@ -12,7 +12,7 @@ import {
   PHONE_NUMBER_MAX,
 } from './constants';
 
-export const sanitizeStrict = (v: string) =>
+export const sanitizeStrict = (v: unknown) =>
   typeof v === 'string'
     ? v
         .replaceAll(
@@ -20,9 +20,9 @@ export const sanitizeStrict = (v: string) =>
           ''
         )
         .trim()
-    : '';
+    : v;
 
-export const sanitizeStrictSingleLine = (v: string) =>
+export const sanitizeStrictSingleLine = (v: unknown) =>
   typeof v === 'string'
     ? v
         .replaceAll(
@@ -31,7 +31,7 @@ export const sanitizeStrictSingleLine = (v: string) =>
         )
         .replaceAll(/\s+/g, ' ')
         .trim()
-    : '';
+    : v;
 
 export const idRequired =
   'رقم المعرف غير صحيح، اعد تحميل الصفحة ثم حاول مرة اخرى';
@@ -45,8 +45,34 @@ export const idRequired =
 export function zodIssueMessage(error: z.ZodError): string {
   const issue = error.issues[0];
   if (issue?.code === 'unrecognized_keys')
-    return `حقول غير معروفة في الطلب: ${issue.keys.join('، ')}`;
+    return `حقول غير معروفة في الطلب: ${reflectKeys(issue.keys)}`;
   return issue?.message ?? 'قم بالتحقق من البيانات المدخله';
+}
+
+/** How many unknown keys are worth naming, and how long each may be. */
+const MAX_REFLECTED_KEYS = 5;
+const MAX_REFLECTED_KEY_LENGTH = 40;
+
+/**
+ * The unknown keys, bounded.
+ *
+ * These are attacker-controlled JSON key names and they were interpolated whole:
+ * measured against the real `selfUpdateUserSchema`, a key named
+ * `<img src=x onerror=alert(1)>` came back verbatim and one 200 000-character
+ * key produced a 200 026-character message. Every other client-facing message in
+ * this API is a server-owned constant.
+ *
+ * Naming them is still worth doing — that is what turns a silently-stripped typo
+ * into an actionable 422 — so they are truncated and counted rather than
+ * dropped. The CRLF case was never exploitable (the body is JSON-escaped);
+ * unbounded length is a defect regardless of what a front-end does with it.
+ */
+function reflectKeys(keys: readonly PropertyKey[]): string {
+  const named = keys
+    .slice(0, MAX_REFLECTED_KEYS)
+    .map((key) => String(key).slice(0, MAX_REFLECTED_KEY_LENGTH));
+  const hidden = keys.length - named.length;
+  return hidden > 0 ? `${named.join('، ')} (+${hidden})` : named.join('، ');
 }
 
 function getIDSchema(
@@ -209,9 +235,15 @@ export const getColorSchema = (
   );
 };
 
-/** @knipignore */
-export const slugPreprocess = (v: string) => {
-  if (typeof v !== 'string') return '';
+/**
+ * Passes a non-string through rather than coercing it to `''`. Same defect as
+ * `sanitizeStrict` above and the admin password field: `''` satisfies the inner
+ * schema's `v === ''` escape hatches, so `slugSchema.safeParse(123)` succeeded.
+ * Unreferenced today — which makes it a trap rather than a live bug, and the
+ * reason to fix it with the class rather than after it becomes one.
+ */
+const slugPreprocess = (v: unknown) => {
+  if (typeof v !== 'string') return v;
 
   return v
     .toLowerCase()
@@ -221,7 +253,6 @@ export const slugPreprocess = (v: string) => {
     .replaceAll(/^-+|-+$/g, '');
 };
 
-/** @knipignore */
 export const slugSchema = z.preprocess(
   slugPreprocess,
   z

@@ -62,7 +62,11 @@ export const POST: Handler = async (ctx) => {
     const identifier =
       channel === 'email' ? parsed.data.email : parsed.data.phoneNumber;
 
-    await enforceOtpVerifyQuota({ channel, identifier });
+    await enforceOtpVerifyQuota({
+      channel,
+      identifier,
+      surface: 'verify_contact',
+    });
 
     const whereClause = eq(userContactColumn(channel), identifier);
 
@@ -99,31 +103,42 @@ export const POST: Handler = async (ctx) => {
     // code (lets a frontend that still calls verify succeed idempotently).
     // Otherwise markContactVerified runs inside the verify transaction, after a
     // real code match, under the FOR UPDATE lock on the user row.
-    await (OTP_AUTO_VERIFY
-      ? withTransaction((tx) =>
-          markContactVerified(tx, {
-            userId: userData.id,
-            channel,
-            auditMeta,
-            onMissing,
-          })
-        )
-      : processOtpVerify({
-          userId: userData.id,
-          userEmail: userData.email,
-          channel,
-          purpose: 'verify_contact',
-          identifier,
-          code,
-          auditMeta,
-          onVerified: (tx) =>
+    try {
+      await (OTP_AUTO_VERIFY
+        ? withTransaction((tx) =>
             markContactVerified(tx, {
               userId: userData.id,
               channel,
               auditMeta,
               onMissing,
-            }),
-        }));
+            })
+          )
+        : processOtpVerify({
+            userId: userData.id,
+            userEmail: userData.email,
+            channel,
+            purpose: 'verify_contact',
+            identifier,
+            code,
+            auditMeta,
+            onVerified: (tx) =>
+              markContactVerified(tx, {
+                userId: userData.id,
+                channel,
+                auditMeta,
+                onMissing,
+              }),
+          }));
+    } catch (error) {
+      // Proof-row state is account-dependent. Only the pre-lookup limiter may
+      // expose 429 and Retry-After on this anonymous endpoint.
+      if (
+        error instanceof CustomError &&
+        error.status === HTTP_STATUS.TOO_MANY_REQUESTS
+      )
+        throw new CustomError(otpMsg.invalidOrExpired, HTTP_STATUS.BAD_REQUEST);
+      throw error;
+    }
 
     await ensureMinDelay(Date.now() - start);
 

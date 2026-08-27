@@ -64,7 +64,21 @@ function isStringLike(type: FilterColumnSpec['type']): boolean {
   return STRING_LIKE_TYPES.has(type);
 }
 
+/**
+ * Canonical decimal only — the same grammar `positiveInt` enforces on the
+ * pagination bounds, for the same reason: bare `Number()` accepts a family of
+ * spellings a query string has no business carrying, and two spelling policies
+ * in one API is one of them being wrong. `Number('')` is 0, so an empty filter
+ * value silently became a filter FOR ZERO; `'0x10'` was 16 and `'1e2'` was 100.
+ *
+ * Fractions are allowed where `positiveInt` forbids them: this bounds a numeric
+ * COLUMN, which may be `numeric`, not a page index.
+ */
+// eslint-disable-next-line security/detect-unsafe-regex -- anchored, no nested quantifier and no overlapping alternation; the optional fraction cannot backtrack into the integer part
+const CANONICAL_DECIMAL = /^-?(?:0|[1-9]\d*)(?:\.\d+)?$/;
+
 function safeNumber(value: unknown): number | null {
+  if (typeof value !== 'string' || !CANONICAL_DECIMAL.test(value)) return null;
   const num = Number(value);
   return Number.isFinite(num) ? num : null;
 }
@@ -150,7 +164,17 @@ function buildCondition(
       return ilike(column, `%${escapeLike(value as string)}%`);
     }
     case 'notILike': {
-      return notIlike(column, `%${escapeLike(value as string)}%`);
+      // `or(..., isNull)`, matching what `isEmpty` fourteen lines down already
+      // does for the same reason. SQL three-valued logic makes
+      // `NULL NOT ILIKE '%abc%'` evaluate to NULL, not TRUE, so a row with no
+      // value was EXCLUDED from a predicate that plainly describes it — absent
+      // from the list and from `meta.total`, with a 200. Reachable today on
+      // `roles.description`, and inherited by every future nullable text column
+      // because the defect is in the shared operator.
+      return or(
+        notIlike(column, `%${escapeLike(value as string)}%`),
+        isNull(column)
+      );
     }
     case 'startsWith': {
       return ilike(column, `${escapeLike(value as string)}%`);
@@ -163,10 +187,15 @@ function buildCondition(
     case 'ne': {
       const negated = filter.operator === 'ne';
 
+      // Same three-valued-logic rule as `notILike` above on every negated form:
+      // `NULL <> x` is NULL, so a row with no value silently fails a predicate
+      // it satisfies.
       if (spec.type === 'boolean') {
         const bool = parseBoolean(value);
         if (bool === null) invalidFilter();
-        return negated ? ne(column, bool) : eq(column, bool);
+        return negated
+          ? or(ne(column, bool), isNull(column))
+          : eq(column, bool);
       }
       if (spec.type === 'date') {
         const { start, next } = dayBounds(value);
@@ -177,9 +206,11 @@ function buildCondition(
       if (spec.type === 'number') {
         const num = safeNumber(value);
         if (num === null) invalidFilter();
-        return negated ? ne(column, num) : eq(column, num);
+        return negated ? or(ne(column, num), isNull(column)) : eq(column, num);
       }
-      return negated ? ne(column, value) : eq(column, value);
+      return negated
+        ? or(ne(column, value), isNull(column))
+        : eq(column, value);
     }
 
     case 'inArray':
@@ -225,26 +256,50 @@ function buildCondition(
       return compareNumber(column, value, gte);
     }
 
+    // The bounds are ORDERED, not taken positionally.
+    //
+    // Presence was validated and ordering was not — the same class this file
+    // rejects fourteen lines above `buildCondition`, where a third slot is a
+    // 422 because a malformed range "answered a question nobody asked with a
+    // 200 instead of reporting the malformed range". A `createdAt` range of
+    // `["2026-12-31", "2026-01-01"]` generated an unsatisfiable predicate and
+    // returned `200, data: [], total: 0`, so a user who transposed two dates
+    // was told there are no matching records.
+    //
+    // Sorting rather than rejecting, deliberately: the smaller value IS the
+    // start of the range, which is what the user meant, and a half-filled range
+    // is already meaningful — one bound alone bounds one side and leaves the
+    // other open, which is why each `undefined` below is not an error.
     case 'isBetween': {
       const [rawStart, rawEnd] = value as string[];
 
       if (spec.type === 'date') {
-        const from = rawStart ? dayBounds(rawStart).start : null;
-        const to = rawEnd ? dayBounds(rawEnd).next : null;
-        if (!from && !to) invalidFilter();
+        const first = rawStart ? dayBounds(rawStart) : null;
+        const second = rawEnd ? dayBounds(rawEnd) : null;
+        if (!first && !second) invalidFilter();
+        // Compared on `start`, so an inverted pair swaps whole calendar days
+        // rather than mixing one day's start with another's end.
+        const ordered =
+          first && second && second.start < first.start
+            ? [second, first]
+            : [first, second];
         return and(
-          from ? gte(column, from) : undefined,
-          to ? lt(column, to) : undefined
+          ordered[0] ? gte(column, ordered[0].start) : undefined,
+          ordered[1] ? lt(column, ordered[1].next) : undefined
         );
       }
 
-      const from = rawStart?.trim() ? safeNumber(rawStart) : null;
-      const to = rawEnd?.trim() ? safeNumber(rawEnd) : null;
-      if (from === null && to === null) invalidFilter();
-      return and(
-        from === null ? undefined : gte(column, from),
-        to === null ? undefined : lte(column, to)
-      );
+      const first = rawStart?.trim() ? safeNumber(rawStart) : null;
+      const second = rawEnd?.trim() ? safeNumber(rawEnd) : null;
+      if (first === null && second === null) invalidFilter();
+      // Both: the smaller bound is the start, whichever slot it arrived in.
+      if (first !== null && second !== null)
+        return and(
+          gte(column, Math.min(first, second)),
+          lte(column, Math.max(first, second))
+        );
+      // One: it bounds its own side and leaves the other open.
+      return first === null ? lte(column, second) : gte(column, first);
     }
 
     // `isEmpty` compares against '' and casts to text, which PostgreSQL
@@ -295,6 +350,9 @@ export function filterColumns<T extends Table>({
     // `toString`, `hasOwnProperty` and `__proto__` all return a truthy value,
     // slip past the unknown-column check, and then blow up further down as a
     // 500 — the exact defect this validator exists to remove.
+    // The `Object.hasOwn` guard is what makes the computed read safe, and the
+    // note above explains why a bare `in` would not be.
+    // eslint-disable-next-line unicorn/no-unsafe-property-key -- guarded above
     const spec = Object.hasOwn(specs, filter.id) ? specs[filter.id] : undefined;
     if (!spec) invalidFilter();
 

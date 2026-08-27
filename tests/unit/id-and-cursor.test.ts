@@ -268,10 +268,7 @@ describe('the cursor round trip', () => {
     });
   });
 
-  test('the string shape the driver actually returns round-trips', () => {
-    // `sessions.createdAt` is `timestamptz` in Drizzle `mode: 'string'` with
-    // precision 2, so what `formatCursor` receives in production is PostgreSQL's
-    // rendering — space separator, two fractional digits, explicit offset.
+  test('the string shape a PostgreSQL client can return round-trips', () => {
     expect(parseCursor(formatCursor('2026-08-25 12:34:56.78+00', ID))).toEqual({
       createdAt: new Date(Date.UTC(2026, 7, 25, 12, 34, 56, 780)),
       id: ID,

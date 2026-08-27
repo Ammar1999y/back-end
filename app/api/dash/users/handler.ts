@@ -187,7 +187,8 @@ export const POST: Handler = async (ctx) => {
         await validateRolePermissionScope(
           actorPermissions,
           validID(validatedData.roleId),
-          tx
+          tx,
+          'grant'
         );
 
       const customPermissions =

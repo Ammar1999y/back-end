@@ -24,6 +24,7 @@ jobs:
         with:
           # Semgrep's --baseline-commit needs the PR base commit in history.
           fetch-depth: 0
+          persist-credentials: false
       - uses: jdx/mise-action@3c2e0cf82a5b2e5249f0d3635a4d83d0ae861518 # v4.2.5
       - name: Semgrep OSS scan
         env:
@@ -43,6 +44,7 @@ jobs:
         with:
           # gitleaks scans history, not just the tip commit.
           fetch-depth: 0
+          persist-credentials: false
       - uses: jdx/mise-action@3c2e0cf82a5b2e5249f0d3635a4d83d0ae861518 # v4.2.5
       - name: Scan git history for secrets
         run: gitleaks git . --redact --verbose --no-banner

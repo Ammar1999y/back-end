@@ -197,6 +197,25 @@ export function defineKeyring(spec: KeyringSpec): Keyring {
         `${spec.activeIdEnv} must identify a key present in ${spec.keyringEnv}`
       );
 
+    // The active key must own the HIGHEST generation, and this is the rule the
+    // file was missing.
+    //
+    // `generation` has exactly one consumer and it reads the field as staleness:
+    // `needsRehash: pepper.generation < activePepper.generation`
+    // (`lib/auth/password.ts`). So with keys `{"1":{generation:1},
+
+    const activeGeneration = keys.get(activeId)?.generation ?? 0;
+    const newest = Math.max(
+      ...keys.values().map((material) => material.generation)
+    );
+    if (activeGeneration < newest)
+      fail(
+        `${spec.activeIdEnv} names key "${activeId}" (generation ${activeGeneration}), ` +
+          `but ${spec.keyringEnv} contains generation ${newest}. The active key must own the ` +
+          'highest generation, or every hash written with the newer key is treated as ' +
+          'current forever. Roll the keyring and the active id together.'
+      );
+
     return { activeId, keys };
   }
 

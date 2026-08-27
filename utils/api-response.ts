@@ -3,6 +3,7 @@ import type { HandlerCookie, HandlerOutput } from '@/lib/http/contract';
 import {
   getConstraintName,
   isForeignKeyViolation,
+  isInvalidTextEncoding,
   isUniqueViolation,
   sanitizeForLog,
 } from '@/utils';
@@ -110,11 +111,15 @@ export function apiError({
  * object carrying the field) without pulling in the class at the call site.
  */
 function getErrorHeaders(error: unknown): Record<string, string> | undefined {
-  if (error && typeof error === 'object' && 'responseHeaders' in error) {
-    return (error as { responseHeaders?: Record<string, string> })
-      .responseHeaders;
-  }
-  return undefined;
+  if (!error || typeof error !== 'object' || !('responseHeaders' in error))
+    return undefined;
+  const headers = error.responseHeaders;
+  if (!headers || typeof headers !== 'object' || Array.isArray(headers))
+    return undefined;
+  const entries = Object.entries(headers);
+  if (!entries.every(([, value]) => typeof value === 'string'))
+    return undefined;
+  return Object.fromEntries(entries) as Record<string, string>;
 }
 
 /**
@@ -142,6 +147,13 @@ export function handleApiError(
       ...(headers && { headers }),
     });
   }
+
+  if (isInvalidTextEncoding(error))
+    return apiError({
+      message: MSG_INVALID_INPUT,
+      status: HTTP_STATUS.UNPROCESSABLE,
+      ...(extraHeaders && { headers: extraHeaders }),
+    });
 
   console.error(sanitizeForLog(error));
   return apiError({

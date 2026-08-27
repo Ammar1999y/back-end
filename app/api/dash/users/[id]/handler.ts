@@ -249,7 +249,7 @@ async function handleSelfEdit(
   targetId: EntityID,
   body: Record<string, unknown>,
   auditMeta: AuditMeta
-): Promise<{ updatedAt: string }> {
+): Promise<{ updatedAt: Date }> {
   if (!actor.hasRole)
     throw new CustomError(MSG_INSUFFICIENT_PERMISSIONS, HTTP_STATUS.FORBIDDEN);
 
@@ -266,14 +266,7 @@ async function handleSelfEdit(
     // the pre-update value. FOR UPDATE is unnecessary — a user can't race
     // themselves meaningfully, and the WHERE filter blocks updates against
     // a concurrently deactivated/soft-deleted row.
-    // `updated_at` is a `Date`, not a string, and the distinction is earned rather
-    // than assumed: raw `tx.execute` bypasses Drizzle's column mapper, so the
-    // schema's `mode: 'string'` does not apply here and `bun:sql` decodes
-    // `timestamptz` to a `Date`. Asserted in
-    // `tests/integration/driver-contract.test.ts`. It reaches the client as the
-    // same ISO string either way — `JSON.stringify` serialises both — but the
-    // declared `string` type-checked any `.slice()` or comparison a future caller
-    // wrote against it, which would have thrown at run time.
+
     const updated = await tx.execute<{
       old_name: string;
       updated_at: Date;
@@ -308,6 +301,60 @@ async function handleSelfEdit(
   });
 }
 
+/**
+ * Every unreachable-target gate, read WITHOUT a lock.
+ *
+ * A copy of what the locked transaction checks, deliberately: this exists to
+ * refuse before expensive work, and taking a row lock to decide whether to do
+ * the work would defeat the point. It answers with the same 404 the locked gates
+ * answer, so a caller cannot tell the two apart.
+ *
+ * Role AUTHORITY is one of those gates, not a separate concern. Checking only
+ * existence, protection and ownership here left an actor with broad edit scope
+ * but insufficient authority paying for the HIBP request and the 64 MiB Argon2
+ * hash before the locked reachability check refused — which is the same
+ * amplification the preflight exists to remove, against a target that outranks
+ * the caller rather than one they did not create.
+ */
+async function assertTargetEditable(opts: {
+  targetId: EntityID;
+  actorUserId: EntityID;
+  editScope: 'all' | 'own';
+  actorPermissions: Awaited<
+    ReturnType<typeof checkUserPermission>
+  >['permissions'];
+}): Promise<void> {
+  const [target] = await db
+    .select({
+      createdBy: users.createdBy,
+      roleId: users.roleId,
+      roleName: roles.roleName,
+      roleScope: roles.scope,
+    })
+    .from(users)
+    .innerJoin(roles, eq(users.roleId, roles.id))
+    .where(and(eq(users.id, opts.targetId), isNull(users.deletedAt)))
+    .limit(1);
+
+  const unreachable =
+    !target ||
+    isProtectedSystemRole({
+      roleName: target.roleName,
+      scope: target.roleScope,
+    }) ||
+    (opts.editScope === 'own' && target.createdBy !== opts.actorUserId);
+
+  if (unreachable) throw new CustomError(MSG_NOT_FOUND, HTTP_STATUS.NOT_FOUND);
+
+  if (opts.actorPermissions && target.roleId)
+    await validateRolePermissionScope(
+      opts.actorPermissions,
+      target.roleId,
+      db,
+      'reachability'
+    );
+}
+
 async function handleAdminEdit(
   actor: { userId: EntityID; userEmail: string },
   actorPermissions: Awaited<
@@ -317,7 +364,7 @@ async function handleAdminEdit(
   targetId: EntityID,
   body: Record<string, unknown>,
   auditMeta: AuditMeta
-): Promise<{ updatedAt: string }> {
+): Promise<{ updatedAt: Date }> {
   // Strict server contract: unknown keys are rejected (422) instead of
   // stripped, so a misspelled `phone_number` / `passwrod` can't be read as
   // "field not supplied" and return a misleading 200.
@@ -337,7 +384,31 @@ async function handleAdminEdit(
   const isCustomRole = validatedData.roleId === CUSTOM_ROLE_VALUE;
 
   const password = validatedDataParsed.data.password;
-  if (password) await checkPasswordCompromise(password);
+  if (password) {
+    // A cheap, UNLOCKED pre-flight before the expensive work, and only when
+    // there is expensive work to do.
+    //
+    // `checkPasswordCompromise` is an outbound HTTPS request and `hashPassword`
+    // is argon2id at `memoryCost: 65_536, timeCost: 3, parallelism: 4`. Both ran
+    // BEFORE the target row was ever read, so an actor holding only
+    // `users.editOwn` could aim a `PUT` with a `password` at a user they did not
+    // create and spend both — then receive a 404 from a gate three statements
+    // later. Bounded to 10/min/actor by the limiter, so this is amplification
+    // rather than a DoS primitive, but the work was spent unconditionally on
+    // behalf of a target the caller has no authority over.
+    //
+    // ADDITIVE, never authoritative: the locked transaction below re-runs all
+    // three gates under `FOR UPDATE`. This one can only refuse EARLIER, so it
+    // introduces no TOCTOU window — a row that changes between the two reads is
+    // still decided by the locked one.
+    await assertTargetEditable({
+      targetId: userId,
+      actorUserId: actor.userId,
+      editScope,
+      actorPermissions,
+    });
+    await checkPasswordCompromise(password);
+  }
   const hashedPassword = password ? await hashPassword(password) : null;
 
   return withTransaction(async (tx) => {
@@ -382,19 +453,27 @@ async function handleAdminEdit(
     }
 
     if (actorPermissions) {
+      // Reachability: the target's CURRENT role. Answering 403 here is what
+      // distinguished "this account exists and outranks me" from the 404 every
+      // neighbouring gate gives.
       await validateRolePermissionScope(
         actorPermissions,
         lockedUser.roleId,
-        tx
+        tx,
+        'reachability'
       );
 
       if (isCustomRole && validatedData.permissions?.length) {
         validatePermissionScope(actorPermissions, validatedData.permissions);
       } else if (!isCustomRole && validatedData.roleId !== lockedUser.roleId) {
+        // Grant: the role the caller is ASSIGNING. 403 is correct and
+        // actionable — the caller named this role, so its existence is not a
+        // secret from them, and "you cannot confer that" is the useful answer.
         await validateRolePermissionScope(
           actorPermissions,
           validatedData.roleId as EntityID,
-          tx
+          tx,
+          'grant'
         );
       }
     }
@@ -811,10 +890,13 @@ export const DELETE: Handler = async (ctx) => {
         throw new CustomError(MSG_NOT_FOUND, HTTP_STATUS.NOT_FOUND);
 
       if (actorPermissions) {
+        // Reachability: the DELETE path's target role — same disclosure as the
+        // PUT path above.
         await validateRolePermissionScope(
           actorPermissions,
           lockedUser.role_id,
-          tx
+          tx,
+          'reachability'
         );
       }
 

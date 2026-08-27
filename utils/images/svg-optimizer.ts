@@ -6,7 +6,6 @@ import { SERVER_MAX_IMAGE_SIZE } from '@/utils/validation/constants';
 
 import {
   DANGEROUS_ATTRIBUTES,
-  DANGEROUS_CSS_PATTERNS,
   DANGEROUS_ELEMENTS,
   isDangerousValue,
   safeDecodeURI,
@@ -15,10 +14,27 @@ import {
 
 // 🟥 اذا مستقبلا قررت اسمح للانميشن انه يتم تمريره، اقوم بفك التعليق الخاص بالانميشن، واخلي المكتبه تسمح بمرور الانميشن
 
+const REFERENCE_ATTRIBUTES = ['href', 'xlink:href'] as const;
+
+const LOCAL_FRAGMENT = /^#[^\s#"'<>]+$/u;
+
+const SAFE_DATA_URI =
+  /^data:image\/(?:png|jpe?g|gif|webp|avif);base64,[\w+/=]+$/i;
+
 interface SanitizeSvgOptions {
   convertColor?: boolean;
   parser?: DOMParser;
   serializer?: XMLSerializer;
+}
+
+function isSingleSvgRoot(markup: string, parser: DOMParser): boolean {
+  const doc = parser.parseFromString(markup, 'image/svg+xml');
+  if (doc.querySelector('parsererror')) return false;
+  const root = doc.documentElement;
+  return (
+    root?.localName?.toLowerCase() === 'svg' &&
+    root.namespaceURI === 'http://www.w3.org/2000/svg'
+  );
 }
 
 /**
@@ -150,6 +166,11 @@ export function sanitizeSvg(
 
     const allElements = doc.querySelectorAll('*');
     allElements.forEach((element) => {
+      if (element.hasAttribute('style')) {
+        errors.push('تم إزالة خاصية style');
+        element.removeAttribute('style');
+      }
+
       DANGEROUS_ATTRIBUTES.forEach((attr) => {
         if (!element.hasAttribute(attr)) {
           return;
@@ -177,13 +198,30 @@ export function sanitizeSvg(
         }
       });
 
-      if (element.localName?.toLowerCase() === 'use') {
+      // `href` / `xlink:href` on the two elements that DEREFERENCE them.
+      //
+      // `<image>` is the reason this is not `use`-only: an `<image>` pointing at
+      // an absolute URL is fetched by the VIEWER when the stored object renders,
+      // which beacons their IP, User-Agent and Referer and lets the picture
+      // change after review. DOMPurify does not help — `image` is in its
+      // `DEFAULT_DATA_URI_TAGS`, so the attribute survives.
+      //
+      // `use` may only reference a same-document fragment. `image` may also
+      // carry a self-contained `data:` URI, which is how a legitimately inlined
+      // raster arrives; `isDangerousValue` above has already rejected
+      // `data:text/html` and the script-bearing SVG data URI.
+      const localName = element.localName?.toLowerCase();
+      if (localName === 'use' || localName === 'image') {
+        const allowsDataUri = localName === 'image';
         let hasLocalReference = false;
-        for (const name of ['href', 'xlink:href']) {
+        for (const name of REFERENCE_ATTRIBUTES) {
           const raw = element.getAttribute(name);
           if (raw === null) continue;
           const reference = raw.trim();
-          if (/^#[^\s#"'<>]+$/u.test(reference)) {
+          if (
+            LOCAL_FRAGMENT.test(reference) ||
+            (allowsDataUri && SAFE_DATA_URI.test(reference))
+          ) {
             element.setAttribute(name, reference);
             hasLocalReference = true;
           } else {
@@ -192,7 +230,7 @@ export function sanitizeSvg(
           }
         }
         if (!hasLocalReference) {
-          errors.push('تم إزالة عنصر use بدون مرجع محلي');
+          errors.push(`تم إزالة عنصر ${localName} بدون مرجع محلي`);
           element.remove();
         }
       }
@@ -211,33 +249,9 @@ export function sanitizeSvg(
       );
     };
 
-    const styleElements = doc.querySelectorAll('style');
-    styleElements.forEach((styleEl) => {
-      let cssContent = styleEl.textContent || '';
-
-      const decodedCSS = safeDecodeURI(cssContent);
-
-      const hasDangerousCSS = DANGEROUS_CSS_PATTERNS.some(
-        (pattern) => pattern.test(cssContent) || pattern.test(decodedCSS)
-      );
-
-      if (hasDangerousCSS) {
-        errors.push('تم إزالة style يحتوي على كود خطير');
-        styleEl.remove();
-        return;
-      }
-
-      cssContent = cssContent.replaceAll(
-        /(fill|stroke)\s*:\s*([^;}]+?)(?=\s*[;}])/gi,
-        (_match, property, value) => {
-          if (!shouldConvertColor(value)) {
-            return `${property}: ${value}`;
-          }
-          return `${property}: currentColor`;
-        }
-      );
-
-      styleEl.textContent = cssContent;
+    doc.querySelectorAll('style').forEach((styleEl) => {
+      errors.push('تم إزالة عنصر style');
+      styleEl.remove();
     });
 
     const allElementsWithColors = svgElement.querySelectorAll('*');
@@ -261,9 +275,26 @@ export function sanitizeSvg(
     const sanitized = sanitize(cleanedSvg, {
       USE_PROFILES: { svg: true, svgFilters: true },
       ADD_TAGS: ['use'],
+      FORBID_TAGS: ['style'],
+      FORBID_ATTR: ['style'],
     });
 
-    if (!sanitized || !sanitized.includes('<svg'))
+    // STRUCTURAL, not a substring test.
+    //
+    // The sweep above ran on an XML tree, where `<p>` is an ordinary child of
+    // `<svg>`. DOMPurify then re-parses the serialized string as HTML, where the
+    // breakout tags (`p`, `div`, `table`, `h1`, `pre`, …) TERMINATE foreign
+    // content — so those nodes come back out sitting AFTER `</svg>`.
+    // `includes('<svg')` cannot see that, and returned `isValid: true` for two
+    // shapes that both escaped this function's own contract: a 55-byte input
+    // whose output made svgo throw `SvgoParserError` (an unauthenticated,
+    // deterministic 500), and a two-root document that was stored and served as
+    // `image/svg+xml` and which no browser XML parser will render.
+    //
+    // Re-parsing as XML answers exactly the question the contract makes: is this
+    // ONE well-formed SVG root with no sibling content? Text or an element after
+    // `</svg>` is a parse error, and so is a second root.
+    if (!sanitized || !isSingleSvgRoot(sanitized, domParser))
       return {
         isValid: false,
         cleanedSvg: '',

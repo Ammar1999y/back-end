@@ -29,7 +29,12 @@ async function verifyTurnstileToken(
       : process.env.TURNSTILE_SECRET_KEY;
 
   if (!secretKey) {
-    console.error('[captcha] TURNSTILE_SECRET_KEY missing — rejecting request');
+    console.error(
+      JSON.stringify({
+        msg: 'captcha.secret missing',
+        nodeEnv: process.env.NODE_ENV ?? null,
+      })
+    );
     return false;
   }
 

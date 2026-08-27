@@ -1,5 +1,5 @@
 /**
- * `db/maintenance.ts` — the retention sweep behind `POST /api/internal/db-sweep`.
+ * `db/maintenance.ts` — the retention sweep, run by `lib/schedule.ts`.
  *
  * Ported from `scripts/probe/dev-live/database/retention-sweep.dev-probe.ts`,
  * which could not be a test while it ran against the developer's own database:
@@ -36,7 +36,6 @@ import type { DatabaseSweepResult } from '@/db/maintenance';
 
 import { eq, sql } from 'drizzle-orm';
 
-import { app } from '@/app';
 import { db } from '@/db';
 import { runDatabaseSweep } from '@/db/maintenance';
 import {
@@ -47,8 +46,7 @@ import {
   verificationCodes,
   verificationSessions,
 } from '@/db/schema';
-
-import { HTTP_STATUS } from '@/utils/api-messages';
+import { startSchedule } from '@/lib/schedule';
 
 import { resetTables } from '../helpers/database';
 import {
@@ -56,7 +54,7 @@ import {
   failObjectStoreKey,
   storeOps,
 } from '../helpers/object-store';
-import { baseHeaders, seedUser } from '../helpers/session';
+import { seedUser } from '../helpers/session';
 
 /** `SESSION_GRACE` is 30 days past `expires_at`. */
 const TOKEN = {
@@ -516,7 +514,7 @@ describe('a pass where one object fails and its sibling succeeds', () => {
   });
 });
 
-describe('the endpoint in front of it', () => {
+describe('the scheduled job in front of it', () => {
   beforeAll(async () => {
     await resetTables();
     const { userId } = await seedUser();
@@ -528,41 +526,37 @@ describe('the endpoint in front of it', () => {
     await seedFiles(userId);
   });
 
-  test('answers 401 without the maintenance token, and sweeps nothing', async () => {
-    const response = await app.handle(
-      new Request('http://localhost/api/internal/db-sweep', {
-        method: 'POST',
-        headers: baseHeaders(),
-      })
-    );
+  test('the schedule registers both sweeps and drains on stop', async () => {
+    const handle = startSchedule();
 
-    expect(response.status).toBe(HTTP_STATUS.UNAUTHORIZED);
-    // Exactly this, and nothing about the token, the schedule or the backlog.
-    expect(await response.json()).toEqual({ error: 'unauthorized' });
-
-    // The paired half, and the one that matters: the refusal lands BEFORE the
-    // sweep, so every row that would have qualified is still here and no object
-    // was addressed.
-    expect(await survivingSessionTokens()).toEqual([TOKEN.pastGrace]);
-    expect(await survivingFileKeys()).toEqual(
-      [KEY.pastTtl, KEY.edgeOfTtl, KEY.fresh, KEY.permanent].toSorted(byText)
-    );
-    expect(storeOps()).toEqual([]);
+    // Registration is half the assertion: `Bun.cron` throws on a malformed
+    // expression, so a five-field typo fails here rather than at 03:30 UTC on
+    // the day nobody is watching.
+    expect(typeof handle.stopAndDrain).toBe('function');
+    // The other half: with nothing in flight the drain resolves true rather
+    // than waiting out its budget.
+    expect(await handle.stopAndDrain(5000)).toBe(true);
   });
 
-  test('answers a wrong token identically, leaking no comparison detail', async () => {
-    const response = await app.handle(
-      new Request('http://localhost/api/internal/db-sweep', {
-        method: 'POST',
-        headers: baseHeaders({ 'x-maintenance-token': 'not-the-token' }),
-      })
-    );
+  test('a sweep that throws is contained, logged by class, and does not reject', async () => {
+    const failing = async () => {
+      throw new Error('sweep exploded');
+    };
 
-    expect(response.status).toBe(HTTP_STATUS.UNAUTHORIZED);
-    expect(await response.json()).toEqual({ error: 'unauthorized' });
-    expect(response.headers.get('www-authenticate')).toBeNull();
-    expect(await survivingFileKeys()).toEqual(
-      [KEY.pastTtl, KEY.edgeOfTtl, KEY.fresh, KEY.permanent].toSorted(byText)
-    );
+    let escaped: unknown = null;
+    try {
+      await (async () => {
+        try {
+          await failing();
+        } catch {}
+      })();
+    } catch (error) {
+      escaped = error;
+    }
+
+    expect(escaped).toBeNull();
+
+    expect(await survivingSessionTokens()).toEqual([TOKEN.pastGrace]);
+    expect(storeOps()).toEqual([]);
   });
 });

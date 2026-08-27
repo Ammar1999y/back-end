@@ -16,8 +16,17 @@
 import { readdirSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import type { Node } from 'typescript';
 
-import ts from 'typescript';
+import {
+  createSourceFile,
+  forEachChild,
+  isNonNullExpression,
+  isPropertyDeclaration,
+  isVariableDeclaration,
+  ScriptKind,
+  ScriptTarget,
+} from 'typescript';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -87,12 +96,12 @@ const findSilencersInFile = (filePath: string): MatchLocation[] => {
   // eslint-disable-next-line security/detect-non-literal-fs-filename -- filePath comes from scanDirectory's walk of ROOT, never from input
   const content = readFileSync(filePath, 'utf8');
   const relativePath = toRelativePath(filePath);
-  const sourceFile = ts.createSourceFile(
+  const sourceFile = createSourceFile(
     filePath,
     content,
-    ts.ScriptTarget.Latest,
+    ScriptTarget.Latest,
     true,
-    filePath.endsWith('.tsx') ? ts.ScriptKind.TSX : ts.ScriptKind.TS
+    filePath.endsWith('.tsx') ? ScriptKind.TSX : ScriptKind.TS
   );
 
   const matches: MatchLocation[] = [];
@@ -110,9 +119,9 @@ const findSilencersInFile = (filePath: string): MatchLocation[] => {
   };
 
   // AST Visitor
-  const visit = (node: ts.Node) => {
+  const visit = (node: Node) => {
     // 1. Non-null assertion expression: e.g. `foo!`, `bar!.baz`
-    if (ts.isNonNullExpression(node)) {
+    if (isNonNullExpression(node)) {
       const { line, column } = getLoc(node.end - 1);
       matches.push({
         file: relativePath,
@@ -125,7 +134,7 @@ const findSilencersInFile = (filePath: string): MatchLocation[] => {
 
     // 2. Definite assignment assertion: e.g. `class A { name!: string }` or `let x!: string`
     if (
-      (ts.isPropertyDeclaration(node) || ts.isVariableDeclaration(node)) &&
+      (isPropertyDeclaration(node) || isVariableDeclaration(node)) &&
       node.exclamationToken
     ) {
       const { line, column } = getLoc(node.exclamationToken.pos);
@@ -138,7 +147,7 @@ const findSilencersInFile = (filePath: string): MatchLocation[] => {
       });
     }
 
-    ts.forEachChild(node, visit);
+    forEachChild(node, visit);
   };
 
   visit(sourceFile);
@@ -146,7 +155,7 @@ const findSilencersInFile = (filePath: string): MatchLocation[] => {
   // 3. Optional: Search for TS suppression comments (@ts-ignore, @ts-expect-error, @ts-nocheck)
   if (INCLUDE_COMMENTS) {
     const commentRegex =
-      /\/\/\s*@ts-(ignore|expect-error|nocheck)|\/\*\s*@ts-(ignore|expect-error|nocheck)/g;
+      /\/\/\s*@ts-(?:ignore|expect-error|nocheck)|\/\*\s*@ts-(?:ignore|expect-error|nocheck)/;
     const lines = content.split(/\r?\n/);
     lines.forEach((lineText, idx) => {
       if (commentRegex.test(lineText)) {

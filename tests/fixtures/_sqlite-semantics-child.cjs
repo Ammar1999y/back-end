@@ -189,10 +189,16 @@ try {
     db.close(false);
   }
 
-  // ---- backlog probe must cover BOTH limiter tables ------------------------
+  // ---- backlog probe -------------------------------------------------------
   // The sweep route's `hasMore` is the only signal that expired rows are piling
-  // up. A probe that read `rate_limit` alone would report a clean sweep while
-  // `auth_rate_limit` — the login limiter's table — grew without bound.
+  // up, so the probe has to answer from the index rather than a scan — and it
+  // must report FALSE once every row's expiry is in the future, or the signal is
+  // permanently true and therefore worthless.
+  //
+  // One table, not two: `auth_rate_limit` was dropped when Better Auth's own
+  // limiter was switched off (`lib/rate-limit/store.ts` migration 2). The DDL
+  // extracted above still creates it and then drops it, which is why nothing
+  // here may reference it.
   {
     const db = open('backlog.db');
     db.exec(sql.rateLimitDdl);
@@ -200,45 +206,34 @@ try {
     const rlInsert = db.prepare(
       'INSERT INTO rate_limit (key, window_start, count, expires_at) VALUES (?,?,?,?)'
     );
-    const authInsert = db.prepare(
-      'INSERT INTO auth_rate_limit (key, count, window_start, last_request, expires_at) VALUES (?,?,?,?,?)'
-    );
-    const present = () => Number(probe.get(1000, 1000).present);
+    const present = () => Number(probe.get(1000).present);
 
     const empty = present();
-    authInsert.run('a', 1, 0, 0, 500);
-    const authOnly = present();
-    db.prepare('DELETE FROM auth_rate_limit').run();
     rlInsert.run('b', 0, 1, 500);
-    const rlOnly = present();
+    const expired = present();
     db.prepare('UPDATE rate_limit SET expires_at = 5000').run();
     const future = present();
 
     check(
-      'backlog probe reports expired rows in either limiter table',
-      empty === 0 && authOnly === 1 && rlOnly === 1 && future === 0,
-      `empty=${empty} authOnly=${authOnly} rlOnly=${rlOnly} future=${future}`
+      'backlog probe reports expired rows and only expired rows',
+      empty === 0 && expired === 1 && future === 0,
+      `empty=${empty} expired=${expired} future=${future}`
     );
 
     // Seeded first: the query planner picks a full scan over a near-empty table
     // regardless of the index, so an unseeded plan check would prove nothing.
     db.transaction(() => {
-      for (let i = 0; i < 500; i++) {
-        rlInsert.run(`b${i}`, 0, 1, 9_000_000 + i);
-        authInsert.run(`a${i}`, 1, 0, 0, 9_000_000 + i);
-      }
+      for (let i = 0; i < 500; i++) rlInsert.run(`b${i}`, 0, 1, 9_000_000 + i);
     })();
     const plan = db
       .prepare(`EXPLAIN QUERY PLAN ${sql.anyExpired}`)
-      .all(1000, 1000)
+      .all(1000)
       .map((r) => r.detail)
       .join(' | ');
     check(
-      'backlog probe searches both expires_at indexes rather than scanning',
+      'backlog probe searches the expires_at index rather than scanning',
       plan.includes('INDEX rate_limit_expires_at') &&
-        plan.includes('INDEX auth_rate_limit_expires_at') &&
-        !plan.includes('SCAN rate_limit') &&
-        !plan.includes('SCAN auth_rate_limit'),
+        !plan.includes('SCAN rate_limit'),
       plan
     );
     db.close(false);

@@ -5,7 +5,11 @@ import { withTransaction } from '@/db';
 import { getAuditMeta } from '@/lib/audit';
 import { verifyTurnstileRequest } from '@/lib/captcha';
 import { requireSession } from '@/lib/http/session';
-import { enforceRateLimit, userIdentifier } from '@/lib/rate-limit';
+import {
+  enforceOtpVerifyQuota,
+  enforceRateLimit,
+  userIdentifier,
+} from '@/lib/rate-limit';
 
 import { HTTP_STATUS, MSG_UPDATE_ERROR } from '@/utils/api-messages';
 import {
@@ -54,6 +58,12 @@ export const POST: Handler = async (ctx) => {
 
     const newEmail = parsed.data.newEmail;
     const auditMeta = getAuditMeta(ctx);
+
+    await enforceOtpVerifyQuota({
+      channel: 'email',
+      identifier: newEmail,
+      surface: 'contact_change',
+    });
 
     // OTP_AUTO_VERIFY commits directly (idempotent if initiate already did).
     // Otherwise the session lookup keyed by (userId, contactKind, purpose,

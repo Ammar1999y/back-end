@@ -4,7 +4,9 @@
     "target": "ESNext",
     "module": "Preserve",
     "lib": ["dom", "dom.iterable", "esnext"],
+    // JavaScript admitted into the program must receive the same type checking.
     "allowJs": true,
+    "checkJs": true,
     "skipLibCheck": true,
     "strict": true,
     "noEmit": true,

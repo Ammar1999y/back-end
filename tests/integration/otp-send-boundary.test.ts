@@ -51,7 +51,7 @@ import { CustomError } from '@/utils/error-class';
 import { processOtpSend } from '@/utils/otp';
 
 import { resetTables } from '../helpers/database';
-import { failNextMail, sentMail } from '../helpers/mailbox';
+import { failNextMail, sentMail, settleDelivery } from '../helpers/mailbox';
 
 /** `emailSchema` only accepts a handful of domains; the send path re-validates. */
 const EMAIL = 'otp.boundary.probe@gmail.com';
@@ -109,6 +109,7 @@ async function proofRow() {
     .select({
       id: verificationSessions.id,
       attemptNumber: verificationSessions.attemptNumber,
+      nextAllowedAt: verificationSessions.nextAllowedAt,
     })
     .from(verificationSessions)
     .where(
@@ -120,12 +121,12 @@ async function proofRow() {
   return rows[0] ?? null;
 }
 
-describe('a delivery failure after the commit', () => {
+describe('a delivery failure after prepare', () => {
   test('surfaces to the caller', () => {
     expect(fixture.threw).not.toBeNull();
   });
 
-  test('the throw came from the delivery boundary, not from an earlier check', () => {
+  test('the throw came from the delivery boundary, not from an earlier check', async () => {
     // Without this the assertions below would also pass if `processOtpSend` threw
     // BEFORE attempting delivery — a different bug with identical symptoms. The
     // discriminator is the error's identity: `sendOtpEmail` converts a transport
@@ -137,17 +138,18 @@ describe('a delivery failure after the commit', () => {
     );
     // And nothing was recorded as delivered, so the stub rejected rather than
     // silently accepting the message.
+    await settleDelivery();
     expect(sentMail()).toEqual([]);
   });
 
-  test('leaves the verification session COMMITTED, with its attempt spent', async () => {
-    // The behavioural change. Under the old ordering this row did not exist.
+  test('refunds the attempt and cooldown', async () => {
     const row = await proofRow();
     expect(row).not.toBeNull();
-    expect(row?.attemptNumber).toBe(1);
+    expect(row?.attemptNumber).toBe(0);
+    expect(row?.nextAllowedAt).toBeNull();
   });
 
-  test('leaves the code row COMMITTED, as a MAC envelope not an Argon2id hash', async () => {
+  test('removes the undelivered code', async () => {
     const row = await proofRow();
     expect(row).not.toBeNull();
 
@@ -156,9 +158,6 @@ describe('a delivery failure after the commit', () => {
       .from(verificationCodes)
       .where(eq(verificationCodes.sessionId, row?.id ?? ''));
 
-    expect(codes).toHaveLength(1);
-    // Ties the two changes together: the row that survived the commit boundary
-    // also proves the send path writes the new `o1:` envelope, not `p1:`.
-    expect(codes[0]?.code).toStartWith('o1:');
+    expect(codes).toHaveLength(0);
   });
 });

@@ -3,6 +3,14 @@ import { DASHBOARD_PAGES } from '@/lib/permissions/constants';
 export const URL_MAX = 500;
 export const MAX_IMAGE_SIZE = 1; // MB - placeholder, will be replaced
 export const MAX_IMAGE_PIXELS = 25_000_000; // 25MP max (e.g., 5000×5000) - prevents decompression bombs
+/**
+ * WebP's own hard ceiling per side, and therefore the contract: an image inside
+ * MAX_IMAGE_PIXELS can still be un-encodable. Measured — a 1000x20000 PNG is
+ * 20 MP and 100 KB, so it passes both the pixel cap and the 1 MiB file cap, and
+ * the encoder then threw `ERR_IMAGE_ENCODE_FAILED`, which reached the caller as
+ * a 500. Checked from the header, before the decode.
+ */
+export const MAX_IMAGE_EDGE = 16_383;
 export const SERVER_MAX_IMAGE_SIZE = 0.2;
 export const NAME_MAX = 150;
 
@@ -22,10 +30,10 @@ export const OTP_MAX_ATTEMPTS = 5;
 // ⚠️ Baked into DB CHECK constraint `chk_verify_attempt_number_max` (db/schema.ts).
 // Changing this value requires generating a new migration to keep the DB in sync.
 export const OTP_MAX_VERIFY_ATTEMPTS = 5;
-// Cap on failed verifies per (userId, contactKind), summed across every
-// purpose. NOT a rolling window: each proof row anchors its own 24h period, so
-// the bound is the sum of independently-anchored counters. Survives resend
-// cycles so an attacker cannot reset it by requesting a new code.
+// Cap on failed verifies per (userId, contactKind, purpose) — the unique key
+// of a proof row, so one flow's failures cannot deny another. NOT a rolling
+// window: the row anchors its own 24h period. Survives resend cycles so an
+// attacker cannot reset it by requesting a new code.
 export const OTP_MAX_DAILY_VERIFY_ATTEMPTS = 15;
 export const OTP_EXPIRY_MINUTES = 10;
 export const OTP_BLOCK_DURATION_HOURS = 6;

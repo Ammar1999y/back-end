@@ -17,10 +17,50 @@
  *   function: `shouldOptimizeImage` excludes SVG, and `validateMagicBytes`
  *   rejects animated WebP at the door.
  */
+import { uploadMsg } from '@/app/api/upload/image/messages';
+
+import { HTTP_STATUS } from '@/utils/api-messages';
+import { CustomError } from '@/utils/error-class';
 import {
+  MAX_IMAGE_EDGE,
   MAX_IMAGE_PIXELS,
   SERVER_MAX_IMAGE_SIZE,
 } from '@/utils/validation/constants';
+
+const UNDECODABLE_CODES = new Set([
+  'ERR_IMAGE_DECODE_FAILED',
+  'ERR_IMAGE_UNKNOWN_FORMAT',
+  'ERR_IMAGE_FORMAT_UNSUPPORTED',
+]);
+
+/** `Bun.Image` errors carry a `code`; nothing in the type system promises it. */
+function imageErrorCode(error: unknown): string | null {
+  if (!(error instanceof Error) || !('code' in error)) return null;
+  return typeof error.code === 'string' ? error.code : null;
+}
+
+function toUploadError(error: unknown): CustomError {
+  if (error instanceof CustomError) return error;
+
+  const code = imageErrorCode(error);
+  if (code === 'ERR_IMAGE_TOO_MANY_PIXELS')
+    return new CustomError(
+      uploadMsg.tooManyPixels(Math.floor(MAX_IMAGE_PIXELS / 1_000_000)),
+      HTTP_STATUS.UNPROCESSABLE
+    );
+  if (code !== null && UNDECODABLE_CODES.has(code))
+    return new CustomError(uploadMsg.undecodable, HTTP_STATUS.UNPROCESSABLE);
+  // The dimension guard below refuses this before the encoder is reached; this
+  // is the backstop for a limit the guard does not yet know about. Still a
+  // rejection of the input, so still 422 rather than a server fault.
+  if (code === 'ERR_IMAGE_ENCODE_FAILED')
+    return new CustomError(
+      uploadMsg.edgeTooLong(MAX_IMAGE_EDGE),
+      HTTP_STATUS.UNPROCESSABLE
+    );
+
+  return new CustomError(uploadMsg.uploadFailed, HTTP_STATUS.INTERNAL_ERROR);
+}
 
 export type OptimizeImageOptions = {
   /**
@@ -102,7 +142,70 @@ export type OptimizeImageResult = {
   iterations: number;
 };
 
-export async function optimizeImage(
+/**
+ * A ceiling on the ladder, independent of the option validation below. The
+ * default ladder is 32 rungs; this stops a future edit to the walk itself from
+ * spinning.
+ */
+const MAX_LADDER_RUNGS = 128;
+const MAX_ENCODE_ATTEMPTS = 16;
+
+interface Rung {
+  width: number;
+  quality: number;
+}
+
+/**
+ * Every numeric option, checked before it can drive a loop.
+ *
+ * `buildLadder`'s two `while`s advance by `qualityStep` / `widthStep`. A step of
+ * `0` — or negative, or `NaN` — never reaches the floor, so the loop spins
+ * forever SYNCHRONOUSLY, before the first `await`, taking the event loop with
+ * it. `OptimizeImageOptions` is exported, so that is reachable from a future
+ * caller rather than hypothetical.
+ */
+function assertLadderOptions(opts: {
+  startWidth: number;
+  initialQuality: number;
+  minQuality: number;
+  qualityStep: number;
+  minWidth: number;
+  widthStep: number;
+}): void {
+  for (const [name, value] of Object.entries(opts))
+    if (!Number.isFinite(value) || value <= 0)
+      throw new CustomError(
+        `optimizeImage: ${name} must be a positive finite number`,
+        HTTP_STATUS.INTERNAL_ERROR
+      );
+}
+
+function buildLadder(opts: {
+  startWidth: number;
+  initialQuality: number;
+  minQuality: number;
+  qualityStep: number;
+  minWidth: number;
+  widthStep: number;
+}): Rung[] {
+  assertLadderOptions(opts);
+
+  const rungs: Rung[] = [];
+  let quality = opts.initialQuality;
+  rungs.push({ width: opts.startWidth, quality });
+  while (quality > opts.minQuality && rungs.length < MAX_LADDER_RUNGS) {
+    quality = Math.max(quality - opts.qualityStep, opts.minQuality);
+    rungs.push({ width: opts.startWidth, quality });
+  }
+  let width = opts.startWidth;
+  while (width > opts.minWidth && rungs.length < MAX_LADDER_RUNGS) {
+    width = Math.max(width - opts.widthStep, opts.minWidth);
+    rungs.push({ width, quality: opts.minQuality });
+  }
+  return rungs;
+}
+
+async function optimizeImageWithinSlot(
   input: Buffer,
   options: OptimizeImageOptions = {}
 ): Promise<OptimizeImageResult> {
@@ -116,70 +219,134 @@ export async function optimizeImage(
     widthStep = 100,
   } = options;
 
-  // Header-only read, so a small file declaring a huge canvas is refused before
-  // any pixel buffer is allocated (`ERR_IMAGE_TOO_MANY_PIXELS`).
-  const metadata = await new Bun.Image(input, {
-    maxPixels: MAX_IMAGE_PIXELS,
-  }).metadata();
-  const originalWidth = metadata.width || initialWidth;
+  try {
+    const metadata = await new Bun.Image(input, {
+      maxPixels: MAX_IMAGE_PIXELS,
+    }).metadata();
+    // From the header, before any pixel work. `MAX_IMAGE_PIXELS` bounds AREA and
+    // says nothing about a single side, so an image well inside it can still be
+    // one the output format cannot hold.
+    if (metadata.width > MAX_IMAGE_EDGE || metadata.height > MAX_IMAGE_EDGE)
+      throw new CustomError(
+        uploadMsg.edgeTooLong(MAX_IMAGE_EDGE),
+        HTTP_STATUS.UNPROCESSABLE
+      );
 
-  let currentQuality = initialQuality;
-  let currentWidth = Math.min(originalWidth, initialWidth);
-  let iterations = 0;
+    const originalWidth = metadata.width || initialWidth;
+    const originalHeight = metadata.height || initialWidth;
+    const longestEdgeWidth = Math.max(
+      1,
+      Math.floor((originalWidth * initialWidth) / originalHeight)
+    );
+    const startWidth = Math.min(originalWidth, initialWidth, longestEdgeWidth);
 
-  let attempt = await encodeAttempt(input, currentWidth, currentQuality);
-  iterations++;
+    const ladder = buildLadder({
+      startWidth,
+      initialQuality,
+      minQuality,
+      qualityStep,
+      minWidth: Math.min(minWidth, startWidth),
+      widthStep,
+    });
 
-  // If already under target, return immediately
-  if (attempt.size <= targetSize) {
+    let iterations = 0;
+    const measure = async (index: number) => {
+      if (iterations >= MAX_ENCODE_ATTEMPTS)
+        throw new CustomError(
+          uploadMsg.targetUnreachable,
+          HTTP_STATUS.UNPROCESSABLE
+        );
+      iterations++;
+      const rung = ladder[index];
+      if (!rung) throw new Error('ladder index out of range');
+      return encodeAttempt(input, rung.width, rung.quality);
+    };
+
+    const firstAttempt = await measure(0);
+    let fitting = firstAttempt.size <= targetSize ? firstAttempt : null;
+    let lastMeasured = firstAttempt;
+
+    if (!fitting) {
+      let lo = 1;
+      let hi = ladder.length - 1;
+      while (lo <= hi) {
+        const mid = (lo + hi) >> 1;
+        const attempt = await measure(mid);
+        lastMeasured = attempt;
+        if (attempt.size <= targetSize) {
+          fitting = attempt;
+          hi = mid - 1;
+        } else {
+          lo = mid + 1;
+        }
+      }
+    }
+
+    if (!fitting) {
+      console.warn(
+        JSON.stringify({
+          msg: 'image.optimize target unreachable',
+          finalBytes: lastMeasured.size,
+          targetBytes: targetSize,
+          iterations,
+        })
+      );
+      throw new CustomError(
+        uploadMsg.targetUnreachable,
+        HTTP_STATUS.UNPROCESSABLE
+      );
+    }
+
+    const chosen = fitting;
     return {
-      buffer: attempt.buffer,
-      width: attempt.width,
-      height: attempt.height,
-      size: attempt.size,
+      buffer: chosen.buffer,
+      width: chosen.width,
+      height: chosen.height,
+      size: chosen.size,
       format: 'webp',
       iterations,
     };
+  } catch (error) {
+    if (error instanceof CustomError) throw error;
+    throw toUploadError(error);
   }
+}
 
-  let reduceQuality = true;
+const IMAGE_ENCODER_QUEUE_LIMIT = 4;
+const encoderAdmission = {
+  active: false,
+  waiters: [] as Array<() => void>,
+};
 
-  while (attempt.size > targetSize && iterations < 50) {
-    if (reduceQuality) {
-      if (currentQuality > minQuality)
-        currentQuality = Math.max(currentQuality - qualityStep, minQuality);
-      else {
-        reduceQuality = false;
-        continue;
-      }
-    } else {
-      if (currentWidth > minWidth) {
-        currentWidth = Math.max(currentWidth - widthStep, minWidth);
-      } else {
-        console.warn(
-          `[Image Optimization] Could not reach target size. Final: ${attempt.size} bytes, Target: ${targetSize} bytes`
-        );
-        break;
-      }
-
-      // After width reduction, try quality again
-      reduceQuality = true;
-    }
-
-    attempt = await encodeAttempt(input, currentWidth, currentQuality);
-    iterations++;
-
-    if (attempt.size <= targetSize) break;
+async function acquireEncoder(): Promise<() => void> {
+  if (encoderAdmission.active) {
+    if (encoderAdmission.waiters.length >= IMAGE_ENCODER_QUEUE_LIMIT)
+      throw new CustomError(
+        uploadMsg.processingBusy,
+        HTTP_STATUS.SERVICE_UNAVAILABLE
+      );
+    await new Promise<void>((resolve) => {
+      encoderAdmission.waiters.push(resolve);
+    });
   }
-
-  return {
-    buffer: attempt.buffer,
-    width: attempt.width,
-    height: attempt.height,
-    size: attempt.size,
-    format: 'webp',
-    iterations,
+  encoderAdmission.active = true;
+  return () => {
+    const next = encoderAdmission.waiters.shift();
+    if (next) next();
+    else encoderAdmission.active = false;
   };
+}
+
+export async function optimizeImage(
+  input: Buffer,
+  options: OptimizeImageOptions = {}
+): Promise<OptimizeImageResult> {
+  const release = await acquireEncoder();
+  try {
+    return await optimizeImageWithinSlot(input, options);
+  } finally {
+    release();
+  }
 }
 
 export const shouldOptimizeImage = (mimeType: string) =>

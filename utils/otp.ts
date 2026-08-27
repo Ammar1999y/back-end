@@ -2,13 +2,14 @@ import crypto from 'node:crypto';
 import type { Tx } from '@/db';
 import type { EntityID } from '@/types';
 import type { OtpChannel, OtpPurpose } from '@/utils/validation/otp';
+import type { Transporter } from 'nodemailer';
 
 import { and, eq, gt, isNull, sql } from 'drizzle-orm';
 
 import { withTransaction } from '@/db';
 import { users, verificationCodes, verificationSessions } from '@/db/schema';
 import { sanitizeForLog } from '@/utils';
-import nodemailer from 'nodemailer';
+import { createTransport } from 'nodemailer';
 import { auditLog } from '@/lib/audit';
 import { hashOtpCode, verifyOtpCode } from '@/lib/auth/otp-hash';
 import { enforceOtpGlobalSendBudget, otpContactKind } from '@/lib/rate-limit';
@@ -23,17 +24,24 @@ import {
   OTP_MAX_VERIFY_ATTEMPTS,
 } from '@/utils/validation/constants';
 
+const PROVIDER_TIMEOUT_MS = 5000;
+
 // ── Email Transport (lazy-initialized to avoid crash when env vars are missing) ──
-let _transporter: nodemailer.Transporter | null = null;
+let _transporter: Transporter | null = null;
 function getTransporter() {
   if (!_transporter) {
     // eslint-disable-next-line unicorn/no-top-level-assignment-in-function -- memoized lazy singleton; the assignment IS the cache
-    _transporter = nodemailer.createTransport({
+    _transporter = createTransport({
       service: 'gmail',
       auth: {
         user: process.env.SMTP_USER,
         pass: process.env.SMTP_PASS,
       },
+
+      connectionTimeout: PROVIDER_TIMEOUT_MS,
+      dnsTimeout: PROVIDER_TIMEOUT_MS,
+      greetingTimeout: PROVIDER_TIMEOUT_MS,
+      socketTimeout: PROVIDER_TIMEOUT_MS,
     });
   }
   return _transporter;
@@ -83,6 +91,21 @@ const BLOCK_EXPIRY_RESET = {
   verifyAttemptNumber: 0,
 } as const;
 
+const VERIFY_BLOCK_CLEARED_BY_RESEND = {
+  isBlocked: false,
+  blockedUntil: null,
+  verifyAttemptNumber: 0,
+} as const;
+
+function blockedError(message: string, until: Date | null): CustomError {
+  const error = new CustomError(message, HTTP_STATUS.TOO_MANY_REQUESTS);
+  const seconds = until
+    ? Math.max(1, Math.ceil((until.getTime() - Date.now()) / 1000))
+    : OTP_BLOCK_DURATION_HOURS * 3600;
+  error.responseHeaders = { 'Retry-After': String(seconds) };
+  return error;
+}
+
 // ── Delivery Functions ──
 
 /**
@@ -119,6 +142,7 @@ async function sendOtpSms(
   messageText?: string
 ) {
   const response = await fetch('https://apis.deewan.sa/sms/v1/messages', {
+    signal: AbortSignal.timeout(PROVIDER_TIMEOUT_MS),
     method: 'POST',
     headers: {
       accept: 'application/json',
@@ -146,6 +170,7 @@ async function sendOtpWhatsApp(phoneNumber: string, code: string) {
   formData.append('content', `رمز التحقق هو: ${code}`);
 
   const response = await fetch('https://services.rmz.one/api/whatsapp/send', {
+    signal: AbortSignal.timeout(PROVIDER_TIMEOUT_MS),
     method: 'POST',
     headers: {
       AUTHORIZATION: `Bearer ${process.env.WHATSAPP_API_KEY}`,
@@ -232,14 +257,16 @@ const SAFE_DELIVERY_MESSAGES: ReadonlySet<string> = new Set([
  */
 function readErrorField(
   error: unknown,
-  key: 'message' | 'name'
+  key: 'message' | 'name' | 'code'
 ): string | null {
-  const value = (error as Record<string, unknown> | null | undefined)?.[key];
+  if (typeof error !== 'object' || error === null || !(key in error))
+    return null;
+  const value: unknown = Reflect.get(error, key);
   return typeof value === 'string' ? value : null;
 }
 
 async function sendOtpEmail(email: string, code: string) {
-  let info: Awaited<ReturnType<nodemailer.Transporter['sendMail']>>;
+  let info: Awaited<ReturnType<Transporter['sendMail']>>;
 
   try {
     info = await getTransporter().sendMail({
@@ -258,13 +285,13 @@ async function sendOtpEmail(email: string, code: string) {
     // an SMTP rejection quotes the message it rejected — which is the body
     // containing the plaintext code. Replace it with a fixed error here, at
     // the boundary, and log only the library's own failure class.
-    const rawCode = (error as { code?: unknown })?.code;
+    const rawCode = readErrorField(error, 'code');
     console.error(
       sanitizeForLog({
         msg: 'otp.provider.failed',
         channel: 'email',
         smtpCode:
-          typeof rawCode === 'string' && SMTP_ERROR_CODES.has(rawCode)
+          rawCode !== null && SMTP_ERROR_CODES.has(rawCode)
             ? rawCode
             : 'UNKNOWN',
       })
@@ -366,11 +393,57 @@ interface ProcessOtpSendOptions {
   entityName: string;
   /** Optional custom SMS message. Receives the OTP code as argument */
   smsMessage?: (code: string) => string;
+  /**
+   * Hands the provider call to the caller to run AFTER its response is on the
+   * wire. Every HTTP caller passes one; without it the delivery is awaited
+   * inline, which is what a script or a future non-HTTP caller wants.
+   *
+   * **This is what stops the send endpoints being an existence oracle.**
+   * `ensureMinDelay` is a floor with no ceiling, and the provider call sat on
+   * the response path — so with the SMS provider stubbed to 3 000 ms, four
+   * unregistered numbers answered in 1 502–1 588 ms and four registered ones in
+   * 3 079–3 106 ms, with an identical 200 body every time. The signal is
+   * one-sided and sound: any response above the floor proves the real branch
+   * ran. Raising `MINIMUM_RESPONSE_MS` cannot fix it — the floor would have to
+   * exceed an unbounded third-party call — so the call has to leave the path.
+   *
+   * It also removes two other consequences of the old placement: a slow provider
+   * could exceed the route's 60 s idle ceiling and drop the client's connection
+   * with an empty body while the handler kept running, and those in-flight
+   * requests counted as busy connections that held `app.stop()` open during a
+   * deploy.
+   */
+  deferDelivery?: (task: () => Promise<void>) => void;
 }
 
 interface ProcessOtpSendResult {
   nextAllowedIn: number;
   attemptsRemaining: number;
+}
+
+async function refundFailedDelivery(
+  sessionId: EntityID,
+  hashedCode: string
+): Promise<void> {
+  await withTransaction(async (tx) => {
+    const [removed] = await tx
+      .delete(verificationCodes)
+      .where(
+        and(
+          eq(verificationCodes.sessionId, sessionId),
+          eq(verificationCodes.code, hashedCode)
+        )
+      )
+      .returning({ id: verificationCodes.id });
+    if (!removed) return;
+    await tx
+      .update(verificationSessions)
+      .set({
+        attemptNumber: sql`GREATEST(${verificationSessions.attemptNumber} - 1, 0)`,
+        nextAllowedAt: null,
+      })
+      .where(eq(verificationSessions.id, sessionId));
+  });
 }
 
 /**
@@ -388,6 +461,7 @@ export async function processOtpSend({
   sendTo,
   entityName,
   smsMessage,
+  deferDelivery,
 }: ProcessOtpSendOptions): Promise<ProcessOtpSendResult> {
   // The session row is keyed on what is being proven, not on the transport.
   const contactKind = otpContactKind(channel);
@@ -433,23 +507,28 @@ export async function processOtpSend({
       )
       .for('update');
 
-    // ── Block check ──
-    if (session?.isBlocked && session.blockedUntil) {
-      if (new Date(session.blockedUntil) > now) {
-        const blockedMinutes = Math.ceil(
-          (new Date(session.blockedUntil).getTime() - now.getTime()) / 60_000
-        );
-        const message =
-          blockedMinutes >= 60
-            ? `تم حظر ${entityName} مؤقتاً. يرجى المحاولة بعد ${Math.ceil(blockedMinutes / 60)} ساعة`
-            : `تم حظر ${entityName} مؤقتاً. يرجى المحاولة بعد ${blockedMinutes} دقيقة`;
-        throw new CustomError(message, HTTP_STATUS.TOO_MANY_REQUESTS);
-      }
+    // Captured BEFORE the clear below, so the max-attempts branch can preserve
+    // an existing send-side deadline instead of minting a new one.
+    const existingBlockedUntil = session?.isBlocked
+      ? session.blockedUntil
+      : null;
 
-      // Block expired — the penalty has been served.
+    // ── Block check ──
+    //
+    // A live block is CLEARED here, not thrown on — see
+    // `VERIFY_BLOCK_CLEARED_BY_RESEND` for why that does not weaken anything.
+    // A send-side block survives it, because `attemptNumber` survives it and the
+    // max-attempts branch below re-derives the same block from that counter.
+    if (session?.isBlocked && session.blockedUntil) {
       const [unblocked] = await tx
         .update(verificationSessions)
-        .set(BLOCK_EXPIRY_RESET)
+        .set(
+          session.blockedUntil > now
+            ? VERIFY_BLOCK_CLEARED_BY_RESEND
+            : // Expired: the penalty has been served, so both cycle counters go
+              // back to zero and the send ladder restarts.
+              BLOCK_EXPIRY_RESET
+        )
         .where(eq(verificationSessions.id, session.id))
         .returning({
           id: verificationSessions.id,
@@ -462,9 +541,9 @@ export async function processOtpSend({
     }
 
     // ── Rate-limit check ──
-    if (session?.nextAllowedAt && new Date(session.nextAllowedAt) > now) {
+    if (session?.nextAllowedAt && session.nextAllowedAt > now) {
       const waitSeconds = Math.ceil(
-        (new Date(session.nextAllowedAt).getTime() - now.getTime()) / 1000
+        (session.nextAllowedAt.getTime() - now.getTime()) / 1000
       );
       throw new CustomError(
         `يرجى الانتظار ${waitSeconds} ثانية قبل إعادة الإرسال`,
@@ -476,18 +555,31 @@ export async function processOtpSend({
     // Defer the throw so the block update COMMITS with the transaction.
     // Throwing inside withTransaction rolls back the block write.
     if (session && session.attemptNumber >= OTP_MAX_ATTEMPTS) {
-      const blockedUntil = calculateBlockDuration();
+      // The deadline is stamped ONCE and then preserved. Re-deriving it from
+      // `Date.now()` on every request turns a fixed `OTP_BLOCK_DURATION_HOURS`
+      // penalty into a ROLLING one that anyone who knows the identifier can
+      // extend indefinitely — which is the failure the verify side already
+      // guards against with its own `if (!session.isBlocked)`.
+      //
+      // Reachable specifically because the block check above now CLEARS a live
+      // block before this branch runs (see `VERIFY_BLOCK_CLEARED_BY_RESEND`), so
+      // `session.isBlocked` is always false here and cannot be used as the
+      // guard. `existingBlockedUntil` is captured before that clear.
+      const blockedUntil =
+        existingBlockedUntil && existingBlockedUntil > now
+          ? existingBlockedUntil
+          : calculateBlockDuration();
       await tx
         .update(verificationSessions)
         .set({
           isBlocked: true,
-          blockedUntil: blockedUntil.toISOString(),
+          blockedUntil,
         })
         .where(eq(verificationSessions.id, session.id));
 
-      deferredError = new CustomError(
+      deferredError = blockedError(
         `تجاوزت الحد الأقصى من المحاولات. تم حظر ${entityName} لمدة ${OTP_BLOCK_DURATION_HOURS} ساعة`,
-        HTTP_STATUS.TOO_MANY_REQUESTS
+        blockedUntil
       );
       return null;
     }
@@ -510,8 +602,8 @@ export async function processOtpSend({
         targetIdentifier,
         attemptNumber: 1,
         verifyAttemptNumber: 0,
-        lastSentAt: now.toISOString(),
-        nextAllowedAt: nextAllowedAt.toISOString(),
+        lastSentAt: now,
+        nextAllowedAt,
       })
       .onConflictDoUpdate({
         // Must match ux_verification_sessions_user_contact_purpose — otherwise a
@@ -534,8 +626,8 @@ export async function processOtpSend({
           consumedAt: null,
           // Intentionally do NOT touch verifyAttemptDaily /
           // verifyAttemptWindowStart — they survive resends.
-          lastSentAt: now.toISOString(),
-          nextAllowedAt: nextAllowedAt.toISOString(),
+          lastSentAt: now,
+          nextAllowedAt,
         },
       })
       .returning({
@@ -554,13 +646,13 @@ export async function processOtpSend({
       .values({
         sessionId: updatedSession.id,
         code: hashedCode,
-        expiresAt: expiresAt.toISOString(),
+        expiresAt,
       })
       .onConflictDoUpdate({
         target: verificationCodes.sessionId,
         set: {
           code: hashedCode,
-          expiresAt: expiresAt.toISOString(),
+          expiresAt,
         },
       });
 
@@ -575,6 +667,7 @@ export async function processOtpSend({
         (nextAllowedAt.getTime() - now.getTime()) / 1000
       ),
       attemptsRemaining: OTP_MAX_ATTEMPTS - updatedSession.attemptNumber,
+      sessionId: updatedSession.id,
     };
   });
 
@@ -607,10 +700,42 @@ export async function processOtpSend({
   // The reverse order is not an option: delivering first would hand out a code
   // that a subsequent rollback erases, so the user holds a valid-looking code
   // the database has no record of.
-  await sendOtp(channel, sendTo, otpCode, smsMessage);
+  //
+  // Deferred when the caller supplied a way to defer, awaited otherwise.
+  //
+  // Only the three ANONYMOUS surfaces defer, and only because a provider's
+  // latency on the response path is an account-existence oracle there; their own
+  // catch blocks already swallowed the failure for the same reason, so
+  // `runAfterResponse` logging it costs them nothing. An authenticated caller is
+  // told the truth instead: it awaits, and a rejected send reaches it as an
+  // error rather than as `otpSent: true`.
+  if (!result)
+    throw new CustomError(MSG_OTP_SEND_FAILED, HTTP_STATUS.INTERNAL_ERROR);
+  const deliver = async () => {
+    try {
+      await sendOtp(channel, sendTo, otpCode, smsMessage);
+    } catch (error) {
+      try {
+        await refundFailedDelivery(result.sessionId, hashedCode);
+      } catch (refundError) {
+        console.error(
+          sanitizeForLog({
+            msg: 'otp.delivery.refundFailed',
+            error: refundError,
+          })
+        );
+      }
+      throw error;
+    }
+  };
+  if (deferDelivery) deferDelivery(deliver);
+  else await deliver();
 
   // result is non-null when no deferred error was set.
-  return result as ProcessOtpSendResult;
+  return {
+    nextAllowedIn: result.nextAllowedIn,
+    attemptsRemaining: result.attemptsRemaining,
+  };
 }
 
 // ── Contact Verified Flag ──
@@ -734,7 +859,13 @@ type VerifyOutcome =
   | { kind: 'matched' }
   | { kind: 'mismatch' }
   | { kind: 'no-code' }
-  | { kind: 'blocked' };
+  /**
+   * `blockedUntil` travels out of the transaction so the 429 can carry an
+   * accurate `Retry-After`. Null only when the row was blocked with no expiry
+   * recorded, which the writes below never produce — `blockedError` falls back
+   * to the full duration rather than omitting the header.
+   */
+  | { kind: 'blocked'; blockedUntil: Date | null };
 
 export async function processOtpVerify({
   userId,
@@ -797,8 +928,8 @@ export async function processOtpVerify({
     // session that should be locked entirely.
     if (session.isBlocked && session.blockedUntil) {
       // Already locked — no code is looked at, so nothing is charged.
-      if (new Date(session.blockedUntil) > new Date())
-        return { kind: 'blocked' };
+      if (session.blockedUntil > new Date())
+        return { kind: 'blocked', blockedUntil: session.blockedUntil };
 
       // Block expired — same reset as the send path. Clearing only the verify
       // counter here would unblock verification while leaving a send-cap block
@@ -828,7 +959,7 @@ export async function processOtpVerify({
       .where(
         and(
           eq(verificationCodes.sessionId, session.id),
-          gt(verificationCodes.expiresAt, new Date().toISOString())
+          gt(verificationCodes.expiresAt, new Date())
         )
       )
       .limit(1);
@@ -854,13 +985,15 @@ export async function processOtpVerify({
 
     const windowExpired = sql`NOW() - ${verificationSessions.verifyAttemptWindowStart} > INTERVAL '24 hours'`;
 
-    // 24h failure budget, SUMMED across the identity. NOT a rolling window:
-    // each row anchors its own 24h period at verifyAttemptWindowStart, and the
-    // sum of those independently-anchored counters is what is bounded here. The
-    // counter is stored per (user, contactKind, purpose) row, so read
-    // row-locally it granted the daily budget once per purpose.
-    // Read-then-write is safe: `users` is held FOR UPDATE above, so verifies
-    // for this user are serialized and nothing else writes this column.
+    // 24h failure budget for THIS proof row. The filter is the row's unique
+    // key (ux_verification_sessions_user_contact_purpose), so the SUM reads one
+    // row; it is a SUM only to fold an aged-out window to zero in SQL. Scoped
+    // to the purpose deliberately: a wider scope let failed verify_contact
+    // attempts deny the victim's forgot_password flow.
+    //
+    // NOT a rolling window — the row anchors its own 24h period at
+    // verifyAttemptWindowStart. Read-then-write is safe: `users` is held FOR
+    // UPDATE above, so verifies for this user are serialized.
     const [dailyUsage] = await tx
       .select({
         used: sql<number>`COALESCE(SUM(CASE WHEN ${windowExpired} THEN 0 ELSE ${verificationSessions.verifyAttemptDaily} END), 0)`.mapWith(
@@ -871,7 +1004,8 @@ export async function processOtpVerify({
       .where(
         and(
           eq(verificationSessions.userId, userId),
-          eq(verificationSessions.contactKind, contactKind)
+          eq(verificationSessions.contactKind, contactKind),
+          eq(verificationSessions.purpose, purpose)
         )
       );
 
@@ -879,17 +1013,16 @@ export async function processOtpVerify({
     // Budget already spent: the code is never read, so this request cannot be
     // a guess and is not charged.
     if (dailyUsed >= OTP_MAX_DAILY_VERIFY_ATTEMPTS) {
+      let blockedUntil = session.blockedUntil;
       if (!session.isBlocked) {
+        blockedUntil = calculateBlockDuration();
         await tx
           .update(verificationSessions)
-          .set({
-            isBlocked: true,
-            blockedUntil: calculateBlockDuration().toISOString(),
-          })
+          .set({ isBlocked: true, blockedUntil })
           .where(eq(verificationSessions.id, session.id));
         await auditBlockTransition('daily_cap_reached');
       }
-      return { kind: 'blocked' };
+      return { kind: 'blocked', blockedUntil };
     }
 
     // The per-cycle bound stays in the WHERE clause as defense in depth if the
@@ -924,30 +1057,27 @@ export async function processOtpVerify({
       // window into a rolling block, which is not the documented
       // OTP_BLOCK_DURATION_HOURS contract and lets an attacker keep a victim
       // locked indefinitely.
+      let blockedUntil = session.blockedUntil;
       if (!session.isBlocked) {
+        blockedUntil = calculateBlockDuration();
         await tx
           .update(verificationSessions)
-          .set({
-            isBlocked: true,
-            blockedUntil: calculateBlockDuration().toISOString(),
-          })
+          .set({ isBlocked: true, blockedUntil })
           .where(eq(verificationSessions.id, session.id));
         await auditBlockTransition('cap_reached');
       }
       // Cap was already spent before this request; the code is never read.
-      return { kind: 'blocked' };
+      return { kind: 'blocked', blockedUntil };
     }
 
     const shouldBlock =
       bumped.verifyAttemptNumber >= OTP_MAX_VERIFY_ATTEMPTS ||
       dailyUsed + 1 >= OTP_MAX_DAILY_VERIFY_ATTEMPTS;
-    if (shouldBlock) {
+    const blockUntil = shouldBlock ? calculateBlockDuration() : null;
+    if (blockUntil) {
       await tx
         .update(verificationSessions)
-        .set({
-          isBlocked: true,
-          blockedUntil: calculateBlockDuration().toISOString(),
-        })
+        .set({ isBlocked: true, blockedUntil: blockUntil })
         .where(eq(verificationSessions.id, session.id));
     }
 
@@ -1027,7 +1157,7 @@ export async function processOtpVerify({
     // (`no-code`, already-blocked, budget spent) return before it.
     if (shouldBlock) {
       await auditBlockTransition('threshold_crossed');
-      return { kind: 'blocked' };
+      return { kind: 'blocked', blockedUntil: blockUntil };
     }
     return { kind: 'mismatch' };
   });
@@ -1040,9 +1170,12 @@ export async function processOtpVerify({
       HTTP_STATUS.BAD_REQUEST
     );
   if (outcome.kind === 'blocked')
-    throw new CustomError(
-      'تجاوزت الحد الأقصى من محاولات التحقق. يرجى طلب رمز جديد',
-      HTTP_STATUS.TOO_MANY_REQUESTS
+    // Says it is a block, and carries how long it lasts — see `blockedError`.
+    // The message also tells the caller a NEW code will lift it, which is true
+    // now that a resend clears a verify-side block.
+    throw blockedError(
+      'تم حظر التحقق مؤقتاً بعد تجاوز عدد المحاولات. يرجى طلب رمز جديد',
+      outcome.blockedUntil
     );
   throw new CustomError('رمز التحقق غير صحيح', HTTP_STATUS.BAD_REQUEST);
 }

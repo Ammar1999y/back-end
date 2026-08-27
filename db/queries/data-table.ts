@@ -11,6 +11,7 @@ import {
   MSG_INVALID_FILTER,
 } from '@/lib/data-table/filter-columns';
 import {
+  DATA_TABLE_PARAM_KEYS,
   MAX_PER_PAGE,
   MAX_SEARCH_LENGTH,
   MIN_SEARCH_LENGTH,
@@ -19,6 +20,9 @@ import {
 
 import { HTTP_STATUS } from '@/utils/api-messages';
 import { CustomError } from '@/utils/error-class';
+
+/** `search` is read here rather than by the parser, so it is added here too. */
+const ACCEPTED_PARAM_KEYS = new Set([...DATA_TABLE_PARAM_KEYS, 'search']);
 
 interface DataTableQueryParams<T extends Table> {
   /**
@@ -59,9 +63,17 @@ export function parseDataTableParams<T extends Table>(
 ): DataTableQueryResult<T> {
   const { searchParams } = new URL(url);
 
-  const params: Record<string, string | undefined> = Object.fromEntries(
-    searchParams.entries()
-  );
+  // Unknown as well as repeated. An ignored `serach=` returned an unfiltered
+  // 200 that the caller read as a search result.
+  const seen = new Set<string>();
+  for (const key of searchParams.keys()) {
+    if (seen.has(key) || !ACCEPTED_PARAM_KEYS.has(key))
+      throw new CustomError(MSG_INVALID_FILTER, HTTP_STATUS.UNPROCESSABLE);
+    seen.add(key);
+  }
+
+  const params: Record<string, string | undefined> =
+    Object.fromEntries(searchParams);
 
   // A filter the parser could not read is a client error, not a filter to
   // ignore: dropping it silently broadens an `and` query and narrows an `or`
@@ -94,7 +106,10 @@ export function parseDataTableParams<T extends Table>(
   // `and` query to rows the caller never asked for, whereas dropping a
   // standalone search term returns the caller's ordinary authorized list. A
   // bookmarked 1-2 character URL is a compatibility case, not an attack.
-  const rawSearch = searchParams.get('search')?.trim() ?? '';
+
+  const rawSearch = (searchParams.get('search') ?? '')
+    .replaceAll(/\p{Cc}/gu, '')
+    .trim();
   const search =
     rawSearch.length >= MIN_SEARCH_LENGTH &&
     rawSearch.length <= MAX_SEARCH_LENGTH

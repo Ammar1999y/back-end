@@ -24,22 +24,25 @@
  * DOMPurify re-parses with. Several payloads below are stopped by the second and
  * not the first, which a test of `sanitizeSvg` in isolation could not tell you.
  *
- * **Four `test.failing` groups record live defects, not flaky tests.** They are
- * findings 2, 12, 13 and 14 of `reports/claude-opus-autonomous-audit.md`, each
- * asserted in the direction a fix would take it, so the suite stays green while
- * the defect stands and Bun flags the test the moment it is fixed. Read them
- * before adding anything to this file.
+ * **Two `test.failing` groups record live defects, not flaky tests.** They are
+ * findings 2 and 14 of `reports/claude-opus-autonomous-audit.md`, each asserted
+ * in the direction a fix would take it, so the suite stays green while the
+ * defect stands and Bun flags the test the moment it is fixed. Read them before
+ * adding anything to this file. (Findings 12 and 13 were the same shape and are
+ * now fixed — see `describe('external references in SVG')`.)
  */
 import { describe, expect, test } from 'bun:test';
 import zlib from 'node:zlib';
 
 import { uploadMsg } from '@/app/api/upload/image/messages';
+import { optimizeImage } from '@/lib/r2/optimize-image';
 import {
   ALLOWED_IMAGE_TYPES,
   isAllowedImageType,
   validateMagicBytes,
 } from '@/lib/r2/upload-helper';
 
+import { HTTP_STATUS } from '@/utils/api-messages';
 import {
   DANGEROUS_ATTRIBUTES,
   DANGEROUS_ELEMENTS,
@@ -50,6 +53,8 @@ import {
 import { sanitizeSvgServer, svgOptimizerServer } from '@/utils/images/server';
 import { sanitizeSvg, validateSvgFile } from '@/utils/images/svg-optimizer';
 import {
+  MAX_IMAGE_EDGE,
+  MAX_IMAGE_PIXELS,
   MAX_IMAGE_SIZE,
   SERVER_MAX_IMAGE_SIZE,
 } from '@/utils/validation/constants';
@@ -332,7 +337,7 @@ describe('the structural gates on an SVG', () => {
     // no parser — on the server that path therefore rejects every SVG, valid or
     // not. Recorded here because "fails closed" is the safe direction and the
     // caller is not otherwise covered.
-    expect(globalThis.DOMParser).toBeUndefined();
+    expect(typeof DOMParser).toBe('undefined');
 
     const result = sanitizeSvg(svg('<rect width="8" height="8"/>'));
     expect(result.isValid).toBe(false);
@@ -377,13 +382,16 @@ describe('entity expansion', () => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// GAP 4 — the payloads that are NOT neutralised. Every one of these is a live
-// defect; `test.failing` keeps the suite honest about it rather than silent.
+// GAP 4 — external references. These were live defects (`test.failing`) until
+// `DANGEROUS_CSS_PATTERNS` grew whole-directive `@import` / `@font-face` entries
+// and `EXTERNAL_URL_FUNCTION`, and the reference guard was extended from `use`
+// to `image`. They assert the fix now.
 // ─────────────────────────────────────────────────────────────────────────────
 
-const EXTERNAL_REFERENCE_SURVIVORS: ReadonlyArray<readonly [string, string]> = [
+const EXTERNAL_REFERENCES: ReadonlyArray<readonly [string, string]> = [
   [
-    // `DANGEROUS_CSS_PATTERNS` blocks `@import url(...)` and misses `@import "..."`.
+    // The string form of the directive `@import url(...)` already blocked — this
+    // was the bypass.
     'a CSS @import in its string form',
     svg(
       '<style>@import "https://evil.example/x.css";</style><rect width="8" height="8"/>'
@@ -409,44 +417,103 @@ const EXTERNAL_REFERENCE_SURVIVORS: ReadonlyArray<readonly [string, string]> = [
     'an off-origin url() in a style= attribute',
     svg('<path style="fill:url(https://evil.example/t.svg#g)" d="M0 0"/>'),
   ],
+  [
+    // Protocol-relative: no scheme to blocklist, still an external fetch.
+    'a protocol-relative url() in a style= attribute',
+    svg('<path style="fill:url(//evil.example/t.svg#g)" d="M0 0"/>'),
+  ],
+  [
+    'an off-origin url() inside a <style> rule',
+    svg(
+      '<style>.a{fill:url(https://evil.example/g.svg#x)}</style><path class="a" d="M0 0"/>'
+    ),
+  ],
+  [
+    'an image-set() reference in a style attribute',
+    svg(
+      '<path style="mask-image:image-set(https://evil.example/mask.png 1x)" d="M0 0"/>'
+    ),
+  ],
+  [
+    'an image() reference in a style element',
+    svg(
+      '<style>.a{mask-image:image("https://evil.example/mask.png")}</style><path class="a" d="M0 0"/>'
+    ),
+  ],
 ];
 
-describe('hostile SVG, NOT neutralised', () => {
-  test.failing.each([...EXTERNAL_REFERENCE_SURVIVORS])(
-    'DEFECT (audit §12): %s is stripped',
-    (_name, markup) => {
-      // The invariant `DANGEROUS_CSS_PATTERNS` states by existing is that
-      // external CSS is refused. It is not: each of these is stored verbatim on
-      // the public bucket as `image/svg+xml` + `inline`, so it renders as a
-      // document and the reference is fetched at VIEW time — a beacon for every
-      // future viewer's IP, UA and Referer, changeable remotely after review.
-      //
-      // No script execution in any of them; this is the tracking and
-      // remote-mutation half of the surface, not XSS.
-      const result = clean(markup);
-      expect(result.isValid).toBe(true);
-      expect(result.cleanedSvg).not.toInclude('evil.example');
-    }
-  );
+/**
+ * The forms that MUST survive. Without these the entry above is satisfiable by
+ * a sanitiser that strips every reference, which would silently blank every
+ * gradient, mask, clip-path and sprite the application stores.
+ */
+const LOCAL_REFERENCES: ReadonlyArray<readonly [string, string]> = [
+  [
+    'a same-document use reference',
+    svg('<defs><symbol id="a"><circle r="4"/></symbol></defs><use href="#a"/>'),
+  ],
+  [
+    'a self-contained data: image',
+    svg(
+      '<image width="8" height="8" href="data:image/png;base64,iVBORw0KGgo="/>'
+    ),
+  ],
+  [
+    'a fill referencing a local gradient',
+    svg(
+      '<defs><linearGradient id="g"><stop offset="0" stop-color="#f00"/></linearGradient></defs><rect width="8" height="8" fill="url(#g)"/>'
+    ),
+  ],
+  [
+    'a local clip-path reference',
+    svg(
+      '<defs><clipPath id="c"><circle r="5"/></clipPath></defs><rect width="8" height="8" clip-path="url(#c)"/>'
+    ),
+  ],
+];
 
-  test.failing(
-    'DEFECT (audit §13): content outside the svg root is refused',
-    () => {
-      // The app sweeps an XML tree where `<p>` is a child of `<svg>`; DOMPurify
-      // re-parses the serialisation as HTML, where `p` terminates foreign content,
-      // so the node lands AFTER `</svg>`. The only validity gate is
-      // `sanitized.includes('<svg')`, which cannot see that.
-      //
-      // Measured: 55 bytes in -> `isValid: true`, `cleanedSvg` ==
-      // `<svg xmlns="…"></svg>hi`. Downstream, svgo throws `SvgoParserError:
-      // Text data outside of root node`, which is not a `CustomError`, so an
-      // ordinary request becomes a 500. Nothing executes — this is a deterministic
-      // 500 generator and a corruption path, not XSS.
-      const result = clean(`<svg xmlns="${SVG_NS}"><p>hi</p></svg>`);
+describe('external references in SVG', () => {
+  test.each([...EXTERNAL_REFERENCES])('%s is stripped', (_name, markup) => {
+    // The invariant `DANGEROUS_CSS_PATTERNS` states by existing: external CSS is
+    // refused. Each of these is otherwise stored verbatim on the public bucket
+    // as `image/svg+xml` + `inline`, so it renders as a DOCUMENT and the
+    // reference is fetched at VIEW time — a beacon for every future viewer's IP,
+    // UA and Referer, changeable remotely after review.
+    //
+    // No script execution in any of them; this is the tracking and
+    // remote-mutation half of the surface, not XSS.
+    const result = clean(markup);
+    expect(result.isValid).toBe(true);
+    expect(result.cleanedSvg).not.toInclude('evil.example');
+  });
 
-      expect(result.isValid).toBe(false);
-    }
-  );
+  test.each([...LOCAL_REFERENCES])('%s survives', (_name, markup) => {
+    const result = clean(markup);
+    expect(result.isValid).toBe(true);
+    expect(result.cleanedSvg).toInclude('<svg');
+  });
+
+  test('CSS is removed even when it contains only local references', () => {
+    const result = clean(
+      svg(
+        '<style>.a{fill:url(#g)}</style><rect class="a" style="fill:url(#g)"/>'
+      )
+    );
+    expect(result.isValid).toBe(true);
+    expect(result.cleanedSvg).not.toMatch(/<style\b|\sstyle=/i);
+  });
+
+  test('content outside the svg root is refused', () => {
+    // The app sweeps an XML tree where `<p>` is a child of `<svg>`; DOMPurify
+    // re-parses the serialisation as HTML, where `p` terminates foreign content,
+    // so the node lands AFTER `</svg>`. `sanitized.includes('<svg')` could not
+    // see that: 55 bytes in produced `isValid: true` and
+    // `<svg xmlns="…"></svg>hi`, which made svgo throw `SvgoParserError` and the
+    // request a 500. The gate is structural now — one SVG root, no siblings.
+    const result = clean(`<svg xmlns="${SVG_NS}"><p>hi</p></svg>`);
+
+    expect(result.isValid).toBe(false);
+  });
 
   test('whatever §13 produces, a malformed document is never STORED', () => {
     // The half of §13 that holds today and must keep holding after a fix: the
@@ -626,23 +693,30 @@ function pngChunk(type: string, data: Buffer): Buffer {
   return Buffer.concat([header, data, crc]);
 }
 
-/** A real 8x8 RGBA PNG: signature, IHDR, one IDAT, IEND. */
-function buildPng(size: number): Buffer {
+/**
+ * A real RGBA PNG: signature, IHDR, one IDAT, IEND.
+ *
+ * `flat` fills every pixel identically. The gradient below is the useful default
+ * for format checks, but it defeats zlib: a 1000x20000 gradient is 13 MiB, and
+ * the dimension fixture has to stay UNDER the 1 MiB file limit to prove that
+ * limit does not already catch it.
+ */
+function buildPng(size: number, height = size, flat = false): Buffer {
   const ihdr = Buffer.alloc(13);
   ihdr.writeUInt32BE(size, 0);
-  ihdr.writeUInt32BE(size, 4);
+  ihdr.writeUInt32BE(height, 4);
   ihdr[8] = 8; // bit depth
   ihdr[9] = 6; // colour type 6: truecolour with alpha
 
   const stride = 1 + size * 4; // one filter byte per row
-  const raw = Buffer.alloc(size * stride);
-  for (let y = 0; y < size; y++) {
+  const raw = Buffer.alloc(height * stride);
+  for (let y = 0; y < height; y++) {
     const row = y * stride;
     raw[row] = 0; // filter: none
     for (let x = 0; x < size; x++) {
       const pixel = row + 1 + x * 4;
-      raw[pixel] = (x * 37) & 0xff;
-      raw[pixel + 1] = (y * 53) & 0xff;
+      raw[pixel] = flat ? 0x40 : (x * 37) & 0xff;
+      raw[pixel + 1] = flat ? 0x40 : (y * 53) & 0xff;
       raw[pixel + 2] = 0x40;
       raw[pixel + 3] = 0xff;
     }
@@ -827,6 +901,69 @@ describe('validateMagicBytes fixtures are real images', () => {
     expect(await new Bun.Image(stillWebp).webp().bytes()).toBeInstanceOf(
       Uint8Array
     );
+  });
+});
+
+describe('H4 - one side over what WebP can hold', () => {
+  // 20 MP, so `MAX_IMAGE_PIXELS` (25 MP) admits it, and ~100 KiB, so the 1 MiB
+  // per-file limit admits it too. WebP's ceiling is 16 383 per side, and the
+  // encoder's `ERR_IMAGE_ENCODE_FAILED` reached the caller as a 500 — a server
+  // fault reported for input the server simply cannot accept.
+  const tall = buildPng(1000, 20_000, true);
+
+  test('the fixture really is inside every other limit', async () => {
+    expect(tall.length).toBeLessThan(1024 * 1024);
+    expect(1000 * 20_000).toBeLessThan(MAX_IMAGE_PIXELS);
+    expect(await new Bun.Image(tall).metadata()).toMatchObject({
+      width: 1000,
+      height: 20_000,
+    });
+  });
+
+  test('optimizeImage refuses it as 422, from the header', async () => {
+    await expect(optimizeImage(tall)).rejects.toMatchObject({
+      status: HTTP_STATUS.UNPROCESSABLE,
+      message: uploadMsg.edgeTooLong(MAX_IMAGE_EDGE),
+    });
+  });
+
+  test('a square inside the edge limit still optimises', async () => {
+    const out = await optimizeImage(buildPng(64));
+    expect(out.format).toBe('webp');
+    expect(out.width).toBe(64);
+  });
+
+  test('an unattainable byte target is refused instead of returning oversized output', async () => {
+    await expect(
+      optimizeImage(buildPng(64), { targetSize: 1 })
+    ).rejects.toMatchObject({
+      status: HTTP_STATUS.UNPROCESSABLE,
+      message: uploadMsg.targetUnreachable,
+    });
+  });
+
+  test('initialWidth is a longest-edge ceiling for portrait output', async () => {
+    const out = await optimizeImage(buildPng(100, 300, true), {
+      initialWidth: 80,
+      minWidth: 20,
+      targetSize: 1024 * 1024,
+    });
+    expect(Math.max(out.width, out.height)).toBeLessThanOrEqual(80);
+  });
+
+  test('encoder admission bounds concurrent work and its queue', async () => {
+    const input = buildPng(256, 256, true);
+    const settled = await Promise.allSettled(
+      Array.from({ length: 6 }, () => optimizeImage(input))
+    );
+    const rejected = settled.filter((result) => result.status === 'rejected');
+    expect(rejected).toHaveLength(1);
+    expect(rejected[0]).toMatchObject({
+      reason: {
+        status: HTTP_STATUS.SERVICE_UNAVAILABLE,
+        message: uploadMsg.processingBusy,
+      },
+    });
   });
 });
 

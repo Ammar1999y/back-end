@@ -3,6 +3,8 @@
  * Zod schemas used by handlers. Route-attached Elysia schemas would duplicate
  * validation, while Better Auth's document would advertise blocked routes.
  */
+import { existsSync, readFileSync } from 'node:fs';
+import path from 'node:path';
 import type { Handler } from './contract';
 import type { RouteManifestEntry } from './route-manifest';
 
@@ -35,6 +37,9 @@ import {
   adminUpdatePermissionSchema,
   createPermissionSchema,
 } from '@/utils/validation/permissions';
+
+import { isUndocumentedPath } from './route-manifest';
+import { requireDashboardAccess } from './session';
 
 type JsonSchema = Record<string, unknown>;
 
@@ -366,12 +371,17 @@ function openApiConsistencyProblems(
       );
   }
 
-  // Catch schemas left behind after a route is renamed or removed.
+  // Catch schemas left behind after a route is renamed or removed. Keys for
+  // routes the production filter withholds are not leftovers — the route still
+  // exists, it is only unpublished — so they are exempt rather than reported.
+  const isLeftover = (key: string): boolean =>
+    !keys.has(key) && !isUndocumentedPath(key.slice(key.indexOf(' ') + 1));
+
   for (const key of Object.keys(REQUEST_BODIES))
-    if (!keys.has(key))
+    if (isLeftover(key))
       problems.push(`REQUEST_BODIES has '${key}', which is not a route`);
   for (const key of CREATED_ROUTES)
-    if (!keys.has(key))
+    if (isLeftover(key))
       problems.push(`CREATED_ROUTES has '${key}', which is not a route`);
   for (const key of Object.keys(BETTER_AUTH_BODIES))
     if (!BETTER_AUTH_ALLOWED_PATH_SET.has(key))
@@ -389,10 +399,14 @@ function openApiConsistencyProblems(
  * THROWS on an inconsistent document rather than serving one. A contract that is
  * confidently wrong is worse than one that is unavailable: a generator consumes
  * it without complaint and every client built from it is wrong in the same way.
- * The CI boot smoke test fetches this route and asserts 200, so the failure lands
- * before a deploy rather than in a client.
+ *
+ * Exported for `tests/unit/openapi-contract.test.ts`, which is the gate that
+ * catches it. That used to be the boot smoke test asserting 200 on the route —
+ * which stopped working when the route became authenticated, and was the weaker
+ * gate anyway: it needed a running server and a deploy to fail, where the unit
+ * test fails on `bun run test`.
  */
-function openApiDocument(
+export function openApiDocument(
   manifest: readonly RouteManifestEntry[] = []
 ): JsonSchema {
   const problems = openApiConsistencyProblems(manifest);
@@ -496,12 +510,95 @@ function openApiDocument(
 }
 
 /**
+ * Where `scripts/build-openapi.ts` writes the document, relative to the repo
+ * root. Under `build/`, which is git-ignored and served by nothing: this
+ * document is a map of the whole reachable surface, so it must stay behind the
+ * same authorisation the routes themselves are behind.
+ */
+export const OPENAPI_ARTIFACT_PATH = 'build/openapi.json';
+
+/**
+ * Wraps a manifest getter in a build-once cache.
+ *
+ * Exported separately from the handler because the handler runs the ACCESS
+ * check first — correctly, since a refused caller must not pay for a build —
+ * which makes the memoisation unobservable through the handler without a
+ * session. This is the piece worth asserting, so it is the piece that is
+ * addressable.
+ *
+ * `getManifest` stays lazy: `routes.ts` calls the handler factory while it is
+ * still building `ROUTES`, so the array does not exist yet at that point.
+ */
+export function memoiseOpenApiDocument(
+  getManifest: () => readonly RouteManifestEntry[]
+): () => JsonSchema {
+  let built: { document: JsonSchema } | { error: unknown } | null = null;
+
+  return () => {
+    built ??= (() => {
+      try {
+        return { document: openApiDocument(getManifest()) };
+      } catch (error) {
+        return { error };
+      }
+    })();
+
+    if ('error' in built) throw built.error;
+    return built.document;
+  };
+}
+
+/**
+ * The build artefact, or `null` when there is none.
+ *
+ * Absent is normal in development and under test, where regenerating from the
+ * live route table is what makes an edit visible without a build step. In a
+ * deployment the artefact is present, so the generator never runs on a request
+ * and a route/schema inconsistency has already failed `bun run build`.
+ */
+function prebuiltDocument(): JsonSchema | null {
+  const file = path.resolve(import.meta.dir, '..', '..', OPENAPI_ARTIFACT_PATH);
+  // eslint-disable-next-line security/detect-non-literal-fs-filename -- resolved from this module's own location, never from input
+  if (!existsSync(file)) return null;
+
+  // eslint-disable-next-line security/detect-non-literal-fs-filename -- same
+  const parsed: unknown = JSON.parse(readFileSync(file, 'utf8'));
+  if (!isJsonSchema(parsed))
+    throw new Error(`${OPENAPI_ARTIFACT_PATH} is not a JSON object.`);
+  return parsed;
+}
+
+export function resolveOpenApiDocument(
+  prebuilt: JsonSchema | null,
+  generate: () => JsonSchema,
+  production = process.env.NODE_ENV === 'production'
+): JsonSchema {
+  if (prebuilt) return prebuilt;
+  if (production)
+    throw new Error(`${OPENAPI_ARTIFACT_PATH} is required in production.`);
+  return generate();
+}
+
+/**
  * The route that serves the document.
  *
  * Takes a getter rather than the manifest itself, so this module imports nothing
  * from `routes.ts` and the route table can pass its own manifest without a
- * cycle. Evaluated per request, which also means a schema-conversion failure
- * cannot prevent the server from booting.
+ * cycle. `ROUTES` is still being built when this is called, so the getter is
+ * invoked on FIRST REQUEST, not here.
+ *
+ * **Built exactly once and then frozen.** It used to be rebuilt per request:
+ * `z.toJSONSchema` over ~20 schemas plus a `safeParse(undefined)` per object
+ * field, measured at **9.11 ms/req against 0.095 ms for a 404** — a 96× cost
+ * ratio, ~110 req/s per core, on a route with no admission gate. Bun runs one
+ * JS thread per process and this deployment runs one process, so that was the
+ * whole server. `lib/http/response.ts` also stamps `cache-control: no-store`, so
+ * neither a browser nor Cloudflare absorbed any of it.
+ *
+ * The manifest is static for the life of the process, so nothing about the
+ * document can change after the first build. A conversion failure is cached too,
+ * and rethrown on every subsequent request: retrying it per request would only
+ * restore the amplification for a document that cannot start working.
  *
  * `apiRaw`, not the envelope: an OpenAPI document has a shape fixed by the spec,
  * and a client reading it expects that shape at the top level.
@@ -509,6 +606,25 @@ function openApiDocument(
 export function openApiRouteHandler(
   getManifest: () => readonly RouteManifestEntry[]
 ): Handler {
-  return () =>
-    Promise.resolve(apiRaw({ body: openApiDocument(getManifest()) }));
+  const generate = memoiseOpenApiDocument(getManifest);
+  // Not `??=` on the document itself: "no artefact" is a legitimate resolution,
+  // and a nullish assignment would re-stat the filesystem on every request.
+  let resolved: { document: JsonSchema } | null = null;
+
+  return async (ctx) => {
+    // The document names every path, method, status code and query parameter
+    // this server serves. That is a map of the whole attack surface, so it is
+    // for people who already hold dashboard access — not for anyone who can
+    // reach the origin. `requireDashboardAccess` is the same live-session and
+    // role check every dashboard read performs.
+    //
+    // BEFORE the document is resolved, so a refused caller pays for a session
+    // lookup and nothing else.
+    await requireDashboardAccess(ctx);
+
+    resolved ??= {
+      document: resolveOpenApiDocument(prebuiltDocument(), generate),
+    };
+    return apiRaw({ body: resolved.document });
+  };
 }

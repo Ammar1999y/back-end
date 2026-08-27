@@ -17,6 +17,8 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       # No bun-version: the action reads package.json's `packageManager` field,
       # so the version lives in exactly one place and Renovate bumps it there.
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
@@ -25,6 +27,19 @@ jobs:
         run: bun run lint
       - name: Format check
         run: bun run format:check
+      - name: Build
+        # Generates the OpenAPI artefact from the production-filtered route
+        # table. It is here rather than only in the deploy because a route table
+        # inconsistent with its request schemas throws only under that filter —
+        # which made the endpoint 500 in production while every development
+        # check passed.
+        env:
+          DATABASE_URL: postgres://ci:ci@db.example.com/ci?sslmode=require
+          PASSWORD_PEPPER_ACTIVE_ID: ci
+          PASSWORD_PEPPER_KEYRING: '{"ci":{"generation":1,"secret":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}}'
+          OTP_HMAC_ACTIVE_ID: ci
+          OTP_HMAC_KEYRING: '{"ci":{"generation":1,"secret":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}}'
+        run: bun run build
       - name: Unit tests
         # The cheap tier: no database, no port. `bun run test` is
         # `bun tests/helpers/run.ts unit`, which runs `bun test --isolate
@@ -41,9 +56,10 @@ jobs:
         # This scanner checks handler registration; Knip below covers files under
         # `tests/`, which this import graph treats as entry points.
         run: bun scripts/find-unused-files.ts
-      - name: Unused files, including under tests/
-        # Scope Knip to the unused-file gap without gating on its export report.
-        run: bunx knip --include files
+      - name: Unused files, exports and types
+        run: bun run find:unused-files
+      - name: Duplicate dependency versions
+        run: bun dedupe --check
       - name: Boot smoke test
         # Replaces `next build`. A Bun server has no build artefact, so this is
         # what forces the module graph to evaluate — lib/env.server.ts throws at
@@ -78,6 +94,12 @@ jobs:
           SQLITE_DIR: /tmp/ci-sqlite
           PASSWORD_PEPPER_ACTIVE_ID: ci
           PASSWORD_PEPPER_KEYRING: '{"ci":{"generation":1,"secret":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}}'
+          # Required unconditionally by lib/env.server.ts, like the pepper.
+          # Their absence here aborted the boot before any HTTP check ran, and
+          # the step's real failure was invisible on a developer machine because
+          # `.env` supplied them there.
+          OTP_HMAC_ACTIVE_ID: ci
+          OTP_HMAC_KEYRING: '{"ci":{"generation":1,"secret":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}}'
         run: bun run smoke
 
   # The database-backed tiers. Their own job because they need a PostgreSQL
@@ -129,13 +151,15 @@ jobs:
       TURNSTILE_SECRET_KEY: 1x0000000000000000000000000000000AA
       BETTER_AUTH_SECRET: ci-placeholder-better-auth-secret-000000
       SQLITE_DIR: /tmp/ci-sqlite
-      SQLITE_MAINTENANCE_TOKEN: ci-maintenance-token
+      SQLITE_MAINTENANCE_TOKEN: ci-maintenance-token-0123456789012
       PASSWORD_PEPPER_ACTIVE_ID: ci
       PASSWORD_PEPPER_KEYRING: '{"ci":{"generation":1,"secret":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}}'
       OTP_HMAC_ACTIVE_ID: ci
       OTP_HMAC_KEYRING: '{"ci":{"generation":1,"secret":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}}'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
       # Its own step, deliberately. `package.json` was once edited without
       # regenerating `bun.lock`, so every CI install would have failed while
@@ -149,6 +173,14 @@ jobs:
           bun run test:integration --
           --reporter=junit --reporter-outfile=reports/junit-integration.xml
           --coverage --coverage-reporter=text
+      - name: Publish integration test report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: junit-integration
+          path: reports/junit-integration.xml
+          if-no-files-found: warn
+          retention-days: 14
       - name: Process tests
         # Its own step for the same reason `bun run smoke` is separate: every
         # test here owns a real socket, a real child process or a real signal.
@@ -159,6 +191,8 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: jdx/mise-action@3c2e0cf82a5b2e5249f0d3635a4d83d0ae861518 # v4.2.5
       - name: Lint workflows
         run: actionlint
@@ -167,6 +201,8 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
       - run: bun install --frozen-lockfile
       - name: Dependency audit

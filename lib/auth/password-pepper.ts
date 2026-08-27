@@ -8,11 +8,16 @@
  * generations and the key-count ceiling are stated once, there.
  *
  * **Retirement rule.** Removing a generation from the keyring makes every hash
- * still carrying its id unverifiable — `byId` throws a configuration error,
- * which surfaces as a 500, not a failed login. For passwords that means: keep a
- * generation until every stored hash has been rehashed under a newer one
- * (`verifyPasswordDetailed` reports `needsRehash` for exactly this). The OTP
- * keyring has the same rule with a much shorter horizon; see `./otp-key.ts`.
+ * still carrying its id unverifiable. `byId` throws a configuration error, and
+ * `verifyPasswordDetailed` converts it to an ordinary failed login — so the
+ * symptom is not a 500 an operator would notice but working passwords being
+ * refused, reported only as `auth.password.hash unevaluatable` in the log.
+ * Nothing detects it earlier: which generations are still in USE is a property
+ * of the stored rows, not of the keyring document, so startup validation cannot
+ * see it. Keep a generation until every stored hash has been rehashed under a
+ * newer one (`verifyPasswordDetailed` reports `needsRehash` for exactly this).
+ * The OTP keyring has the same rule with a much shorter horizon; see
+ * `./otp-key.ts`.
  */
 import { defineKeyring } from './keyring';
 

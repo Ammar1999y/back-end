@@ -21,7 +21,7 @@ import {
   schemaTableNames,
 } from '../helpers/database';
 import { egressCalls, egressCallsTo, scriptEgress } from '../helpers/egress';
-import { failNextMail, sentMail } from '../helpers/mailbox';
+import { failNextMail, sentMail, settleDelivery } from '../helpers/mailbox';
 import { HARNESS_PREFIX, HARNESS_SUFFIX } from '../helpers/names';
 import { failObjectStore, storeOps, storeOpsOf } from '../helpers/object-store';
 import {
@@ -256,6 +256,7 @@ describe('boundary overrides and their reset', () => {
     await expect(
       nodemailer.createTransport().sendMail({ to: 'someone@gmail.com' })
     ).rejects.toThrow('550 mailbox unavailable');
+    await settleDelivery();
     expect(sentMail()).toEqual([]);
   });
 });
@@ -346,6 +347,7 @@ describe('SMTP boundary', () => {
     });
 
     const { sentMail } = await import('../helpers/mailbox');
+    await settleDelivery();
     expect(sentMail().map((mail) => mail.to)).toEqual(['someone@gmail.com']);
   });
 });

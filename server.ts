@@ -17,6 +17,7 @@ import { version as bunVersion } from 'bun';
 import { Database } from 'bun:sqlite';
 
 import packageManifest from './package.json';
+import { errorClassOf } from './utils';
 
 /**
  * The three modes this application recognises.
@@ -209,6 +210,12 @@ const { drainAfterResponse, pendingAfterResponse } =
 const { closeRateLimitStore } = await import('./lib/rate-limit/store');
 const { closeCacheStore } = await import('./lib/cache');
 const { closeDatabase } = await import('./db');
+const { startSchedule } = await import('./lib/schedule');
+const { acquireWriterLock } = await import('./lib/sqlite/writer-lock');
+const { SQLITE_DIR } = await import('./lib/env.server');
+
+// Fail startup before synchronous SQLite contention can stall request handling.
+const writerLock = acquireWriterLock(SQLITE_DIR);
 
 /** Keeps the global request ceiling explicit for route and shutdown coordination. */
 const IDLE_TIMEOUT_SECONDS = 60;
@@ -221,6 +228,35 @@ const SHUTDOWN_TIMEOUT_MS =
   (Math.max(IDLE_TIMEOUT_SECONDS, MAX_ROUTE_TIMEOUT_SECONDS) + 15) * 1000;
 
 const AFTER_RESPONSE_DRAIN_MS = 10_000;
+
+// Half-sent requests can hold graceful stop open, so force-close after this grace.
+const GRACEFUL_STOP_MS = 5000;
+
+/**
+ * How long a running sweep gets to finish before shutdown proceeds without it.
+ *
+ * Sized against the batch loop, not the whole sweep: it yields between batches,
+ * so it reaches a safe stopping point quickly even mid-backlog. Comfortably
+ * inside `SHUTDOWN_TIMEOUT_MS`, so this cannot be what trips the forced exit.
+ */
+const SWEEP_DRAIN_MS =
+  SHUTDOWN_TIMEOUT_MS - GRACEFUL_STOP_MS - AFTER_RESPONSE_DRAIN_MS - 5000;
+
+async function stopServer(): Promise<void> {
+  const graceful = app.stop();
+  const timedOut = Symbol('graceful-stop-timeout');
+  const timer = Bun.sleep(GRACEFUL_STOP_MS).then(() => timedOut);
+
+  if ((await Promise.race([graceful, timer])) !== timedOut) return;
+
+  console.error(
+    JSON.stringify({
+      msg: 'graceful stop timed out, closing active connections',
+      graceMs: GRACEFUL_STOP_MS,
+    })
+  );
+  await app.stop(true);
+}
 
 app.listen({ port, idleTimeout: IDLE_TIMEOUT_SECONDS }, (server) => {
   console.log(
@@ -240,16 +276,18 @@ app.listen({ port, idleTimeout: IDLE_TIMEOUT_SECONDS }, (server) => {
   );
 });
 
+const schedule = startSchedule();
+
 const shutdownState = { started: false };
 
-/** Drains in-flight requests on container signals before closing their stores. */
-async function shutdown(signal: string): Promise<void> {
+/** Drains requests and stores; escaped faults retain a nonzero exit code. */
+async function shutdown(signal: string, exitCode = 0): Promise<void> {
   if (shutdownState.started) return;
   shutdownState.started = true;
 
   console.log(JSON.stringify({ msg: 'server stopping', signal }));
 
-  // Keep this timer referenced so a hung drain cannot appear successful.
+  // One deadline covers request, background-job, post-response, and store drain.
   const forced = setTimeout(() => {
     console.error(
       JSON.stringify({
@@ -262,7 +300,9 @@ async function shutdown(signal: string): Promise<void> {
   }, SHUTDOWN_TIMEOUT_MS);
 
   try {
-    await app.stop();
+    await stopServer();
+    const sweepDrained = await schedule.stopAndDrain(SWEEP_DRAIN_MS);
+    if (!sweepDrained) return;
     const drained = await drainAfterResponse(AFTER_RESPONSE_DRAIN_MS);
     // Post-response loss is logged but does not turn a completed drain into a
     // failed deployment.
@@ -277,19 +317,27 @@ async function shutdown(signal: string): Promise<void> {
     console.error(
       JSON.stringify({
         msg: 'shutdown error',
-        errorClass: (error as { name?: string })?.name ?? 'Unknown',
+        errorClass: errorClassOf(error),
       })
     );
   } finally {
-    // PostgreSQL may still wait for in-flight queries, so close it first.
-    await closeStore('postgres', closeDatabase);
-    await closeStore('rate-limit', closeRateLimitStore);
-    await closeStore('cache', closeCacheStore);
+    await closeStores();
   }
 
   clearTimeout(forced);
-  console.log(JSON.stringify({ msg: 'server stopped', signal }));
-  process.exit(0);
+  console.log(JSON.stringify({ msg: 'server stopped', signal, exitCode }));
+  process.exit(exitCode);
+}
+
+const closeState = { done: false };
+async function closeStores(): Promise<void> {
+  if (closeState.done) return;
+  closeState.done = true;
+  await closeStore('postgres', closeDatabase);
+  await closeStore('rate-limit', closeRateLimitStore);
+  await closeStore('cache', closeCacheStore);
+  // Keep ownership until every protected store has closed.
+  await closeStore('writer-lock', writerLock.release);
 }
 
 async function closeStore(
@@ -303,7 +351,7 @@ async function closeStore(
       JSON.stringify({
         msg: 'store close failed',
         store: name,
-        errorClass: (error as { name?: string })?.name ?? 'Unknown',
+        errorClass: errorClassOf(error),
       })
     );
   }
@@ -312,4 +360,17 @@ async function closeStore(
 for (const signal of ['SIGTERM', 'SIGINT'] as const)
   process.on(signal, () => {
     void shutdown(signal);
+  });
+
+// Both sync and async escaped faults must use the store-draining shutdown path.
+for (const event of ['unhandledRejection', 'uncaughtException'] as const)
+  process.on(event, (error: unknown) => {
+    console.error(
+      JSON.stringify({
+        msg: 'unhandled fault',
+        event,
+        errorClass: errorClassOf(error),
+      })
+    );
+    void shutdown(event, 1);
   });

@@ -1,5 +1,6 @@
+import { createHash } from 'node:crypto';
+
 import { sanitizeForLog } from '@/utils';
-import { createHash } from '@better-auth/utils/hash';
 import { betterFetch } from '@better-fetch/fetch';
 
 import { HTTP_STATUS, MSG_PASSWORD_COMPROMISED } from '@/utils/api-messages';
@@ -12,15 +13,36 @@ const HIBP_RETRY_BASE_MS = 75;
 const HIBP_ATTEMPT_TIMEOUT_MS = 1000;
 
 /**
- * k-Anonymity check against the HaveIBeenPwned Passwords API.
- * Only the first 5 characters of the SHA-1 hash are sent to the API.
- * Throws CustomError (400) if the password appears in known breaches.
- * Retries transient failures, then fails open and logs so a HIBP outage
- * doesn't block users on an external dependency.
+ * k-Anonymity check against the HaveIBeenPwned Passwords API. Only the first 5
+ * characters of the SHA-1 hash are sent. Throws `CustomError` (400) if the
+ * password appears in known breaches.
+ *
+ * **THE ONLY implementation, and it FAILS OPEN. Both halves are decisions.**
+ *
+ * Only: `better-auth`'s `haveIBeenPwned` plugin used to be registered as well
+ * (`lib/auth.ts`). It could never fire — its default `paths` do not intersect
+ * this deployment's reachable Better Auth surface — so it was inert
+ * configuration duplicating this file's concept. It is gone; adding it back
+ * reintroduces two implementations of one thing that disagree on the case below.
+ *
+ * Fails open: after `HIBP_RETRIES + 1` bounded attempts, an unreachable HIBP
+ * logs `hibp.degraded` and the password is ACCEPTED. The plugin did the
+ * opposite — `throw new APIError('INTERNAL_SERVER_ERROR')` — and that is the
+ * behaviour deliberately not kept. A third party being down must not take this
+ * service's account creation, password reset and credential rotation down with
+ * it; a breached password that slips through during an outage is still subject
+ * to every other control (length floor, argon2id + pepper, lockout, per-IP
+ * limits), while a hard failure has no compensating control at all.
+ *
+ * The cost, stated rather than hidden: during an HIBP outage every
+ * password-setting path accepts a known-breached password, and the only record
+ * is the log line. Alert on `hibp.degraded`.
  */
 export async function checkPasswordCompromise(password: string): Promise<void> {
-  const digest = await createHash('SHA-1', 'hex').digest(password);
-  const sha1Hash = digest.toUpperCase();
+  const sha1Hash = createHash('sha1')
+    .update(password, 'utf8')
+    .digest('hex')
+    .toUpperCase();
   const prefix = sha1Hash.slice(0, 5);
   const suffix = sha1Hash.slice(5);
 

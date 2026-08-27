@@ -65,10 +65,24 @@ export async function actorCoversTargetRole(
 ): Promise<boolean> {
   if (!actorPermissions) return true;
   try {
-    await validateRolePermissionScope(actorPermissions, roleId, executor);
+    await validateRolePermissionScope(
+      actorPermissions,
+      roleId,
+      executor,
+      'reachability'
+    );
     return true;
   } catch (error) {
-    if (error instanceof CustomError && error.status === HTTP_STATUS.FORBIDDEN)
+    // BOTH refusal shapes. `validateRolePermissionScope` answers 404 under
+    // `'reachability'` and 403 under `'grant'`; this predicate exists to turn
+    // either into `false`, and catching only 403 made the 404 escape a
+    // documented non-throwing contract — turning a dashboard GET that should
+    // return 200 with session metadata omitted into a whole-request 404.
+    if (
+      error instanceof CustomError &&
+      (error.status === HTTP_STATUS.FORBIDDEN ||
+        error.status === HTTP_STATUS.NOT_FOUND)
+    )
       return false;
     throw error;
   }

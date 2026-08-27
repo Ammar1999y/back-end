@@ -69,6 +69,8 @@ interface Fixture {
    */
   rowOfOwnActor: SeededUser;
   rowOfAdmin: SeededUser;
+
+  usersEditAll: SignedInSession;
 }
 
 const state: { fixture: Fixture | null } = { fixture: null };
@@ -100,8 +102,13 @@ beforeAll(async () => {
     permissions: { permissions: { create: true, viewOwn: true } },
   });
 
+  const usersEditAll = await signedInUser({
+    permissions: { users: { view: true, edit: true, delete: true } },
+  });
+
   state.fixture = {
     admin,
+    usersEditAll,
     usersViewAll,
     usersOwn,
     permsViewAll,
@@ -115,7 +122,7 @@ beforeAll(async () => {
       createdBy: admin.user.userId,
     }),
   };
-});
+}, 30_000);
 
 /** The not-found envelope, which is what a scoped refusal has to be. */
 const NOT_FOUND_BODY = {
@@ -245,6 +252,78 @@ describe('`own` scope on GET /api/dash/users/:id', () => {
 
     expect(response.status).toBe(HTTP_STATUS.OK);
     expect(body.data?.id).toBe(fx().rowOfOwnActor.userId);
+  });
+});
+
+describe('a target whose role outranks the caller', () => {
+  /**
+   * The privilege-ranking oracle, from the caller who can actually mount it: an
+   * actor with `users.view` + `users.edit` and NO `permissions.view`.
+   *
+   * They can list users (which per `should-ignore.md` #39 shows every non-system
+   * user) and send a minimal valid `PUT` at each id. While
+   * `validateRolePermissionScope` answered 403 for a target whose role held a
+   * permission the actor did not, the two replies were distinguishable: 404
+   * meant nonexistent / system-role / not-mine, 403 meant "this account exists
+   * and outranks me". That reconstructs the relative privilege ranking of every
+   * account without ever granting `permissions.view` — the grant that is
+   * supposed to gate exactly that knowledge.
+   */
+  /**
+   * A body that PASSES validation, so the reply comes from the authorization
+   * gate rather than from the schema. Both arms send the identical body, and
+   * the actor's own `roleId` is used because it is the one role they are
+   * certain to be allowed to confer.
+   */
+  function editAttempt(
+    actor: SignedInSession,
+    targetId: string,
+    email: string
+  ): Promise<Response> {
+    return app.handle(
+      authedRequest(actor, `/api/dash/users/${targetId}`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          name: 'Renamed By Probe',
+          email,
+          isActive: true,
+          roleId: actor.user.roleId,
+        }),
+      })
+    );
+  }
+
+  test('is refused identically to one that does not exist', async () => {
+    // `admin` holds every action on every page, so its role outranks an actor
+    // that holds only `users`.
+    const outranking = await editAttempt(
+      fx().usersEditAll,
+      fx().admin.user.userId,
+      'probe-outranking@gmail.com'
+    );
+    const nonexistent = await editAttempt(
+      fx().usersEditAll,
+      generateUuidV7(),
+      'probe-nonexistent@gmail.com'
+    );
+
+    expect(outranking.status).toBe(nonexistent.status);
+    expect(outranking.status).toBe(HTTP_STATUS.NOT_FOUND);
+    expect(await outranking.json()).toEqual(await nonexistent.json());
+  });
+
+  test('DELETE answers the same way', async () => {
+    const outranking = await app.handle(
+      authedRequest(
+        fx().usersEditAll,
+        `/api/dash/users/${fx().admin.user.userId}`,
+        { method: 'DELETE' }
+      )
+    );
+
+    expect(outranking.status).toBe(HTTP_STATUS.NOT_FOUND);
+    expect(await outranking.json()).toEqual(NOT_FOUND_BODY);
   });
 });
 
@@ -590,6 +669,14 @@ describe('an audit row written by an actual route mutation', () => {
 
 describe('the maintenance token — the accept path, and the compare that guards it', () => {
   /**
+   * Driven through `GET /api/health/storage?deep=1`, which is now the ONLY
+   * surface the token guards. The two `/api/internal/*` sweep routes it used to
+   * gate are gone — the sweeps run in-process (`lib/schedule.ts`), which is what
+   * removed them from the unauthenticated route table entirely.
+   *
+   * The compare itself is unchanged and shared, so this still covers it: the
+   * route calls the same `maintenanceTokenMatches`.
+   *
    * Imported from `lib/env.server`, never restated. The value is read at module
    * load, so a test file that sets `process.env.SQLITE_MAINTENANCE_TOKEN`
    * changes nothing — `tests/helpers/preload-base.ts` is what makes an
@@ -606,13 +693,9 @@ describe('the maintenance token — the accept path, and the compare that guards
   const wrongInLastByte = `${configured.slice(0, -1)}${configured.endsWith('z') ? 'y' : 'z'}`;
   const wrongInFirstByte = `${configured.startsWith('z') ? 'y' : 'z'}${configured.slice(1)}`;
 
-  function sweep(
-    token: string | null,
-    path = '/api/internal/sqlite-sweep'
-  ): Promise<Response> {
+  function deepProbe(token: string | null): Promise<Response> {
     return app.handle(
-      new Request(`http://localhost${path}`, {
-        method: 'POST',
+      new Request('http://localhost/api/health/storage?deep=1', {
         headers: baseHeaders(
           token === null ? {} : { 'x-maintenance-token': token }
         ),
@@ -627,11 +710,10 @@ describe('the maintenance token — the accept path, and the compare that guards
   });
 
   test('both wrong tokens are the same LENGTH as the configured one, so the length guard cannot answer them', () => {
-    // The case `retention-sweep.test.ts` cannot make: its 13-character token
-    // against a 25-character secret is refused by `a.length === b.length` and
-    // `timingSafeEqual` never runs. Asserted rather than assumed, because a
-    // future change to the configured value would otherwise decay these back
-    // into the short-circuit silently.
+    // Asserted rather than assumed: `maintenanceTokenMatches` short-circuits on
+    // length before `timingSafeEqual` (it must — that function throws on a
+    // length mismatch), so a differently-sized probe never reaches the compare
+    // and these cases would decay into the short-circuit silently.
     for (const wrong of [wrongInFirstByte, wrongInLastByte]) {
       expect(wrong).toHaveLength(configured.length);
       expect(wrong).not.toBe(configured);
@@ -648,42 +730,45 @@ describe('the maintenance token — the accept path, and the compare that guards
   ];
 
   test.each([...refused])(
-    'POST /api/internal/sqlite-sweep refuses a token that is %s',
+    'the deep storage probe refuses a token that is %s',
     async (_label, token) => {
-      const response = await sweep(token);
+      const response = await deepProbe(token);
 
       expect(response.status).toBe(HTTP_STATUS.UNAUTHORIZED);
       // Exactly this, for every refusal: nothing about length, nothing about how
       // far the comparison got, and no `www-authenticate` to enumerate against.
-      expect(await response.json()).toEqual({ error: 'unauthorized' });
+      expect(await response.json()).toEqual({ status: 'unauthorized' });
       expect(response.headers.get('www-authenticate')).toBeNull();
     }
   );
 
-  test('POST /api/internal/sqlite-sweep accepts the configured token and runs the sweep', async () => {
-    const response = await sweep(configured);
+  test('the deep storage probe accepts the configured token and runs the deep checks', async () => {
+    const response = await deepProbe(configured);
     const body = (await response.json()) as {
       status?: string;
-      hasMore?: unknown;
-      removed?: unknown;
+      checks?: Record<string, unknown>;
     };
 
     expect(response.status).toBe(HTTP_STATUS.OK);
-    // The deployed scheduled task reads these at the top level, so the shape is
-    // the contract — a 200 with an envelope around it would break the task.
     expect(body.status).toBe('ok');
-    expect(typeof body.hasMore).toBe('boolean');
-    expect(body.removed).toBeObject();
+    // The two checks that ONLY the authorised branch adds. Their presence is
+    // what distinguishes "accepted" from "answered the cheap branch anyway".
+    expect(body.checks?.quickCheck).toBe(true);
+    expect(body.checks?.writable).toBe(true);
   });
 
-  test('POST /api/internal/db-sweep refuses the same-length wrong token identically', async () => {
-    // The sibling route shares one implementation, and a second copy of a
-    // constant-time compare is exactly the code that drifts. Only the refusal is
-    // asserted here: the accept path performs a database-wide retention sweep
-    // and belongs to `tests/integration/retention-sweep.test.ts`.
-    const response = await sweep(wrongInLastByte, '/api/internal/db-sweep');
+  test('the cheap probe needs no token and does not run the deep checks', async () => {
+    const response = await app.handle(
+      new Request('http://localhost/api/health/storage', {
+        headers: baseHeaders(),
+      })
+    );
+    const body = (await response.json()) as {
+      checks?: Record<string, unknown>;
+    };
 
-    expect(response.status).toBe(HTTP_STATUS.UNAUTHORIZED);
-    expect(await response.json()).toEqual({ error: 'unauthorized' });
+    expect(response.status).toBe(HTTP_STATUS.OK);
+    expect(body.checks).not.toHaveProperty('quickCheck');
+    expect(body.checks).not.toHaveProperty('writable');
   });
 });

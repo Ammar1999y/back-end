@@ -22,11 +22,7 @@ import { OTP_ENABLED, verifyOtpSchema } from '@/utils/validation/otp';
 
 import { API_PATH_MAX, auditLog, getClientIp, USER_AGENT_MAX } from '../audit';
 import { verifyTurnstileRequest } from '../captcha';
-import {
-  enforceOtpVerifyQuota,
-  enforceRateLimit,
-  ipIdentifier,
-} from '../rate-limit';
+import { enforceOtpVerifyQuota } from '../rate-limit';
 import { toAuthApiError } from './api-error';
 
 /**
@@ -72,15 +68,6 @@ export const passwordless = () =>
                 code: CUSTOM_AUTH_CODE,
               });
 
-            // Per-IP cap BEFORE captcha so the outbound siteverify call is bounded.
-            await enforceRateLimit({
-              scope: 'passwordless.verify.ip',
-              identifier: ipIdentifier(headers),
-              limit: 60,
-              window: 60,
-              failClosed: true,
-            });
-
             const captchaOk = await verifyTurnstileRequest(headers);
             if (!captchaOk)
               throw new APIError(HTTP_STATUS.FORBIDDEN, {
@@ -99,7 +86,11 @@ export const passwordless = () =>
             const identifier =
               channel === 'email' ? parsed.data.email : parsed.data.phoneNumber;
 
-            await enforceOtpVerifyQuota({ channel, identifier });
+            await enforceOtpVerifyQuota({
+              channel,
+              identifier,
+              surface: 'passwordless',
+            });
 
             accountRevealing = true;
             const [userData] = await db

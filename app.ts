@@ -13,12 +13,19 @@
  * under `app/api/**` and nothing in `routes.ts`.
  */
 import { ROUTE_PREFIXES, ROUTES } from '@/routes';
+import { errorClassOf } from '@/utils';
 import { cors } from '@elysia/cors';
 import { Elysia } from 'elysia';
 import { auth } from '@/lib/auth';
+import { BASE_ERROR_CODES } from '@/lib/auth/code-errors';
 import { PUBLIC_ORIGIN } from '@/lib/env';
 import { elysiaRouteConfig, toElysiaHandler } from '@/lib/http/adapters/elysia';
 import { runAfterResponse } from '@/lib/http/after-response';
+import {
+  enforcePreAuthIpLimit,
+  UNKNOWN_PREFIX_SCOPE,
+} from '@/lib/http/pre-auth';
+import { buildRequestMeta } from '@/lib/http/request';
 import { toWebResponse } from '@/lib/http/response';
 import { applyResponsePolicy } from '@/lib/http/response-policy';
 import {
@@ -29,12 +36,13 @@ import {
 import { applySecurityHeaders } from '@/lib/http/security-headers';
 
 import {
+  CUSTOM_AUTH_CODE,
   HTTP_STATUS,
   MSG_INTERNAL_ERROR,
   MSG_METHOD_NOT_ALLOWED,
   MSG_PAGE_NOT_FOUND,
 } from '@/utils/api-messages';
-import { apiError } from '@/utils/api-response';
+import { apiError, handleApiError } from '@/utils/api-response';
 
 /**
  * The generated route inventory. Exported because three consumers need it and
@@ -47,6 +55,37 @@ import { apiError } from '@/utils/api-response';
 export const ROUTE_MANIFEST = toManifest(ROUTES);
 
 const lookupMethods = createRouteLookup(ROUTES, ROUTE_PREFIXES);
+
+async function localiseAuthError(response: Response): Promise<Response> {
+  if (response.ok) return response;
+
+  const cloned = response.clone();
+  let body: unknown;
+  try {
+    body = await cloned.json();
+  } catch {
+    return response;
+  }
+
+  const code = (body as { code?: unknown } | null)?.code;
+  if (typeof code !== 'string' || !Object.hasOwn(BASE_ERROR_CODES, code))
+    return response;
+
+  const headers = new Headers(response.headers);
+  headers.set('content-type', 'application/json;charset=utf-8');
+  return Response.json(
+    { message: BASE_ERROR_CODES[code], code: CUSTOM_AUTH_CODE },
+    { status: response.status, statusText: response.statusText, headers }
+  );
+}
+
+export const AUTH_PATH_LIMITS: Readonly<Record<string, number>> = {
+  // Session reads need a separate budget from credential attempts for shared NATs.
+  '/get-session': 300,
+  '/sign-out': 30,
+  '/sign-in/email': 20,
+  '/passwordless/verify': 60,
+};
 
 /**
  * Request start times, for `Server-Timing` and the access log.
@@ -173,6 +212,9 @@ function canonicalRedirect(url: URL): Response | null {
   });
 }
 
+// Short Host values can make Elysia route against a suffix of the real path.
+const MIN_ROUTABLE_HOSTNAME_LENGTH = 4;
+
 /**
  * 404 or 405, decided from the manifest.
  *
@@ -215,6 +257,9 @@ const base = new Elysia({
   .onRequest(({ set, request }) => {
     startedAt.set(request, performance.now());
     applySecurityHeaders(set.headers);
+
+    if (new URL(request.url).hostname.length < MIN_ROUTABLE_HOSTNAME_LENGTH)
+      return finish(request, notFound());
 
     // Route-aware OPTIONS. The CORS plugin answers OPTIONS on ANY path with
     // 204 (it registers its own `OPTIONS /` and `OPTIONS /*` catch-alls —
@@ -302,7 +347,7 @@ const base = new Elysia({
       JSON.stringify({
         msg: 'unhandled server error',
         code,
-        errorClass: (error as { name?: string })?.name ?? 'Unknown',
+        errorClass: errorClassOf(error),
       })
     );
     return finish(
@@ -376,10 +421,26 @@ function register(instance: typeof base): typeof base {
       instance.route(
         method,
         `${prefix.prefix}/*`,
-        ({ request }: { request: Request }) => {
+        async ({ request }: { request: Request }) => {
           const url = new URL(request.url);
           const subPath = url.pathname.slice(prefix.prefix.length);
-          if (prefix.paths.includes(subPath)) return auth.handler(request);
+          try {
+            // Admission must precede Better Auth plugins that perform outbound work.
+            // The allowlist decides the SCOPE, not just the budget. An
+            // allowlisted path gets its own key and its own limit; everything
+            // else shares ONE fixed key, so rotating `/api/auth/<random>` can
+            // neither multiply the budget nor the `rate_limit` keyspace.
+            const known = prefix.paths.includes(subPath);
+            await enforcePreAuthIpLimit(buildRequestMeta(request), {
+              limit: known ? AUTH_PATH_LIMITS[subPath] : undefined,
+              scope: known ? undefined : UNKNOWN_PREFIX_SCOPE,
+            });
+          } catch (error) {
+            // This wildcard bypasses the adapter that normally preserves API errors.
+            return toWebResponse(handleApiError(error));
+          }
+          if (prefix.paths.includes(subPath))
+            return localiseAuthError(await auth.handler(request));
           // Unreachable auth paths now answer with this API's envelope like every
           // other unknown path, instead of Better Auth's own bodyless 404 — and
           // the trailing-slash form redirects, which the wildcard match had been
