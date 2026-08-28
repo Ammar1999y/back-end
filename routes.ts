@@ -37,7 +37,6 @@ import * as meChangeEmailVerify from '@/app/api/dash/users/me/change-email/verif
 import * as meChangePassword from '@/app/api/dash/users/me/change-password/handler';
 import * as meChangePhone from '@/app/api/dash/users/me/change-phone/handler';
 import * as meChangePhoneVerify from '@/app/api/dash/users/me/change-phone/verify/handler';
-import * as devEmailTestFixed from '@/app/api/dev/email-test/fixed/handler';
 import * as devSignUp from '@/app/api/dev/sign-up/handler';
 import * as healthStorage from '@/app/api/health/storage/handler';
 import * as uploadImage from '@/app/api/upload/image/handler';
@@ -282,20 +281,13 @@ export const ROUTES: readonly RouteDefinition[] = [
   },
 
   // ---- dev-only -----------------------------------------------------------
-  // TODO: remove both endpoints in production
+  // TODO: remove this endpoint in production
   {
     method: 'POST',
     path: '/api/dev/sign-up',
     handler: devSignUp.POST,
     preAuth: 'none',
     body: 'json',
-  },
-  {
-    method: 'GET',
-    path: '/api/dev/email-test/fixed',
-    handler: devEmailTestFixed.GET,
-    preAuth: 'none',
-    body: 'none',
   },
 
   // ---- contract ------------------------------------------------------------

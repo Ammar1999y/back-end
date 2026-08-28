@@ -1,10 +1,8 @@
 /**
  * Exclusive upper bound for a prefix range scan.
  *
- * Its own module, with no driver import, for two reasons: the logic is pure and
- * worth testing directly, and `bun test` cannot load `better-sqlite3` — so a
- * test importing `lib/cache/index.ts` would crash the runner. Keeping this here
- * lets the tests exercise the REAL function rather than a copy of its algorithm.
+ * Its own module, with no driver import, so a test can exercise the REAL
+ * function without opening a database or reading `SQLITE_DIR`.
  *
  * ## Why a constant upper bound is wrong
  *

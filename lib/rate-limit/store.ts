@@ -203,7 +203,8 @@ export function closeRateLimitStore(): void {
 
 /**
  * Deletes expired rows, in bounded batches, yielding between them.
- * Invoked by `app/api/internal/sqlite-sweep/route.ts`.
+ * Invoked by `runMaintenanceSweep` (lib/sqlite/maintenance.ts), which the
+ * `sqlite-expiry-sweep` job in `lib/schedule.ts` drives.
  *
  * Must run as ONE scheduled job, not per process: N app processes each running
  * their own interval would multiply writes against the store most sensitive to

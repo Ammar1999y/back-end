@@ -36,8 +36,12 @@
     `app/api/dash/permissions/[id]/route.ts`
 22. **`ROLE_NAME_MIN = 1` Is Extremely Permissive** —
     `utils/validation/constants.ts`
-23. **Dead Code in `resolveUserUniqueViolation`** — `utils/api-response.ts` —
-    Checks for nonexistent `ux_users_phone_number` constraint
+23. **`resolveUserUniqueViolation` maps both user unique constraints** —
+    `utils/api-response.ts` — the earlier note called `ux_users_phone_number`
+    nonexistent; it does exist (`db/schema.ts`, a partial unique index on
+    `phone_number WHERE deleted_at IS NULL AND phone_number IS NOT NULL`), so
+    the mapping is live and correct, not dead code. Kept as a record that the
+    question was asked and settled.
 24. **`chk_size_bytes_positive` Allows Zero-Byte Files** — `db/schema.ts`
 25. **`checkMultiplePermissions` Uses Two DB Round-Trips** —
     `lib/permissions/checker.ts`
@@ -97,11 +101,16 @@
 51. **Self-Edit Password Change Skips Session Revocation** —
     `app/api/dash/users/[id]/route.ts` — Same reasoning as #70; `validID` always
     matches session ID format
-52. **H2: HIBP check fails open silently and has no HTTP timeout** —
-    `lib/auth/check-password.ts:18-59` — `checkPasswordCompromise` retries the
-    HIBP API up to 3 times and falls through silently on exhaustion with no
-    `AbortSignal`; during an HIBP outage, compromised passwords are silently
-    accepted and admin operations stall 10–30s on user-creation hot path
+52. **HIBP check fails open silently** — `lib/auth/check-password.ts:41-91` —
+    `checkPasswordCompromise` makes up to 3 attempts and, on exhaustion, logs
+    `hibp.degraded` and ACCEPTS the password. Deliberate and documented in the
+    function's own comment: a third party being down must not take account
+    creation, password reset and credential rotation down with it, and a
+    breached password that slips through is still subject to the length floor,
+    argon2id + pepper, lockout and the per-IP limits. Alert on `hibp.degraded`.
+    The timeout half of this entry is obsolete: each attempt now carries an
+    `AbortController` with `HIBP_ATTEMPT_TIMEOUT_MS = 1000` plus 75/150 ms
+    backoff, so the worst case is ~3.2 s, not the 10–30 s stall recorded here.
 53. **Better Auth `password.verify: () => true` Stub** — `lib/auth.ts:26-47` —
     Built-in verify is stubbed; the before-hook runs the real
     `verifyLoginAttempt` and only 3 paths are allowlisted (`/get-session`,

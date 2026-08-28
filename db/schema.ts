@@ -284,10 +284,10 @@ export const users = pgTable(
 // Sessions Table
 // ================================
 // Retention: `db/maintenance.ts` deletes rows 30 days past `expiresAt`, on the
-// `/api/internal/db-sweep` schedule. Not a correctness boundary — every read
-// already filters on `expiresAt` — so the sweep only reclaims disk, and the
-// 30-day tail keeps a just-expired session inspectable while someone is asking
-// why a user was logged out.
+// `database-retention-sweep` schedule in `lib/schedule.ts`. Not a correctness
+// boundary — every read already filters on `expiresAt` — so the sweep only
+// reclaims disk, and the 30-day tail keeps a just-expired session inspectable
+// while someone is asking why a user was logged out.
 export const sessions = pgTable(
   'sessions',
   {

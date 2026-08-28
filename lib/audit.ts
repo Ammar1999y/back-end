@@ -12,7 +12,7 @@ import { API_PATH_MAX, USER_AGENT_MAX } from './audit/constants';
 const MAX_IP_LENGTH = 45;
 const IP_SCHEMA = z.union([z.ipv4(), z.ipv6()]);
 // Re-exported from a leaf module so db/schema.ts can import these without
-// reaching back into lib/audit.ts → a Turbopack-breaking import cycle.
+// reaching back into lib/audit.ts → an import cycle.
 export { API_PATH_MAX, USER_AGENT_MAX } from './audit/constants';
 
 /**
