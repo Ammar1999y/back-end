@@ -211,12 +211,16 @@ export const phoneSchema = z.preprocess(
       if (val.startsWith('5')) return '966' + val;
       return val;
     })
+    // The bounds above describe the value AFTER separators are stripped, so
+    // publishing them would reject input this schema accepts: `+966 51 234
+    // 5678` is 16 characters against a cap meant for the 12 digits left.
+    // `minLength: 1` survives that — no preprocess turns `''` into a number.
     .meta({
       type: undefined,
       minLength: undefined,
       maxLength: undefined,
       pattern: undefined,
-      anyOf: [{ type: 'string' }, { type: 'number' }],
+      anyOf: [{ type: 'string', minLength: 1 }, { type: 'number' }],
       description:
         'Saudi mobile number. Strings may contain separators or Arabic digits; numbers are also accepted. Normalized output is 9665XXXXXXXX.',
     })
@@ -226,10 +230,18 @@ export const phoneSchema = z.preprocess(
 // and normalized by phoneSchema. The key is always present (nullable, not
 // optional) so the inferred input/output shapes stay consistent for
 // react-hook-form resolvers — callers send `null` to mean "no number".
-export const optionalPhoneSchema = z.preprocess(
-  (v) => (v == null || (typeof v === 'string' && v.trim() === '') ? null : v),
-  phoneSchema.nullable()
-);
+export const optionalPhoneSchema = z
+  .preprocess(
+    (v) => (v == null || (typeof v === 'string' && v.trim() === '') ? null : v),
+    phoneSchema.nullable()
+  )
+  // Must NOT inherit `phoneSchema`'s `minLength: 1`: the preprocess here runs
+  // first and maps `''` to `null`, which is how a caller clears the number.
+  .meta({
+    anyOf: [{ type: 'string' }, { type: 'number' }, { type: 'null' }],
+    description:
+      'Saudi mobile number, as accepted by the required form. `null` or an empty string clears it; omitting the key on an update leaves it unchanged.',
+  });
 
 /** @knipignore */
 export const trimed = (v: string) => (typeof v === 'string' ? v.trim() : '');

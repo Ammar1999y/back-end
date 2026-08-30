@@ -56,6 +56,7 @@ import {
   MAX_PER_PAGE,
   MAX_SEARCH_LENGTH,
   MAX_SORT_RAW_LENGTH,
+  MIN_SEARCH_LENGTH,
 } from '@/lib/data-table/parsers';
 import { openApiRouteHandler } from '@/lib/http/openapi';
 import {
@@ -88,7 +89,9 @@ const dataTableQuery = (
   {
     name: 'perPage',
     required: false,
-    description: 'Rows per page.',
+    // A dependency between two parameters, which no OpenAPI keyword expresses.
+    description:
+      'Rows per page. A `maxPerPage` on the same request lowers this ceiling; a value above the effective ceiling is rejected, not clamped.',
     type: 'integer',
     minimum: 1,
     maximum: MAX_PER_PAGE,
@@ -112,12 +115,13 @@ const dataTableQuery = (
     description: 'How multiple structured filters are combined.',
     enum: ['and', 'or'],
   },
+  // No `maxLength`, unlike the parameters above: this is the one the parser
+  // ignores rather than rejects, and a bound the server does not enforce makes
+  // a generated client refuse a request this API accepts.
   {
     name: 'search',
     required: false,
-    description:
-      'Quick search. Terms shorter than three characters are intentionally ignored.',
-    maxLength: MAX_SEARCH_LENGTH,
+    description: `Quick search. Terms outside ${MIN_SEARCH_LENGTH}–${MAX_SEARCH_LENGTH} characters are ignored rather than rejected, so the response is the unfiltered list.`,
   },
 ];
 

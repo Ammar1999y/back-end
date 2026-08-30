@@ -21,6 +21,8 @@ import {
   toRegisteredRoutes,
 } from '@/lib/http/route-manifest';
 
+import { isChannelEnabled, OTP_CHANNELS } from '@/utils/validation/otp';
+
 const REPO_ROOT = path.join(import.meta.dir, '..', '..');
 
 /** Locale-independent string ordering, so a sorted comparison is stable. */
@@ -342,6 +344,84 @@ describe('request and response contract fidelity', () => {
     expect(operationIds.size).toBe(30);
   });
 
+  test('no subschema carries $schema', () => {
+    // The converter stamps it on results that get spliced in as SUBSCHEMAS,
+    // where 2020-12 does not allow it.
+    const offenders: string[] = [];
+    visitObjects(document, (value) => {
+      if ('$schema' in value)
+        offenders.push(JSON.stringify(value).slice(0, 80));
+    });
+    expect(offenders).toEqual([]);
+  });
+
+  test('a user and the role endpoint publish the SAME permissions shape', () => {
+    // Both handlers map `role.rolePermissions` identically, so the one field
+    // the two endpoints share must not have two published types.
+    const user = responseSchemaOf(
+      document,
+      '/api/dash/users/{id}',
+      'get',
+      '200'
+    );
+    const role = responseSchemaOf(
+      document,
+      '/api/dash/permissions/{id}',
+      'get',
+      '200'
+    );
+    const permissionsOf = (envelope: Record<string, unknown>) =>
+      objectProperty(
+        objectProperty(objectProperty(envelope, 'properties'), 'data'),
+        'properties'
+      ).permissions;
+
+    expect(permissionsOf(user)).toEqual({
+      type: 'array',
+      items: expect.objectContaining({ type: 'object' }),
+    });
+    expect(permissionsOf(user)).toEqual(permissionsOf(role));
+  });
+
+  test('the two routes that re-issue the session cookie say so', () => {
+    for (const pathName of [
+      '/api/dash/users/me/change-email',
+      '/api/dash/users/me/change-email/verify',
+    ]) {
+      const responses = operationOf(document, pathName, 'post')
+        .responses as Record<string, Record<string, unknown>>;
+      expect(objectProperty(responses['200'] ?? {}, 'headers')).toHaveProperty(
+        'Set-Cookie'
+      );
+    }
+    // Not on a route that leaves the identity alone.
+    const password = operationOf(
+      document,
+      '/api/dash/users/me/change-password',
+      'post'
+    ).responses as Record<string, Record<string, unknown>>;
+    expect(password['200']?.headers).toBeUndefined();
+  });
+
+  test('a 503 that only a deployment change clears is not described as a throttle', () => {
+    // The limiter owns the same status, and its "retry shortly" wording is
+    // wrong for a state only a deployment change clears.
+    for (const pathName of [
+      '/api/dash/users/me/change-email',
+      '/api/dash/users/me/change-phone',
+    ]) {
+      const responses = operationOf(document, pathName, 'post')
+        .responses as Record<string, Record<string, unknown>>;
+      expect(responses['503']?.description).toContain('OTP channel');
+    }
+    const password = operationOf(
+      document,
+      '/api/dash/users/me/change-password',
+      'post'
+    ).responses as Record<string, Record<string, unknown>>;
+    expect(password['503']?.description).not.toContain('OTP channel');
+  });
+
   test('handler-enriched ids stay in the path and out of update bodies', () => {
     const permissionBody = requestSchemaOf(
       document,
@@ -388,10 +468,23 @@ describe('request and response contract fidelity', () => {
       '/api/dash/users/me/change-phone',
       'post'
     );
+    // A required phone never accepts `''` — the mistake a form is likeliest to
+    // submit for an untouched field.
     const phone = (phoneBody.properties as Record<string, unknown>)
       .newPhoneNumber as Record<string, unknown>;
-    expect(phone.type).toEqual(['string', 'number']);
+    expect(phone.anyOf).toEqual([
+      { type: 'string', minLength: 1 },
+      { type: 'number' },
+    ]);
     expect(phone.description).toContain('Saudi mobile');
+
+    // The optional one must not inherit that bound: `''` is how it is cleared.
+    const userBody = requestSchemaOf(document, '/api/dash/users', 'post');
+    const optionalPhone = objectProperty(
+      objectProperty(userBody, 'properties'),
+      'phoneNumber'
+    );
+    expect(optionalPhone.type).toEqual(['string', 'number', 'null']);
 
     const permissionBody = requestSchemaOf(
       document,
@@ -440,8 +533,56 @@ describe('request and response contract fidelity', () => {
         type: 'string',
         maxLength: 8192,
       });
+      // The one parameter the parser ignores rather than rejects, so a
+      // published length would be a bound the server never enforces.
+      const search = parameters.find(
+        (parameter) => parameter.name === 'search'
+      );
+      expect(search?.schema).toEqual({ type: 'string' });
+      expect(search?.description).toContain('ignored rather than rejected');
       expect(statusesOf(document, pathName, 'get')).toContain('422');
     }
+  });
+
+  test('only the sends narrow their channel union to what this deployment enabled', () => {
+    // `channelEnabledRefine` is the half `z.toJSONSchema` cannot see.
+    const channelsOf = (pathName: string): string[] => {
+      const schema = requestSchemaOf(document, pathName, 'post');
+      const branches = (schema.oneOf ?? schema.anyOf) as
+        Record<string, unknown>[] | undefined;
+      return (branches ?? [])
+        .map(
+          (branch) =>
+            objectProperty(objectProperty(branch, 'properties'), 'channel')
+              .const
+        )
+        .filter((value): value is string => typeof value === 'string');
+    };
+    const enabled: string[] = OTP_CHANNELS.filter((channel) =>
+      isChannelEnabled(channel)
+    );
+    // Guard: with none enabled the routes 404 and publish the full union.
+    expect(enabled.length).toBeGreaterThan(0);
+
+    for (const pathName of [
+      '/api/auth/otp/send',
+      '/api/auth/forgot-password/send',
+      '/api/auth/passwordless/send',
+    ])
+      expect(channelsOf(pathName).toSorted(byText)).toEqual(
+        enabled.toSorted(byText)
+      );
+
+    // A verify spends an already-delivered code, so it accepts a channel
+    // disabled since.
+    const every: string[] = [...OTP_CHANNELS];
+    for (const pathName of [
+      '/api/auth/otp/verify',
+      '/api/auth/forgot-password/reset',
+    ])
+      expect(channelsOf(pathName).toSorted(byText)).toEqual(
+        every.toSorted(byText)
+      );
   });
 
   test('every application envelope success has concrete data and errors have the error discriminator', () => {
@@ -1155,6 +1296,24 @@ describe('the statuses each Better Auth operation declares', () => {
           endpoint.path,
           [...(MEASURED[endpoint.path] ?? [])].toSorted(byText),
         ]);
+  });
+
+  test('a path with its own limiter declares BOTH throttle body shapes', () => {
+    // Two producers, two shapes: the wildcard's limiter answers through
+    // `handleApiError`, the endpoint's own through `toAuthApiError`.
+    const document = openApiDocument(toManifest(ROUTES));
+    const branchesOf = (pathName: string, status: string) =>
+      responseSchemaOf(document, pathName, 'post', status).anyOf as
+        unknown[] | undefined;
+
+    for (const status of ['429', '503']) {
+      const branches = branchesOf('/api/auth/passwordless/verify', status);
+      expect(branches).toHaveLength(2);
+      expect(branches?.[1]).toMatchObject({ required: ['message'] });
+      // `/sign-in/email` has no inner limiter, so widening it would advertise
+      // a body it cannot send.
+      expect(branchesOf('/api/auth/sign-in/email', status)).toBeUndefined();
+    }
   });
 });
 

@@ -45,6 +45,7 @@ import {
   MAX_IMAGE_SIZE,
 } from '@/utils/validation/constants';
 import {
+  isChannelEnabled,
   resetPasswordSchema,
   sendOtpSchema,
   verifyOtpSchema,
@@ -152,6 +153,16 @@ const QUERY_VALIDATION_ROUTES = new Set([
   'GET /api/dash/permissions',
   'GET /api/dash/users',
   'GET /api/dash/users/:id/sessions',
+]);
+
+/**
+ * Routes that answer 503 when no OTP channel can carry their confirmation code
+ * — a second producer of the status the rate limiter owns, and the only one a
+ * client cannot retry its way out of.
+ */
+const CHANNEL_UNAVAILABLE_ROUTES = new Set([
+  'POST /api/dash/users/me/change-email',
+  'POST /api/dash/users/me/change-phone',
 ]);
 
 const OPERATION_DOCS: Record<string, { summary: string; tag: string }> = {
@@ -293,13 +304,18 @@ const BETTER_AUTH_BODIES: Record<string, z.ZodType> = {
  * document missing one constraint is worth more than a route that 500s. The
  * per-schema catch is the same reasoning one level up — a future schema that
  * breaks the converter must not take the whole contract down with it.
+ *
+ * `$schema` is dropped because these results are spliced in as SUBSCHEMAS, and
+ * under 2020-12 that keyword belongs to a schema RESOURCE root — which a
+ * `oneOf` branch with no `$id` is not.
  */
 function toJsonSchema(schema: z.ZodType): JsonSchema | null {
   try {
-    return z.toJSONSchema(schema, {
+    const { $schema: _dialect, ...converted } = z.toJSONSchema(schema, {
       io: 'input',
       unrepresentable: 'any',
     }) as JsonSchema;
+    return converted;
   } catch {
     return null;
   }
@@ -525,6 +541,44 @@ function addUserRoleRules(schema: JsonSchema, update: boolean): JsonSchema {
   };
 }
 
+/**
+ * The routes whose schema carries `channelEnabledRefine`. Not the verifies:
+ * those deliberately accept a channel disabled since the code was delivered, so
+ * narrowing them would publish a refusal the runtime does not make.
+ */
+const OTP_SEND_ROUTES = new Set([
+  'POST /api/auth/forgot-password/send',
+  'POST /api/auth/otp/send',
+  'POST /api/auth/passwordless/send',
+]);
+
+/**
+ * Drops the union branches whose channel this deployment does not accept.
+ *
+ * The refinement is the half `z.toJSONSchema` cannot see, so a disabled channel
+ * was published as a valid body that answers 422. Same deployment-shaped
+ * narrowing `addUserRoleRules` already does for `PHONE_ENABLED`.
+ */
+function restrictToEnabledChannels(schema: JsonSchema): JsonSchema {
+  const key = branchKey(schema);
+  const branches = key === null ? null : schema[key];
+  if (key === null || !Array.isArray(branches)) return schema;
+
+  const kept = branches.filter((branch) => {
+    if (!isJsonSchema(branch) || !isJsonSchema(branch.properties)) return true;
+    const channel = branch.properties.channel;
+    if (!isJsonSchema(channel) || typeof channel.const !== 'string')
+      return true;
+    return isChannelEnabled(channel.const);
+  });
+
+  // Nothing left means `OTP_ENABLED` is false and the route 404s before it
+  // reads a body — no request for a narrowed schema to describe, and an empty
+  // `oneOf` is not a valid schema.
+  if (kept.length === 0 || kept.length === branches.length) return schema;
+  return { ...schema, [key]: kept };
+}
+
 function applyRequestContractRules(
   key: string | undefined,
   schema: JsonSchema,
@@ -534,6 +588,8 @@ function applyRequestContractRules(
   if (key === 'POST /api/dash/users') result = addUserRoleRules(result, false);
   if (key === 'PUT /api/dash/users/:id' && branch === 0)
     result = addUserRoleRules(result, true);
+  if (key !== undefined && OTP_SEND_ROUTES.has(key))
+    result = restrictToEnabledChannels(result);
   return result;
 }
 
@@ -841,7 +897,10 @@ const SUCCESS_DATA_SCHEMAS: Record<string, JsonSchema> = {
       role: NULLABLE_ROLE_SUMMARY_SCHEMA,
       createdAt: DATE_TIME_SCHEMA,
       updatedAt: DATE_TIME_SCHEMA,
-      permissions: USER_PERMISSION_MATRIX_SCHEMA,
+      // The role's rows, mapped exactly as `GET /api/dash/permissions/:id` maps
+      // them. NOT `USER_PERMISSION_MATRIX_SCHEMA` — that is the page-keyed
+      // shape the SESSION metadata carries.
+      permissions: { type: 'array', items: PAGE_PERMISSION_SCHEMA },
       sessions: { type: 'array', items: SESSION_SUMMARY_SCHEMA },
       sessionsHasMore: { type: 'boolean' },
       sessionsNextCursor: NULLABLE_CURSOR_SCHEMA,
@@ -895,11 +954,29 @@ const PAGINATED_SUCCESS_ROUTES = new Set([
   'GET /api/dash/users',
 ]);
 
+/**
+ * Routes whose success calls `refreshSessionCookies`. A client that ignores the
+ * new `Set-Cookie` keeps presenting a token the change just invalidated.
+ */
+const SESSION_COOKIE_ROUTES = new Set([
+  'POST /api/dash/users/me/change-email',
+  'POST /api/dash/users/me/change-email/verify',
+]);
+
+const SET_COOKIE_HEADER: JsonSchema = {
+  'Set-Cookie': {
+    description:
+      'Re-issued session cookie. The token presented on this request is no longer valid.',
+    schema: { type: 'string' },
+  },
+};
+
 function successResponseFor(key: string): JsonSchema {
   const data = SUCCESS_DATA_SCHEMAS[key];
   if (!data) throw new Error(`No success data schema for ${key}`);
   return {
     description: 'Success.',
+    ...(SESSION_COOKIE_ROUTES.has(key) && { headers: SET_COOKIE_HEADER }),
     content: {
       'application/json': {
         schema: successEnvelopeSchema(data, PAGINATED_SUCCESS_ROUTES.has(key)),
@@ -1104,6 +1181,47 @@ const BETTER_AUTH_PATH_STATUSES: Record<
   '/passwordless/verify': ['400', '401', '403', '422'],
 };
 
+/** What an `APIError` serialises to. `code` is not required — the shape is the dependency's. */
+const BETTER_AUTH_ERROR_SCHEMA: JsonSchema = {
+  type: 'object',
+  properties: { message: { type: 'string' }, code: { type: 'string' } },
+  required: ['message'],
+};
+
+/**
+ * Paths that throttle from INSIDE the endpoint as well as from the wildcard's
+ * admission limiter, and so answer 429/503 in two body shapes: the wildcard's
+ * goes to `handleApiError` (envelope), an inner `CustomError` goes to
+ * `toAuthApiError`. Only `/passwordless/verify` has an inner limiter, and
+ * Better Auth's own `rateLimit` is disabled.
+ */
+const BETTER_AUTH_LOCAL_THROTTLE_PATHS = new Set(['/passwordless/verify']);
+
+/** Widen one admission-limiter response to admit Better Call's shape too. */
+function withBetterAuthErrorShape(
+  response: unknown,
+  detail: string
+): JsonSchema {
+  if (!isJsonSchema(response)) return BETTER_AUTH_ERROR_SCHEMA;
+  const content = isJsonSchema(response.content) ? response.content : {};
+  const json = isJsonSchema(content['application/json'])
+    ? content['application/json']
+    : {};
+  return {
+    ...response,
+    description: `${String(response.description ?? '')} ${detail}`.trim(),
+    content: {
+      ...content,
+      'application/json': {
+        ...json,
+        // `anyOf`: the envelope satisfies the Better Call shape too, so
+        // exactly-one would fail on the body the limiter actually sends.
+        schema: { anyOf: [json.schema, BETTER_AUTH_ERROR_SCHEMA] },
+      },
+    },
+  };
+}
+
 function betterAuthResponses(path: string, method: HttpMethod): JsonSchema {
   const statuses = [
     '200',
@@ -1112,6 +1230,17 @@ function betterAuthResponses(path: string, method: HttpMethod): JsonSchema {
     ...(BETTER_AUTH_PATH_STATUSES[path] ?? []),
   ];
   const responses: JsonSchema = { ...PRE_AUTH_RESPONSES };
+
+  if (BETTER_AUTH_LOCAL_THROTTLE_PATHS.has(path)) {
+    responses['429'] = withBetterAuthErrorShape(
+      responses['429'],
+      'The endpoint’s own per-destination verify quota answers here too, in Better Auth’s error shape.'
+    );
+    responses['503'] = withBetterAuthErrorShape(
+      responses['503'],
+      'That quota is fail-closed, so a degraded limiter store refuses here in Better Auth’s error shape.'
+    );
+  }
 
   for (const status of statuses) {
     const generated = generatedBetterAuthResponse(
@@ -1224,6 +1353,15 @@ function commonResponses(entry: RouteManifestEntry): JsonSchema {
   if (entry.preAuth === 'ip-limit' || entry.handlerRateLimit)
     Object.assign(responses, PRE_AUTH_RESPONSES);
 
+  // AFTER the limiter block, which owns the same status and would overwrite it.
+  const throttle = responses['503'];
+  if (CHANNEL_UNAVAILABLE_ROUTES.has(key) && isJsonSchema(throttle))
+    responses['503'] = {
+      ...throttle,
+      description:
+        'The admission limiter store is unavailable and fails closed, or no OTP channel able to verify this contact is enabled.',
+    };
+
   return responses;
 }
 
@@ -1280,6 +1418,17 @@ function openApiConsistencyProblems(
       problems.push(
         `QUERY_VALIDATION_ROUTES has '${key}', which is not a route`
       );
+  for (const key of CHANNEL_UNAVAILABLE_ROUTES)
+    if (isLeftover(key))
+      problems.push(
+        `CHANNEL_UNAVAILABLE_ROUTES has '${key}', which is not a route`
+      );
+  for (const key of SESSION_COOKIE_ROUTES)
+    if (isLeftover(key))
+      problems.push(`SESSION_COOKIE_ROUTES has '${key}', which is not a route`);
+  for (const key of OTP_SEND_ROUTES)
+    if (isLeftover(key))
+      problems.push(`OTP_SEND_ROUTES has '${key}', which is not a route`);
   for (const key of Object.keys(OPERATION_DOCS))
     if (isLeftover(key))
       problems.push(`OPERATION_DOCS has '${key}', which is not a route`);
