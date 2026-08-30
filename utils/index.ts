@@ -565,10 +565,11 @@ export const formatDate = (date: string) =>
     year: 'numeric',
   });
 
-// UUID v7 validation regex
-// Format: xxxxxxxx-xxxx-7xxx-xxxx-xxxxxxxxxxxx
-const UUID_V7_REGEX =
-  /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+/** UUID v7, shared by runtime validation and the generated OpenAPI contract. */
+export const UUID_V7_FRAGMENT =
+  '[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-7[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}';
+export const UUID_V7_PATTERN = `^${UUID_V7_FRAGMENT}$`;
+export const UUID_V7_REGEX = new RegExp(UUID_V7_PATTERN);
 
 /**
  * Validates if the given value is a valid UUID v7

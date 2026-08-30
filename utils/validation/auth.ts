@@ -161,7 +161,6 @@ function refineUserUpdatePayload(data: UserPayloadShape, ctx: z.RefinementCtx) {
 export const createUserSchema = userRoleSchema.superRefine(refineUserPayload);
 
 const updateUserObject = userRoleSchema.omit({ password: true }).extend({
-  id: idSchema,
   isActive: z.boolean(),
   /**
    * A non-string is a TYPE ERROR, not "no change".
@@ -201,15 +200,26 @@ const updateUserObject = userRoleSchema.omit({ password: true }).extend({
  * let a stripped typo look like "not supplied" and return 200 without
  * performing the update.
  */
-export const adminUpdateUserSchema = updateUserObject
+const adminUpdateUserBodyObject = updateUserObject
   .extend({ phoneNumber: optionalPhoneSchema.optional() })
+  .strict();
+
+export const adminUpdateUserBodySchema = adminUpdateUserBodyObject.superRefine(
+  refineUserUpdatePayload
+);
+
+export const adminUpdateUserSchema = adminUpdateUserBodyObject
+  .extend({ id: idSchema })
   .strict()
   .superRefine(refineUserUpdatePayload);
 
 // Reject unknown keys with .strict() so a client sending email/roleId/password/
 // isActive gets a 4xx instead of a misleading 200 with the fields silently stripped.
-export const selfUpdateUserSchema = userRoleSchema
+export const selfUpdateUserBodySchema = userRoleSchema
   .pick({ name: true })
+  .strict();
+
+export const selfUpdateUserSchema = selfUpdateUserBodySchema
   .extend({ id: idSchema })
   .strict();
 

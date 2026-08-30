@@ -10,7 +10,7 @@ const SITEVERIFY_URL =
 
 const CAPTCHA_HEADER = 'x-captcha-response';
 
-const MAX_TOKEN_LENGTH = 2048;
+export const CAPTCHA_TOKEN_MAX_LENGTH = 2048;
 
 // Cap the outbound siteverify call so a Cloudflare slowdown can't stall
 // OTP/auth handlers indefinitely. Failure here flows through fail-closed.
@@ -21,7 +21,7 @@ async function verifyTurnstileToken(
   token: string,
   remoteIp?: string | null
 ): Promise<boolean> {
-  if (!token || token.length > MAX_TOKEN_LENGTH) return false;
+  if (!token || token.length > CAPTCHA_TOKEN_MAX_LENGTH) return false;
 
   const secretKey =
     process.env.NODE_ENV === 'development'

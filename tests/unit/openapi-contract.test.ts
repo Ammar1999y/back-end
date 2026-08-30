@@ -65,6 +65,81 @@ function operationOf(
   return operation as Record<string, unknown>;
 }
 
+function responseSchemaOf(
+  document: unknown,
+  pathName: string,
+  method: string,
+  status: string
+): Record<string, unknown> {
+  const operation = operationOf(document, pathName, method);
+  const responses = operation.responses as Record<string, unknown>;
+  const response = responses[status] as Record<string, unknown>;
+  const content = response.content as Record<string, unknown>;
+  const json = content['application/json'] as Record<string, unknown>;
+  return json.schema as Record<string, unknown>;
+}
+
+function requestSchemaOf(
+  document: unknown,
+  pathName: string,
+  method: string,
+  mediaType = 'application/json'
+): Record<string, unknown> {
+  const operation = operationOf(document, pathName, method);
+  const requestBody = operation.requestBody as Record<string, unknown>;
+  const content = requestBody.content as Record<string, unknown>;
+  const media = content[mediaType] as Record<string, unknown>;
+  return media.schema as Record<string, unknown>;
+}
+
+function visitObjects(
+  value: unknown,
+  visit: (value: Record<string, unknown>) => void
+): void {
+  if (Array.isArray(value)) {
+    for (const item of value) visitObjects(item, visit);
+    return;
+  }
+  if (typeof value !== 'object' || value === null) return;
+  const object = value as Record<string, unknown>;
+  visit(object);
+  for (const child of Object.values(object)) visitObjects(child, visit);
+}
+
+function objectProperty(
+  object: Record<string, unknown>,
+  key: string
+): Record<string, unknown> {
+  const value = object[key];
+  if (typeof value !== 'object' || value === null || Array.isArray(value))
+    throw new Error(`${key} is not an object`);
+  return value as Record<string, unknown>;
+}
+
+function documentOperations(document: unknown): Array<{
+  pathName: string;
+  method: string;
+  operation: Record<string, unknown>;
+}> {
+  const paths = (document as { paths: Record<string, unknown> }).paths;
+  const operations: Array<{
+    pathName: string;
+    method: string;
+    operation: Record<string, unknown>;
+  }> = [];
+  for (const [pathName, pathItem] of Object.entries(paths))
+    for (const method of ['get', 'post', 'put', 'delete']) {
+      const operation = (pathItem as Record<string, unknown>)[method];
+      if (operation && typeof operation === 'object')
+        operations.push({
+          pathName,
+          method,
+          operation: operation as Record<string, unknown>,
+        });
+    }
+  return operations;
+}
+
 describe('the OpenAPI document', () => {
   test('builds from the full route table without throwing', () => {
     const paths = pathsOf(openApiDocument(toManifest(ROUTES)));
@@ -162,7 +237,7 @@ describe('artifact resolution', () => {
   });
 
   test('development may generate when no artifact exists', () => {
-    const document = { openapi: '3.1.0' };
+    const document = { openapi: '3.1.1' };
     expect(resolveOpenApiDocument(null, () => document, false)).toBe(document);
   });
 });
@@ -242,6 +317,275 @@ describe('the envelope schema against the shape handlers actually emit', () => {
     expect(metaProperties().toSorted(byText)).toEqual(
       Object.keys(meta).toSorted(byText)
     );
+  });
+});
+
+describe('request and response contract fidelity', () => {
+  const document = openApiDocument(toPublishedManifest(ROUTES, true));
+
+  test('the document is OpenAPI 3.1.1 and every operation is named, tagged, and explicit about security', () => {
+    expect((document as Record<string, unknown>).openapi).toBe('3.1.1');
+    expect((document as Record<string, unknown>).servers).toEqual([
+      expect.objectContaining({ url: '/' }),
+    ]);
+
+    const operationIds = new Set<string>();
+    for (const { operation } of documentOperations(document)) {
+      expect(typeof operation.summary).toBe('string');
+      expect((operation.summary as string).length).toBeGreaterThan(0);
+      expect(Array.isArray(operation.tags)).toBe(true);
+      expect(Array.isArray(operation.security)).toBe(true);
+      expect(typeof operation.operationId).toBe('string');
+      expect(operationIds.has(operation.operationId as string)).toBe(false);
+      operationIds.add(operation.operationId as string);
+    }
+    expect(operationIds.size).toBe(30);
+  });
+
+  test('handler-enriched ids stay in the path and out of update bodies', () => {
+    const permissionBody = requestSchemaOf(
+      document,
+      '/api/dash/permissions/{id}',
+      'put'
+    );
+    expect(
+      Object.keys(permissionBody.properties as Record<string, unknown>)
+    ).not.toContain('id');
+
+    const userBody = requestSchemaOf(document, '/api/dash/users/{id}', 'put');
+    const branches = userBody.oneOf as Record<string, unknown>[];
+    expect(branches).toHaveLength(2);
+    for (const branch of branches)
+      expect(
+        Object.keys(branch.properties as Record<string, unknown>)
+      ).not.toContain('id');
+
+    const operation = operationOf(document, '/api/dash/users/{id}', 'put');
+    const id = (operation.parameters as Record<string, unknown>[]).find(
+      (parameter) => parameter.name === 'id'
+    );
+    const idSchema = id?.schema as Record<string, unknown>;
+    expect(idSchema).toMatchObject({ type: 'string', format: 'uuid' });
+    expect(idSchema.pattern).toBeString();
+  });
+
+  test('runtime password, phone, permission, and pagination constraints survive publication', () => {
+    const passwordBody = requestSchemaOf(
+      document,
+      '/api/dash/users/me/change-password',
+      'post'
+    );
+    const passwordProperties = objectProperty(passwordBody, 'properties');
+    expect(
+      objectProperty(passwordProperties, 'currentPassword').pattern
+    ).toBeString();
+    expect(
+      objectProperty(passwordProperties, 'newPassword').pattern
+    ).toBeString();
+
+    const phoneBody = requestSchemaOf(
+      document,
+      '/api/dash/users/me/change-phone',
+      'post'
+    );
+    const phone = (phoneBody.properties as Record<string, unknown>)
+      .newPhoneNumber as Record<string, unknown>;
+    expect(phone.type).toEqual(['string', 'number']);
+    expect(phone.description).toContain('Saudi mobile');
+
+    const permissionBody = requestSchemaOf(
+      document,
+      '/api/dash/permissions',
+      'post'
+    );
+    const permissions = (
+      permissionBody.properties as Record<string, Record<string, unknown>>
+    ).permissions;
+    expect(permissions?.['x-unique-by']).toBe('name');
+    const item = permissions?.items as Record<string, unknown>;
+    expect(Array.isArray(item.allOf)).toBe(true);
+  });
+
+  test('both list routes publish the complete bounded query DSL and its 422', () => {
+    const expected = [
+      'filters',
+      'joinOperator',
+      'maxPerPage',
+      'page',
+      'perPage',
+      'search',
+      'sort',
+    ];
+    for (const pathName of ['/api/dash/users', '/api/dash/permissions']) {
+      const operation = operationOf(document, pathName, 'get');
+      const parameters = operation.parameters as Record<string, unknown>[];
+      expect(
+        parameters
+          .map((parameter) => parameter.name)
+          .filter((name): name is string => typeof name === 'string')
+          .toSorted(byText)
+      ).toEqual(expected);
+      const perPage = parameters.find(
+        (parameter) => parameter.name === 'perPage'
+      );
+      expect(perPage?.schema).toMatchObject({
+        type: 'integer',
+        minimum: 1,
+        maximum: 100,
+      });
+      const filters = parameters.find(
+        (parameter) => parameter.name === 'filters'
+      );
+      expect(filters?.schema).toMatchObject({
+        type: 'string',
+        maxLength: 8192,
+      });
+      expect(statusesOf(document, pathName, 'get')).toContain('422');
+    }
+  });
+
+  test('every application envelope success has concrete data and errors have the error discriminator', () => {
+    const manifest = toPublishedManifest(ROUTES, true).filter(
+      (entry) => entry.response === 'envelope'
+    );
+    for (const entry of manifest) {
+      const pathName = entry.path.replaceAll(/:(\w+)/g, '{$1}');
+      const method = entry.method.toLowerCase();
+      const operation = operationOf(document, pathName, method);
+      const responses = operation.responses as Record<string, unknown>;
+      const successStatus = '201' in responses ? '201' : '200';
+      const success = responseSchemaOf(
+        document,
+        pathName,
+        method,
+        successStatus
+      );
+      const successProperties = objectProperty(success, 'properties');
+      expect(objectProperty(successProperties, 'success').const).toBe(true);
+      expect(
+        Object.keys(objectProperty(successProperties, 'data')).length
+      ).toBeGreaterThan(0);
+
+      const errorStatuses = Object.keys(responses).filter(
+        (status) => status !== successStatus
+      );
+      for (const status of errorStatuses) {
+        const error = responseSchemaOf(document, pathName, method, status);
+        const errorProperties = objectProperty(error, 'properties');
+        expect(objectProperty(errorProperties, 'success').const).toBe(false);
+        expect(objectProperty(errorProperties, 'data').type).toBe('null');
+      }
+    }
+  });
+
+  test('representative response shapes match handler outputs', () => {
+    const users = responseSchemaOf(document, '/api/dash/users', 'get', '200');
+    expect(users.required).toEqual(['success', 'message', 'data', 'meta']);
+    const userData = (users.properties as Record<string, unknown>)
+      .data as Record<string, unknown>;
+    const userItem = userData.items as Record<string, unknown>;
+    expect(Object.keys(userItem.properties as Record<string, unknown>)).toEqual(
+      expect.arrayContaining([
+        'id',
+        'name',
+        'email',
+        'isActive',
+        'roleId',
+        'role',
+        'createdAt',
+        'updatedAt',
+      ])
+    );
+
+    const revoked = responseSchemaOf(
+      document,
+      '/api/dash/users/{id}/sessions',
+      'delete',
+      '200'
+    );
+    const revokedData = (revoked.properties as Record<string, unknown>)
+      .data as Record<string, unknown>;
+    const revokedIds = (
+      revokedData.properties as Record<string, Record<string, unknown>>
+    ).revoked;
+    expect(revokedIds).toMatchObject({ type: 'array', uniqueItems: true });
+    expect(revokedIds?.items).toMatchObject({ format: 'uuid' });
+  });
+
+  test('Better Auth fragments are valid 3.1, filtered, and include hidden session query options', () => {
+    const getSession = operationOf(document, '/api/auth/get-session', 'get');
+    expect(
+      (getSession.parameters as Record<string, unknown>[])
+        .map((parameter) => parameter.name)
+        .filter((name): name is string => typeof name === 'string')
+        .toSorted(byText)
+    ).toEqual(['disableCookieCache', 'disableRefresh']);
+    expect(getSession.security).toEqual([{}, { sessionCookie: [] }]);
+
+    const components = (document as { components: Record<string, unknown> })
+      .components;
+    const schemas = components.schemas as Record<string, unknown>;
+    expect(Object.keys(schemas).toSorted(byText)).toEqual(['Session', 'User']);
+    const user = schemas.User as Record<string, unknown>;
+    expect(
+      Object.keys(user.properties as Record<string, unknown>)
+    ).not.toContain('roleName');
+    const session = schemas.Session as Record<string, unknown>;
+    const metadata = (
+      session.properties as Record<string, Record<string, unknown>>
+    ).metadata;
+    expect(metadata).toMatchObject({ type: 'object', default: {} });
+
+    const invalidTypes: unknown[] = [];
+    const nullableKeywords: unknown[] = [];
+    visitObjects(document, (object) => {
+      if (object.type === 'json') invalidTypes.push(object.type);
+      if ('nullable' in object) nullableKeywords.push(object.nullable);
+    });
+    expect(invalidTypes).toEqual([]);
+    expect(nullableKeywords).toEqual([]);
+  });
+
+  test('multipart limits and throttling response headers are concrete', () => {
+    const upload = requestSchemaOf(
+      document,
+      '/api/upload/image',
+      'post',
+      'multipart/form-data'
+    );
+    const files = (upload.properties as Record<string, unknown>)
+      .files as Record<string, unknown>;
+    expect(files).toMatchObject({
+      type: 'string',
+      format: 'binary',
+      maxLength: 1024 * 1024,
+    });
+    expect(files['x-allowed-content-types']).toEqual([
+      'image/png',
+      'image/webp',
+      'image/svg+xml',
+    ]);
+
+    const operation = operationOf(document, '/api/upload/image', 'post');
+    const limited = (
+      operation.responses as Record<string, Record<string, unknown>>
+    )['429'];
+    expect(limited?.headers).toMatchObject({
+      'Retry-After': expect.any(Object),
+      'X-RateLimit-Limit': expect.any(Object),
+      'X-RateLimit-Remaining': expect.any(Object),
+    });
+  });
+
+  test('405 is not falsely attached to correctly selected operations', () => {
+    const offenders: string[] = [];
+    for (const { pathName, method, operation } of documentOperations(
+      document
+    )) {
+      const responses = operation.responses as Record<string, unknown>;
+      if ('405' in responses) offenders.push(`${method} ${pathName}`);
+    }
+    expect(offenders).toEqual([]);
   });
 });
 
@@ -491,7 +835,7 @@ describe('the refusals an operation declares for its own authorisation', () => {
         entry.method.toLowerCase()
       );
       expect(operation.security).toEqual(
-        entry.auth === 'public' ? undefined : [{ sessionCookie: [] }]
+        entry.auth === 'public' ? [] : [{ sessionCookie: [] }]
       );
     }
   });
@@ -645,13 +989,18 @@ describe('the refusals an operation declares for its own authorisation', () => {
     const json = content['application/json'] as Record<string, unknown>;
     const schema = json.schema as Record<string, unknown>;
 
-    expect(schema.required).toEqual(['openapi', 'info', 'paths']);
+    expect(schema.required).toEqual([
+      'openapi',
+      'info',
+      'servers',
+      'tags',
+      'components',
+      'paths',
+    ]);
     expect(statusesOf(document, '/openapi.json', 'get')).toEqual([
       '200',
       '401',
       '403',
-      '404',
-      '405',
       '429',
       '500',
       '503',
@@ -693,7 +1042,7 @@ describe('the refusals an operation declares for its own authorisation', () => {
       Object.keys(operation.responses as Record<string, unknown>).toSorted(
         byText
       )
-    ).toEqual(['200', '401', '404', '405', '500', '503']);
+    ).toEqual(['200', '401', '503']);
 
     const responses = operation.responses as Record<string, unknown>;
     const ok = responses['200'] as Record<string, unknown>;

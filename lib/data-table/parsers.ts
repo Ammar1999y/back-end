@@ -10,9 +10,9 @@ import { OUT_OF_RANGE, positiveInt } from '@/utils';
 
 import { dataTableConfig } from './config';
 
-const MAX_RAW_LENGTH = 4096;
+export const MAX_SORT_RAW_LENGTH = 4096;
 /** Filters carry values, so they get a larger raw budget than sorts. */
-const MAX_FILTERS_RAW_LENGTH = MAX_RAW_LENGTH * 2;
+export const MAX_FILTERS_RAW_LENGTH = MAX_SORT_RAW_LENGTH * 2;
 const MAX_ID_LENGTH = 64;
 const MAX_VALUE_LENGTH = 512;
 const MAX_SORT_ITEMS = 10;
@@ -113,7 +113,7 @@ function parseSortingState<TData>(
   onDropped?: () => void
 ): ExtendedColumnSort<TData>[] {
   if (!value) return [];
-  if (value.length > MAX_RAW_LENGTH) {
+  if (value.length > MAX_SORT_RAW_LENGTH) {
     onDropped?.();
     return [];
   }
@@ -286,7 +286,7 @@ function parseFiltersState<TData>(
 
 // ─── Search Params ──────────────────────────────────────────────────
 
-const MAX_PAGE = 10_000;
+export const MAX_PAGE = 10_000;
 export const MAX_PER_PAGE = 100;
 
 export interface GetDataSchema<T = Record<string, unknown>> {

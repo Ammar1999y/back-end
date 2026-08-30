@@ -9,7 +9,9 @@ import type { Handler } from './contract';
 import type { HttpMethod, RouteManifestEntry } from './route-manifest';
 
 import { deleteSessionsSchema } from '@/app/api/dash/users/[id]/sessions/handler';
+import { SESSION_CURSOR_PATTERN } from '@/app/api/dash/users/[id]/sessions/pagination';
 import { devSignUpSchema } from '@/app/api/dev/sign-up/handler';
+import { UUID_V7_PATTERN } from '@/utils';
 import * as z from 'zod';
 import { auth } from '@/lib/auth';
 import {
@@ -17,10 +19,17 @@ import {
   BETTER_AUTH_ENDPOINTS,
   betterAuthServes,
 } from '@/lib/auth/allowed-paths';
+import { CAPTCHA_TOKEN_MAX_LENGTH } from '@/lib/captcha';
+import {
+  DASHBOARD_PAGE_NAMES,
+  PERMISSION_ACTIONS,
+} from '@/lib/permissions/constants';
+import { ALLOWED_IMAGE_TYPES } from '@/lib/r2/upload-helper';
 
 import { apiRaw } from '@/utils/api-response';
+import { PHONE_ENABLED, PHONE_REQUIRED } from '@/utils/config';
 import {
-  adminUpdateUserSchema,
+  adminUpdateUserBodySchema,
   changeEmailSchema,
   changeEmailVerifySchema,
   changePasswordSchema,
@@ -28,15 +37,20 @@ import {
   changePhoneVerifySchema,
   createUserSchema,
   loginSchema,
-  selfUpdateUserSchema,
+  selfUpdateUserBodySchema,
 } from '@/utils/validation/auth';
+import {
+  MAX_IMAGE_EDGE,
+  MAX_IMAGE_PIXELS,
+  MAX_IMAGE_SIZE,
+} from '@/utils/validation/constants';
 import {
   resetPasswordSchema,
   sendOtpSchema,
   verifyOtpSchema,
 } from '@/utils/validation/otp';
 import {
-  adminUpdatePermissionSchema,
+  adminUpdatePermissionBodySchema,
   createPermissionSchema,
 } from '@/utils/validation/permissions';
 
@@ -66,9 +80,12 @@ export const REQUEST_BODIES: Record<string, z.ZodType | readonly z.ZodType[]> =
     'POST /api/auth/otp/verify': verifyOtpSchema,
     'POST /api/auth/passwordless/send': sendOtpSchema,
     'POST /api/dash/permissions': createPermissionSchema,
-    'PUT /api/dash/permissions/:id': adminUpdatePermissionSchema,
+    'PUT /api/dash/permissions/:id': adminUpdatePermissionBodySchema,
     'POST /api/dash/users': createUserSchema,
-    'PUT /api/dash/users/:id': [adminUpdateUserSchema, selfUpdateUserSchema],
+    'PUT /api/dash/users/:id': [
+      adminUpdateUserBodySchema,
+      selfUpdateUserBodySchema,
+    ],
     'POST /api/dash/users/me/change-email': changeEmailSchema,
     'POST /api/dash/users/me/change-email/verify': changeEmailVerifySchema,
     'POST /api/dash/users/me/change-password': changePasswordSchema,
@@ -110,6 +127,151 @@ const BODYLESS_BAD_REQUEST_ROUTES = new Set([
   'DELETE /api/dash/users/:id',
 ]);
 
+/** Correct-method operations whose own handler can deliberately answer 404. */
+const NOT_FOUND_ROUTES = new Set([
+  'POST /api/auth/forgot-password/reset',
+  'POST /api/auth/forgot-password/send',
+  'POST /api/auth/otp/send',
+  'POST /api/auth/otp/verify',
+  'POST /api/auth/passwordless/send',
+  'GET /api/dash/permissions/:id',
+  'PUT /api/dash/permissions/:id',
+  'DELETE /api/dash/permissions/:id',
+  'POST /api/dash/users/me/change-email',
+  'POST /api/dash/users/me/change-phone',
+  'POST /api/dash/users/me/change-phone/verify',
+  'GET /api/dash/users/:id',
+  'PUT /api/dash/users/:id',
+  'DELETE /api/dash/users/:id',
+  'GET /api/dash/users/:id/sessions',
+  'DELETE /api/dash/users/:id/sessions',
+]);
+
+/** Bodyless routes whose query parser can reject a supplied value with 422. */
+const QUERY_VALIDATION_ROUTES = new Set([
+  'GET /api/dash/permissions',
+  'GET /api/dash/users',
+  'GET /api/dash/users/:id/sessions',
+]);
+
+const OPERATION_DOCS: Record<string, { summary: string; tag: string }> = {
+  'POST /api/auth/forgot-password/reset': {
+    summary: 'Reset a forgotten password',
+    tag: 'Authentication',
+  },
+  'POST /api/auth/forgot-password/send': {
+    summary: 'Send a password-reset code',
+    tag: 'Authentication',
+  },
+  'POST /api/auth/otp/send': {
+    summary: 'Send a one-time code',
+    tag: 'Authentication',
+  },
+  'POST /api/auth/otp/verify': {
+    summary: 'Verify a one-time code',
+    tag: 'Authentication',
+  },
+  'POST /api/auth/passwordless/send': {
+    summary: 'Send a passwordless sign-in code',
+    tag: 'Authentication',
+  },
+  'GET /api/dash/permissions': {
+    summary: 'List roles and permission counts',
+    tag: 'Permissions',
+  },
+  'POST /api/dash/permissions': {
+    summary: 'Create a role and permission matrix',
+    tag: 'Permissions',
+  },
+  'GET /api/dash/permissions/:id': {
+    summary: 'Get a role permission matrix',
+    tag: 'Permissions',
+  },
+  'PUT /api/dash/permissions/:id': {
+    summary: 'Update a role permission matrix',
+    tag: 'Permissions',
+  },
+  'DELETE /api/dash/permissions/:id': {
+    summary: 'Delete a role',
+    tag: 'Permissions',
+  },
+  'GET /api/dash/roles': {
+    summary: 'List assignable roles',
+    tag: 'Permissions',
+  },
+  'POST /api/dash/users/me/change-email': {
+    summary: 'Start an email-address change',
+    tag: 'Account',
+  },
+  'POST /api/dash/users/me/change-email/verify': {
+    summary: 'Verify and commit an email-address change',
+    tag: 'Account',
+  },
+  'POST /api/dash/users/me/change-password': {
+    summary: 'Change the current password',
+    tag: 'Account',
+  },
+  'POST /api/dash/users/me/change-phone': {
+    summary: 'Start a phone-number change',
+    tag: 'Account',
+  },
+  'POST /api/dash/users/me/change-phone/verify': {
+    summary: 'Verify and commit a phone-number change',
+    tag: 'Account',
+  },
+  'GET /api/dash/users': {
+    summary: 'List dashboard users',
+    tag: 'Users',
+  },
+  'POST /api/dash/users': {
+    summary: 'Create a dashboard user',
+    tag: 'Users',
+  },
+  'GET /api/dash/users/:id': {
+    summary: 'Get a dashboard user',
+    tag: 'Users',
+  },
+  'PUT /api/dash/users/:id': {
+    summary: 'Update a dashboard user',
+    tag: 'Users',
+  },
+  'DELETE /api/dash/users/:id': {
+    summary: 'Delete a dashboard user',
+    tag: 'Users',
+  },
+  'GET /api/dash/users/:id/sessions': {
+    summary: 'List a user’s active sessions',
+    tag: 'Sessions',
+  },
+  'DELETE /api/dash/users/:id/sessions': {
+    summary: 'Revoke a user’s sessions',
+    tag: 'Sessions',
+  },
+  'POST /api/upload/image': {
+    summary: 'Upload an image',
+    tag: 'Uploads',
+  },
+  'GET /api/health/storage': {
+    summary: 'Check storage readiness',
+    tag: 'Operations',
+  },
+  'POST /api/dev/sign-up': {
+    summary: 'Create a development system user',
+    tag: 'Development',
+  },
+  'GET /openapi.json': {
+    summary: 'Get this API contract',
+    tag: 'Contract',
+  },
+};
+
+const BETTER_AUTH_SUMMARIES: Record<string, string> = {
+  'GET /get-session': 'Get the current Better Auth session',
+  'POST /sign-out': 'Sign out the current session',
+  'POST /sign-in/email': 'Sign in with email and password',
+  'POST /passwordless/verify': 'Verify a passwordless sign-in code',
+};
+
 /**
  * Better Auth request bodies for the paths this deployment actually serves.
  *
@@ -145,6 +307,37 @@ function toJsonSchema(schema: z.ZodType): JsonSchema | null {
 
 function isJsonSchema(value: unknown): value is JsonSchema {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/** Repair Better Auth's OpenAPI-3.0-era schema fragments for a 3.1 document. */
+function normalizeOpenApi31(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(normalizeOpenApi31);
+  if (!isJsonSchema(value)) return value;
+
+  const normalized = Object.fromEntries(
+    Object.entries(value)
+      .filter(([key]) => key !== 'nullable')
+      .map(([key, child]) => [key, normalizeOpenApi31(child)])
+  ) as JsonSchema;
+
+  if (normalized.type === 'json') {
+    normalized.type = 'object';
+    normalized.additionalProperties = true;
+  }
+
+  if (value.nullable === true) {
+    if (typeof normalized.type === 'string')
+      normalized.type = [normalized.type, 'null'];
+    else if (Array.isArray(normalized.type)) {
+      if (!normalized.type.includes('null'))
+        normalized.type = [...normalized.type, 'null'];
+    } else return { anyOf: [normalized, { type: 'null' }] };
+  }
+
+  if (normalized.default === '{}' && normalized.type === 'object')
+    normalized.default = {};
+
+  return normalized;
 }
 
 /** The key a converted union puts its branches under, or null if it is not one. */
@@ -229,16 +422,134 @@ function withRequiredKeys(schema: unknown, converted: JsonSchema): JsonSchema {
   return converted;
 }
 
+function permissionDependencyRule(
+  actions: readonly string[],
+  requiredReadActions: readonly string[]
+): JsonSchema {
+  const anyTrue = (names: readonly string[]): JsonSchema => {
+    const branches = names.map((action) => ({
+      properties: { [action]: { const: true } },
+      required: [action],
+    }));
+    return branches.length === 1 && branches[0]
+      ? branches[0]
+      : { anyOf: branches };
+  };
+  return {
+    if: {
+      properties: {
+        permissions: anyTrue(actions),
+      },
+      required: ['permissions'],
+    },
+    // eslint-disable-next-line unicorn/no-thenable -- `then` is a JSON Schema conditional keyword
+    then: {
+      properties: {
+        permissions: anyTrue(requiredReadActions),
+      },
+    },
+  };
+}
+
+function addPagePermissionRules(schema: JsonSchema): JsonSchema {
+  if (!isJsonSchema(schema.properties)) return schema;
+  const permissions = schema.properties.permissions;
+  if (!isJsonSchema(permissions)) return schema;
+  const items = permissions.items;
+  if (!isJsonSchema(items)) return schema;
+
+  permissions.description =
+    'Page names must be unique. Unsupported actions may be omitted or false, never true.';
+  permissions['x-unique-by'] = 'name';
+  items.allOf = [
+    permissionDependencyRule(['edit', 'delete'], ['view']),
+    permissionDependencyRule(['editOwn', 'deleteOwn'], ['view', 'viewOwn']),
+    {
+      if: {
+        properties: { name: { const: 'home' } },
+        required: ['name'],
+      },
+      // eslint-disable-next-line unicorn/no-thenable -- `then` is a JSON Schema conditional keyword
+      then: {
+        properties: {
+          permissions: {
+            properties: Object.fromEntries(
+              Object.keys(PERMISSION_ACTIONS)
+                .filter((action) => action !== 'view')
+                .map((action) => [action, { const: false }])
+            ),
+          },
+        },
+      },
+    },
+  ];
+  return schema;
+}
+
+function addUserRoleRules(schema: JsonSchema, update: boolean): JsonSchema {
+  const customThen: JsonSchema = {
+    properties: { permissions: { minItems: 1 } },
+    ...(!update && { required: ['permissions'] }),
+  };
+  const rules: JsonSchema[] = [
+    {
+      if: {
+        properties: { roleId: { const: 'custom' } },
+        required: ['roleId'],
+      },
+      // eslint-disable-next-line unicorn/no-thenable -- `then` is a JSON Schema conditional keyword
+      then: customThen,
+      else: { properties: { permissions: { maxItems: 0 } } },
+    },
+  ];
+
+  if (!PHONE_ENABLED)
+    rules.push({
+      properties: {
+        phoneNumber: {
+          description: 'Phone input is disabled; omit this field or clear it.',
+        },
+      },
+    });
+  else if (PHONE_REQUIRED)
+    rules.push({
+      properties: {
+        phoneNumber: { not: { type: 'null' } },
+      },
+      ...(!update && { required: ['phoneNumber'] }),
+    });
+
+  return {
+    ...schema,
+    allOf: [...(Array.isArray(schema.allOf) ? schema.allOf : []), ...rules],
+  };
+}
+
+function applyRequestContractRules(
+  key: string | undefined,
+  schema: JsonSchema,
+  branch: number
+): JsonSchema {
+  let result = addPagePermissionRules(schema);
+  if (key === 'POST /api/dash/users') result = addUserRoleRules(result, false);
+  if (key === 'PUT /api/dash/users/:id' && branch === 0)
+    result = addUserRoleRules(result, true);
+  return result;
+}
+
 function requestBody(
-  schemas: z.ZodType | readonly z.ZodType[]
+  schemas: z.ZodType | readonly z.ZodType[],
+  key?: string
 ): JsonSchema | null {
   const list: readonly z.ZodType[] = Array.isArray(schemas)
     ? schemas
     : [schemas as z.ZodType];
   const converted = list
-    .map((schema) => {
+    .map((schema, index) => {
       const json = toJsonSchema(schema);
-      return json === null ? null : withRequiredKeys(schema, json);
+      return json === null
+        ? null
+        : applyRequestContractRules(key, withRequiredKeys(schema, json), index);
     })
     .filter((s): s is JsonSchema => s !== null);
   if (converted.length === 0) return null;
@@ -266,7 +577,7 @@ function toOpenApiPath(path: string): {
         name,
         in: 'path',
         required: true,
-        schema: { type: 'string' },
+        schema: name === 'id' ? UUID_SCHEMA : { type: 'string' },
       });
       return `{${name}}`;
     })
@@ -274,45 +585,328 @@ function toOpenApiPath(path: string): {
   return { path: converted, parameters };
 }
 
-/**
- * The response envelope every application endpoint returns.
- *
- * Written here rather than derived from `HandlerEnvelope`, because that is a
- * TypeScript interface and types do not survive to runtime. It is the one piece
- * of this document that can drift from the code; `lib/http/contract.ts` is the
- * definition it must match.
- *
- * And it HAD drifted: `meta` declared `pageSize`, a name that appears nowhere
- * else in the repository, and omitted `pageCount`. Both paginated endpoints emit
- * `PaginationMeta` (`utils/api-response.ts`), so a client generated from this
- * document read `undefined` for the page size and could not build a pager.
- * `tests/unit/openapi-contract.test.ts` now asserts these property names against
- * a real `PaginationMeta` value, which is what closes the drift the comment above
- * could only warn about.
- */
-const ENVELOPE_SCHEMA: JsonSchema = {
-  type: 'object',
-  properties: {
-    success: { type: 'boolean' },
-    message: { type: 'string' },
-    data: {},
-    meta: {
-      type: 'object',
-      properties: {
-        page: { type: 'integer' },
-        perPage: { type: 'integer' },
-        total: { type: 'integer' },
-        pageCount: { type: 'integer' },
-      },
-    },
-  },
-  required: ['success', 'message', 'data'],
+const UUID_SCHEMA: JsonSchema = {
+  type: 'string',
+  format: 'uuid',
+  pattern: UUID_V7_PATTERN,
+};
+const DATE_TIME_SCHEMA: JsonSchema = { type: 'string', format: 'date-time' };
+const NULL_SCHEMA: JsonSchema = { type: 'null' };
+const NULLABLE_STRING_SCHEMA: JsonSchema = { type: ['string', 'null'] };
+const NULLABLE_CURSOR_SCHEMA: JsonSchema = {
+  type: ['string', 'null'],
+  pattern: SESSION_CURSOR_PATTERN,
 };
 
-const ENVELOPE_RESPONSE = {
-  description: 'The standard API envelope.',
-  content: { 'application/json': { schema: ENVELOPE_SCHEMA } },
+const PAGINATION_META_SCHEMA: JsonSchema = {
+  type: 'object',
+  properties: {
+    page: { type: 'integer', minimum: 1 },
+    perPage: { type: 'integer', minimum: 1 },
+    total: { type: 'integer', minimum: 0 },
+    pageCount: { type: 'integer', minimum: 0 },
+  },
+  required: ['page', 'perPage', 'total', 'pageCount'],
+  additionalProperties: false,
 };
+
+const ERROR_ENVELOPE_SCHEMA: JsonSchema = {
+  type: 'object',
+  properties: {
+    success: { const: false },
+    message: { type: 'string' },
+    data: NULL_SCHEMA,
+  },
+  required: ['success', 'message', 'data'],
+  additionalProperties: false,
+};
+
+function successEnvelopeSchema(
+  data: JsonSchema,
+  paginated = false
+): JsonSchema {
+  return {
+    type: 'object',
+    properties: {
+      success: { const: true },
+      message: { type: 'string' },
+      data,
+      ...(paginated && { meta: PAGINATION_META_SCHEMA }),
+    },
+    required: ['success', 'message', 'data', ...(paginated ? ['meta'] : [])],
+    additionalProperties: false,
+  };
+}
+
+const ERROR_RESPONSE: JsonSchema = {
+  description: 'The standard API error envelope.',
+  content: { 'application/json': { schema: ERROR_ENVELOPE_SCHEMA } },
+};
+
+const PERMISSION_ACTION_PROPERTIES = Object.fromEntries(
+  Object.keys(PERMISSION_ACTIONS).map((action) => [action, { type: 'boolean' }])
+);
+const PARTIAL_ACTIONS_SCHEMA: JsonSchema = {
+  type: 'object',
+  properties: PERMISSION_ACTION_PROPERTIES,
+  additionalProperties: false,
+};
+const COMPLETE_ACTIONS_SCHEMA: JsonSchema = {
+  ...PARTIAL_ACTIONS_SCHEMA,
+  required: Object.keys(PERMISSION_ACTIONS),
+};
+const PAGE_PERMISSION_SCHEMA: JsonSchema = {
+  type: 'object',
+  properties: {
+    name: { type: 'string', enum: [...DASHBOARD_PAGE_NAMES] },
+    permissions: PARTIAL_ACTIONS_SCHEMA,
+  },
+  required: ['name', 'permissions'],
+  additionalProperties: false,
+};
+const USER_PERMISSION_MATRIX_SCHEMA: JsonSchema = {
+  type: 'object',
+  properties: Object.fromEntries(
+    DASHBOARD_PAGE_NAMES.map((page) => [page, COMPLETE_ACTIONS_SCHEMA])
+  ),
+  additionalProperties: false,
+};
+const ROLE_SUMMARY_SCHEMA: JsonSchema = {
+  type: 'object',
+  properties: {
+    id: UUID_SCHEMA,
+    roleName: { type: 'string' },
+  },
+  required: ['id', 'roleName'],
+  additionalProperties: false,
+};
+const NULLABLE_ROLE_SUMMARY_SCHEMA: JsonSchema = {
+  anyOf: [ROLE_SUMMARY_SCHEMA, NULL_SCHEMA],
+};
+const ROLE_ID_SCHEMA: JsonSchema = {
+  anyOf: [UUID_SCHEMA, { const: 'custom' }],
+};
+const NULLABLE_ROLE_ID_SCHEMA: JsonSchema = {
+  anyOf: [UUID_SCHEMA, { const: 'custom' }, NULL_SCHEMA],
+};
+const SESSION_SUMMARY_SCHEMA: JsonSchema = {
+  type: 'object',
+  properties: {
+    id: UUID_SCHEMA,
+    ipAddress: NULLABLE_STRING_SCHEMA,
+    userAgent: NULLABLE_STRING_SCHEMA,
+    createdAt: DATE_TIME_SCHEMA,
+    isCurrent: { type: 'boolean' },
+  },
+  required: ['id', 'ipAddress', 'userAgent', 'createdAt', 'isCurrent'],
+  additionalProperties: false,
+};
+const UPDATED_AT_SCHEMA: JsonSchema = {
+  type: 'object',
+  properties: { updatedAt: DATE_TIME_SCHEMA },
+  required: ['updatedAt'],
+  additionalProperties: false,
+};
+const CREATED_ID_SCHEMA: JsonSchema = {
+  type: 'object',
+  properties: { id: UUID_SCHEMA },
+  required: ['id'],
+  additionalProperties: false,
+};
+const OTP_SENT_SCHEMA: JsonSchema = {
+  type: 'object',
+  properties: { nextAllowedIn: { const: 30 } },
+  required: ['nextAllowedIn'],
+  additionalProperties: false,
+};
+const VERIFIED_SCHEMA: JsonSchema = {
+  type: 'object',
+  properties: { verified: { const: true } },
+  required: ['verified'],
+  additionalProperties: false,
+};
+const CONTACT_CHANGE_SCHEMA: JsonSchema = {
+  oneOf: [
+    {
+      type: 'object',
+      properties: { autoVerified: { const: true } },
+      required: ['autoVerified'],
+      additionalProperties: false,
+    },
+    {
+      type: 'object',
+      properties: { otpSent: { const: true } },
+      required: ['otpSent'],
+      additionalProperties: false,
+    },
+  ],
+};
+
+const SUCCESS_DATA_SCHEMAS: Record<string, JsonSchema> = {
+  'POST /api/auth/forgot-password/reset': {
+    type: 'object',
+    properties: { reset: { const: true } },
+    required: ['reset'],
+    additionalProperties: false,
+  },
+  'POST /api/auth/forgot-password/send': OTP_SENT_SCHEMA,
+  'POST /api/auth/otp/send': OTP_SENT_SCHEMA,
+  'POST /api/auth/otp/verify': VERIFIED_SCHEMA,
+  'POST /api/auth/passwordless/send': OTP_SENT_SCHEMA,
+  'GET /api/dash/permissions': {
+    type: 'array',
+    items: {
+      type: 'object',
+      properties: {
+        id: UUID_SCHEMA,
+        roleName: { type: 'string' },
+        description: NULLABLE_STRING_SCHEMA,
+        isActive: { type: 'boolean' },
+        createdAt: DATE_TIME_SCHEMA,
+        updatedAt: DATE_TIME_SCHEMA,
+        usersCount: { type: 'integer', minimum: 0 },
+      },
+      required: [
+        'id',
+        'roleName',
+        'description',
+        'isActive',
+        'createdAt',
+        'updatedAt',
+        'usersCount',
+      ],
+      additionalProperties: false,
+    },
+  },
+  'POST /api/dash/permissions': CREATED_ID_SCHEMA,
+  'GET /api/dash/permissions/:id': {
+    type: 'object',
+    properties: {
+      id: UUID_SCHEMA,
+      roleName: { type: 'string' },
+      description: NULLABLE_STRING_SCHEMA,
+      isActive: { type: 'boolean' },
+      permissions: { type: 'array', items: PAGE_PERMISSION_SCHEMA },
+    },
+    required: ['id', 'roleName', 'description', 'isActive', 'permissions'],
+    additionalProperties: false,
+  },
+  'PUT /api/dash/permissions/:id': UPDATED_AT_SCHEMA,
+  'DELETE /api/dash/permissions/:id': NULL_SCHEMA,
+  'GET /api/dash/roles': { type: 'array', items: ROLE_SUMMARY_SCHEMA },
+  'POST /api/dash/users/me/change-email': CONTACT_CHANGE_SCHEMA,
+  'POST /api/dash/users/me/change-email/verify': VERIFIED_SCHEMA,
+  'POST /api/dash/users/me/change-password': NULL_SCHEMA,
+  'POST /api/dash/users/me/change-phone': CONTACT_CHANGE_SCHEMA,
+  'POST /api/dash/users/me/change-phone/verify': VERIFIED_SCHEMA,
+  'GET /api/dash/users': {
+    type: 'array',
+    items: {
+      type: 'object',
+      properties: {
+        id: UUID_SCHEMA,
+        name: { type: 'string' },
+        email: { type: 'string', format: 'email' },
+        isActive: { type: 'boolean' },
+        roleId: ROLE_ID_SCHEMA,
+        createdAt: DATE_TIME_SCHEMA,
+        updatedAt: DATE_TIME_SCHEMA,
+        role: ROLE_SUMMARY_SCHEMA,
+      },
+      required: [
+        'id',
+        'name',
+        'email',
+        'isActive',
+        'roleId',
+        'createdAt',
+        'updatedAt',
+        'role',
+      ],
+      additionalProperties: false,
+    },
+  },
+  'POST /api/dash/users': CREATED_ID_SCHEMA,
+  'GET /api/dash/users/:id': {
+    type: 'object',
+    properties: {
+      id: UUID_SCHEMA,
+      name: { type: 'string' },
+      email: { type: 'string', format: 'email' },
+      emailVerified: { type: 'boolean' },
+      phoneNumber: NULLABLE_STRING_SCHEMA,
+      phoneNumberVerified: { type: 'boolean' },
+      isActive: { type: 'boolean' },
+      roleId: NULLABLE_ROLE_ID_SCHEMA,
+      role: NULLABLE_ROLE_SUMMARY_SCHEMA,
+      createdAt: DATE_TIME_SCHEMA,
+      updatedAt: DATE_TIME_SCHEMA,
+      permissions: USER_PERMISSION_MATRIX_SCHEMA,
+      sessions: { type: 'array', items: SESSION_SUMMARY_SCHEMA },
+      sessionsHasMore: { type: 'boolean' },
+      sessionsNextCursor: NULLABLE_CURSOR_SCHEMA,
+    },
+    required: [
+      'id',
+      'name',
+      'email',
+      'emailVerified',
+      'phoneNumber',
+      'phoneNumberVerified',
+      'isActive',
+      'roleId',
+      'role',
+      'createdAt',
+      'updatedAt',
+      'permissions',
+    ],
+    dependentRequired: {
+      sessions: ['sessionsHasMore', 'sessionsNextCursor'],
+      sessionsHasMore: ['sessions', 'sessionsNextCursor'],
+      sessionsNextCursor: ['sessions', 'sessionsHasMore'],
+    },
+    additionalProperties: false,
+  },
+  'PUT /api/dash/users/:id': UPDATED_AT_SCHEMA,
+  'DELETE /api/dash/users/:id': NULL_SCHEMA,
+  'GET /api/dash/users/:id/sessions': {
+    type: 'object',
+    properties: {
+      sessions: { type: 'array', items: SESSION_SUMMARY_SCHEMA },
+      nextCursor: NULLABLE_CURSOR_SCHEMA,
+    },
+    required: ['sessions', 'nextCursor'],
+    additionalProperties: false,
+  },
+  'DELETE /api/dash/users/:id/sessions': {
+    type: 'object',
+    properties: {
+      revoked: { type: 'array', items: UUID_SCHEMA, uniqueItems: true },
+    },
+    required: ['revoked'],
+    additionalProperties: false,
+  },
+  'POST /api/upload/image': { type: 'array', items: { type: 'string' } },
+  'POST /api/dev/sign-up': CREATED_ID_SCHEMA,
+};
+
+const PAGINATED_SUCCESS_ROUTES = new Set([
+  'GET /api/dash/permissions',
+  'GET /api/dash/users',
+]);
+
+function successResponseFor(key: string): JsonSchema {
+  const data = SUCCESS_DATA_SCHEMAS[key];
+  if (!data) throw new Error(`No success data schema for ${key}`);
+  return {
+    description: 'Success.',
+    content: {
+      'application/json': {
+        schema: successEnvelopeSchema(data, PAGINATED_SUCCESS_ROUTES.has(key)),
+      },
+    },
+  };
+}
 
 const STORAGE_CHECKS_SCHEMA: JsonSchema = {
   type: 'object',
@@ -401,12 +995,14 @@ const OPENAPI_DOCUMENT_RESPONSE: JsonSchema = {
       schema: {
         type: 'object',
         properties: {
-          openapi: { const: '3.1.0' },
+          openapi: { const: '3.1.1' },
           info: { type: 'object' },
+          servers: { type: 'array' },
+          tags: { type: 'array' },
           components: { type: 'object' },
           paths: { type: 'object' },
         },
-        required: ['openapi', 'info', 'paths'],
+        required: ['openapi', 'info', 'servers', 'tags', 'components', 'paths'],
         additionalProperties: true,
       },
     },
@@ -424,11 +1020,31 @@ const OPENAPI_DOCUMENT_RESPONSE: JsonSchema = {
 const PRE_AUTH_RESPONSES: JsonSchema = {
   '429': {
     description: 'Per-IP admission limit. See `Retry-After`.',
-    content: { 'application/json': { schema: ENVELOPE_SCHEMA } },
+    headers: {
+      'Retry-After': {
+        description: 'Seconds until the caller should retry.',
+        schema: { type: 'integer', minimum: 1 },
+      },
+      'X-RateLimit-Limit': {
+        description: 'Request or cost budget for the active window.',
+        schema: { type: 'integer', minimum: 1 },
+      },
+      'X-RateLimit-Remaining': {
+        description: 'Budget remaining in the active window.',
+        schema: { type: 'integer', minimum: 0 },
+      },
+    },
+    content: { 'application/json': { schema: ERROR_ENVELOPE_SCHEMA } },
   },
   '503': {
     description: 'The admission limiter store is unavailable and fails closed.',
-    content: { 'application/json': { schema: ENVELOPE_SCHEMA } },
+    headers: {
+      'Retry-After': {
+        description: 'Seconds until the caller should retry.',
+        schema: { type: 'integer', minimum: 1 },
+      },
+    },
+    content: { 'application/json': { schema: ERROR_ENVELOPE_SCHEMA } },
   },
 };
 
@@ -463,7 +1079,9 @@ function generatedBetterAuthResponse(
   const operation = generatedBetterAuthOperation(path, method);
   if (!operation || !isJsonSchema(operation.responses)) return null;
   const response = operation.responses[status];
-  return isJsonSchema(response) ? response : null;
+  if (!isJsonSchema(response)) return null;
+  const normalized = normalizeOpenApi31(response);
+  return isJsonSchema(normalized) ? normalized : null;
 }
 
 /**
@@ -515,29 +1133,32 @@ function betterAuthResponses(path: string, method: HttpMethod): JsonSchema {
 }
 
 /**
- * The responses every route can produce regardless of its handler, because the
- * server produces them: the 404/405 boundary, the pre-auth limiter, and the
- * fail-closed limiter store.
+ * Responses derived from route policy and the handler-level status inventory.
+ * A wrong method is a different request, so 405 belongs to the routing boundary,
+ * not to every correctly selected operation.
  */
 function commonResponses(entry: RouteManifestEntry): JsonSchema {
+  if (entry.response === 'storage-health') return { ...STORAGE_RESPONSES };
+
   const key = `${entry.method} ${entry.path}`;
   const success = CREATED_ROUTES.has(key) ? '201' : '200';
   const responses: JsonSchema = {
-    '404': ENVELOPE_RESPONSE,
-    '405': {
-      description: 'The path exists under a different method. See `Allow`.',
-      content: { 'application/json': { schema: ENVELOPE_SCHEMA } },
+    '500': {
+      ...ERROR_RESPONSE,
+      description: 'An unexpected server or dependency failure occurred.',
     },
-    '500': ENVELOPE_RESPONSE,
+    [success]:
+      entry.response === 'openapi-document'
+        ? OPENAPI_DOCUMENT_RESPONSE
+        : successResponseFor(key),
   };
 
-  if (entry.response === 'storage-health')
-    return { ...responses, ...STORAGE_RESPONSES };
-
-  responses[success] =
-    entry.response === 'openapi-document'
-      ? OPENAPI_DOCUMENT_RESPONSE
-      : ENVELOPE_RESPONSE;
+  if (NOT_FOUND_ROUTES.has(key))
+    responses['404'] = {
+      ...ERROR_RESPONSE,
+      description:
+        'The target does not exist, is outside the caller’s visible scope, or the feature is disabled.',
+    };
 
   // A body route rejects an absent or malformed body with 400 (`requireJsonBody`,
   // `utils/api-response.ts`) before its schema ever runs. Documented because it
@@ -548,13 +1169,13 @@ function commonResponses(entry: RouteManifestEntry): JsonSchema {
         entry.body === 'none'
           ? 'The operation violates a handler-level business rule.'
           : 'The request body is absent, empty, not parseable, or violates a handler-level business rule.',
-      content: { 'application/json': { schema: ENVELOPE_SCHEMA } },
+      content: { 'application/json': { schema: ERROR_ENVELOPE_SCHEMA } },
     };
 
   if (CONFLICT_ROUTES.has(key))
     responses['409'] = {
       description: 'A unique value or permission assignment already exists.',
-      content: { 'application/json': { schema: ENVELOPE_SCHEMA } },
+      content: { 'application/json': { schema: ERROR_ENVELOPE_SCHEMA } },
     };
 
   // 422 is the standard validation failure, and it is NOT limited to body
@@ -562,11 +1183,15 @@ function commonResponses(entry: RouteManifestEntry): JsonSchema {
   // malformed id (`app/api/dash/users/[id]/handler.ts`, `.../permissions/[id]`,
   // `.../sessions`). Both conditions are readable from the manifest, which is
   // why they belong here rather than in a per-route table.
-  if (entry.body !== 'none' || entry.path.includes(':'))
+  if (
+    entry.body === 'json' ||
+    entry.path.includes(':') ||
+    QUERY_VALIDATION_ROUTES.has(key)
+  )
     responses['422'] = {
       description:
         'Validation failed — a schema field, or a path parameter, was rejected.',
-      content: { 'application/json': { schema: ENVELOPE_SCHEMA } },
+      content: { 'application/json': { schema: ERROR_ENVELOPE_SCHEMA } },
     };
 
   // The refusals the route's own authorisation produces, from the one field that
@@ -576,7 +1201,7 @@ function commonResponses(entry: RouteManifestEntry): JsonSchema {
   if (entry.auth !== 'public') {
     responses['401'] = {
       description: 'No session, or the session row is no longer live.',
-      content: { 'application/json': { schema: ENVELOPE_SCHEMA } },
+      content: { 'application/json': { schema: ERROR_ENVELOPE_SCHEMA } },
     };
   }
 
@@ -593,7 +1218,7 @@ function commonResponses(entry: RouteManifestEntry): JsonSchema {
             ? 'The caller lacks the required authority or failed the required captcha.'
             : 'The caller lacks the grant, scope or role authority this route requires.'
           : 'The captcha this route requires was absent or rejected.',
-      content: { 'application/json': { schema: ENVELOPE_SCHEMA } },
+      content: { 'application/json': { schema: ERROR_ENVELOPE_SCHEMA } },
     };
 
   if (entry.preAuth === 'ip-limit' || entry.handlerRateLimit)
@@ -612,6 +1237,10 @@ function openApiConsistencyProblems(
 
   for (const entry of manifest) {
     const key = `${entry.method} ${entry.path}`;
+    if (!(key in OPERATION_DOCS))
+      problems.push(`${key} has no OPERATION_DOCS entry`);
+    if (entry.response === 'envelope' && !(key in SUCCESS_DATA_SCHEMAS))
+      problems.push(`${key} has no concrete success data schema`);
     // Multipart schemas come from route policy; JSON schemas are explicit.
     if (entry.body === 'json' && !(key in REQUEST_BODIES))
       problems.push(
@@ -643,6 +1272,25 @@ function openApiConsistencyProblems(
       problems.push(
         `BODYLESS_BAD_REQUEST_ROUTES has '${key}', which is not a route`
       );
+  for (const key of NOT_FOUND_ROUTES)
+    if (isLeftover(key))
+      problems.push(`NOT_FOUND_ROUTES has '${key}', which is not a route`);
+  for (const key of QUERY_VALIDATION_ROUTES)
+    if (isLeftover(key))
+      problems.push(
+        `QUERY_VALIDATION_ROUTES has '${key}', which is not a route`
+      );
+  for (const key of Object.keys(OPERATION_DOCS))
+    if (isLeftover(key))
+      problems.push(`OPERATION_DOCS has '${key}', which is not a route`);
+  for (const key of Object.keys(SUCCESS_DATA_SCHEMAS))
+    if (isLeftover(key))
+      problems.push(`SUCCESS_DATA_SCHEMAS has '${key}', which is not a route`);
+  for (const key of PAGINATED_SUCCESS_ROUTES)
+    if (isLeftover(key))
+      problems.push(
+        `PAGINATED_SUCCESS_ROUTES has '${key}', which is not a route`
+      );
   // A body belongs to a POST. Checked against the endpoint table rather than
   // against the paths alone, so a body declared for a GET-only path — a request
   // no client can make — is reported instead of published.
@@ -661,6 +1309,10 @@ function openApiConsistencyProblems(
 
   for (const endpoint of BETTER_AUTH_ENDPOINTS)
     for (const method of endpoint.methods) {
+      if (!(`${method} ${endpoint.path}` in BETTER_AUTH_SUMMARIES))
+        problems.push(
+          `Better Auth ${method} ${endpoint.path} has no summary entry`
+        );
       const operation = generatedBetterAuthOperation(endpoint.path, method);
       if (operation) {
         for (const status of ['200', '400', '404', '500'])
@@ -674,7 +1326,99 @@ function openApiConsistencyProblems(
         );
     }
 
+  for (const key of Object.keys(BETTER_AUTH_SUMMARIES)) {
+    const separator = key.indexOf(' ');
+    const method = key.slice(0, separator) as HttpMethod;
+    const path = key.slice(separator + 1);
+    if (!betterAuthServes(path, method))
+      problems.push(
+        `BETTER_AUTH_SUMMARIES has '${key}', which is not a Better Auth endpoint`
+      );
+  }
+
   return problems;
+}
+
+function referencedBetterAuthSchemas(paths: JsonSchema): JsonSchema {
+  const normalized = normalizeOpenApi31(BETTER_AUTH_OPENAPI.components.schemas);
+  if (!isJsonSchema(normalized)) return {};
+
+  const referenced = new Set<string>();
+  const visit = (value: unknown): void => {
+    if (Array.isArray(value)) {
+      for (const item of value) visit(item);
+      return;
+    }
+    if (!isJsonSchema(value)) return;
+    const ref = value.$ref;
+    if (typeof ref === 'string') {
+      const match = /^#\/components\/schemas\/(.+)$/.exec(ref);
+      if (match?.[1] && !referenced.has(match[1])) {
+        referenced.add(match[1]);
+        visit(normalized[match[1]]);
+      }
+    }
+    for (const child of Object.values(value)) visit(child);
+  };
+  visit(paths);
+
+  const selected = Object.fromEntries(
+    [...referenced]
+      .filter((name) => isJsonSchema(normalized[name]))
+      .map((name) => [name, normalized[name]])
+  ) as JsonSchema;
+
+  const user = selected.User;
+  if (isJsonSchema(user) && isJsonSchema(user.properties)) {
+    const properties = Object.fromEntries(
+      // Configured `returned: false`; the upstream generator does not honour it.
+      Object.entries(user.properties).filter(([name]) => name !== 'roleName')
+    );
+    selected.User = {
+      ...user,
+      properties: {
+        ...properties,
+        id: UUID_SCHEMA,
+        email: { type: 'string', format: 'email' },
+        image: { type: ['string', 'null'] },
+        roleId: {
+          type: ['string', 'null'],
+          pattern: UUID_V7_PATTERN,
+        },
+      },
+    };
+  }
+
+  const session = selected.Session;
+  if (isJsonSchema(session) && isJsonSchema(session.properties)) {
+    selected.Session = {
+      ...session,
+      properties: {
+        ...session.properties,
+        id: UUID_SCHEMA,
+        userId: UUID_SCHEMA,
+        ipAddress: NULLABLE_STRING_SCHEMA,
+        userAgent: NULLABLE_STRING_SCHEMA,
+        metadata: {
+          type: 'object',
+          properties: {
+            roleId: { type: ['string', 'null'], pattern: UUID_V7_PATTERN },
+            roleName: NULLABLE_STRING_SCHEMA,
+            roleScope: {
+              type: ['string', 'null'],
+              enum: ['system', 'standard', 'custom', null],
+            },
+            permissions: USER_PERMISSION_MATRIX_SCHEMA,
+          },
+          additionalProperties: false,
+          default: {},
+          readOnly: true,
+        },
+      },
+    };
+  }
+
+  return selected;
 }
 
 /**
@@ -709,23 +1453,36 @@ export function openApiDocument(
     // `resource` is required — a client that omits it gets a 400 it could not have
     // anticipated from this document.
     const queryParams = entry.query ?? [];
-    for (const param of queryParams)
+    for (const param of queryParams) {
+      const schema: JsonSchema = {
+        type: param.type ?? 'string',
+        ...(param.enum && { enum: [...param.enum] }),
+        ...(param.minimum !== undefined && { minimum: param.minimum }),
+        ...(param.maximum !== undefined && { maximum: param.maximum }),
+        ...(param.minLength !== undefined && { minLength: param.minLength }),
+        ...(param.maxLength !== undefined && { maxLength: param.maxLength }),
+        ...(param.pattern !== undefined && { pattern: param.pattern }),
+      };
       parameters.push({
         name: param.name,
         in: 'query',
         required: param.required,
         description: param.description,
-        schema: param.enum
-          ? { type: 'string', enum: [...param.enum] }
-          : { type: 'string' },
+        schema,
+        ...(param.example !== undefined && { example: param.example }),
       });
+    }
     if (entry.captcha)
       parameters.push({
         name: 'x-captcha-response',
         in: 'header',
         required: true,
         description: 'Cloudflare Turnstile response token.',
-        schema: { type: 'string', minLength: 1 },
+        schema: {
+          type: 'string',
+          minLength: 1,
+          maxLength: CAPTCHA_TOKEN_MAX_LENGTH,
+        },
       });
     if (entry.response === 'storage-health')
       parameters.push({
@@ -736,16 +1493,21 @@ export function openApiDocument(
         schema: { type: 'string', minLength: 1 },
       });
 
+    const key = `${entry.method} ${entry.path}`;
+    const docs = OPERATION_DOCS[key];
+    if (!docs) throw new Error(`No operation documentation for ${key}`);
     const operation: JsonSchema = {
       operationId: `${entry.method.toLowerCase()}${entry.path.replaceAll(/[^a-zA-Z0-9]/g, '_')}`,
+      summary: docs.summary,
+      tags: [docs.tag],
       responses: commonResponses(entry),
+      security: entry.auth === 'public' ? [] : [{ sessionCookie: [] }],
     };
-    if (entry.auth !== 'public') operation.security = [{ sessionCookie: [] }];
     if (parameters.length > 0) operation.parameters = parameters;
 
-    const schemas = REQUEST_BODIES[`${entry.method} ${entry.path}`];
+    const schemas = REQUEST_BODIES[key];
     if (schemas) {
-      const body = requestBody(schemas);
+      const body = requestBody(schemas, key);
       if (body) operation.requestBody = body;
     } else if (entry.body === 'multipart') {
       operation.requestBody = {
@@ -755,9 +1517,18 @@ export function openApiDocument(
             schema: {
               type: 'object',
               properties: {
-                files: { type: 'string', format: 'binary' },
+                files: {
+                  type: 'string',
+                  format: 'binary',
+                  'x-allowed-content-types': [...ALLOWED_IMAGE_TYPES],
+                  maxLength: MAX_IMAGE_SIZE * 1024 * 1024,
+                  description:
+                    `Exactly one PNG, WebP or SVG file. Maximum ${MAX_IMAGE_SIZE} MiB, ` +
+                    `${MAX_IMAGE_PIXELS.toLocaleString('en-US')} decoded pixels, and ${MAX_IMAGE_EDGE.toLocaleString('en-US')} pixels on either edge.`,
+                },
               },
               required: ['files'],
+              additionalProperties: false,
             },
           },
         },
@@ -778,31 +1549,64 @@ export function openApiDocument(
     // duplicate ids and made the document invalid for every generator.
     const build = (method: HttpMethod): JsonSchema => {
       const generated = generatedBetterAuthOperation(endpoint.path, method);
+      const summary =
+        BETTER_AUTH_SUMMARIES[`${method} ${endpoint.path}`] ??
+        `Better Auth ${method} ${endpoint.path}`;
       const operation: JsonSchema = {
         operationId: `betterAuth_${method.toLowerCase()}${slug}`,
+        summary,
+        tags: ['Authentication'],
         description:
           'Served by Better Auth, which owns its own routing, validation and ' +
           'response shapes under this prefix. Every Better Auth path outside ' +
           'this list is answered 404 by the before-hook in lib/auth.ts.',
         responses: betterAuthResponses(endpoint.path, method),
+        security:
+          endpoint.path === '/get-session' || endpoint.path === '/sign-out'
+            ? [{}, { sessionCookie: [] }]
+            : [],
       };
-      if (endpoint.captcha)
-        operation.parameters = [
+      const parameters: JsonSchema[] = [];
+      if (method === 'GET' && endpoint.path === '/get-session')
+        parameters.push(
           {
-            name: 'x-captcha-response',
-            in: 'header',
-            required: true,
-            description: 'Cloudflare Turnstile response token.',
-            schema: { type: 'string', minLength: 1 },
+            name: 'disableCookieCache',
+            in: 'query',
+            required: false,
+            description:
+              'Read the database-backed session instead of the signed cookie cache.',
+            schema: { type: 'boolean' },
           },
-        ];
+          {
+            name: 'disableRefresh',
+            in: 'query',
+            required: false,
+            description: 'Do not refresh session expiry during this read.',
+            schema: { type: 'boolean' },
+          }
+        );
+      if (endpoint.captcha)
+        parameters.push({
+          name: 'x-captcha-response',
+          in: 'header',
+          required: true,
+          description: 'Cloudflare Turnstile response token.',
+          schema: {
+            type: 'string',
+            minLength: 1,
+            maxLength: CAPTCHA_TOKEN_MAX_LENGTH,
+          },
+        });
+      if (parameters.length > 0) operation.parameters = parameters;
       // Only the method that carries it. A documented request body on `GET`
       // describes a request no client can make.
       if (schema && method === 'POST') {
         const body = requestBody(schema);
         if (body) operation.requestBody = body;
-      } else if (method === 'POST' && isJsonSchema(generated?.requestBody))
-        operation.requestBody = generated.requestBody;
+      } else if (method === 'POST' && isJsonSchema(generated?.requestBody)) {
+        const normalized = normalizeOpenApi31(generated.requestBody);
+        if (isJsonSchema(normalized)) operation.requestBody = normalized;
+      }
       return operation;
     };
 
@@ -825,15 +1629,51 @@ export function openApiDocument(
   }
 
   return {
-    openapi: '3.1.0',
+    openapi: '3.1.1',
     info: {
       title: 'Dashboard API',
       version: '0.1.0',
+      license: {
+        name: 'Private; redistribution is not licensed',
+        identifier: 'LicenseRef-Proprietary',
+      },
       description:
         'Generated from the route manifest in `routes.ts` and the Zod schemas the handlers validate with. Not hand-maintained.',
     },
+    servers: [
+      {
+        url: '/',
+        description: 'The same origin that served this document.',
+      },
+    ],
+    tags: [
+      {
+        name: 'Authentication',
+        description: 'Sign-in, sign-out, password recovery, and OTP flows.',
+      },
+      {
+        name: 'Account',
+        description: 'Authenticated self-service account changes.',
+      },
+      {
+        name: 'Permissions',
+        description: 'Dashboard roles and permission matrices.',
+      },
+      { name: 'Users', description: 'Dashboard user administration.' },
+      {
+        name: 'Sessions',
+        description: 'User session inspection and revocation.',
+      },
+      { name: 'Uploads', description: 'Authorized dashboard media uploads.' },
+      { name: 'Operations', description: 'Deployment readiness probes.' },
+      {
+        name: 'Development',
+        description: 'Endpoints registered only in development mode.',
+      },
+      { name: 'Contract', description: 'The generated OpenAPI document.' },
+    ],
     components: {
-      schemas: BETTER_AUTH_OPENAPI.components.schemas,
+      schemas: referencedBetterAuthSchemas(paths),
       securitySchemes: {
         sessionCookie: {
           type: 'apiKey',

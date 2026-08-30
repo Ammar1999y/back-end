@@ -35,6 +35,11 @@ import * as dashPermissions from '@/app/api/dash/permissions/handler';
 import * as dashRoles from '@/app/api/dash/roles/handler';
 import * as dashUsersId from '@/app/api/dash/users/[id]/handler';
 import * as dashUsersIdSessions from '@/app/api/dash/users/[id]/sessions/handler';
+import {
+  SESSION_CURSOR_MAX_LENGTH,
+  SESSION_CURSOR_PATTERN,
+  SESSIONS_MAX_PAGE_SIZE,
+} from '@/app/api/dash/users/[id]/sessions/pagination';
 import * as dashUsers from '@/app/api/dash/users/handler';
 import * as meChangeEmail from '@/app/api/dash/users/me/change-email/handler';
 import * as meChangeEmailVerify from '@/app/api/dash/users/me/change-email/verify/handler';
@@ -45,6 +50,13 @@ import * as devSignUp from '@/app/api/dev/sign-up/handler';
 import * as healthStorage from '@/app/api/health/storage/handler';
 import * as uploadImage from '@/app/api/upload/image/handler';
 import { BETTER_AUTH_ENDPOINTS } from '@/lib/auth/allowed-paths';
+import {
+  MAX_FILTERS_RAW_LENGTH,
+  MAX_PAGE,
+  MAX_PER_PAGE,
+  MAX_SEARCH_LENGTH,
+  MAX_SORT_RAW_LENGTH,
+} from '@/lib/data-table/parsers';
 import { openApiRouteHandler } from '@/lib/http/openapi';
 import {
   toPublishedManifest,
@@ -53,6 +65,61 @@ import {
 // A plain frozen object of page keys — no server library, so the framework-free
 // property above holds.
 import { DASHBOARD_PAGE_NAMES } from '@/lib/permissions/constants';
+
+const dataTableQuery = (
+  columns: string
+): NonNullable<RouteDefinition['query']> => [
+  {
+    name: 'maxPerPage',
+    required: false,
+    description: 'Upper bound applied to perPage for this request.',
+    type: 'integer',
+    minimum: 1,
+    maximum: MAX_PER_PAGE,
+  },
+  {
+    name: 'page',
+    required: false,
+    description: 'One-based page number.',
+    type: 'integer',
+    minimum: 1,
+    maximum: MAX_PAGE,
+  },
+  {
+    name: 'perPage',
+    required: false,
+    description: 'Rows per page.',
+    type: 'integer',
+    minimum: 1,
+    maximum: MAX_PER_PAGE,
+  },
+  {
+    name: 'sort',
+    required: false,
+    description: `JSON array of { id, desc } objects. Allowed ids: ${columns}.`,
+    maxLength: MAX_SORT_RAW_LENGTH,
+    example: '[{"id":"createdAt","desc":true}]',
+  },
+  {
+    name: 'filters',
+    required: false,
+    description: `JSON array of { id, value, variant, operator, filterId } objects. Allowed ids: ${columns}.`,
+    maxLength: MAX_FILTERS_RAW_LENGTH,
+  },
+  {
+    name: 'joinOperator',
+    required: false,
+    description: 'How multiple structured filters are combined.',
+    enum: ['and', 'or'],
+  },
+  {
+    name: 'search',
+    required: false,
+    description:
+      'Quick search. Terms shorter than three characters are intentionally ignored.',
+    maxLength: MAX_SEARCH_LENGTH,
+  },
+];
 
 export const ROUTES: readonly RouteDefinition[] = [
   // ---- auth ---------------------------------------------------------------
@@ -125,6 +192,9 @@ export const ROUTES: readonly RouteDefinition[] = [
     handlerRateLimit: true,
     body: 'none',
     response: 'envelope',
+    query: dataTableQuery(
+      'roleName, description, isActive, createdAt, updatedAt'
+    ),
   },
   {
     method: 'POST',
@@ -250,6 +320,7 @@ export const ROUTES: readonly RouteDefinition[] = [
     handlerRateLimit: true,
     body: 'none',
     response: 'envelope',
+    query: dataTableQuery('name, email, isActive, createdAt, updatedAt'),
   },
   {
     method: 'POST',
@@ -309,12 +380,18 @@ export const ROUTES: readonly RouteDefinition[] = [
       {
         name: 'limit',
         required: false,
-        description: 'Page size. Clamped server-side.',
+        description: 'Page size.',
+        type: 'integer',
+        minimum: 1,
+        maximum: SESSIONS_MAX_PAGE_SIZE,
       },
       {
         name: 'cursor',
         required: false,
-        description: 'Opaque cursor from a previous page.',
+        description:
+          'Cursor returned by the previous page: ISO-8601 UTC milliseconds, a pipe, then a UUIDv7.',
+        maxLength: SESSION_CURSOR_MAX_LENGTH,
+        pattern: SESSION_CURSOR_PATTERN,
       },
     ],
   },
@@ -381,8 +458,9 @@ export const ROUTES: readonly RouteDefinition[] = [
       {
         name: 'deep',
         required: false,
-        description: 'Set to 1 to run SQLite integrity and write probes.',
-        enum: ['1'],
+        description:
+          'Set to 1 to run SQLite integrity and write probes. Other values use the cheap probe.',
+        example: '1',
       },
     ],
   },

@@ -177,11 +177,9 @@ export const createPermissionSchema = z.object({
   isActive: z.boolean(),
 });
 
-const updatePermissionSchema = createPermissionSchema
-  .extend({
-    id: idSchema,
-  })
-  .partial({ permissions: true }); // Make permissions optional for updates
+export const adminUpdatePermissionBodySchema = createPermissionSchema
+  .partial({ permissions: true })
+  .strict();
 
 /**
  * UPDATE rejects unknown top-level keys instead of stripping them: a misspelled
@@ -198,7 +196,9 @@ const updatePermissionSchema = createPermissionSchema
  * those double as react-hook-form resolvers whose state legitimately carries
  * those response-only fields.
  */
-export const adminUpdatePermissionSchema = updatePermissionSchema.strict();
+export const adminUpdatePermissionSchema = adminUpdatePermissionBodySchema
+  .extend({ id: idSchema })
+  .strict();
 
 // Type inference, used in the front end
 // type CreatePermissionInput = z.input<typeof createPermissionSchema>;

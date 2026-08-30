@@ -1,4 +1,4 @@
-import { validID } from '@/utils';
+import { UUID_V7_FRAGMENT, validID } from '@/utils';
 
 import { HTTP_STATUS } from '@/utils/api-messages';
 import { CustomError } from '@/utils/error-class';
@@ -10,8 +10,9 @@ import { safeDate } from '@/utils/time';
  * not be discovered at all — and selective revocation needs its id.
  */
 export const SESSIONS_PAGE_SIZE = 50;
-const SESSIONS_MAX_PAGE_SIZE = 100;
-const CURSOR_MAX_LENGTH = 128;
+export const SESSIONS_MAX_PAGE_SIZE = 100;
+export const SESSION_CURSOR_MAX_LENGTH = 128;
+export const SESSION_CURSOR_PATTERN = String.raw`^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z\|${UUID_V7_FRAGMENT}$`;
 
 /**
  * ONE canonical cursor format: `<ISO-8601 UTC with milliseconds>|<uuid>`.
@@ -77,7 +78,7 @@ export function parseCursor(
   // was advancing while re-reading the same rows, which for a revocation list
   // can hide the session it is hunting for.
   if (raw === null) return null;
-  if (!raw || raw.length > CURSOR_MAX_LENGTH) invalidCursor();
+  if (!raw || raw.length > SESSION_CURSOR_MAX_LENGTH) invalidCursor();
   const separator = raw.lastIndexOf('|');
   if (separator <= 0) invalidCursor();
   const id = validID(raw.slice(separator + 1));

@@ -79,8 +79,16 @@ interface RouteQueryParam {
   required: boolean;
   /** One line, shown in the generated document. */
   description: string;
+  /** The value after standard OpenAPI query deserialization. */
+  type?: 'string' | 'integer';
   /** Closed value set, when there is one. */
   enum?: readonly string[];
+  minimum?: number;
+  maximum?: number;
+  minLength?: number;
+  maxLength?: number;
+  pattern?: string;
+  example?: string | number;
 }
 
 export interface RouteDefinition {
@@ -106,11 +114,7 @@ export interface RouteDefinition {
   body: BodyPolicy;
   response: ResponsePolicy;
   /**
-   * Query parameters this route reads. Optional, and absent means "none that can
-   * be enumerated" rather than "none": the data-table routes consume the whole
-   * query string as an open filter DSL (`db/queries/data-table.ts` reads
-   * `searchParams.entries()` wholesale), so their surface is not a fixed list and
-   * is deliberately left undeclared.
+   * Query parameters this route reads. Optional, and absent means none.
    */
   query?: readonly RouteQueryParam[];
   /**

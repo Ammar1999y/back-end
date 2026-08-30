@@ -2,7 +2,7 @@ import type { EntityID } from '@/types';
 
 import * as z from 'zod';
 
-import { normalizeArabicDigits, validID } from '..';
+import { normalizeArabicDigits, UUID_V7_REGEX, validID } from '..';
 import { sanitizeSvg } from '../images/svg-optimizer';
 import { safeDate } from '../time';
 import {
@@ -139,7 +139,7 @@ function getIDSchema(
   // when EntityID is number
   // const schema = z.int(idRequired).min(1, idRequired).max(MAX_ID, idRequired);
   // when EntityID is UUID
-  const schema = z.string(idRequired).min(1, idRequired);
+  const schema = z.string(idRequired).regex(UUID_V7_REGEX, idRequired);
 
   return z.preprocess(
     (v: EntityID) => validID(v) || (optional ? null : 0),
@@ -183,16 +183,9 @@ export const passwordSchema = z.preprocess(
     .string('كلمة المرور مطلوبة')
     .min(PASSWORD_MIN, `كلمة المرور يجب أن تكون ${PASSWORD_MIN} أحرف على الأقل`)
     .max(PASSWORD_MAX, `كلمة المرور يجب أن لا تتجاوز ${PASSWORD_MAX} حرفاً`)
-    .refine(
-      (val) =>
-        /[a-z]/.test(val) &&
-        /[A-Z]/.test(val) &&
-        /[0-9]/.test(val) &&
-        /[^a-zA-Z0-9]/.test(val),
-      {
-        error: 'تحقق من صحة كلمة المرور',
-      }
-    )
+    .regex(/^(?=.*[a-z])(?=.*[A-Z])(?=.*[0-9])(?=.*[^a-zA-Z0-9]).*$/, {
+      error: 'تحقق من صحة كلمة المرور',
+    })
 );
 
 // Saudi phone: strips non-digits, accepts 966XXXXXXXXX / 05XXXXXXXX / 5XXXXXXXX
@@ -210,22 +203,22 @@ export const phoneSchema = z.preprocess(
     .string(saudiPhoneEmptyError)
     .min(1, saudiPhoneEmptyError)
     .max(PHONE_NUMBER_MAX, saudiPhoneFormatError)
-    .refine(
-      (val) => {
-        // 966XXXXXXXXX (12 digits), 05XXXXXXXX (10 digits), or 5XXXXXXXX (9 digits)
-        if (val.startsWith('966')) return /^9665\d{8}$/.test(val);
-        if (val.startsWith('05')) return /^05\d{8}$/.test(val);
-        if (val.startsWith('5')) return /^5\d{8}$/.test(val);
-        return false;
-      },
-      { message: saudiPhoneFormatError }
-    )
+    .regex(/^(?:9665\d{8}|05\d{8}|5\d{8})$/, saudiPhoneFormatError)
     .transform((val) => {
       // Normalize to 9665XXXXXXXX
       if (val.startsWith('966')) return val;
       if (val.startsWith('05')) return '966' + val.slice(1);
       if (val.startsWith('5')) return '966' + val;
       return val;
+    })
+    .meta({
+      type: undefined,
+      minLength: undefined,
+      maxLength: undefined,
+      pattern: undefined,
+      anyOf: [{ type: 'string' }, { type: 'number' }],
+      description:
+        'Saudi mobile number. Strings may contain separators or Arabic digits; numbers are also accepted. Normalized output is 9665XXXXXXXX.',
     })
 );
 
