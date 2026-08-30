@@ -94,6 +94,41 @@ test('a code whose key was REMOVED throws rather than reporting a wrong code', a
   expect(err).toContain('no key is configured for stored key ID "b"');
 });
 
+test('a removed key makes the stored value UNEVALUABLE, which is what the verify boundary reads', async () => {
+  // The same configuration error as the test above, asked as a question instead
+  // of surfaced as a throw. `processOtpVerify` asks this first: letting
+  // `verifyOtpCode` throw rolled the transaction back into a 500 on the two
+  // ANONYMOUS verification endpoints, while an unknown identifier took the
+  // generic 400 — so a mis-timed rotation distinguished a real live proof from a
+  // nonexistent account. It answers "invalid or expired" now, which is the truth.
+  const hashed = await run(TWO_KEYS, ['envelope']);
+  const stored = JSON.parse(hashed.out).stored as string;
+
+  const present = await run(TWO_KEYS, ['evaluable', stored]);
+  expect(JSON.parse(present.out)).toEqual({ evaluable: true });
+
+  const removed = await run(ONE_KEY, ['evaluable', stored]);
+  expect(removed.code).toBe(0);
+  expect(JSON.parse(removed.out)).toEqual({ evaluable: false });
+});
+
+test.each([
+  ['empty', ''],
+  ['no envelope', 'deadbeef'],
+  ['wrong version', 'o2:a:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA'],
+  ['too few segments', 'o1:a'],
+])(
+  'a malformed stored value is EVALUABLE (%s), so it stays a wrong code rather than a 500',
+  async (_label, stored) => {
+    // The boundary between the two answers: only a missing key generation is
+    // unevaluable. A corrupted row must keep taking the ordinary
+    // wrong-code path, which `verifyOtpCode` already gives it.
+    const { code, out } = await run(TWO_KEYS, ['evaluable', stored]);
+    expect(code).toBe(0);
+    expect(JSON.parse(out)).toEqual({ evaluable: true });
+  }
+);
+
 test.each([
   ['empty', ''],
   ['no envelope', 'deadbeef'],

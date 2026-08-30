@@ -24,34 +24,40 @@
  * DOMPurify re-parses with. Several payloads below are stopped by the second and
  * not the first, which a test of `sanitizeSvg` in isolation could not tell you.
  *
- * **Two `test.failing` groups record live defects, not flaky tests.** They are
- * findings 2 and 14 of `reports/claude-opus-autonomous-audit.md`, each asserted
- * in the direction a fix would take it, so the suite stays green while the
- * defect stands and Bun flags the test the moment it is fixed. Read them before
- * adding anything to this file. (Findings 12 and 13 were the same shape and are
- * now fixed — see `describe('external references in SVG')`.)
+ * **No `test.failing` here.** Two groups used to record live defects that way —
+ * the metadata-only `validateSvgFile` and the zero-length RIFF chunk. Both are
+ * resolved: the first function is gone (the server pipeline is the single
+ * validation boundary) and the second is a passing regression case below.
  */
-import { describe, expect, test } from 'bun:test';
+import { describe, expect, spyOn, test } from 'bun:test';
 import zlib from 'node:zlib';
 
+import {
+  UPLOAD_MEGAPIXEL_BUDGET,
+  UPLOAD_REQUEST_UNIT,
+} from '@/app/api/upload/image/handler';
 import { uploadMsg } from '@/app/api/upload/image/messages';
-import { optimizeImage } from '@/lib/r2/optimize-image';
+import { measureEncodeCost, optimizeImage } from '@/lib/r2/optimize-image';
 import {
   ALLOWED_IMAGE_TYPES,
   isAllowedImageType,
   validateMagicBytes,
+  validateSvgUpload,
 } from '@/lib/r2/upload-helper';
 
 import { HTTP_STATUS } from '@/utils/api-messages';
 import {
+  ANIMATION_ELEMENTS,
   DANGEROUS_ATTRIBUTES,
   DANGEROUS_ELEMENTS,
   isDangerousValue,
   safeDecodeURI,
   SVG_MAX_ELEMENTS,
+  SVG_MAX_RENDERED_NODES,
 } from '@/utils/images/config';
+import { rasterDimensions } from '@/utils/images/raster-bytes';
 import { sanitizeSvgServer, svgOptimizerServer } from '@/utils/images/server';
-import { sanitizeSvg, validateSvgFile } from '@/utils/images/svg-optimizer';
+import { sanitizeSvg } from '@/utils/images/svg-optimizer';
 import {
   MAX_IMAGE_EDGE,
   MAX_IMAGE_PIXELS,
@@ -439,6 +445,40 @@ const EXTERNAL_REFERENCES: ReadonlyArray<readonly [string, string]> = [
       '<style>.a{mask-image:image("https://evil.example/mask.png")}</style><path class="a" d="M0 0"/>'
     ),
   ],
+  // Everything below is an element OTHER than `image`/`use` that dereferences
+  // `href`. The guard used to name those two, and the generic value check passes
+  // an ordinary `https:` value — so each of these reached the public bucket with
+  // its reference intact and `isValid: true`, nothing even stripped.
+  [
+    'an feImage href, which SVG 2 defines as an external-resource reference',
+    svg(
+      '<filter id="f"><feImage href="https://evil.example/pixel.png"/></filter><rect width="8" height="8" filter="url(#f)"/>'
+    ),
+  ],
+  [
+    'a textPath href',
+    svg(
+      '<text><textPath href="https://evil.example/x.svg#p">hi</textPath></text>'
+    ),
+  ],
+  [
+    'a gradient template href',
+    svg(
+      '<linearGradient id="g" href="https://evil.example/g.svg#h"/><rect width="8" height="8" fill="url(#g)"/>'
+    ),
+  ],
+  [
+    'a pattern template xlink:href',
+    svg(
+      '<pattern id="p" xlink:href="https://evil.example/p.svg#q"/><rect width="8" height="8" fill="url(#p)"/>'
+    ),
+  ],
+  [
+    'a filter href',
+    svg(
+      '<filter id="f" href="https://evil.example/f.svg#g"/><rect width="8" height="8" filter="url(#f)"/>'
+    ),
+  ],
 ];
 
 /**
@@ -454,7 +494,7 @@ const LOCAL_REFERENCES: ReadonlyArray<readonly [string, string]> = [
   [
     'a self-contained data: image',
     svg(
-      '<image width="8" height="8" href="data:image/png;base64,iVBORw0KGgo="/>'
+      '<image width="8" height="8" href="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="/>'
     ),
   ],
   [
@@ -555,6 +595,322 @@ describe('external references in SVG', () => {
     expect(result.cleanedSvg).not.toInclude('evil.example');
     expect(result.cleanedSvg).not.toInclude('<use');
   });
+
+  test('the external reference is gone from the STORED bytes, not only the cleaned ones', () => {
+    // svgo runs after the sanitiser (`processImage`), and the earlier defect was
+    // measured on the svgo output: the reference survived both stages. Asserted
+    // end to end so a future sanitiser change cannot be judged on `cleanedSvg`
+    // alone.
+    for (const [, markup] of EXTERNAL_REFERENCES) {
+      const result = clean(markup);
+      expect(result.isValid).toBe(true);
+      expect(svgOptimizerServer({ data: result.cleanedSvg })).not.toInclude(
+        'evil.example'
+      );
+    }
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Animation — refused for every format the route admits, not stripped
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('animation in an SVG', () => {
+  test.each([...ANIMATION_ELEMENTS])(
+    'a <%s> element makes the whole document a refusal, not a silent flatten',
+    (tag) => {
+      const result = clean(
+        svg(`<rect width="8" height="8"/><${tag} attributeName="x"/>`)
+      );
+
+      expect(result.isValid).toBe(false);
+      expect(result.cleanedSvg).toBe('');
+      // The reason is what `processImage` branches on to produce the same
+      // "animated uploads are not supported" message an animated WebP gets.
+      expect(result.reason).toBe('animated');
+    }
+  );
+
+  test('a namespace-prefixed animation element is refused too', () => {
+    const result = clean(
+      `<svg xmlns="${SVG_NS}" xmlns:s="${SVG_NS}"><rect width="8" height="8"/><s:animateTransform attributeName="transform"/></svg>`
+    );
+
+    expect(result.isValid).toBe(false);
+    expect(result.reason).toBe('animated');
+  });
+
+  test('a still document is untouched by the animation gate', () => {
+    const result = clean(svg('<rect width="8" height="8"/>'));
+
+    expect(result.isValid).toBe(true);
+    expect(result.reason).toBeUndefined();
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Expansion — what a renderer instantiates, which the element count does not bound
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('the <use> expansion bound', () => {
+  /** `levels` nested groups, each instantiating the previous one twice. */
+  const useChain = (levels: number) => {
+    const parts: string[] = [];
+    for (let i = 0; i < levels; i++)
+      parts.push(
+        i === 0
+          ? '<g id="l0"><rect width="1" height="1"/></g>'
+          : `<g id="l${i}"><use href="#l${i - 1}"/><use href="#l${i - 1}"/></g>`
+      );
+    return `<svg xmlns="${SVG_NS}">${parts.join('')}<use href="#l${levels - 1}"/></svg>`;
+  };
+
+  test('a nested <use> chain inside every other ceiling is refused', () => {
+    const bomb = useChain(123);
+
+    // The point of the finding: it passes both structural gates the sanitiser
+    // had. 2^123 rendered nodes from 6.5 KB of source.
+    expect(new Blob([bomb]).size).toBeLessThan(SVG_SIZE_CAP);
+    expect((bomb.match(/<[^>]+>/g) ?? []).length).toBeLessThan(
+      SVG_MAX_ELEMENTS
+    );
+
+    const result = clean(bomb);
+    expect(result.isValid).toBe(false);
+    expect(result.cleanedSvg).toBe('');
+    expect(result.errors.join('')).toInclude(String(SVG_MAX_RENDERED_NODES));
+  });
+
+  test('a reference cycle is refused rather than followed', () => {
+    const result = clean(
+      `<svg xmlns="${SVG_NS}"><g id="a"><use href="#a"/></g><use href="#a"/></svg>`
+    );
+
+    expect(result.isValid).toBe(false);
+    expect(result.cleanedSvg).toBe('');
+  });
+
+  test('an ordinary sprite sheet stays well inside the bound', () => {
+    // Without this the entry above is satisfiable by refusing every `<use>`.
+    const sprite = `<svg xmlns="${SVG_NS}"><defs><symbol id="i"><rect width="8" height="8"/><circle r="2"/></symbol></defs>${'<use href="#i"/>'.repeat(40)}</svg>`;
+
+    const result = clean(sprite);
+    expect(result.isValid).toBe(true);
+    expect(result.cleanedSvg).toInclude('<use');
+  });
+
+  /**
+   * The same chain with the SECOND reference of each level percent-encoded.
+   *
+   * A renderer resolves a fragment DECODED — Chromium's
+   * `SVGURLReferenceResolver` runs `DecodeUrlEscapeSequences` before
+   * `getElementById` — while `LOCAL_FRAGMENT` admits `%`, so `#%6c0` reached the
+   * stored document intact and cost ONE node against the ceiling while
+   * instantiating `id="l0"` in every viewer. Measured before the fix: 20 levels
+   * accepted with all 20 encoded references preserved through svgo.
+   */
+  const encodedUseChain = (levels: number, encode: boolean) => {
+    const parts = ['<g id="l0"><rect width="1" height="1"/></g>'];
+    for (let i = 1; i < levels; i++) {
+      const second = encode ? `#%6c${i - 1}` : `#l${i - 1}`;
+      parts.push(
+        `<g id="l${i}"><use href="#l${i - 1}"/><use href="${second}"/></g>`
+      );
+    }
+    return `<svg xmlns="${SVG_NS}">${parts.join('')}<use href="#l${levels - 1}"/></svg>`;
+  };
+
+  test('a percent-encoded fragment is counted, not waved through', () => {
+    const plain = clean(encodedUseChain(20, false));
+    const encoded = clean(encodedUseChain(20, true));
+
+    // The control: the identical document with plain fragments is refused, so
+    // the encoded one differs only in spelling.
+    expect(plain.isValid).toBe(false);
+    expect(encoded.isValid).toBe(false);
+    expect(encoded.errors.join('')).toInclude(String(SVG_MAX_RENDERED_NODES));
+  });
+
+  test('a percent-encoded fragment that resolves is still a legitimate reference', () => {
+    // Counting it must not mean refusing it: `#%69` names `id="i"` and renders.
+    const result = clean(
+      `<svg xmlns="${SVG_NS}"><defs><symbol id="i"><rect width="8" height="8"/></symbol></defs><use href="#%69"/></svg>`
+    );
+
+    expect(result.isValid).toBe(true);
+    expect(result.cleanedSvg).toInclude('<use');
+  });
+
+  /**
+   * `<marker>` content is instantiated once per VERTEX of the path referencing
+   * it, and the vertex count lives in one `d` attribute — which costs a single
+   * element against `SVG_MAX_ELEMENTS` however many vertices it names. Following
+   * `<use>` alone therefore counted a 100-element marker once and missed the
+   * multiplier entirely.
+   */
+  const markerBomb = (elements: number, vertices: number) => {
+    const marker = `<marker id="m" markerWidth="4" markerHeight="4"><g>${'<rect width="1" height="1"/>'.repeat(elements)}</g></marker>`;
+    let d = 'M0 0';
+    for (let i = 0; i < vertices; i++) d += ` L${i} ${i}`;
+    return `<svg xmlns="${SVG_NS}"><defs>${marker}</defs><path d="${d}" marker-mid="url(#m)"/></svg>`;
+  };
+
+  test('a marker applied at every vertex of a long path is refused', () => {
+    const bomb = markerBomb(100, 3000);
+
+    // Inside every other ceiling: a few hundred tags, well under the byte cap.
+    expect(new Blob([bomb]).size).toBeLessThan(SVG_SIZE_CAP);
+    expect((bomb.match(/<[^>]+>/g) ?? []).length).toBeLessThan(
+      SVG_MAX_ELEMENTS
+    );
+
+    const result = clean(bomb);
+    expect(result.isValid).toBe(false);
+    expect(result.errors.join('')).toInclude(String(SVG_MAX_RENDERED_NODES));
+  });
+
+  test('a marker reference cycle cannot launder a <use> bomb', () => {
+    // `cost` answers `Infinity` for a cycle, and the marker charge multiplies it
+    // by the number of EXTRA instantiation sites — which is zero for
+    // `marker-start`. `0 * Infinity` is `NaN`, and `NaN > limit` is false, so a
+    // single-site marker pointing at its own subtree turned this bomb from
+    // refused into accepted. The ceiling has to read a `NaN` as OVER the limit,
+    // never under it.
+    const chain = ['<g id="l0"><rect width="1" height="1"/></g>'];
+    for (let i = 1; i < 20; i++)
+      chain.push(
+        `<g id="l${i}"><use href="#l${i - 1}"/><use href="#l${i - 1}"/></g>`
+      );
+    const cycle =
+      '<defs><marker id="m"><path d="M0 0" marker-start="url(#m)"/></marker></defs>' +
+      '<path d="M0 0" marker-start="url(#m)"/>';
+    const laundered = `<svg xmlns="${SVG_NS}">${cycle}${chain.join('')}<use href="#l19"/></svg>`;
+
+    expect(clean(laundered).isValid).toBe(false);
+    // And the cycle alone is refused too, rather than counted as one node.
+    expect(
+      clean(
+        `<svg xmlns="${SVG_NS}"><defs><marker id="m"><path d="M0 0 L1 1 L2 2" marker-mid="url(#m)"/></marker></defs><path d="M0 0 L1 1 L2 2" marker-mid="url(#m)"/></svg>`
+      ).isValid
+    ).toBe(false);
+  });
+
+  test('an ordinary marker on an ordinary path survives', () => {
+    // Without this the entry above is satisfiable by refusing every marker.
+    const result = clean(
+      `<svg xmlns="${SVG_NS}"><defs><marker id="m"><circle r="1"/></marker></defs><path d="M0 0 L1 1 L2 2 L3 3" marker-start="url(#m)" marker-mid="url(#m)" marker-end="url(#m)"/></svg>`
+    );
+
+    expect(result.isValid).toBe(true);
+    expect(result.cleanedSvg).toInclude('marker-mid');
+  });
+
+  /**
+   * `marker-start` and `marker-end` render once per REFERENCING ELEMENT, so a
+   * hundred elements naming one marker instantiate it a hundred times. The
+   * counter credited one instantiation back per element instead of once per
+   * document, which at one site cancelled the whole charge — a hundred
+   * references cost nothing at all.
+   */
+  const repeatedMarker = (users: number, elements: number, attribute: string) =>
+    `<svg xmlns="${SVG_NS}"><defs><marker id="m">${'<rect width="1" height="1"/>'.repeat(elements)}</marker></defs>${`<path d="M0 0 L1 1" ${attribute}="url(#m)"/>`.repeat(users)}</svg>`;
+
+  test.each(['marker-start', 'marker-end'])(
+    'a marker named by a hundred elements through %s is refused',
+    (attribute) => {
+      const bomb = repeatedMarker(100, 100, attribute);
+
+      expect((bomb.match(/<[^>]+>/g) ?? []).length).toBeLessThan(
+        SVG_MAX_ELEMENTS
+      );
+      expect(clean(bomb).isValid).toBe(false);
+    }
+  );
+
+  test('a marker inherited from a group reaches every path under it', () => {
+    // The property is inherited, so the declaration sits on the `<g>` while the
+    // instantiations happen on its children. Reading only the element the
+    // attribute is written on counted none of them.
+    const inherited = `<svg xmlns="${SVG_NS}"><defs><marker id="m">${'<rect width="1" height="1"/>'.repeat(100)}</marker></defs><g marker-start="url(#m)">${'<path d="M0 0 L1 1"/>'.repeat(100)}</g></svg>`;
+
+    expect((inherited.match(/<[^>]+>/g) ?? []).length).toBeLessThan(
+      SVG_MAX_ELEMENTS
+    );
+    expect(clean(inherited).isValid).toBe(false);
+  });
+
+  test('line references are charged, including a marker containing nested uses', () => {
+    const chain = ['<g id="l0"><rect width="1" height="1"/></g>'];
+    for (let i = 1; i < 8; i++)
+      chain.push(
+        `<g id="l${i}"><use href="#l${i - 1}"/><use href="#l${i - 1}"/></g>`
+      );
+    const bomb = `<svg xmlns="${SVG_NS}"><defs>${chain.join('')}<marker id="m"><use href="#l7"/></marker></defs>${'<line x2="1" marker-start="url(#m)"/>'.repeat(20)}</svg>`;
+
+    expect((bomb.match(/<[^>]+>/g) ?? []).length).toBeLessThan(
+      SVG_MAX_ELEMENTS
+    );
+    expect(clean(bomb).isValid).toBe(false);
+  });
+
+  test('an inherited marker reaches geometry instantiated by use', () => {
+    const inherited = `<svg xmlns="${SVG_NS}"><defs><line id="line" x2="1"/><marker id="m">${'<rect width="1" height="1"/>'.repeat(100)}</marker></defs><g marker-start="url(#m)">${'<use href="#line"/>'.repeat(100)}</g></svg>`;
+
+    expect(clean(inherited).isValid).toBe(false);
+  });
+
+  test('CSS-escaped marker URLs are canonicalised before they are counted', () => {
+    const line = String.raw`<line x2="1" marker-start="u\72l(#\6d )"/>`;
+    const escaped = `<svg xmlns="${SVG_NS}"><defs><marker id="m">${'<rect width="1" height="1"/>'.repeat(100)}</marker></defs>${line.repeat(100)}</svg>`;
+
+    expect(clean(escaped).isValid).toBe(false);
+  });
+
+  test('an ordinary marker on a line survives', () => {
+    const result = clean(
+      `<svg xmlns="${SVG_NS}"><defs><marker id="m"><circle r="1"/></marker></defs><line x2="8" marker-start="url(#m)" marker-end="url(#m)"/></svg>`
+    );
+
+    expect(result.isValid).toBe(true);
+    expect(result.cleanedSvg).toInclude('marker-start');
+  });
+
+  test('a handful of elements sharing a small marker still survives', () => {
+    // The bound above is satisfiable by refusing every repeated reference.
+    expect(clean(repeatedMarker(20, 2, 'marker-start')).isValid).toBe(true);
+  });
+});
+
+describe('the xlink namespace, however it is spelled', () => {
+  /** Sketch and OmniGraffle bind the xlink namespace to `xl`, not `xlink`. */
+  const withPrefix = (inner: string) =>
+    `<svg xmlns="${SVG_NS}" xmlns:xl="${XLINK_NS}" width="8" height="8">${inner}</svg>`;
+
+  test('an external reference under a foreign prefix is stripped', () => {
+    // A qualified-name lookup never saw `xl:href`, so a bare `https:` value —
+    // which `isDangerousValue` passes — survived this sweep, closed only by
+    // DOMPurify dropping an attribute in a namespace it does not recognise.
+    const result = clean(
+      withPrefix(
+        '<image width="8" height="8" xl:href="https://evil.example/p.png"/>'
+      )
+    );
+
+    expect(result.isValid).toBe(true);
+    expect(result.cleanedSvg).not.toInclude('evil.example');
+  });
+
+  test('a same-document reference under a foreign prefix survives', () => {
+    // The other half of the same blindness: no reference was FOUND on
+    // `<use xl:href="#a"/>`, so a legitimate Sketch-exported sprite lost every
+    // `<use>` to the reference-less removal.
+    const result = clean(
+      withPrefix('<symbol id="a"><circle r="1"/></symbol><use xl:href="#a"/>')
+    );
+
+    expect(result.isValid).toBe(true);
+    expect(result.cleanedSvg).toInclude('use');
+  });
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -565,56 +921,30 @@ const PNG_SIGNATURE = Uint8Array.from([
   0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
 ]);
 
-describe('validateSvgFile', () => {
-  test('refuses a missing file', () => {
-    expect(validateSvgFile(undefined as unknown as File)).not.toBeNull();
-  });
-
-  test('refuses a file that is neither typed nor named as an SVG', () => {
-    const wrong = new File([PNG_SIGNATURE], 'payload.png', {
-      type: 'image/png',
-    });
-    expect(validateSvgFile(wrong)).not.toBeNull();
-  });
-
-  test('accepts up to the cap and refuses one byte past it', () => {
-    const at = new File([new Uint8Array(SVG_SIZE_CAP)], 'a.svg', {
-      type: 'image/svg+xml',
-    });
-    const over = new File([new Uint8Array(SVG_SIZE_CAP + 1)], 'a.svg', {
-      type: 'image/svg+xml',
-    });
-
-    expect(validateSvgFile(at)).toBeNull();
-    expect(validateSvgFile(over)).not.toBeNull();
-  });
-
-  test.failing('DEFECT: a non-SVG carrying an .svg name is refused', () => {
-    // It is not. `validateSvgFile` reads `file.type`, `file.name` and
-    // `file.size` and never opens the file, so PNG bytes named `payload.svg`
-    // return `null` — accepted — under either declared type.
-    //
-    // Not currently exploitable, and the reason is the next test: nothing calls
-    // this on the server path, and the content check that does run refuses the
-    // same input. It is asserted because `reports/test-strategy.md:1274` claims
-    // this function performs the check, and a future caller trusting that claim
-    // is the hazard.
-    expect(
-      validateSvgFile(
-        new File([PNG_SIGNATURE], 'payload.svg', { type: 'image/svg+xml' })
-      )
-    ).not.toBeNull();
-  });
-
-  test('the content check that actually refuses it is the sanitiser', () => {
+describe('the SVG content boundary', () => {
+  // `validateSvgFile` used to live here: an exported helper that read `file.type`,
+  // `file.name` and `file.size` and never opened the file, so PNG bytes named
+  // `payload.svg` came back as valid. It had no caller outside this block, and
+  // the server pipeline already refuses the same input by CONTENT — so the
+  // weaker parallel boundary is gone rather than repaired, leaving one authority.
+  test('a non-SVG carrying an .svg name is refused by content', () => {
     // `processImage` decodes the buffer as UTF-8 and hands it to
-    // `sanitizeSvgServer` (`upload-helper.ts:205-213`); no `<svg` substring
-    // means a 400, whatever the name said.
+    // `sanitizeSvgServer`; no `<svg` substring means a 400, whatever the name
+    // said.
     const asText = Buffer.from(PNG_SIGNATURE).toString('utf8');
 
     const result = clean(asText);
     expect(result.isValid).toBe(false);
     expect(result.cleanedSvg).toBe('');
+  });
+
+  test('the size ceiling belongs to the sanitiser, and applies to content', () => {
+    const at = `<svg xmlns="${SVG_NS}"><desc>${'A'.repeat(SVG_SIZE_CAP - 200)}</desc><rect width="1" height="1"/></svg>`;
+    const over = `<svg xmlns="${SVG_NS}"><desc>${'A'.repeat(SVG_SIZE_CAP)}</desc></svg>`;
+
+    expect(new Blob([at]).size).toBeLessThanOrEqual(SVG_SIZE_CAP);
+    expect(clean(at).isValid).toBe(true);
+    expect(clean(over).isValid).toBe(false);
   });
 });
 
@@ -785,6 +1115,9 @@ const realPng = buildPng(IMAGE_SIZE);
 const stillWebp = Buffer.from(
   await new Bun.Image(realPng).webp({ quality: 80 }).bytes()
 );
+const losslessWebp = Buffer.from(
+  await new Bun.Image(realPng).webp({ lossless: true }).bytes()
+);
 
 /** The compressed frame out of the real still, reused by every forgery below. */
 const realFrame = findRiffChunk(stillWebp, 'VP8 ');
@@ -832,6 +1165,23 @@ const extendedStillWebp = riffContainer(
   ])
 );
 
+test('the shared dimension reader covers PNG and every WebP encoding', () => {
+  expect(findRiffChunk(stillWebp, 'VP8 ')).not.toBeNull();
+  expect(findRiffChunk(losslessWebp, 'VP8L')).not.toBeNull();
+  expect(findRiffChunk(extendedStillWebp, 'VP8X')).not.toBeNull();
+
+  for (const [mimeType, bytes] of [
+    ['image/png', realPng],
+    ['image/webp', stillWebp],
+    ['image/webp', losslessWebp],
+    ['image/webp', extendedStillWebp],
+  ] as const)
+    expect(rasterDimensions(bytes, mimeType)).toEqual({
+      width: IMAGE_SIZE,
+      height: IMAGE_SIZE,
+    });
+});
+
 /** Animated: VP8X with the animation bit, ANIM, two ANMF frames. */
 const animatedWebp = riffContainer(
   Buffer.concat([
@@ -862,6 +1212,47 @@ const animatedBehindEmptyChunk = riffContainer(
     animationFrame,
   ])
 );
+
+/**
+ * An APNG: `acTL` before the first `IDAT`, plus one `fcTL`/`fdAT` pair.
+ *
+ * Built rather than borrowed so the chunk ORDER is the property under test — an
+ * `acTL` after `IDAT` is ignored by decoders and must not count as animated.
+ */
+function buildApng(acTlBeforeIdat: boolean): Buffer {
+  const ihdr = Buffer.alloc(13);
+  ihdr.writeUInt32BE(IMAGE_SIZE, 0);
+  ihdr.writeUInt32BE(IMAGE_SIZE, 4);
+  ihdr[8] = 8;
+  ihdr[9] = 6;
+
+  const acTl = Buffer.alloc(8);
+  acTl.writeUInt32BE(2, 0); // num_frames
+  acTl.writeUInt32BE(0, 4); // num_plays: forever
+
+  const fcTl = Buffer.alloc(26);
+  fcTl.writeUInt32BE(0, 0); // sequence number
+  fcTl.writeUInt32BE(IMAGE_SIZE, 4);
+  fcTl.writeUInt32BE(IMAGE_SIZE, 8);
+
+  const stride = 1 + IMAGE_SIZE * 4;
+  const frame = zlib.deflateSync(Buffer.alloc(IMAGE_SIZE * stride));
+  const fdAt = Buffer.concat([Buffer.alloc(4), frame]);
+
+  return Buffer.concat([
+    Buffer.from(PNG_SIGNATURE),
+    pngChunk('IHDR', ihdr),
+    ...(acTlBeforeIdat ? [pngChunk('acTL', acTl)] : []),
+    pngChunk('fcTL', fcTl),
+    pngChunk('IDAT', frame),
+    ...(acTlBeforeIdat ? [] : [pngChunk('acTL', acTl)]),
+    pngChunk('fdAT', fdAt),
+    pngChunk('IEND', Buffer.alloc(0)),
+  ]);
+}
+
+const apng = buildApng(true);
+const apngWithLateAcTl = buildApng(false);
 
 /** A GIF header with markup behind it — the classic upload polyglot. */
 const gifPolyglot = Buffer.concat([
@@ -1163,19 +1554,394 @@ describe('validateMagicBytes — the animated-WebP branch', () => {
     expect(() => validateMagicBytes(lying, 'image/webp')).not.toThrow();
   });
 
-  test.failing(
-    'DEFECT: a zero-length chunk before VP8X does not hide the animation flag',
-    () => {
-      // `isAnimatedWebp` bails the walk on the first `size <= 0` chunk, so one
-      // empty (and legal) chunk ahead of VP8X makes the animation flag
-      // unreachable and the file is accepted as a still. It then reaches
-      // `optimizeImage`, which rejects it as corrupt with a generic 422 instead
-      // of the animation-specific 400 this branch exists to provide.
-      //
-      // Fix shape: skip a zero-length chunk (`offset += 8`) instead of returning.
-      expect(
-        validateMagicBytes(animatedBehindEmptyChunk, 'image/webp')
-      ).toEqual({ valid: false, animated: true });
+  test('a zero-length chunk before VP8X does not hide the animation flag', () => {
+    // The walk used to bail on the first `size <= 0` chunk, so one empty (and
+    // legal) `XMP ` ahead of VP8X made the animation flag unreachable: the file
+    // was admitted as a still and then rejected by `optimizeImage` as corrupt,
+    // with a generic 422 instead of the animation-specific 400 this branch
+    // exists to provide.
+    expect(validateMagicBytes(animatedBehindEmptyChunk, 'image/webp')).toEqual({
+      valid: false,
+      animated: true,
+    });
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// validateMagicBytes — the APNG branch. Same policy as WebP, and it has to be:
+// an APNG is conventionally named `.png` and declared `image/png`, so before
+// this it was admitted and silently flattened to its first frame with a 200.
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('validateMagicBytes — the animated-PNG branch', () => {
+  test('an APNG is refused with { valid: false, animated: true }', () => {
+    expect(validateMagicBytes(apng, 'image/png')).toEqual({
+      valid: false,
+      animated: true,
+    });
+  });
+
+  test('a still PNG is still accepted', () => {
+    expect(validateMagicBytes(realPng, 'image/png')).toEqual({ valid: true });
+  });
+
+  test('an acTL AFTER the first IDAT is not animation', () => {
+    // Position is the rule, not presence: a decoder ignores `acTL` there, so
+    // treating it as animated would refuse a still PNG carrying a stray chunk.
+    expect(validateMagicBytes(apngWithLateAcTl, 'image/png')).toEqual({
+      valid: true,
+    });
+  });
+
+  test('a truncated APNG does not throw', () => {
+    for (let length = 8; length <= apng.length; length += 3)
+      expect(() =>
+        validateMagicBytes(apng.subarray(0, length), 'image/png')
+      ).not.toThrow();
+  });
+
+  test('a PNG chunk declaring a size past the end of the buffer does not throw', () => {
+    const lying = Buffer.concat([
+      Buffer.from(PNG_SIGNATURE),
+      (() => {
+        const header = Buffer.alloc(8);
+        header.writeUInt32BE(0xff_ff_ff_f0, 0);
+        header.write('tEXt', 4, 'ascii');
+        return header;
+      })(),
+      Buffer.alloc(8),
+    ]);
+
+    expect(() => validateMagicBytes(lying, 'image/png')).not.toThrow();
+  });
+
+  test('every admitted raster format is covered by an animation check', () => {
+    // The class this finding was an instance of: three formats admitted, all
+    // three with a standard animation form, and only one checked. SVG is the
+    // exemption — it carries no magic bytes and `sanitizeSvg` refuses its
+    // animation elements instead.
+    const rasterTypes = ALLOWED_IMAGE_TYPES.filter(
+      (type) => type !== 'image/svg+xml'
+    );
+
+    expect(rasterTypes.length).toBeGreaterThan(0);
+    for (const type of rasterTypes) {
+      const animatedFixture = type === 'image/png' ? apng : animatedWebp;
+      expect(validateMagicBytes(animatedFixture, type)).toEqual({
+        valid: false,
+        animated: true,
+      });
+    }
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The per-user upload budget, in megapixels
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('the upload budget is charged in megapixels', () => {
+  /**
+   * The unit the limiter spends, and the two ceilings it derives.
+   *
+   * The budget is a MEGAPIXEL count, not a request count, because the encoder is
+   * process-global and serialized while `MAX_IMAGE_PIXELS` admits 25 MP — so a
+   * request count sized for thumbnails is 91 s of exclusive encoder demand per
+   * minute when every request is a pixel bomb. Neither number had an assertion,
+   * and between them they decide both ceilings.
+   */
+  test('one request costs at least the floor, so the request ceiling is explicit', () => {
+    // `BUDGET / UNIT` is the per-user request rate, whatever the pixels. At a
+    // floor of 1 it was 100/min — a silent five-fold widening of a limit nobody
+    // meant to move, because most uploads are far under a megapixel and an SVG
+    // never reaches `measureEncodeCost` at all.
+    expect(UPLOAD_MEGAPIXEL_BUDGET / UPLOAD_REQUEST_UNIT).toBe(20);
+  });
+
+  test('a maximum-size image still fits in one window', () => {
+    // `rateLimit` refuses `cost > limit` WITHOUT a write, so a budget under the
+    // cost of one legal upload is a permanent 429 rather than a slow path.
+    // `app/api/upload/image/handler.ts` throws at load if this stops holding;
+    // importing it above is what runs that check, and this states the number.
+    const worstCase = Math.max(
+      UPLOAD_REQUEST_UNIT,
+      Math.ceil(MAX_IMAGE_PIXELS / 1_000_000)
+    );
+
+    expect(worstCase).toBeLessThanOrEqual(UPLOAD_MEGAPIXEL_BUDGET);
+    // And the worst case really is bounded: four such uploads per window.
+    expect(Math.floor(UPLOAD_MEGAPIXEL_BUDGET / worstCase)).toBe(4);
+  });
+
+  test.each([
+    ['a thumbnail', 8, 8, 1],
+    ['exactly one megapixel', 1000, 1000, 1],
+    ['just over one megapixel', 1001, 1000, 2],
+    ['four megapixels', 2000, 2000, 4],
+  ])(
+    '%s costs %s units',
+    async (_label, width, height, expected) => {
+      // Rounded UP and floored at one: a fractional charge would let a stream of
+      // sub-megapixel requests cost nothing.
+      const png = buildPng(width, height, true);
+      expect(await measureEncodeCost(png)).toBe(expected);
+    },
+    30_000
+  );
+
+  test('the cost comes from the HEADER, not from a decode', async () => {
+    // The reason it can run before the encoder slot is taken. A PNG truncated to
+    // its IHDR costs exactly what the whole file costs, while ENCODING the same
+    // bytes fails — so the charge demonstrably never decoded a pixel.
+    const full = buildPng(1200, 900, true);
+    const headerOnly = full.subarray(0, 100);
+
+    expect(await measureEncodeCost(full)).toBe(2);
+    expect(await measureEncodeCost(headerOnly)).toBe(2);
+    expect(new Bun.Image(headerOnly).webp().bytes()).rejects.toThrow();
+  }, 30_000);
+
+  test('a pixel bomb is refused here rather than inside the encoder', async () => {
+    // `MAX_IMAGE_PIXELS` is enforced by `Bun.Image`'s own `maxPixels`, which
+    // `measureEncodeCost` passes — so the rejection lands before the request is
+    // charged and before it queues for the encoder.
+    const edge = Math.ceil(Math.sqrt(MAX_IMAGE_PIXELS)) + 1;
+    const bomb = buildPng(edge, edge, true);
+
+    expect(measureEncodeCost(bomb)).rejects.toMatchObject({
+      status: HTTP_STATUS.UNPROCESSABLE,
+      message: uploadMsg.tooManyPixels(
+        Math.floor(MAX_IMAGE_PIXELS / 1_000_000)
+      ),
+    });
+  }, 60_000);
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// A raster inlined into an SVG obeys the same policy as one uploaded directly
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('an inline data: raster is held to the upload policy', () => {
+  const inline = (mimeType: string, bytes: Buffer) =>
+    svg(
+      `<image width="8" height="8" href="data:${mimeType};base64,${bytes.toString('base64')}"/>`
+    );
+
+  test.each([
+    ['a still PNG', 'image/png', () => realPng],
+    ['a still WebP', 'image/webp', () => stillWebp],
+  ])('%s survives', (_label, mimeType, bytes) => {
+    // The capability this allowance exists for: a legitimately inlined bitmap.
+    const result = clean(inline(mimeType, bytes()));
+
+    expect(result.isValid).toBe(true);
+    expect(result.cleanedSvg).toInclude('data:');
+  });
+
+  test.each([
+    ['an APNG', 'image/png', () => apng],
+    ['an animated WebP', 'image/webp', () => animatedWebp],
+  ])(
+    '%s is REFUSED with the same reason the direct upload gives',
+    (_label, mimeType, bytes) => {
+      // The class: `removeRasterImages` matched `xlink:href` only (svgo 4.1.0), so
+      // the modern spelling stored and served an animated raster from the public
+      // bucket while the same bytes uploaded directly were refused by the byte
+      // checks. Both boundaries read the same predicate now.
+      expect(validateMagicBytes(bytes(), mimeType)).toEqual({
+        valid: false,
+        animated: true,
+      });
+
+      // Refused, NOT stripped — and that is the half a security fix alone would
+      // have missed. Stripping answers 200 with the picture silently gone, which
+      // is verbatim the failure `ANIMATION_ELEMENTS` refuses rather than strips
+      // and the one the APNG byte check exists to remove. The bytes never
+      // reached the bucket either way; the policy did not answer the same twice.
+      const result = clean(inline(mimeType, bytes()));
+      expect(result.isValid).toBe(false);
+      expect(result.reason).toBe('animated');
+      expect(result.cleanedSvg).toBe('');
     }
   );
+
+  test('all three routes animation takes answer alike', () => {
+    // Uploaded directly, declared with SMIL, or inlined on a reference — one
+    // policy, one disposition. `processImage` maps `reason: 'animated'` to the
+    // same `animatedNotAllowed` message the byte check produces.
+    expect(validateMagicBytes(apng, 'image/png')).toMatchObject({
+      valid: false,
+      animated: true,
+    });
+    expect(
+      clean(svg('<rect><animate attributeName="x"/></rect>'))
+    ).toMatchObject({ isValid: false, reason: 'animated' });
+    expect(clean(inline('image/png', apng))).toMatchObject({
+      isValid: false,
+      reason: 'animated',
+    });
+  });
+
+  test('a type the upload route does not admit is stripped, not refused', () => {
+    // The OTHER axis, and it keeps the reference answer. GIF is not in
+    // `ALLOWED_IMAGE_TYPES`, so it is refused for its TYPE — exactly as an
+    // `https:` reference is — and its bytes are never reached, which is why an
+    // animated GIF is stripped here where an APNG is refused. Stripping an
+    // unsupported reference is the contract every other unsupported reference
+    // in this file gets.
+    const gif = Buffer.from('R0lGODlhAQABAAAAACw=', 'base64');
+    expect(isAllowedImageType('image/gif')).toBe(false);
+
+    const result = clean(inline('image/gif', gif));
+    expect(result.isValid).toBe(true);
+    expect(result.reason).toBeUndefined();
+    expect(result.cleanedSvg).not.toInclude('data:');
+  });
+
+  test('a payload that is not what it declares is stripped', () => {
+    // A declared type nothing verifies is the same hole the magic-byte check
+    // closes on the direct path. Stripped rather than refused: a mismatched
+    // payload is a broken reference, not an animated upload.
+    const result = clean(inline('image/png', stillWebp));
+
+    expect(result.isValid).toBe(true);
+    expect(result.cleanedSvg).not.toInclude('data:');
+  });
+
+  test('a signature without readable dimensions is stripped', () => {
+    const result = clean(inline('image/png', Buffer.from(PNG_SIGNATURE)));
+
+    expect(result.isValid).toBe(true);
+    expect(result.cleanedSvg).not.toInclude('data:');
+  });
+
+  test('svgo does not delete a raster the sanitiser kept', () => {
+    // `removeRasterImages` used to answer this question by attribute SPELLING —
+    // deleting an `xlink:href` bitmap and keeping the identical `href` one. The
+    // sanitiser is the single authority now, so the post-svgo bytes have to
+    // agree with it.
+    const result = clean(inline('image/png', realPng));
+    expect(result.isValid).toBe(true);
+
+    const stored = svgOptimizerServer({ data: result.cleanedSvg });
+    expect(stored).toInclude('data:image/png;base64,');
+  });
+
+  /**
+   * Dimensions come out of the header, so a fixture needs a real IHDR and
+   * nothing else — `buildPng` would allocate the raster, and 25 MP of RGBA is
+   * 100 MB for a test that never decodes a pixel.
+   */
+  const pngHeader = (width: number, height: number) => {
+    const ihdr = Buffer.alloc(13);
+    ihdr.writeUInt32BE(width, 0);
+    ihdr.writeUInt32BE(height, 4);
+    ihdr[8] = 8;
+    ihdr[9] = 6;
+    return Buffer.concat([
+      Buffer.from(PNG_SIGNATURE),
+      pngChunk('IHDR', ihdr),
+      pngChunk('IEND', Buffer.alloc(0)),
+    ]);
+  };
+
+  test.each([
+    [
+      'over MAX_IMAGE_PIXELS',
+      5001,
+      5001,
+      'too-many-pixels',
+      uploadMsg.tooManyPixels(Math.floor(MAX_IMAGE_PIXELS / 1_000_000)),
+    ],
+    [
+      'over MAX_IMAGE_EDGE',
+      MAX_IMAGE_EDGE + 1,
+      2,
+      'edge-too-long',
+      uploadMsg.edgeTooLong(MAX_IMAGE_EDGE),
+    ],
+  ] as const)(
+    'an inline raster %s is refused, as the direct path refuses it',
+    (_label, width, height, reason, message) => {
+      // The gap this closes: the direct path answers 422 on these bytes while
+      // wrapping them in an SVG stored them, so the SVG was a way to pay the
+      // floor for a raster the pixel ceiling exists to reject.
+      const result = clean(inline('image/png', pngHeader(width, height)));
+
+      expect(result.isValid).toBe(false);
+      expect(result.reason).toBe(reason);
+
+      const logged = spyOn(console, 'error').mockImplementation(() => {});
+      try {
+        validateSvgUpload(
+          Buffer.from(inline('image/png', pngHeader(width, height))),
+          'bomb.svg'
+        );
+        throw new Error('expected validateSvgUpload to reject');
+      } catch (error) {
+        expect(error).toMatchObject({
+          status: HTTP_STATUS.UNPROCESSABLE,
+          message,
+        });
+      } finally {
+        logged.mockRestore();
+      }
+    }
+  );
+
+  test('a legal inline raster survives, and is charged its megapixels', () => {
+    const document = inline('image/png', pngHeader(4000, 4000));
+
+    expect(4000 * 4000).toBeLessThan(MAX_IMAGE_PIXELS);
+    expect(clean(document).isValid).toBe(true);
+    const result = clean(document);
+    expect(result.isValid).toBe(true);
+    if (!result.isValid) throw new Error('expected valid SVG');
+    expect(result.embeddedRasterMegapixels).toBe(16);
+  });
+
+  test('XML character references cannot hide an admitted raster from metering', () => {
+    const escaped = inline('image/png', pngHeader(4000, 4000)).replace(
+      'data:image/png;base64,',
+      'data:image/png&#59;base64,'
+    );
+    const result = clean(escaped);
+
+    expect(result.isValid).toBe(true);
+    if (!result.isValid) throw new Error('expected valid SVG');
+    expect(result.cleanedSvg).toInclude('data:image/png;base64,');
+    expect(result.embeddedRasterMegapixels).toBe(16);
+  });
+
+  test('every embedded raster is charged, not just the first', () => {
+    // The flat floor priced all three the same as an empty icon.
+    const three = svg(
+      `<image href="data:image/png;base64,${pngHeader(2000, 2000).toString('base64')}"/>`.repeat(
+        3
+      )
+    );
+
+    const result = clean(three);
+    expect(result.isValid).toBe(true);
+    if (!result.isValid) throw new Error('expected valid SVG');
+    expect(result.embeddedRasterMegapixels).toBe(12);
+  });
+
+  test('the aggregate embedded pixels cannot exceed the one-file ceiling', () => {
+    const aggregateBomb = svg(
+      `<image href="data:image/png;base64,${pngHeader(4000, 4000).toString('base64')}"/>`.repeat(
+        2
+      )
+    );
+
+    const result = clean(aggregateBomb);
+    expect(result.isValid).toBe(false);
+    expect(result.reason).toBe('too-many-pixels');
+  });
+
+  test('a document with no raster is charged nothing', () => {
+    const result = clean(svg('<path d="M0 0h8v8H0z"/>'));
+    expect(result.isValid).toBe(true);
+    if (!result.isValid) throw new Error('expected valid SVG');
+    expect(result.embeddedRasterMegapixels).toBe(0);
+  });
 });

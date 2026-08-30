@@ -10,10 +10,16 @@ import { encode } from 'blurhash';
 
 import { HTTP_STATUS } from '@/utils/api-messages';
 import { CustomError } from '@/utils/error-class';
+import {
+  hasRasterSignature,
+  isAnimatedRaster,
+  matchesMagicBytes,
+} from '@/utils/images/raster-bytes';
 import { imageToRgba } from '@/utils/images/rgba';
 import { sanitizeSvgServer, svgOptimizerServer } from '@/utils/images/server';
 import { generateShortId, sanitizeFilename } from '@/utils/sanitize-filename';
 import {
+  MAX_IMAGE_EDGE,
   MAX_IMAGE_PIXELS,
   SERVER_MAX_IMAGE_SIZE,
 } from '@/utils/validation/constants';
@@ -48,51 +54,19 @@ export function isAllowedImageType(
   return ALLOWED_IMAGE_TYPES.includes(mimeType as AllowedImageType);
 }
 
-// Magic bytes signatures for file type validation
-const MAGIC_BYTES = {
-  'image/png': {
-    bytes: [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a],
-    offset: 0,
-  },
-  'image/webp': {
-    bytes: [0x52, 0x49, 0x46, 0x46],
-    offset: 0,
-    secondary: { bytes: [0x57, 0x45, 0x42, 0x50], offset: 8 },
-  },
-} as const;
-
 /**
- * A WebP whose extended header declares the ANIMATION flag.
+ * The stored extension, from the RESOLVED MIME type and never from `file.name`.
  *
- * Rejected deliberately: animated uploads are not a feature of this application,
- * and until now they were accepted and silently flattened to their first frame,
- * so a user got back a still image with no explanation. Refusing them here is
- * also what keeps the decode path narrow — `Bun.Image` cannot decode animated
- * WebP at all (`ERR_IMAGE_DECODE_FAILED`), and a rejection with a message beats
- * a 500 four layers down.
- *
- * The flag lives in bit 1 of the first byte of the `VP8X` chunk, which a simple
- * (non-extended) WebP does not have at all — hence the chunk walk rather than a
- * fixed offset. Structure per the WebP container spec: `RIFF<size>WEBP` then
- * 8-byte-headed chunks, each padded to an even length.
+ * Every other component of an R2 key is a random hex id or `sanitizeFilename`
+ * output; taking this one from the client's string put attacker-chosen path
+ * segments into the key — `file.name = "x.a/../../../../evil"` yields
+ * `temp/<id>_x.a/../../../../evil`, escaping the `temp/` prefix.
  */
-const WEBP_ANIMATION_FLAG = 0x02;
-
-function isAnimatedWebp(buffer: Buffer): boolean {
-  let offset = 12; // past `RIFF<size>WEBP`
-  while (offset + 8 <= buffer.length) {
-    const fourcc = buffer.toString('ascii', offset, offset + 4);
-    const size = buffer.readUInt32LE(offset + 4);
-    if (fourcc === 'VP8X')
-      return ((buffer[offset + 8] ?? 0) & WEBP_ANIMATION_FLAG) !== 0;
-    // An `ANIM` chunk without a VP8X flag is malformed, but treat it as animated
-    // rather than reasoning about which of two contradictory headers wins.
-    if (fourcc === 'ANIM' || fourcc === 'ANMF') return true;
-    if (size <= 0) return false;
-    offset += 8 + size + (size % 2);
-  }
-  return false;
-}
+const MIME_EXTENSIONS = new Map<string, string>([
+  ['image/png', 'png'],
+  ['image/webp', 'webp'],
+  ['image/svg+xml', 'svg'],
+]);
 
 /**
  * Validates file content matches its declared MIME type using magic bytes.
@@ -105,25 +79,9 @@ export function validateMagicBytes(
   // SVG validation is handled by sanitizeSvgServer
   if (mimeType === 'image/svg+xml') return { valid: true };
 
-  const signature = MAGIC_BYTES[mimeType as keyof typeof MAGIC_BYTES];
-  if (!signature) return { valid: true };
-
-  // Check primary signature
-  const primaryMatch = signature.bytes.every(
-    (byte, i) => buffer[signature.offset + i] === byte
-  );
-  if (!primaryMatch) return { valid: false };
-
-  // Check secondary signature if exists (WebP needs RIFF + WEBP)
-  const secondary = 'secondary' in signature ? signature.secondary : undefined;
-  if (secondary) {
-    const secondaryMatch = secondary.bytes.every(
-      (byte, i) => buffer[secondary.offset + i] === byte
-    );
-    if (!secondaryMatch) return { valid: false };
-  }
-
-  if (mimeType === 'image/webp' && isAnimatedWebp(buffer))
+  if (!hasRasterSignature(mimeType)) return { valid: true };
+  if (!matchesMagicBytes(buffer, mimeType)) return { valid: false };
+  if (isAnimatedRaster(buffer, mimeType))
     return { valid: false, animated: true };
 
   return { valid: true };
@@ -182,12 +140,49 @@ type ProcessedImage = {
   originalSize?: number;
 };
 
+export interface ValidatedSvgUpload {
+  cleanedSvg: string;
+  embeddedRasterMegapixels: number;
+}
+
+export interface UploadImageInput {
+  file: File;
+  buffer: Buffer;
+  validatedSvg?: ValidatedSvgUpload;
+}
+
+export function validateSvgUpload(
+  buffer: Buffer,
+  fileName: string
+): ValidatedSvgUpload {
+  const result = sanitizeSvgServer(buffer.toString('utf8'));
+  if (result.isValid)
+    return {
+      cleanedSvg: result.cleanedSvg,
+      embeddedRasterMegapixels: result.embeddedRasterMegapixels,
+    };
+
+  console.error('SVG sanitization failed:', sanitizeForLog(result.errors));
+  throw new CustomError(
+    result.reason === 'animated'
+      ? uploadMsg.animatedNotAllowed(sanitizeFilename(fileName))
+      : result.reason === 'too-many-pixels'
+        ? uploadMsg.tooManyPixels(Math.floor(MAX_IMAGE_PIXELS / 1_000_000))
+        : result.reason === 'edge-too-long'
+          ? uploadMsg.edgeTooLong(MAX_IMAGE_EDGE)
+          : uploadMsg.invalidSvg,
+    result.reason === 'too-many-pixels' || result.reason === 'edge-too-long'
+      ? HTTP_STATUS.UNPROCESSABLE
+      : HTTP_STATUS.BAD_REQUEST
+  );
+}
+
 // Process a single image (validate, optimize, sanitize, generate blurhash)
 async function processImage(
-  file: File,
-  targetSize: number,
-  preBuffer?: Buffer
+  input: UploadImageInput,
+  targetSize: number
 ): Promise<ProcessedImage> {
+  const { file } = input;
   // Validate MIME type
   if (!isAllowedImageType(file.type)) {
     throw new CustomError(
@@ -196,10 +191,7 @@ async function processImage(
     );
   }
 
-  const arrayBuffer = preBuffer ?? Buffer.from(await file.arrayBuffer());
-  let buffer: Buffer = Buffer.isBuffer(arrayBuffer)
-    ? arrayBuffer
-    : Buffer.from(arrayBuffer);
+  let buffer = input.buffer;
   let finalMimeType = file.type;
   let finalSize = file.size;
   let width: number | undefined;
@@ -209,16 +201,8 @@ async function processImage(
 
   // Handle SVG files
   if (file.type === 'image/svg+xml') {
-    const svgContent = buffer.toString('utf8');
-    const sanitizeResult = sanitizeSvgServer(svgContent);
-
-    if (!sanitizeResult.isValid) {
-      console.error(
-        'SVG sanitization failed:',
-        sanitizeForLog(sanitizeResult.errors)
-      );
-      throw new CustomError(uploadMsg.invalidSvg, HTTP_STATUS.BAD_REQUEST);
-    }
+    const sanitizeResult =
+      input.validatedSvg ?? validateSvgUpload(buffer, file.name);
 
     const optimizedSvg = svgOptimizerServer({
       data: sanitizeResult.cleanedSvg,
@@ -257,7 +241,7 @@ async function processImage(
     }).metadata();
     width = metadata.width;
     height = metadata.height;
-    finalExtension = file.name.split('.').pop()?.toLowerCase() || 'webp';
+    finalExtension = MIME_EXTENSIONS.get(finalMimeType) ?? 'webp';
   }
 
   return {
@@ -276,8 +260,7 @@ async function processImage(
 }
 
 export async function uploadImagesToR2(params: {
-  files: File[];
-  preBuffers?: Buffer[];
+  images: UploadImageInput[];
   targetSize?: number;
   bucketType?: BucketType;
   /**
@@ -289,8 +272,7 @@ export async function uploadImagesToR2(params: {
   uploadedBy?: EntityID;
 }): Promise<string[]> {
   const {
-    files: imageFiles,
-    preBuffers,
+    images,
     bucketType = 'public',
     targetSize = SERVER_MAX_IMAGE_SIZE * 1024 * 1024,
     uploadedBy,
@@ -301,9 +283,7 @@ export async function uploadImagesToR2(params: {
   try {
     // Process all images (optimize, generate blurhash, etc.)
     const processedImages = await Promise.all(
-      imageFiles.map((file, i) =>
-        processImage(file, targetSize, preBuffers?.[i])
-      )
+      images.map((image) => processImage(image, targetSize))
     );
 
     // Pre-populate keys so cleanup always has the full list on partial failure

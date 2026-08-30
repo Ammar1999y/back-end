@@ -22,7 +22,11 @@ import {
 } from '@/utils/api-response';
 import { OTP_AUTO_VERIFY } from '@/utils/config';
 import { CustomError } from '@/utils/error-class';
-import { markContactVerified, processOtpVerify } from '@/utils/otp';
+import {
+  collapseProofThrottle,
+  markContactVerified,
+  processOtpVerify,
+} from '@/utils/otp';
 import { OTP_ENABLED, verifyOtpSchema } from '@/utils/validation/otp';
 
 import { ensureMinDelay, otpMsg } from '../messages';
@@ -131,13 +135,10 @@ export const POST: Handler = async (ctx) => {
           }));
     } catch (error) {
       // Proof-row state is account-dependent. Only the pre-lookup limiter may
-      // expose 429 and Retry-After on this anonymous endpoint.
-      if (
-        error instanceof CustomError &&
-        error.status === HTTP_STATUS.TOO_MANY_REQUESTS
-      )
-        throw new CustomError(otpMsg.invalidOrExpired, HTTP_STATUS.BAD_REQUEST);
-      throw error;
+      // expose 429 and Retry-After on this anonymous endpoint — which is exactly
+      // what the marker distinguishes, so this no longer swallows a limiter 429
+      // that happened to surface from inside the call.
+      throw collapseProofThrottle(error, otpMsg.invalidOrExpired);
     }
 
     await ensureMinDelay(Date.now() - start);

@@ -110,14 +110,14 @@ function methodCanHaveBody(method: string): boolean {
  * RFC 9110 §8.3 and a parameter (`; boundary=…`, `; charset=utf-8`) is not part
  * of the type.
  *
- * One limit, measured rather than assumed: Bun's own `Request.formData()` is
- * case-SENSITIVE and throws `Can't decode form data from body because of
- * incorrect MIME type/boundary` on `Multipart/Form-Data`. This function
- * therefore admits a spec-valid mixed-case multipart request that the runtime
- * parser then refuses — the outcome is the same 400 either way, and it fails
- * closed. Do not "fix" this by making the matcher case-sensitive to agree with
- * the parser; JSON, which this file parses itself, is genuinely
- * case-insensitive end to end.
+ * Matcher and runtime parser agree end to end on the pinned Bun. They did not
+ * up to 1.3.14, where `Request.formData()` matched `form-data` case-SENSITIVELY
+ * and threw on `Multipart/Form-Data`; 1.4.0 — the floor `server.ts` asserts —
+ * made it case-insensitive, and all three spellings now parse (measured). The
+ * regression cases in `tests/unit/request-body-policy.test.ts` are what catch a
+ * floor regression rather than leaving it to be inferred — this pointer is the
+ * only thing tying a version-gated behaviour to its guard, so it has to name the
+ * file that actually holds them.
  */
 function mediaTypeEssence(contentType: string | null): string {
   if (!contentType) return '';

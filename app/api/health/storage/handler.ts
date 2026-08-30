@@ -106,6 +106,7 @@ export const GET: Handler = async (ctx) => {
       const written = store.consume.get<{ count: number }>(
         PROBE_KEY,
         now,
+        1,
         now + 1000,
         Number.MAX_SAFE_INTEGER
       );

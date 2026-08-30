@@ -1,11 +1,11 @@
+import { MSG_CUSTOM_ROLE_NEEDS_PERMISSIONS } from '@/utils/api-messages';
+
 export const userMsg = {
-  notDashboardUser: 'ليس من مستخدمين لوحة التحكم',
   passwordUpdateFailed:
     'تعذر تحديث كلمة المرور، هذا المستخدم لا يملك حساباً بكلمة مرور',
-  cannotModifyOwnPermissions: 'لا يمكنك تعديل صلاحياتك الخاصة',
   cannotDeleteSelf: 'لا يمكنك حذف حسابك الخاص',
   roleNotFound: 'الدور غير موجود أو غير متاح',
-  customRoleNeedsPermissions: 'يجب تحديد صلاحيات للدور المخصص',
+  customRoleNeedsPermissions: MSG_CUSTOM_ROLE_NEEDS_PERMISSIONS,
   currentPasswordIncorrect: 'كلمة المرور الحالية غير صحيحة',
   passwordChanged: 'تم تغيير كلمة المرور بنجاح',
   emailChanged: 'تم تغيير البريد الإلكتروني بنجاح',

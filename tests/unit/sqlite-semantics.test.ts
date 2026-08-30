@@ -108,5 +108,5 @@ for (const result of outcome.results) {
 test('every semantic assertion ran', () => {
   // Guards against a child that silently stopped early: a shrinking suite would
   // otherwise look like a passing one.
-  expect(outcome.results.length).toBe(10);
+  expect(outcome.results.length).toBe(11);
 });

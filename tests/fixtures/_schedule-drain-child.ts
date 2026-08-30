@@ -45,8 +45,12 @@ await started.promise;
 const drained = await schedule.stopAndDrain(DRAIN_MS);
 emit('drain returned', { mode, drained });
 
-// Deliberately AFTER the drain, mirroring `server.ts`: a store closed while a
-// sweep is mid-batch is what the drain exists to prevent, and only the order of
-// these two lines can show it.
-emit('stores closed');
+// The BRANCH is what mirrors `server.ts`, not just the order. A store closed
+// while a sweep is mid-batch is what the drain exists to prevent, so the
+// coordinator closes stores only on positive proof that nothing is in flight —
+// and on a timed-out drain it logs `stores left open for forced exit` and
+// returns WITHOUT closing them. Emitting `stores closed` unconditionally here
+// pinned the sequence that behaviour replaced, so the one test naming the
+// timed-out drain asserted the opposite of what ships.
+emit(drained ? 'stores closed' : 'stores left open for forced exit');
 process.exit(0);

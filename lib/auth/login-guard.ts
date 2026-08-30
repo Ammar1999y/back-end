@@ -39,7 +39,29 @@ const PASSWORD_UPGRADE_AUDIT_META = {
   apiPath: 'internal/password-hash-upgrade',
 } satisfies AuditMeta;
 
-export interface VerifyAttemptOptions {
+/**
+ * What a password check is FOR.
+ *
+ * Required rather than defaulted, because the audit event it labels used to say
+ * something it could not know. `verifyLoginAttempt` writes its success row from
+ * inside Better Auth's `before` hook — ahead of the session-creation hook that
+ * can still reject an inactive role, a missing required role or an unverified
+ * contact — and the same helper proves the current password for three
+ * already-authenticated mutation routes, one of which then rejects the request
+ * because the submitted address is unchanged. All of those wrote
+ * `loginSuccess: true`, so a forensic query could not treat that marker as
+ * evidence a session existed.
+ *
+ * What this labels is the PROOF. `loginSuccess` is written once, after issuance,
+ * by the `session.create.after` hook in `lib/auth.ts`.
+ */
+type PasswordProofPurpose =
+  | 'sign_in'
+  | 'reauth_change_password'
+  | 'reauth_change_email'
+  | 'reauth_change_phone';
+
+interface VerifyAttemptBase {
   password: string;
   /** Find user by email (login flow) */
   email?: string;
@@ -51,13 +73,31 @@ export interface VerifyAttemptOptions {
   returnPasswordProof?: boolean;
   /** Reuse an existing transaction instead of creating a new one */
   tx?: Tx;
-  /**
-   * When provided, lockout enter/exit and successful-login transitions are
-   * recorded in audit_logs. Failed-password attempts are intentionally not
-   * audited (high volume, low signal); only the lockout transition is.
-   */
-  auditMeta?: AuditMeta;
 }
+
+/**
+ * Auditing and its label travel together, and the TYPE is what says so.
+ *
+ * "Required whenever `auditMeta` is supplied" was prose over two optional
+ * fields, enforced by a runtime `throw new Error` — which is not a `LoginRejected`
+ * and so escapes the only mapping `lib/auth.ts` has for this call, surfacing as
+ * an empty Better Auth 500 on a sign-in. Expressed as a union it is a compile
+ * error at the call site instead, where the caller knows the answer.
+ *
+ * When provided, lockout enter/exit and password-proof events are recorded in
+ * `audit_logs`. Failed-password attempts are intentionally not audited (high
+ * volume, low signal); only the lockout transition is.
+ */
+type AuditedAttempt = {
+  auditMeta: AuditMeta;
+  purpose: PasswordProofPurpose;
+};
+
+/** `undefined` rather than absent, so an object literal cannot supply one alone. */
+type UnauditedAttempt = { auditMeta?: undefined; purpose?: undefined };
+
+export type VerifyAttemptOptions = VerifyAttemptBase &
+  (AuditedAttempt | UnauditedAttempt);
 
 export interface VerifiedPasswordProof {
   readonly accountId: EntityID;
@@ -115,7 +155,16 @@ export async function verifyLoginAttempt(
     returnPasswordProof = false,
     tx: externalTx,
     auditMeta,
+    purpose,
   } = options;
+
+  // Kept behind the type above, not instead of it: `VerifyAttemptOptions` makes
+  // this unreachable from any type-checked caller, and this is the backstop for
+  // one that is not. It throws a plain Error, which `lib/auth.ts` does not map —
+  // so reaching it is a 500, which is the correct answer to a programming error
+  // and the wrong one to anything a request can cause.
+  if (auditMeta && !purpose)
+    throw new Error('verifyLoginAttempt requires a purpose with auditMeta');
 
   const executor = async (tx: Tx): Promise<AttemptResult> => {
     const identityFilter = userId
@@ -290,7 +339,11 @@ export async function verifyLoginAttempt(
         newData: {
           failedLoginAttempts: 0,
           lockedUntil: null,
-          loginSuccess: true,
+          // NOT `loginSuccess`: at this point a password has been proven and
+          // nothing more. The gates that can still refuse the request run after
+          // this returns.
+          passwordVerified: true,
+          purpose,
         },
         meta: auditMeta,
       });

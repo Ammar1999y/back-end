@@ -466,6 +466,22 @@ export function validatePermissionScope(
  */
 export type RoleScopeCheck = 'reachability' | 'grant';
 
+/**
+ * The `reachability` answer, extracted so a call site that already holds the
+ * target's permission rows can give it without re-reading them.
+ *
+ * `DELETE /api/dash/permissions/:id` is that call site: it reads
+ * `role_permissions` `FOR SHARE` for its own audit payload and then called
+ * `validatePermissionScope` directly, bypassing the decision this type exists to
+ * force. The result was `403 "you cannot GRANT permissions you don't own"` for a
+ * request that grants nothing, where the neighbouring PUT on the same role
+ * answers 404.
+ */
+export function collapseToNotFound(error: unknown): never {
+  if (!(error instanceof CustomError)) throw error;
+  throw new CustomError(MSG_NOT_FOUND, HTTP_STATUS.NOT_FOUND);
+}
+
 /** `FOR SHARE` so the role cannot be re-permissioned between this read and the caller's write. */
 export async function validateRolePermissionScope(
   actorPermissions: Partial<PermissionObject>,
@@ -492,10 +508,10 @@ export async function validateRolePermissionScope(
   try {
     validatePermissionScope(actorPermissions, targetPerms);
   } catch (error) {
-    if (check === 'grant' || !(error instanceof CustomError)) throw error;
+    if (check === 'grant') throw error;
     // Collapsed into the answer every other reachability gate gives, so a
     // caller cannot tell "outranks me" from "does not exist".
-    throw new CustomError(MSG_NOT_FOUND, HTTP_STATUS.NOT_FOUND);
+    collapseToNotFound(error);
   }
 }
 

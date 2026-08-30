@@ -27,7 +27,7 @@ import {
   requireJsonBody,
 } from '@/utils/api-response';
 import { CustomError } from '@/utils/error-class';
-import { processOtpVerify } from '@/utils/otp';
+import { collapseProofThrottle, processOtpVerify } from '@/utils/otp';
 import { OTP_ENABLED, resetPasswordSchema } from '@/utils/validation/otp';
 
 import { ensureMinDelay, otpMsg } from '../../otp/messages';
@@ -160,8 +160,13 @@ export const POST: Handler = async (ctx) => {
       message: otpMsg.passwordResetSuccess,
       data: { reset: true },
     });
-  } catch (error) {
+  } catch (caught) {
     await ensureMinDelay(Date.now() - start);
+    // A proof-state throttle is account-dependent — a proof row exists only for
+    // a real account — so it collapses to the generic 400 BEFORE the status
+    // filter below, which deliberately lets a 429 keep its own shape. The
+    // pre-lookup IP and destination limiters carry no marker and still surface.
+    const error = collapseProofThrottle(caught, otpMsg.invalidOrExpired);
     // Collapse privacy-sensitive statuses; keep 429/503/500/422 distinct (and
     // password-compromised surfaces its own message).
     if (

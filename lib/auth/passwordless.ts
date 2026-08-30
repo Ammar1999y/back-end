@@ -17,13 +17,55 @@ import {
   MSG_PAGE_NOT_FOUND,
 } from '@/utils/api-messages';
 import { CustomError } from '@/utils/error-class';
-import { markContactVerified, processOtpVerify } from '@/utils/otp';
+import {
+  collapseProofThrottle,
+  markContactVerified,
+  processOtpVerify,
+} from '@/utils/otp';
 import { OTP_ENABLED, verifyOtpSchema } from '@/utils/validation/otp';
 
 import { API_PATH_MAX, auditLog, getClientIp, USER_AGENT_MAX } from '../audit';
 import { verifyTurnstileRequest } from '../captcha';
 import { enforceOtpVerifyQuota } from '../rate-limit';
 import { toAuthApiError } from './api-error';
+
+/**
+ * Records that a just-issued session was withdrawn before its cookie shipped.
+ *
+ * Best-effort and swallowed: the caller is already rethrowing the failure that
+ * caused it, and a second fault here must not replace that one. A missing
+ * compensating row leaves the same gap this closes, which is why it is logged.
+ */
+async function recordAbandonedSession(params: {
+  userId: string;
+  userEmail: string;
+  sessionId: string;
+  auditMeta: { ip: string | null; userAgent: string | null; apiPath: string };
+}): Promise<void> {
+  try {
+    await withTransaction((tx) =>
+      auditLog(tx, {
+        userId: params.userId,
+        userEmail: params.userEmail,
+        action: 'DELETE',
+        tableName: 'sessions',
+        recordId: params.sessionId,
+        oldData: { loginSuccess: true },
+        newData: { sessionAbandoned: true, reason: 'cookie_delivery_failed' },
+        meta: params.auditMeta,
+      })
+    );
+  } catch (error) {
+    console.error(
+      sanitizeForLog({
+        msg: 'passwordless.abandonedSessionAudit.failed',
+        userId: params.userId,
+        sessionId: params.sessionId,
+        error,
+      })
+    );
+  }
+}
 
 /**
  * Passwordless login (step 2 / verify). Reuses the project's hardened OTP
@@ -41,7 +83,36 @@ export const passwordless = () =>
     endpoints: {
       passwordlessVerify: createAuthEndpoint(
         '/passwordless/verify',
-        { method: 'POST', body: z.record(z.string(), z.unknown()) },
+        {
+          method: 'POST',
+          body: z.record(z.string(), z.unknown()),
+          metadata: {
+            openapi: {
+              responses: {
+                '200': {
+                  description: 'Passwordless sign-in succeeded.',
+                  content: {
+                    'application/json': {
+                      schema: {
+                        type: 'object',
+                        properties: {
+                          success: { type: 'boolean' },
+                          message: { type: 'string' },
+                          data: {
+                            type: 'object',
+                            properties: { loggedIn: { type: 'boolean' } },
+                            required: ['loggedIn'],
+                          },
+                        },
+                        required: ['success', 'message', 'data'],
+                      },
+                    },
+                  },
+                },
+              },
+            },
+          },
+        },
         async (ctx) => {
           const headers: Headers =
             (ctx as { headers?: Headers }).headers ??
@@ -195,6 +266,19 @@ export const passwordless = () =>
               // The row exists but its token was never delivered. Leaving it
               // would put a session the user cannot see or use into their
               // active-session list, so compensate explicitly.
+              //
+              // `createSession` above already fired `session.create.after`, so a
+              // `loginSuccess` row for this session is committed and CANNOT be
+              // withdrawn — an audit log is append-only. The compensating event
+              // below is what keeps the trail honest: without it the marker
+              // describes a session that no longer exists, which is the exact
+              // invariant centralising the write was meant to restore.
+              await recordAbandonedSession({
+                userId: userData.id,
+                userEmail: userData.email,
+                sessionId: session.id,
+                auditMeta,
+              });
               await ctx.context.internalAdapter
                 .deleteSession(session.token)
                 .catch(() => {
@@ -219,48 +303,26 @@ export const passwordless = () =>
               throw cookieError;
             }
 
-            // Supplementary: mirrors the `loginSuccess` row that
-            // verifyLoginAttempt writes for password sign-in, so both methods
-            // look the same in the trail. Best-effort by design — the session
-            // is already issued and the cookie already staged, so failing the
-            // request now would log the user in and tell them it didn't work.
-            // The in-transaction proof event above is the record that matters.
-            try {
-              await withTransaction((tx) =>
-                auditLog(tx, {
-                  userId: userData.id,
-                  userEmail: userData.email,
-                  action: 'UPDATE',
-                  tableName: 'users',
-                  recordId: userData.id,
-                  oldData: {},
-                  newData: {
-                    loginSuccess: true,
-                    method: 'passwordless',
-                    channel,
-                    sessionId: session.id,
-                  },
-                  meta: auditMeta,
-                })
-              );
-            } catch (auditError) {
-              console.error(
-                sanitizeForLog({
-                  msg: 'passwordless.loginAudit.failed',
-                  userId: userData.id,
-                  error: auditError,
-                })
-              );
-            }
-
+            // No `loginSuccess` row here any more: `lib/auth.ts`'s
+            // `session.create.after` hook writes exactly one, for every method
+            // that issues a session, and this endpoint's `createSession` above
+            // triggers it. Two writers meant two rows for one login. The channel
+            // this login used is on the in-transaction proof event above, which
+            // is the record that matters.
             await ensureMinDelay(Date.now() - start);
             return ctx.json({
               success: true,
               message: otpMsg.loginSuccess,
               data: { loggedIn: true },
             });
-          } catch (e) {
+          } catch (caught) {
             if (accountRevealing) await ensureMinDelay(Date.now() - start);
+            // Before `toAuthApiError`, which preserves 429 with its headers by
+            // design: a proof-state throttle is account-dependent, so on this
+            // ANONYMOUS endpoint it has to become the same generic 400 an unknown
+            // address gets. The pre-lookup limiter 429s above are unmarked and
+            // still surface.
+            const e = collapseProofThrottle(caught, otpMsg.invalidOrExpired);
             if (e instanceof APIError) throw e;
             if (e instanceof CustomError)
               throw toAuthApiError(e, otpMsg.invalidOrExpired);

@@ -2,6 +2,7 @@ import { describe, expect, test } from 'bun:test';
 import type {
   DashboardPage,
   PermissionAction,
+  PermissionObject,
 } from '@/lib/permissions/constants';
 
 import { resolveActionScope } from '@/lib/permissions/checker';
@@ -10,6 +11,17 @@ import {
   OWN_ACTION_MAP,
   PERMISSION_ACTIONS,
 } from '@/lib/permissions/constants';
+import {
+  collapseToNotFound,
+  validatePermissionScope,
+} from '@/lib/permissions/utils';
+
+import {
+  HTTP_STATUS,
+  MSG_CANNOT_GRANT_UNOWNED_PERMISSIONS,
+  MSG_NOT_FOUND,
+} from '@/utils/api-messages';
+import { CustomError } from '@/utils/error-class';
 
 /**
  * `resolveActionScope` — the two cases its own comment records as previously
@@ -139,5 +151,70 @@ describe('caller-supplied keys cannot reach the prototype', () => {
         'view'
       )
     ).toEqual({ allowed: false, scope: null });
+  });
+});
+
+describe('the reachability collapse both role write paths must give', () => {
+  /**
+   * `RoleScopeCheck` says the distinction is "a disclosure boundary, not a style
+   * choice": every neighbouring unreachable-target gate answers `404
+   * MSG_NOT_FOUND`, and answering `403 "you cannot GRANT permissions you don't
+   * own"` instead tells a caller without `permissions.view` that a role exists
+   * and outranks them.
+   *
+   * `DELETE /api/dash/permissions/:id` bypassed the helper that makes that
+   * decision — it called `validatePermissionScope` directly, to avoid re-reading
+   * `role_permissions` it already held `FOR SHARE` — so a deletion, which grants
+   * nothing, answered 403 where the neighbouring PUT on the same role answered
+   * 404. `collapseToNotFound` is the extracted collapse both now share.
+   */
+  const outranking = [
+    {
+      name: 'users' as DashboardPage,
+      permissions: { view: true, delete: true } as Record<string, boolean>,
+    },
+  ];
+  /**
+   * Holds `view` but not `delete`, so the target's matrix outranks it.
+   *
+   * A PARTIAL page record, which is the real shape: session metadata carries only
+   * the actions a role was granted, and `PermissionObject`'s per-page value is a
+   * full `Record`, so the cast is what the runtime already passes.
+   */
+  const actor = { users: { view: true } } as Partial<PermissionObject>;
+
+  function scopeError(): unknown {
+    try {
+      validatePermissionScope(actor, outranking);
+    } catch (error) {
+      return error;
+    }
+    throw new Error('expected validatePermissionScope to reject');
+  }
+
+  test('the un-collapsed answer is the 403 grant message', () => {
+    const error = scopeError();
+
+    expect(error).toBeInstanceOf(CustomError);
+    expect((error as CustomError).status).toBe(HTTP_STATUS.FORBIDDEN);
+    expect((error as CustomError).message).toBe(
+      MSG_CANNOT_GRANT_UNOWNED_PERMISSIONS
+    );
+  });
+
+  test('collapsed, it is indistinguishable from a nonexistent role', () => {
+    expect(() => collapseToNotFound(scopeError())).toThrow(
+      expect.objectContaining({
+        status: HTTP_STATUS.NOT_FOUND,
+        message: MSG_NOT_FOUND,
+      })
+    );
+  });
+
+  test('a non-CustomError is rethrown untouched, not turned into a 404', () => {
+    // Collapsing an unexpected fault would hide a real bug behind a routine
+    // "not found".
+    const bug = new TypeError('unrelated');
+    expect(() => collapseToNotFound(bug)).toThrow(bug);
   });
 });

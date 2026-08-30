@@ -12,11 +12,12 @@
  * one more adapter and one more version of this file, and touching nothing
  * under `app/api/**` and nothing in `routes.ts`.
  */
-import { ROUTE_PREFIXES, ROUTES } from '@/routes';
+import { REGISTERED_ROUTES, ROUTE_PREFIXES } from '@/routes';
 import { errorClassOf } from '@/utils';
 import { cors } from '@elysia/cors';
 import { Elysia } from 'elysia';
 import { auth } from '@/lib/auth';
+import { betterAuthServes } from '@/lib/auth/allowed-paths';
 import { BASE_ERROR_CODES } from '@/lib/auth/code-errors';
 import { PUBLIC_ORIGIN } from '@/lib/env';
 import { elysiaRouteConfig, toElysiaHandler } from '@/lib/http/adapters/elysia';
@@ -52,9 +53,9 @@ import { apiError, handleApiError } from '@/utils/api-response';
  *
  * @knipignore
  */
-export const ROUTE_MANIFEST = toManifest(ROUTES);
+export const ROUTE_MANIFEST = toManifest(REGISTERED_ROUTES);
 
-const lookupMethods = createRouteLookup(ROUTES, ROUTE_PREFIXES);
+const lookupMethods = createRouteLookup(REGISTERED_ROUTES, ROUTE_PREFIXES);
 
 async function localiseAuthError(response: Response): Promise<Response> {
   if (response.ok) return response;
@@ -78,14 +79,6 @@ async function localiseAuthError(response: Response): Promise<Response> {
     { status: response.status, statusText: response.statusText, headers }
   );
 }
-
-export const AUTH_PATH_LIMITS: Readonly<Record<string, number>> = {
-  // Session reads need a separate budget from credential attempts for shared NATs.
-  '/get-session': 300,
-  '/sign-out': 30,
-  '/sign-in/email': 20,
-  '/passwordless/verify': 60,
-};
 
 /**
  * Request start times, for `Server-Timing` and the access log.
@@ -177,7 +170,7 @@ const CORS_POLICY = {
 export const MAX_REQUEST_BODY_BYTES = 8 * 1024 * 1024;
 
 /** Lets shutdown honor the longest route-specific timeout. */
-export const MAX_ROUTE_TIMEOUT_SECONDS = ROUTES.reduce(
+export const MAX_ROUTE_TIMEOUT_SECONDS = REGISTERED_ROUTES.reduce(
   (longest, route) => Math.max(longest, route.timeoutSeconds ?? 0),
   0
 );
@@ -373,7 +366,7 @@ function register(instance: typeof base): typeof base {
   // Every policy a route needs is a REQUIRED field on its record in `routes.ts`,
   // so a new route cannot lose its pre-auth limit or its body policy by omitting
   // an argument here.
-  for (const route of ROUTES)
+  for (const route of REGISTERED_ROUTES)
     instance.route(
       route.method,
       route.path,
@@ -416,39 +409,74 @@ function register(instance: typeof base): typeof base {
    * downstream of the plugin chain. Making it here removes the class; the
    * upstream fix removed one instance of it.
    */
-  for (const prefix of ROUTE_PREFIXES)
-    for (const method of prefix.methods)
+  for (const prefix of ROUTE_PREFIXES) {
+    // The union of every sub-path's methods. Registered from the table rather
+    // than declared beside it, so a prefix cannot be mounted for a method no
+    // path under it serves.
+    const registered = new Set(prefix.paths.flatMap((entry) => entry.methods));
+    for (const method of registered)
       instance.route(
         method,
         `${prefix.prefix}/*`,
         async ({ request }: { request: Request }) => {
           const url = new URL(request.url);
           const subPath = url.pathname.slice(prefix.prefix.length);
+          // One lookup answers membership, the budget and (via
+          // `betterAuthServes`) the method — all from the same record.
+          const known = prefix.paths.find((path) => path.path === subPath);
           try {
             // Admission must precede Better Auth plugins that perform outbound work.
             // The allowlist decides the SCOPE, not just the budget. An
             // allowlisted path gets its own key and its own limit; everything
             // else shares ONE fixed key, so rotating `/api/auth/<random>` can
             // neither multiply the budget nor the `rate_limit` keyspace.
-            const known = prefix.paths.includes(subPath);
             await enforcePreAuthIpLimit(buildRequestMeta(request), {
-              limit: known ? AUTH_PATH_LIMITS[subPath] : undefined,
+              limit: known?.preAuthLimit,
               scope: known ? undefined : UNKNOWN_PREFIX_SCOPE,
             });
           } catch (error) {
             // This wildcard bypasses the adapter that normally preserves API errors.
             return toWebResponse(handleApiError(error));
           }
-          if (prefix.paths.includes(subPath))
-            return localiseAuthError(await auth.handler(request));
-          // Unreachable auth paths now answer with this API's envelope like every
+          // Unreachable auth paths answer with this API's envelope like every
           // other unknown path, instead of Better Auth's own bodyless 404 — and
           // the trailing-slash form redirects, which the wildcard match had been
           // hiding from `onError`.
-          return canonicalRedirect(url) ?? notFound();
+          //
+          // `routeMiss`, not `notFound`: five real `ROUTES` entries sit under
+          // this prefix (`/api/auth/otp/*`, `/api/auth/forgot-password/*`,
+          // `/api/auth/passwordless/send`) and are not Better Auth paths, so a
+          // `GET` on one falls through the `GET /api/auth/*` wildcard to here.
+          // Answering 404 made the same wrong-method condition on the same path
+          // give two answers depending on the method: measured, `GET
+          // /api/auth/otp/send` → 404 with no `Allow` while `PUT` on it → 405
+          // with `Allow: POST, OPTIONS`, because PUT is not a method this
+          // wildcard is mounted for and reached `onError` instead. `routeMiss`
+          // falls back to `notFound()` on an empty lookup, so a genuinely
+          // unknown sub-path keeps its 404.
+          if (!known) return canonicalRedirect(url) ?? routeMiss(url.pathname);
+          // A known path under a method it does not serve is a 405 with an
+          // accurate `Allow`, decided from the same table. Handing it to
+          // `auth.handler` instead answered Better Auth's own 404 for
+          // `GET /sign-out`, and let `GET /sign-in/email` reach the captcha
+          // plugin's processing before the method was rejected.
+          if (!betterAuthServes(subPath, request.method))
+            return routeMiss(url.pathname);
+          // Better Auth answers 404 for a HEAD on a path it serves for GET
+          // (measured on 1.7.1), and Elysia dispatches HEAD to the GET
+          // registration — so the substitution has to happen here or HEAD is
+          // unserved on every auth path. The runtime discards the body.
+          // `new Request(url, …)` is a GET; naming the method explicitly is what
+          // the linter objects to, not the substitution.
+          const forwarded =
+            request.method === 'HEAD'
+              ? new Request(request.url, { headers: request.headers })
+              : request;
+          return localiseAuthError(await auth.handler(forwarded));
         },
         elysiaRouteConfig
       );
+  }
 
   return instance;
 }

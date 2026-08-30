@@ -1,5 +1,7 @@
 /** Behavior gates for every security decision that consumes timestamptz strings. */
 import { beforeAll, describe, expect, test } from 'bun:test';
+import { readFileSync } from 'node:fs';
+import path from 'node:path';
 import type { SeededUser, SignedInSession } from '../helpers/session';
 
 import { eq, sql } from 'drizzle-orm';
@@ -83,7 +85,34 @@ beforeAll(async () => {
   };
 });
 
-test('CI executes these gates in an explicit non-UTC timezone', () => {
+test('CI still DECLARES a non-UTC timezone for the database tiers', () => {
+  // Asserted from the workflow FILE, unconditionally, because the runtime check
+  // below cannot protect its own precondition: `REQUIRE_NON_UTC_TZ` is set in
+  // exactly one place — the same `ci.yml` block that sets `TZ` — so removing the
+  // timezone configuration removed the guard with it and this file passed green
+  // while asserting nothing. Deleting either line now fails here.
+  //
+  // Not asserted from `process.env` unconditionally: a developer whose own
+  // machine sits at UTC would fail a suite they have not broken, and a gate that
+  // fails for that reason is a gate that gets deleted.
+  const workflowPath = path.join(
+    import.meta.dir,
+    '..',
+    '..',
+    '.github',
+    'workflows',
+    'ci.yml'
+  );
+  // eslint-disable-next-line security/detect-non-literal-fs-filename -- a fixed path derived from this module's own location, never from input
+  const workflow = readFileSync(workflowPath, 'utf8');
+  const declared = /^\s*TZ:\s*(\S+)\s*$/m.exec(workflow)?.[1];
+
+  expect(declared).toBeString();
+  expect(declared).not.toBe('UTC');
+  expect(workflow).toInclude("REQUIRE_NON_UTC_TZ: '1'");
+});
+
+test('CI executes these gates in the exact declared timezone', () => {
   if (process.env.REQUIRE_NON_UTC_TZ !== '1') return;
 
   expect(process.env.TZ).toBe('Asia/Riyadh');

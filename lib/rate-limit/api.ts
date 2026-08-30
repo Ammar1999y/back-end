@@ -260,6 +260,13 @@ export async function enforceRateLimit(opts: {
   /** Window duration in seconds. Defaults to 60. */
   window?: number;
   /**
+   * Units this request spends against `limit`. Defaults to 1. Use it where the
+   * work behind one request varies by orders of magnitude, so the budget and the
+   * capacity behind it are sized against each other rather than against a
+   * request count — see `app/api/upload/image/handler.ts`.
+   */
+  cost?: number;
+  /**
    * When true, reject with 503 if the rate-limit store is unreachable
    * instead of silently letting the request through. Use for auth/OTP
    * paths where losing the limiter is a real security event.
@@ -271,6 +278,7 @@ export async function enforceRateLimit(opts: {
     identifier: `${opts.scope}:${opts.identifier}`,
     limit: opts.limit,
     window,
+    cost: opts.cost,
   });
 
   if (result.degraded && opts.failClosed) {

@@ -12,12 +12,9 @@
  *
  * `preinstall` invokes it as `bun scripts/require-bun.mjs`. Under `bun install`
  * Bun is present by definition, so that command cannot fail for want of a
- * runtime — and the alternative, `node …`, would have leaned on Bun prepending
- * a `node` symlink that points at itself when no Node is on `$PATH`. That
- * substitution is real and measured here on Windows, but it is the deployment
- * container — Bun image, no Node — that would have depended on it, and it could
- * not be verified on Linux from this machine. A build that breaks for an
- * unverifiable reason is not worth the tidier command.
+ * runtime. `node …` there would instead depend on Bun's `node`-symlink
+ * substitution holding inside the deployment container (Bun image, no Node),
+ * which is not verifiable from a developer machine.
  *
  * `node scripts/require-bun.mjs` is the BOOTSTRAP, for the one case the hook
  * cannot serve: a machine with no Bun at all, where nothing Bun-flavoured can

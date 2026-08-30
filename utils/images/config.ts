@@ -15,7 +15,12 @@ export const svgoConfig: Config = {
       },
     },
     'removeScripts',
-    'removeRasterImages',
+    // No `removeRasterImages`: on svgo 4.1.0 it matches `xlink:href` only, and
+    // only `jpe?g|png|gif` (verified in the plugin source), so it deleted a
+    // legitimate inlined bitmap on one spelling while passing an animated GIF on
+    // the other. `sanitizeSvg`'s `isSafeInlineRaster` is the single authority on
+    // which rasters may be inlined, and it decides by NAMESPACE and by the
+    // decoded bytes rather than by a prefix literal.
     'removeTitle',
   ],
 } as const;
@@ -24,13 +29,33 @@ export const svgoConfig: Config = {
 // SVG Sanitizer Config
 // ─────────────────────────────────────────────────────────────────────────────
 
-export interface SanitizeResult {
-  isValid: boolean;
-  cleanedSvg: string;
-  errors: string[];
-}
+export type SanitizeResult =
+  | {
+      isValid: true;
+      cleanedSvg: string;
+      errors: string[];
+      embeddedRasterMegapixels: number;
+      reason?: never;
+    }
+  | {
+      isValid: false;
+      cleanedSvg: '';
+      errors: string[];
+      reason?: 'animated' | 'edge-too-long' | 'too-many-pixels';
+    };
 
 export const SVG_MAX_ELEMENTS = 500;
+
+/**
+ * Ceiling on the RENDERED node count, which `SVG_MAX_ELEMENTS` does not bound.
+ *
+ * A `<use>` chain multiplies where the source grows linearly: measured, 123
+ * levels each referencing the previous twice is 372 tags — inside the element
+ * cap, with nothing stripped — and instantiates 2¹²³ nodes in the viewer's
+ * renderer. Ten times the source ceiling leaves ordinary sprite sheets (one
+ * symbol used a few dozen times) far below it.
+ */
+export const SVG_MAX_RENDERED_NODES = SVG_MAX_ELEMENTS * 10;
 
 export const DANGEROUS_ELEMENTS = [
   'script',
@@ -44,6 +69,27 @@ export const DANGEROUS_ELEMENTS = [
 ] as const;
 
 /**
+ * SMIL animation, and the elements that only exist to serve it.
+ *
+ * A separate list from `DANGEROUS_ELEMENTS` because the disposition differs: a
+ * dangerous element is stripped and the document is kept, while an animated
+ * upload is REFUSED. Stripping would hand back a silently flattened still image
+ * with no explanation — verbatim the failure the WebP animation check exists to
+ * remove — so all three admitted formats now answer the same way.
+ *
+ * `mpath` earns its place twice: it is animation-only, and it dereferences a URL.
+ */
+export const ANIMATION_ELEMENTS = [
+  'animate',
+  'animateColor',
+  'animateMotion',
+  'animateTransform',
+  'set',
+  'mpath',
+  'discard',
+] as const;
+
+/**
  * A CSS escape: a backslash followed by 1-6 hex digits and one optional
  * whitespace, or a backslash followed by any other single character.
  *
@@ -54,7 +100,7 @@ export const DANGEROUS_ELEMENTS = [
  */
 const CSS_ESCAPE = /\\(?:([0-9a-f]{1,6})[ \t\n\f\r]?|([\s\S]))/gi;
 
-function decodeCssEscapes(value: string): string {
+export function decodeCssEscapes(value: string): string {
   return value.replaceAll(
     CSS_ESCAPE,
     (_match, hex: string | undefined, raw: string | undefined) => {

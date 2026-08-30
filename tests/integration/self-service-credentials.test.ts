@@ -1292,7 +1292,7 @@ describe('POST /api/dash/users/me/change-phone', () => {
     expect(sentMail()).toEqual([]);
   });
 
-  test('verify rejects a disabled channel at the schema, and is session-gated', async () => {
+  test('verify is session-gated, and answers on the PROOF rather than the channel', async () => {
     const anonymous = await app.handle(
       anonPost(CHANGE_PHONE_VERIFY, {
         newPhoneNumber: '966500000002',
@@ -1309,7 +1309,14 @@ describe('POST /api/dash/users/me/change-phone', () => {
         code: ARBITRARY_CODE,
       })
     );
-    expect(authenticated.status).toBe(HTTP_STATUS.UNPROCESSABLE);
+    // 404 "no code was sent", not a 422 on the channel. `changePhoneVerifySchema`
+    // no longer re-checks channel availability, matching
+    // `changeEmailVerifySchema`: the channel is not part of the proof's identity
+    // — `processOtpVerify` selects by `contactKind` and `sms`/`whatsapp` both
+    // collapse to `'phone'` — so the check stranded a delivered code for the
+    // honest caller while the same request naming the sibling channel verified
+    // the identical row. What answers here is the absence of a proof.
+    expect(authenticated.status).toBe(HTTP_STATUS.NOT_FOUND);
     expect(await phoneOf(subject('pwGuard').userId)).toBeNull();
   });
 });

@@ -5,5 +5,4 @@ export const permissionMsg = {
   customPrefixForbidden: (prefix: string) =>
     `لا يمكن أن يبدأ اسم الدور بـ "${prefix}"`,
   cannotEditOwnRole: 'لا يمكنك تعديل الدور المخصص لحسابك',
-  customRoleRequiresPermissions: 'يجب تحديد صلاحيات للدور المخصص',
 };

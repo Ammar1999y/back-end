@@ -6,34 +6,22 @@ import type { EntityID } from '@/types';
 import { auditLogs } from '@/db/schema';
 import * as z from 'zod';
 
-import { API_PATH_MAX, USER_AGENT_MAX } from './audit/constants';
+import {
+  API_PATH_MAX,
+  TRUSTED_IP_HEADERS,
+  USER_AGENT_MAX,
+} from './audit/constants';
 
 // Max valid IP length: IPv6 mapped IPv4 = 45 chars
 const MAX_IP_LENGTH = 45;
 const IP_SCHEMA = z.union([z.ipv4(), z.ipv6()]);
 // Re-exported from a leaf module so db/schema.ts can import these without
 // reaching back into lib/audit.ts → an import cycle.
-export { API_PATH_MAX, USER_AGENT_MAX } from './audit/constants';
-
-/**
- * Trusted edge headers. Shared with Better Auth
- * (`advanced.ipAddress.ipAddressHeaders`) so every IP-derived decision in the
- * app — our limiters, Better Auth's limiter, and session IP metadata — reads
- * the same source instead of Better Auth defaulting to `x-forwarded-for`.
- *
- * `x-vercel-forwarded-for` was removed with the framework: there is no Vercel in
- * this deployment, and a trusted-header entry nothing sets is pure attack
- * surface — a forged value would have been accepted on syntax alone.
- *
- * TODO(proxy-trust): the value here is accepted on SYNTAX alone; nothing checks
- * that the socket peer is the expected upstream, so a request that reaches the
- * origin directly can forge it. Resolution is deferred until the edge is final
- * (the correct TRUSTED_PROXY_CIDRS are not knowable before then) — see
- * reports/should-ignore.md #63 and finding 14 of
- * reports/elysia-migration-review-final.md. `server.requestIP(request)` is the
- * mechanism; it asserts the PROXY, and does not replace this header rule.
- */
-export const TRUSTED_IP_HEADERS = ['cf-connecting-ip'] as const;
+export {
+  API_PATH_MAX,
+  TRUSTED_IP_HEADERS,
+  USER_AGENT_MAX,
+} from './audit/constants';
 
 /**
  * The identifier used when no trusted header is present AND this is a

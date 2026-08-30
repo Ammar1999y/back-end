@@ -74,6 +74,15 @@ export interface ScheduleHandle {
  * Registration stays explicit so importing application modules cannot start
  * timers.
  *
+ * **Both jobs are registered in EVERY process that calls this, and neither is
+ * safe to run twice concurrently** — the retention sweep would have two passes
+ * deleting the same rows. What keeps that to one owner today is not this
+ * function: it is `acquireWriterLock(SQLITE_DIR)` in `server.ts`, which runs
+ * BEFORE this and fails the second instance's startup outright. The two are a
+ * pair, so a change to either has to account for the other; giving the jobs
+ * their own election is the prerequisite for ever running N app processes
+ * against one `SQLITE_DIR`.
+ *
  * `jobs` is a parameter only so `tests/process/schedule-drain.test.ts` can drive
  * the drain with a job whose duration it controls. Production passes nothing.
  */

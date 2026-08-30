@@ -3,10 +3,11 @@ import type { EntityID } from '@/types';
 import * as z from 'zod';
 import { CUSTOM_ROLE_VALUE } from '@/lib/permissions/constants';
 
+import { MSG_CUSTOM_ROLE_NEEDS_PERMISSIONS } from '@/utils/api-messages';
 import { PHONE_ENABLED, PHONE_REQUIRED } from '@/utils/config';
 
 import { NAME_MAX } from './constants';
-import { channelEnabledRefine, otpCodeSchema, PHONE_OTP_CHANNELS } from './otp';
+import { otpCodeSchema, PHONE_OTP_CHANNELS } from './otp';
 import { permissionsArraySchema } from './permissions';
 import {
   emailSchema,
@@ -117,7 +118,7 @@ function validateCustomRolePermissions(
   if (missing && data.roleId === CUSTOM_ROLE_VALUE) {
     ctx.addIssue({
       code: z.ZodIssueCode.custom,
-      message: 'يجب تحديد صلاحيات للدور المخصص',
+      message: MSG_CUSTOM_ROLE_NEEDS_PERMISSIONS,
       path: ['permissions'],
     });
   }
@@ -242,15 +243,24 @@ export const changePhoneSchema = z.object({
   channel: phoneOtpChannelSchema,
 });
 
-// Self-service: change own phone — step 2 (verify + commit). Re-checks channel
-// availability so a channel disabled between initiate and verify is rejected.
-export const changePhoneVerifySchema = z
-  .object({
-    newPhoneNumber: phoneSchema,
-    channel: phoneOtpChannelSchema,
-    code: otpCodeSchema,
-  })
-  .superRefine(channelEnabledRefine);
+/**
+ * Self-service: change own phone — step 2 (verify + commit).
+ *
+ * No `channelEnabledRefine`, matching `changeEmailVerifySchema`. It used to
+ * re-check availability "so a channel disabled between initiate and verify is
+ * rejected", and that check could not do what it claimed: the channel is not part
+ * of the proof's identity — `processOtpVerify` selects the row by `contactKind`
+ * and the verify quota buckets by it, both collapsing `sms` and `whatsapp` onto
+ * `'phone'`. Measured with `sms` enabled and `whatsapp` not: the request naming
+ * `whatsapp` was refused while the identical request naming `sms` verified the
+ * SAME proof row and committed the change. So it stranded a valid code for the
+ * honest client that knew how the code was delivered, and stopped nobody.
+ */
+export const changePhoneVerifySchema = z.object({
+  newPhoneNumber: phoneSchema,
+  channel: phoneOtpChannelSchema,
+  code: otpCodeSchema,
+});
 
 // Type inference for the front end
 // type CreateUserInput = z.input<typeof createUserSchema>;

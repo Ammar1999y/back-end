@@ -53,7 +53,7 @@ try {
 
     let admitted = 0;
     for (let i = 0; i < 20; i++) {
-      if (consume.get('k', windowStart, windowStart + WINDOW_MS, LIMIT))
+      if (consume.get('k', windowStart, 1, windowStart + WINDOW_MS, LIMIT))
         admitted++;
     }
     const stored = db
@@ -68,7 +68,7 @@ try {
     // R-1: a denied request must not write at all
     const before = db.prepare('SELECT total_changes() AS c').get().c;
     for (let i = 0; i < 10; i++)
-      consume.get('k', windowStart, windowStart + WINDOW_MS, LIMIT);
+      consume.get('k', windowStart, 1, windowStart + WINDOW_MS, LIMIT);
     const writes = db.prepare('SELECT total_changes() AS c').get().c - before;
     check(
       'denied requests perform zero writes',
@@ -80,6 +80,7 @@ try {
     const rolled = consume.get(
       'k',
       windowStart + WINDOW_MS,
+      1,
       windowStart + 2 * WINDOW_MS,
       LIMIT
     );
@@ -87,6 +88,68 @@ try {
       'window rollover resets the counter to 1',
       rolled && Number(rolled.count) === 1,
       `count after rollover = ${rolled ? rolled.count : 'no row'}`
+    );
+    db.close(false);
+  }
+
+  // ---- a cost above 1 spends that many units, and cannot overshoot ---------
+  // `app/api/upload/image/handler.ts` charges megapixels rather than requests,
+  // so the statement has to be exact for cost > 1 in both directions: the stored
+  // count is the SUM of the costs, and an admission that would cross `max` is
+  // refused without a write rather than clamped.
+  {
+    const db = open('cost.db');
+    db.exec(sql.rateLimitDdl);
+    const consume = db.prepare(sql.consume);
+    const windowStart = 3000 * WINDOW_MS;
+    const LIMIT = 10;
+    const stored = () =>
+      Number(
+        db.prepare('SELECT count FROM rate_limit WHERE key=?').get('c').count
+      );
+
+    const first = consume.get(
+      'c',
+      windowStart,
+      4,
+      windowStart + WINDOW_MS,
+      LIMIT
+    );
+    const second = consume.get(
+      'c',
+      windowStart,
+      4,
+      windowStart + WINDOW_MS,
+      LIMIT
+    );
+    const afterTwo = stored();
+    // 8 spent, 2 left: a 4-unit charge must be refused while a 2-unit one fits.
+    const overshoot = consume.get(
+      'c',
+      windowStart,
+      4,
+      windowStart + WINDOW_MS,
+      LIMIT
+    );
+    const afterRefusal = stored();
+    const exact = consume.get(
+      'c',
+      windowStart,
+      2,
+      windowStart + WINDOW_MS,
+      LIMIT
+    );
+
+    check(
+      'a cost above 1 spends exactly that many units and never overshoots max',
+      Boolean(first) &&
+        Boolean(second) &&
+        afterTwo === 8 &&
+        !overshoot &&
+        afterRefusal === 8 &&
+        Boolean(exact) &&
+        stored() === LIMIT,
+      `afterTwo=${afterTwo} refusedWrote=${afterRefusal !== 8} final=${stored()} expected=${LIMIT}`
     );
     db.close(false);
   }
@@ -99,15 +162,16 @@ try {
     const windowStart = 2000 * WINDOW_MS;
     const LIMIT = 2;
     for (let i = 0; i < LIMIT; i++)
-      ca.get('r', windowStart, windowStart + WINDOW_MS, LIMIT);
+      ca.get('r', windowStart, 1, windowStart + WINDOW_MS, LIMIT);
 
-    const denied = ca.get('r', windowStart, windowStart + WINDOW_MS, LIMIT);
+    const denied = ca.get('r', windowStart, 1, windowStart + WINDOW_MS, LIMIT);
 
     // A concurrent process rolls the row into the NEXT window.
     const b = open('race.db');
     b.prepare(sql.consume).get(
       'r',
       windowStart + WINDOW_MS,
+      1,
       windowStart + 2 * WINDOW_MS,
       LIMIT
     );

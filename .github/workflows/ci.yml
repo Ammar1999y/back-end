@@ -87,6 +87,40 @@ jobs:
         # These are throwaway values shaped to pass validation only — no real
         # credential belongs in this file.
         run: bun run smoke
+      - name: Boot smoke test (production posture)
+        # The same boot, in the posture that is actually deployed — because the
+        # job above runs as `development` and therefore evaluated a DIFFERENT
+        # module graph from production's. Measured: `development` emits 11
+        # security headers and production emits 12, and the whole of
+        # `betterAuthSecretError` plus the production branch of `assertEnv` were
+        # unreachable from any whole-process check. A regression that drops HSTS
+        # or breaks a production-only module-load path passed every gate and
+        # would be found by the first production request.
+        #
+        # `smoke` asserts `SECURITY_HEADERS` by value and the child inherits this
+        # environment, so the 12-header set — HSTS included — is what gets
+        # compared here. `http://localhost` is exempt from the https-origin rule
+        # (`lib/env.ts`), which is what lets this run on a runner at all.
+        #
+        # A boot on the runner, NOT a run against production: `DATABASE_URL`
+        # stays unreachable, `SQLITE_DIR` is a throwaway temp path, and every
+        # credential below is shaped to pass validation and nothing else. The
+        # boot-refuses-a-missing-variable cases live in
+        # `tests/process/startup-gates.test.ts`, which asserts exit codes rather
+        # than needing a step per variable.
+        env:
+          NODE_ENV: production
+          SMOKE_PORT: 3998
+          SQLITE_DIR: /tmp/ci-sqlite-production
+          BETTER_AUTH_SECRET: ci-placeholder-better-auth-secret-000000
+          SMTP_USER: ci@example.invalid
+          SMTP_PASS: ci-placeholder
+          R2_ACCOUNT_ID: ci-placeholder
+          R2_ACCESS_KEY_ID: ci-placeholder
+          R2_SECRET_ACCESS_KEY: ci-placeholder
+          R2_PUBLIC_BUCKET: ci-placeholder
+          R2_PRIVATE_BUCKET: ci-placeholder
+        run: bun run smoke
 
   # The database-backed tiers. Their own job because they need a PostgreSQL
   # service container, and because keeping them out of `verify` means a lint
@@ -152,10 +186,15 @@ jobs:
       - name: Integration tests
         # The harness migration builds the test template, so no separate migrate
         # step can drift from the schema used by the tests.
+        #
+        # The reporters come from `bunfig.toml`, which wins over
+        # `--coverage-reporter` on the command line (measured). Without the gate
+        # in the next step these flags computed coverage and threw it away, which
+        # reads as a gate and gates nothing.
         run: >-
           bun run test:integration --
           --reporter=junit --reporter-outfile=reports/junit-integration.xml
-          --coverage --coverage-reporter=text
+          --coverage
       - name: Publish integration test report
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -169,6 +208,16 @@ jobs:
         # test here owns a real socket, a real child process or a real signal.
         # It is also the tier where the win32-skipped cases actually run.
         run: bun run test:process
+      - name: Coverage floor
+        # LAST in this job, and that placement is the point: a coverage dip is a
+        # ratchet signal rather than a correctness failure, and sitting ahead of
+        # the process tier it skipped `tests/process/startup-gates.test.ts` — the
+        # fail-closed admission gates — over a percentage.
+        #
+        # Bun's own `coverageThreshold` cannot express this floor: it is applied
+        # per FILE on 1.4.0, and this repository has files a given tier
+        # legitimately never loads. See the script's header.
+        run: bun scripts/check-coverage.ts
 
   workflows:
     runs-on: ubuntu-24.04

@@ -340,7 +340,7 @@ describe('a pass with a healthy object store', () => {
       sessions: { removed: 1, hasMore: false },
       verificationSessions: { removed: 2, hasMore: false },
       verificationCodes: { removed: 1, hasMore: false },
-      tempFiles: { removed: 1, hasMore: false },
+      tempFiles: { removed: 1, hasMore: false, degraded: false },
     });
     // The "stays" partner of the backlog signal asserted under a failing R2
     // below: a completed pass must not ask to be re-run.
@@ -431,7 +431,13 @@ describe('a pass whose object-store delete fails', () => {
     // Or a total R2 outage reads as a clean sweep and nothing reschedules it.
     expect(r2Down().swept.removed.tempFiles.hasMore).toBe(true);
     expect(r2Down().swept.hasMore).toBe(true);
-    expect(r2Down().swept.status).toBe('ok');
+    // And it reports DEGRADED, not `ok`. `hasMore` alone is indistinguishable
+    // from an ordinary backlog, so an alert built on the sweep-level status —
+    // the signal the sibling SQLite job defines and the only one either job
+    // emits — stayed quiet through a total object-store outage while temporary
+    // uploads accumulated in the bucket and were billed.
+    expect(r2Down().swept.status).toBe('degraded');
+    expect(r2Down().swept.removed.tempFiles.degraded).toBe(true);
     // And the failure stays inside its own table: the three with nothing to do
     // must not inherit the backlog flag.
     expect(r2Down().swept.removed.sessions).toEqual({
@@ -504,7 +510,11 @@ describe('a pass where one object fails and its sibling succeeds', () => {
   test('unfinished work is still reported, so the failed row is retried later', () => {
     expect(partial().swept.removed.tempFiles.hasMore).toBe(true);
     expect(partial().swept.hasMore).toBe(true);
-    expect(partial().swept.status).toBe('ok');
+    // Degraded on ANY failed delete, not only on a run that removed nothing:
+    // partial progress still means a store this pass was asked to sweep was not
+    // fully swept, and `hasMore` alone reads as an ordinary backlog.
+    expect(partial().swept.status).toBe('degraded');
+    expect(partial().swept.removed.tempFiles.degraded).toBe(true);
   });
 
   test('both objects were addressed, and nothing else was', () => {

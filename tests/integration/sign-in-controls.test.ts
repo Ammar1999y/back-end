@@ -26,9 +26,17 @@ import type { SeededUser } from '../helpers/session';
 
 import { eq } from 'drizzle-orm';
 
-import { app, AUTH_PATH_LIMITS } from '@/app';
+import { app } from '@/app';
 import { db } from '@/db';
-import { sessions, users } from '@/db/schema';
+import {
+  auditLogs,
+  roles,
+  sessions,
+  users,
+  verificationCodes,
+  verificationSessions,
+} from '@/db/schema';
+import { BETTER_AUTH_ENDPOINTS } from '@/lib/auth/allowed-paths';
 import { BASE_ERROR_CODES } from '@/lib/auth/code-errors';
 import {
   LOCK_DURATION_SECONDS,
@@ -38,6 +46,8 @@ import { PUBLIC_ORIGIN } from '@/lib/env';
 import { PRE_AUTH_LIMIT } from '@/lib/http/pre-auth';
 
 import { CUSTOM_AUTH_CODE, HTTP_STATUS } from '@/utils/api-messages';
+import { hashOtpCode } from '@/utils/otp';
+import { OTP_EXPIRY_MINUTES } from '@/utils/validation/constants';
 
 import { resetTables } from '../helpers/database';
 import { egressCallsTo, scriptEgress } from '../helpers/egress';
@@ -428,12 +438,16 @@ describe('outbound captcha admission', () => {
   test('N+1 requests produce at most N siteverify calls', async () => {
     scriptEgress(TURNSTILE_HOST, () => Response.json({ success: false }));
 
-    // The sign-in budget, not `PRE_AUTH_LIMIT`: admission for this path is
-    // `AUTH_PATH_LIMITS['/sign-in/email']`, applied in the prefix handler ahead
-    // of the captcha plugin's `onRequest`. That ordering is the whole assertion
-    // — the plugin's outbound `siteverify` carries a 10 s timeout and had no
-    // bound of any kind while Better Auth's own rule for this path was `false`.
-    const limit = AUTH_PATH_LIMITS['/sign-in/email'] ?? PRE_AUTH_LIMIT;
+    // The sign-in budget, not `PRE_AUTH_LIMIT`: admission for this path is the
+    // `preAuthLimit` its own `BETTER_AUTH_ENDPOINTS` record declares, applied in
+    // the prefix handler ahead of the captcha plugin's `onRequest`. That
+    // ordering is the whole assertion — the plugin's outbound `siteverify`
+    // carries a 10 s timeout and had no bound of any kind while Better Auth's
+    // own rule for this path was `false`.
+    const limit =
+      BETTER_AUTH_ENDPOINTS.find(
+        (endpoint) => endpoint.path === '/sign-in/email'
+      )?.preAuthLimit ?? PRE_AUTH_LIMIT;
 
     const statuses: number[] = [];
     for (let n = 0; n <= limit; n++) {
@@ -538,5 +552,173 @@ describe('the cookie sign-in sets', () => {
     expect(value).not.toContain(fixture.user.email);
     expect(value).not.toContain(fixture.user.userId);
     expect(value.length).toBeGreaterThan(0);
+  });
+});
+
+describe('what the audit trail claims about a login', () => {
+  /**
+   * `loginSuccess` has to mean "a session exists", and it did not.
+   *
+   * `verifyLoginAttempt` wrote it from Better Auth's `before` hook — ahead of the
+   * `session.create.before` gates that can still reject an inactive role, a
+   * missing required role or an unverified contact — and the same helper proves
+   * the current password for three already-authenticated mutation routes, one of
+   * which then rejects the request because the submitted address is unchanged. So
+   * a forensic query could not tell a completed login from a rejected one or from
+   * a routine password re-prompt. Now the proof and the issuance are two
+   * different events.
+   */
+  async function rowsFor(userId: string) {
+    const rows = await db
+      .select({
+        action: auditLogs.action,
+        tableName: auditLogs.tableName,
+        newData: auditLogs.newData,
+        oldData: auditLogs.oldData,
+      })
+      .from(auditLogs)
+      .where(eq(auditLogs.userId, userId));
+    return rows.map((row) => ({
+      action: row.action,
+      tableName: row.tableName,
+      data: (row.newData ?? {}) as Record<string, unknown>,
+      oldData: row.oldData,
+    }));
+  }
+
+  /**
+   * A live `passwordless_login` proof for `user`, hashed by the production
+   * helper.
+   *
+   * Direct SQL rather than a send request: the send path defers delivery and the
+   * code it issues is never returned to the client, so a test that goes through
+   * it cannot present the right code. `hashOtpCode` is the same envelope the
+   * real send writes, so the verify path is exercised for real.
+   */
+  async function seedPasswordlessProof(
+    userId: string,
+    email: string,
+    code: string
+  ): Promise<void> {
+    const [row] = await db
+      .insert(verificationSessions)
+      .values({
+        userId,
+        channel: 'email',
+        identifier: email,
+        purpose: 'passwordless_login',
+        attemptNumber: 1,
+      })
+      .returning({ id: verificationSessions.id });
+    if (!row) throw new Error('seedPasswordlessProof inserted no session');
+
+    await db.insert(verificationCodes).values({
+      sessionId: row.id,
+      code: hashOtpCode(code),
+      expiresAt: new Date(Date.now() + OTP_EXPIRY_MINUTES * 60 * 1000),
+    });
+  }
+
+  beforeEach(async () => {
+    await resetTables();
+    resetSqliteStores();
+    acceptCaptcha();
+  });
+
+  test('a completed sign-in records the proof and exactly one issuance', async () => {
+    const user = await seedUser();
+    const response = await attempt(user.email, user.password);
+    expect(response.status).toBe(HTTP_STATUS.OK);
+
+    const rows = await rowsFor(user.userId);
+    const proofs = rows.filter((row) => row.data.passwordVerified === true);
+    const issuances = rows.filter((row) => row.data.loginSuccess === true);
+
+    expect(proofs).toHaveLength(1);
+    expect(proofs[0]?.data.purpose).toBe('sign_in');
+    // Exactly one, and on `sessions` rather than on `users`: the row it is about
+    // is the session that now exists. Two writers used to produce two rows for
+    // one passwordless login.
+    expect(issuances).toHaveLength(1);
+    expect(issuances[0]?.tableName).toBe('sessions');
+    expect(issuances[0]?.data.method).toBe('password');
+    // INSERT with no prior state: the row it describes was just created, and
+    // `computeChangedFields({}, newData)` on an UPDATE reported every key as
+    // changed against a state that never existed.
+    expect(issuances[0]?.action).toBe('INSERT');
+    expect(issuances[0]?.oldData).toBeNull();
+  });
+
+  test('a passwordless login records exactly one issuance, labelled passwordless', async () => {
+    // The method this centralisation was introduced FOR: `createSession` fires
+    // the same hook, and the endpoint used to write its own row as well — two
+    // rows for one login. Nothing pinned that, so a second writer could come
+    // back unnoticed.
+    const code = '424242';
+    const user = await seedUser();
+    await seedPasswordlessProof(user.userId, user.email, code);
+
+    const response = await app.handle(
+      new Request('http://localhost/api/auth/passwordless/verify', {
+        method: 'POST',
+        headers: baseHeaders({ 'content-type': 'application/json' }),
+        body: JSON.stringify({ channel: 'email', email: user.email, code }),
+      })
+    );
+    expect(response.status).toBe(HTTP_STATUS.OK);
+
+    const rows = await rowsFor(user.userId);
+    const issuances = rows.filter((row) => row.data.loginSuccess === true);
+
+    expect(issuances).toHaveLength(1);
+    expect(issuances[0]?.tableName).toBe('sessions');
+    expect(issuances[0]?.data.method).toBe('passwordless');
+    expect(issuances[0]?.action).toBe('INSERT');
+
+    // No password was proven, so no proof event may claim one.
+    expect(rows.filter((row) => row.data.passwordVerified === true)).toEqual(
+      []
+    );
+    // And the in-transaction proof event that IS the authoritative record.
+    expect(
+      rows.filter((row) => row.data.passwordlessProofVerified === true)
+    ).toHaveLength(1);
+  });
+
+  test('a rejected post-password gate records the proof and NO issuance', async () => {
+    // The password is correct and the ACCOUNT is active — `verifyLoginAttempt`
+    // filters an inactive user out before the password is even compared, so
+    // deactivating the user would test the wrong gate. Deactivating its ROLE is
+    // the one that runs AFTER the password: `verifyLoginAttempt` never looks at
+    // the role, and `session.create.before` refuses on it. Before the split, this
+    // request wrote `loginSuccess: true` for a login that never happened.
+    const user = await seedUser();
+    await db
+      .update(roles)
+      .set({ isActive: false })
+      .where(eq(roles.id, user.roleId));
+
+    const response = await attempt(user.email, user.password);
+    expect(response.status).toBe(HTTP_STATUS.UNAUTHORIZED);
+    expect(await sessionCount(user.userId)).toBe(0);
+
+    const rows = await rowsFor(user.userId);
+    expect(
+      rows.filter((row) => row.data.passwordVerified === true)
+    ).toHaveLength(1);
+    expect(rows.filter((row) => row.data.loginSuccess === true)).toEqual([]);
+  });
+
+  test('a wrong password records neither', async () => {
+    const user = await seedUser();
+
+    const response = await attempt(user.email, WRONG_PASSWORD);
+    expect(response.status).toBe(HTTP_STATUS.UNAUTHORIZED);
+
+    const rows = await rowsFor(user.userId);
+    expect(rows.filter((row) => row.data.passwordVerified === true)).toEqual(
+      []
+    );
+    expect(rows.filter((row) => row.data.loginSuccess === true)).toEqual([]);
   });
 });

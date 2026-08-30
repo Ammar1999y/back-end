@@ -202,38 +202,20 @@ export function zonedNextDayStart(
 /**
  * Normalize a client-supplied date filter value to a calendar day.
  *
- * `YYYY-MM-DD` is the contract. Epoch milliseconds are still accepted so
- * previously bookmarked URLs keep working; they are resolved to the calendar
- * day they fall on **in the business timezone**, which is deterministic
- * server-side instead of depending on the host zone.
+ * `YYYY-MM-DD` is the whole contract, so this takes no timezone: the zone only
+ * matters once a calendar day is turned into instants, which is
+ * `zonedDayStart`/`zonedNextDayStart`.
+ *
+ * There USED to be an epoch-milliseconds branch here "so previously bookmarked
+ * URLs keep working". It could not: the only non-test caller is `dayBounds`, and
+ * `parsers.ts` stringifies every filter value (`safeString`) before it gets
+ * there, so the branch required `typeof raw === 'number'` and never saw one.
+ * Measured end to end, a `createdAt` filter carrying either a numeric or a
+ * string epoch value answered 422. Deleted rather than wired through: the
+ * contract clients can actually express is unchanged, and this repository has no
+ * bookmarked URL to keep working.
  */
-export function toCalendarDate(
-  raw: unknown,
-  timeZone: string = BUSINESS_TIMEZONE
-): string | null {
+export function toCalendarDate(raw: unknown): string | null {
   if (typeof raw === 'string' && CALENDAR_DATE_PATTERN.test(raw)) return raw;
-
-  // Only a REAL number, and only a plausible epoch. `Number(raw)` was applied to
-  // arbitrary client JSON, so a malformed filter resolved to 1970 and the query
-  // ran — `"2026"` -> 1970-01-01, `1700000000` (seconds, not ms) -> 1970-01-20,
-  // `"0x10"` -> 1970-01-01, `[1700000000000]` -> 2023-11-15. `dayBounds` raises
-  // a 422 only on `null`, so every one of those answered `200` with an empty
-  // table and no signal, from generated SQL reading
-  // `created_at >= '1969-12-31T21:00Z'`. A bare year is the realistic trigger.
-  //
-  // The floor is what makes a bare year fail: `2026` as epoch milliseconds is
-  // two seconds after 1970-01-01, and no bookmarked URL this compatibility path
-  // exists for carries a timestamp from that era.
-  if (typeof raw !== 'number' || !Number.isFinite(raw)) return null;
-  if (Math.abs(raw) < EPOCH_MS_FLOOR) return null;
-  const instant = safeDate(raw);
-  return instant ? calendarDayInZone(instant, timeZone) : null;
+  return null;
 }
-
-/**
- * Below this, an "epoch milliseconds" value is a malformed filter rather than a
- * date. 1971-01-01, chosen because it is comfortably above every small integer a
- * client could send by mistake (a bare year, a count, an index) and comfortably
- * below any timestamp a real bookmark carries.
- */
-const EPOCH_MS_FLOOR = 31_536_000_000;

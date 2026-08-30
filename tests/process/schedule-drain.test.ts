@@ -85,6 +85,10 @@ describe('shutdown while a scheduled sweep is running', () => {
     // The drain gives up and says so. `probe finished` never arrives, which is
     // the loss this reports: shutdown proceeds, it does not hang.
     expect(outcome.messages).toContain('sweep drain timed out');
+    // And the stores stay OPEN. A sweep that is still running may still touch
+    // one, so `server.ts` hands the process to the forced-exit timer rather than
+    // closing underneath it — which is what turned a slow retention sweep into
+    // `Statement has finalized`.
     expect(
       outcome.messages.filter((m) => m !== 'sweep drain timed out')
     ).toEqual([
@@ -92,8 +96,9 @@ describe('shutdown while a scheduled sweep is running', () => {
       'probe started',
       'waiting for in-flight sweep',
       'drain returned',
-      'stores closed',
+      'stores left open for forced exit',
     ]);
+    expect(outcome.messages).not.toContain('stores closed');
     expect(
       outcome.lines.find((line) => line.msg === 'drain returned')
     ).toMatchObject({ drained: false });

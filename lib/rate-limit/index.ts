@@ -38,8 +38,23 @@ export async function rateLimit(opts: {
   identifier: string;
   limit: number;
   window: number;
+  /** Units this request spends. Defaults to 1; see `SQL_CONSUME`. */
+  cost?: number;
 }): Promise<RateLimitResult> {
   const windowMs = opts.window * 1000;
+  const cost = opts.cost ?? 1;
+
+  // A cost over the whole budget can never be admitted, and the statement cannot
+  // refuse it: both the INSERT and the window-rollover branch write `cost`
+  // unconditionally. Refused here, without a write.
+  if (!Number.isSafeInteger(cost) || cost < 1 || cost > opts.limit)
+    return {
+      success: false,
+      limit: opts.limit,
+      remaining: 0,
+      retryAfter: opts.window,
+      degraded: false,
+    };
 
   try {
     const now = Date.now();
@@ -47,6 +62,7 @@ export async function rateLimit(opts: {
     const admitted = getRateLimitStore().consume.get<ConsumeRow>(
       opts.identifier,
       windowStart,
+      cost,
       windowStart + windowMs,
       opts.limit
     );

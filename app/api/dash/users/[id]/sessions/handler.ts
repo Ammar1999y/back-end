@@ -47,19 +47,34 @@ export { SESSIONS_PAGE_SIZE } from './pagination';
  * `body: 'json'`, and a contract that omits the shape of a body it says exists
  * is worse than one that admits it does not know.
  */
-export const deleteSessionsSchema = z.union([
-  z
-    .object({
-      sessionIds: z
-        .array(idSchema, { message: idRequired })
-        .min(1, 'يجب تحديد جلسة واحدة على الأقل')
-        .max(IDS_ARRAY_MAX),
-    })
-    .strict(),
-  // Emergency path: end every other session in one transaction, without
-  // having to enumerate ids that pagination may not even have surfaced yet.
-  z.object({ revokeAll: z.literal(true) }).strict(),
-]);
+export const deleteSessionsSchema = z.union(
+  [
+    z
+      .object({
+        sessionIds: z
+          .array(idSchema, { message: idRequired })
+          .min(1, 'يجب تحديد جلسة واحدة على الأقل')
+          .max(IDS_ARRAY_MAX, `الحد الأقصى ${IDS_ARRAY_MAX} جلسة في الطلب`),
+      })
+      .strict(),
+    // Emergency path: end every other session in one transaction, without
+    // having to enumerate ids that pagination may not even have surfaced yet.
+    z.object({ revokeAll: z.literal(true) }).strict(),
+  ],
+  // The union's fallback message, for the bodies that reach it — and which ones
+  // do is measured, not assumed. Zod 4.5 reports the FIRST branch's issue when
+  // exactly one branch matched the shape and failed a constraint inside it:
+  // `{sessionIds: []}` answers `too_small` with this schema's own minimum
+  // message and 51 ids answer `too_big` with its maximum message. It falls back
+  // to a single `invalid_union` issue when no branch got that far — a bad id
+  // inside the array, `revokeAll: false`, and `{}` — and that is where the
+  // English `"Invalid input"` used to surface. So all three messages are live
+  // client copy; none of them is decorative.
+  {
+    error:
+      'حدد جلسة واحدة على الأقل عبر sessionIds، أو أرسل revokeAll: true لإنهاء الجلسات الأخرى',
+  }
+);
 
 /**
  * Shared authorization for the sessions sub-resource: the owner, or an actor
@@ -266,12 +281,9 @@ export const DELETE: Handler = async (ctx) => {
       ? []
       : request.sessionIds.filter((id) => id !== currentSessionId);
 
-    if (!revokeAll && idsToDelete.length === 0)
-      return apiSuccess({ message: MSG_DELETED });
-
     const auditMeta = getAuditMeta(ctx);
 
-    await withTransaction(async (tx) => {
+    const revoked = await withTransaction(async (tx) => {
       if (!isSelf)
         await assertTargetReachable(tx, {
           targetId,
@@ -280,6 +292,15 @@ export const DELETE: Handler = async (ctx) => {
           actorPermissions,
           lock: true,
         });
+
+      // AFTER `assertTargetReachable`, not before it. The empty-set
+      // short-circuit used to precede the transaction entirely, so a request
+      // naming only the actor's own current session — the id this endpoint
+      // filters out — answered `200 "deleted"` for a target user that does not
+      // exist, while the same request naming any other id answered 404. That
+      // contradicts `target-user.ts`: "a subresource must never be reachable
+      // when its parent is not."
+      if (!revokeAll && idsToDelete.length === 0) return [];
 
       const deleted = await tx
         .delete(sessions)
@@ -310,9 +331,16 @@ export const DELETE: Handler = async (ctx) => {
           meta: auditMeta,
         });
       }
+
+      return deleted.map((row) => row.id);
     });
 
-    return apiSuccess({ message: MSG_DELETED });
+    // The set actually revoked, so "nothing matched" is distinguishable from
+    // "revoked". A user who selects only the row this endpoint flags
+    // `isCurrent: true` — "log out this device" — is declined by design (the
+    // acting session is always preserved), and with a bare `200 "deleted"` the
+    // client had no way to tell.
+    return apiSuccess({ message: MSG_DELETED, data: { revoked } });
   } catch (error) {
     return handleApiError(error, MSG_DELETE_ERROR);
   }

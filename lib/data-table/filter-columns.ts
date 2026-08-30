@@ -220,21 +220,36 @@ function buildCondition(
       const values = (value as string[]).filter(Boolean);
       if (values.length === 0) invalidFilter();
 
+      // The same three-valued-logic rule `notILike` and `ne` above already
+      // apply, on the third negated form — which was not swept with them.
+      // `NULL NOT IN ($1)` evaluates to NULL, not TRUE, so "does not contain any
+      // of […]" hid every row with no value from both the rows and `meta.total`,
+      // with a 200. Not reachable while the only registered `boolean` columns
+      // are NOT NULL; a nullable `multiSelect` column arms it.
+      const excludeNulls = (condition: SQL) =>
+        negated ? or(condition, isNull(column)) : condition;
+
       if (spec.type === 'boolean') {
         const bools = values.map(parseBoolean);
         if (bools.includes(null)) invalidFilter();
-        return negated
-          ? notInArray(column, bools as boolean[])
-          : inArray(column, bools as boolean[]);
+        return excludeNulls(
+          negated
+            ? notInArray(column, bools as boolean[])
+            : inArray(column, bools as boolean[])
+        );
       }
       if (spec.type === 'number') {
         const nums = values.map(safeNumber);
         if (nums.includes(null)) invalidFilter();
-        return negated
-          ? notInArray(column, nums as number[])
-          : inArray(column, nums as number[]);
+        return excludeNulls(
+          negated
+            ? notInArray(column, nums as number[])
+            : inArray(column, nums as number[])
+        );
       }
-      return negated ? notInArray(column, values) : inArray(column, values);
+      return excludeNulls(
+        negated ? notInArray(column, values) : inArray(column, values)
+      );
     }
 
     // Comparison operators. For dates the labels are calendar-relative:
@@ -289,8 +304,19 @@ function buildCondition(
         );
       }
 
-      const first = rawStart?.trim() ? safeNumber(rawStart) : null;
-      const second = rawEnd?.trim() ? safeNumber(rawEnd) : null;
+      // Absent and uncoercible must not collapse into one `null`. They did, and
+      // only the first legitimately means an open-ended side: `isBetween
+      // ["abc","100"]` printed `WHERE col <= $1` with `[100]`, so a client that
+      // expressed a lower bound got a 200 whose rows include everything below it
+      // — strictly broader than the request, with no error. Every sibling
+      // operator (`gt "abc"`, the date branch, `isBetween ["abc","def"]`) already
+      // rejects the same input; this was the one that dropped.
+      const first = rawStart?.trim()
+        ? (safeNumber(rawStart) ?? invalidFilter())
+        : null;
+      const second = rawEnd?.trim()
+        ? (safeNumber(rawEnd) ?? invalidFilter())
+        : null;
       if (first === null && second === null) invalidFilter();
       // Both: the smaller bound is the start, whichever slot it arrived in.
       if (first !== null && second !== null)

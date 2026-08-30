@@ -1,11 +1,14 @@
 import { describe, expect, test } from 'bun:test';
 
+import { PgDialect } from 'drizzle-orm/pg-core';
+
 import { parseDataTableParams } from '@/db/queries/data-table';
 import { users } from '@/db/schema';
 import { normalizeArabicDigits, OUT_OF_RANGE, positiveInt } from '@/utils';
 import * as z from 'zod';
 import { filterColumns } from '@/lib/data-table/filter-columns';
 import { parseSearchParams } from '@/lib/data-table/parsers';
+import { REQUEST_BODIES } from '@/lib/http/openapi';
 
 import { HTTP_STATUS } from '@/utils/api-messages';
 import { toCalendarDate } from '@/utils/time';
@@ -167,6 +170,150 @@ describe('L4 - a numeric filter value uses the canonical grammar', () => {
       expect(() => filter(value)).not.toThrow();
     }
   );
+
+  const between = (value: string[]) =>
+    filterColumns({
+      table: users,
+      filters: [
+        {
+          filterId: 'f1',
+          id: 'failedLoginAttempts',
+          value,
+          operator: 'isBetween',
+          variant: 'number',
+        },
+      ],
+      joinOperator: 'and',
+      specs: { failedLoginAttempts: { type: 'number' } },
+    });
+
+  test.each([
+    ['a malformed lower bound', ['abc', '100']],
+    ['a malformed upper bound', ['1', 'abc']],
+    ['both malformed', ['abc', 'def']],
+    ['an empty-string spelling of a number', ['0x10', '']],
+  ])('isBetween with %s is a 422, not a dropped bound', (_label, value) => {
+    // The one operator that DROPPED: `['abc','100']` printed `WHERE col <= $1`
+    // and returned 200 with every row below the lower bound the client asked
+    // for. Absent (`''`) and uncoercible (`'abc'`) are different requests, and
+    // only the first means an open-ended side.
+    expect(() => between(value as string[])).toThrow(
+      expect.objectContaining({ status: HTTP_STATUS.UNPROCESSABLE })
+    );
+  });
+
+  test.each([
+    ['both bounds', ['1', '100']],
+    ['lower only', ['1', '']],
+    ['upper only', ['', '100']],
+  ])('isBetween with %s is still a filter', (_label, value) => {
+    // Without these the entry above is satisfiable by rejecting every range.
+    expect(() => between(value as string[])).not.toThrow();
+  });
+});
+
+describe('negated set membership includes rows with no value', () => {
+  // The three-valued-logic rule this file's siblings already apply to `notILike`
+  // and `ne`: `NULL NOT IN ($1)` is NULL, not TRUE, so a row with no value was
+  // EXCLUDED from a predicate that plainly describes it — missing from the list
+  // and from `meta.total`, with a 200.
+  const dialect = new PgDialect();
+  // `ne` is only offered for `select`, the array operators only for
+  // `multiSelect` (`lib/data-table/config.ts`), so the two halves of the
+  // comparison use the descriptor each operator is actually reachable from —
+  // both against the same nullable column.
+  const printed = (operator: 'inArray' | 'notInArray' | 'ne') => {
+    const isArrayOperator = operator !== 'ne';
+    const condition = filterColumns({
+      table: users,
+      filters: [
+        {
+          filterId: 'f1',
+          id: 'phoneNumber',
+          value: isArrayOperator ? ['0500000000'] : '0500000000',
+          operator,
+          variant: isArrayOperator ? 'multiSelect' : 'select',
+        },
+      ],
+      joinOperator: 'and',
+      specs: {
+        phoneNumber: { type: isArrayOperator ? 'multiSelect' : 'select' },
+      },
+    });
+    if (!condition) throw new Error('filterColumns produced no condition');
+    return dialect.sqlToQuery(condition).sql;
+  };
+
+  test('notInArray unions IS NULL, matching the ne it sits beside', () => {
+    expect(printed('notInArray')).toInclude('is null');
+    expect(printed('ne')).toInclude('is null');
+  });
+
+  test('inArray does not, because NULL is genuinely not a member', () => {
+    expect(printed('inArray')).not.toInclude('is null');
+  });
+});
+
+describe('no client-facing validation message is Zod ASCII', () => {
+  /**
+   * One assertion over the whole class, because the per-node fixes drifted:
+   * `roleId` had its `error:` wired by hand while thirteen other nodes across the
+   * dashboard write routes still answered in English — `"Invalid input"` from
+   * every union, `"Invalid input: expected boolean, received undefined"` from a
+   * `PUT /api/dash/users/:id` missing `isActive`.
+   *
+   * `REQUEST_BODIES` is the complete registry of schemas a client can reach, so
+   * this covers a new route the moment it is added rather than when someone
+   * remembers to test it.
+   */
+  const HOSTILE_BODIES: readonly unknown[] = [
+    {},
+    null,
+    [],
+    'x',
+    0,
+    true,
+    { unexpectedKey: 1 },
+    { channel: 'nope' },
+    { revokeAll: false },
+    { sessionIds: ['not-a-uuid'] },
+    { id: 1, roleId: 1, name: 1, email: 1, isActive: 'yes' },
+  ];
+
+  const entries = Object.entries(REQUEST_BODIES).flatMap(([route, schemas]) =>
+    (Array.isArray(schemas) ? schemas : [schemas]).map(
+      (schema, index) => [`${route} [${index}]`, schema] as const
+    )
+  );
+
+  test('every schema in REQUEST_BODIES is reachable from this sweep', () => {
+    // Per KEY, not a count. `entries.length >= keys.length` cannot fail for the
+    // reason it names — every key contributing at least one entry is what makes
+    // it true — while a route registered as `[]` contributes none and is silently
+    // uncovered, which a second key with two schemas then hides.
+    const covered = new Set(
+      entries.map(([label]) => label.slice(0, label.lastIndexOf(' [')))
+    );
+
+    const byCodePoint = (a: string, b: string) => (a < b ? -1 : a > b ? 1 : 0);
+    expect([...covered].toSorted(byCodePoint)).toEqual(
+      Object.keys(REQUEST_BODIES).toSorted(byCodePoint)
+    );
+  });
+
+  test.each(entries)(
+    '%s answers in Arabic for every hostile body',
+    (_route, schema) => {
+      for (const body of HOSTILE_BODIES) {
+        const parsed = schema.safeParse(body);
+        if (parsed.success) continue;
+        const message = zodIssueMessage(parsed.error);
+        // The property: a message with no Arabic letter is one this project did
+        // not author, so it came from Zod's defaults.
+        expect(message).toMatch(/\p{Script=Arabic}/u);
+      }
+    }
+  );
 });
 
 describe('M9 - control characters never reach a bound parameter', () => {
@@ -220,10 +367,14 @@ describe('L3 - a malformed date filter is null, not 1970', () => {
     expect(toCalendarDate(input as unknown)).toBeNull();
   });
 
-  test('the two forms that ARE the contract still resolve', () => {
+  test('the one form that IS the contract resolves', () => {
     expect(toCalendarDate('2026-08-02')).toBe('2026-08-02');
-    // Epoch milliseconds stay accepted for bookmarked URLs.
-    expect(toCalendarDate(1_700_000_000_000)).toBeString();
+    // Epoch milliseconds are NOT part of it. The branch that accepted them was
+    // unreachable through `parseDataTableParams` — `safeString` stringifies every
+    // filter value first — so the documented "bookmarked URLs keep working"
+    // capability answered 422 end to end. Deleted rather than wired through.
+    expect(toCalendarDate(1_700_000_000_000)).toBeNull();
+    expect(toCalendarDate('1700000000000')).toBeNull();
   });
 });
 

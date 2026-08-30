@@ -1,18 +1,13 @@
 {
   "$schema": "https://unpkg.com/knip@latest/schema.json",
   "tags": ["-knipignore"],
-  // Entries used to be inferred by knip's Next.js plugin, which treated every
-  // `app/**/route.ts` as a root. Next is gone, and so are those files, so the
-  // real runtime graph now has exactly one root: `server.ts`. It validates the
-  // runtime and then dynamically imports `app.ts`, which imports `routes.ts`,
-  // which imports every handler — knip follows dynamic imports, so the chain
-  // needs no extra entry.
+  // The runtime graph has exactly one root: `server.ts` validates the runtime
+  // and then dynamically imports `app.ts` -> `routes.ts` -> every handler, and
+  // knip follows dynamic imports.
   //
-  // Declaring `entry` at all REPLACES knip's defaults, which is why the test
-  // patterns below have to be spelled out: without them knip's built-in
-  // `**/*.test.ts` root disappears and every file under `tests/` reports as
-  // unused. That is exactly what happened when `scripts/probe/local` moved to
-  // `tests/` — the old `scripts/**/*.ts` entry had been covering it by accident.
+  // Declaring `entry` at all REPLACES knip's defaults, which is why every other
+  // root below has to be spelled out — including the test patterns, whose
+  // built-in `**/*.test.ts` root disappears with them.
   "entry": [
     "server.ts",
     "scripts/**/*.ts",
@@ -45,22 +40,18 @@
     // `bunfig.toml`'s `[test] preload`.
     "tests/helpers/preload-database.ts",
   ],
-  // `drizzle.config.ts`, `eslint.config.mjs` and `prettier.config.js` used to be
-  // listed here and are not any more: knip recognises all three as tool configs
-  // on its own and reported each as a redundant entry pattern.
+  // Tool configs (`drizzle.config.ts`, `eslint.config.mjs`, `prettier.config.js`)
+  // are deliberately absent: knip recognises those itself and reports a
+  // redundant entry pattern for each. Nothing is ignored either — knip flags a
+  // stale `ignore` entry as a config hint.
   //
-  // Nothing is ignored. The previous entry — `scripts/probe/local/_*-child.cjs`
-  // — pointed at a directory that no longer exists, and knip flagged it as a
-  // stale config hint; the children it covered are now declared as entries above.
-  //
-  // Both of these are loaded by name through `FlatCompat.extends()` in
-  // eslint.config.mjs. Knip resolves imports statically, so it cannot see
-  // string-addressed plugins. Verified active with `eslint --print-config`.
+  // Both below are loaded by NAME through `FlatCompat.extends()` in
+  // eslint.config.mjs. Knip resolves imports statically, so it cannot see a
+  // string-addressed plugin. Verified active with `eslint --print-config`.
   "ignoreDependencies": [
     "eslint-plugin-no-unsanitized",
     "eslint-plugin-security",
     // Optional dependencies used only by manually run benchmarks.
-    "better-sqlite3",
     "sharp",
     "uuid",
   ],

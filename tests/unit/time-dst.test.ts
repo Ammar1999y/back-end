@@ -154,11 +154,12 @@ for (const zone of [
   );
 }
 
-// Bookmarked epoch-millisecond filter values still resolve to a calendar day.
+// `YYYY-MM-DD` is the whole contract. The epoch-milliseconds branch this used to
+// assert was unreachable through the API (`parsers.ts` stringifies every filter
+// value before `dayBounds` sees it) and is gone.
 check(
-  'toCalendarDate(epoch ms) in zone',
-  toCalendarDate(Date.UTC(2026, 10, 1, 4, 30), 'America/New_York') ===
-    '2026-11-01'
+  'toCalendarDate rejects epoch milliseconds',
+  toCalendarDate(Date.UTC(2026, 10, 1, 4, 30)) === null
 );
 check('toCalendarDate rejects 0', toCalendarDate(0) === null);
 check('toCalendarDate rejects garbage', toCalendarDate('not-a-date') === null);

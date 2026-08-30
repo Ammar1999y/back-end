@@ -945,9 +945,7 @@ client; a `ZodError` becomes 422 with field-level detail;
 fixture). Assert `getErrorHeaders` preserves `Retry-After` and `X-RateLimit-*`:
 the limiter's contract is in the headers, not the body.
 
-**`utils/images/*` — `sanitizeSvg`, `validateSvgFile`, `isDangerousValue`,
-`safeDecodeURI`.** Corrected 2026-08-25; four claims this entry used to make are
-false, and each would have produced a test that passed while asserting nothing.
+**`utils/images/*` — `sanitizeSvg`, `isDangerousValue`, `safeDecodeURI`.**
 
 - **`sanitizeSvg` is not testable as a pure function under Bun.** With no injected
   `DOMParser` it takes its catch path and returns `isValid: false` for
@@ -955,26 +953,23 @@ false, and each would have produced a test that passed while asserting nothing.
   asserting only the failure branch. The real entry point is `sanitizeSvgServer`,
   which supplies jsdom.
 
-- **"All neutralized" is false**, and this is the important one. Measured through
-  `sanitizeSvgServer`: the external-reference class survives intact — a
-  `<style>@import "https://…"</style>` in its string form, `@font-face src`, an
-  external `xlink:href` or `href`, and an off-origin `url()` in a `style=`
-  attribute are all stored VERBATIM with `errors: []`. `DANGEROUS_CSS_PATTERNS`
-  blocks only the `@import url(...)` spelling. On objects served
-  `image/svg+xml` + `Content-Disposition: inline` from a public bucket, that is a
-  beacon fetched at view time whose content the uploader controls after review.
-  So the assertion cannot be `expect(isValid).toBe(true)` — it has to be that the
-  payload token is ABSENT from the output, and the cases that fail that must be
-  marked rather than written to match current behaviour.
+- **The assertion is that the payload is ABSENT from the output**, never
+  `expect(isValid).toBe(true)`. Stored objects are served `image/svg+xml` +
+  `Content-Disposition: inline` from a public bucket, so anything that survives is
+  a document a browser renders — and the historical failures in this class were
+  all "accepted, with the payload intact": external CSS in its string form,
+  `@font-face src`, an external `href`/`xlink:href` on `image`/`use` and then on
+  `feImage`, `textPath`, gradients and patterns.
 
-- **`validateSvgFile` does NOT reject a non-SVG with an `.svg` name.** It reads
-  `type`, `name` and `size` and never opens the file; PNG bytes named
-  `payload.svg` return `null` (accepted). What actually catches that content is
-  `sanitizeSvgServer`.
+- **`validateSvgFile` is gone.** It read `type`, `name` and `size` and never
+  opened the file, so PNG bytes named `payload.svg` were accepted; it had no
+  caller outside its own tests, and `sanitizeSvgServer` refuses the same input by
+  CONTENT. One validation boundary, not two.
 
-Also absent from the entry and worth adding: an entity-expansion payload has no
-structural ceiling at all — both existing gates measure the PRE-expansion text —
-so the property to assert is the absence, not a stopwatch.
+Two structural properties to assert alongside the payload cases, because both are
+invisible to a content check: an entity-expansion payload (the size and element
+gates measure the PRE-expansion text) and a `<use>` chain (the element gate
+measures the SOURCE, and `<use>` multiplies).
 
 **`lib/r2/upload-helper.ts` — `validateMagicBytes`, `isAllowedImageType`.** Each
 allowed type's real magic bytes pass; a PNG header under a `.jpg` name is judged

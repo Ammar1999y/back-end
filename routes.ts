@@ -10,10 +10,14 @@
  * contract changes: `app/api/dash/users/[id]/route.ts` became
  * `/api/dash/users/:id`, and so on.
  *
- * Every row states BOTH policies explicitly. `preAuth` and `body` are required
- * fields, so a new route cannot silently inherit "no pre-auth limit" or "parse
- * whatever the client sent" by omitting an argument — the omission does not
- * compile.
+ * Every row states its request and response policies explicitly. Required
+ * fields make omission a compile error rather than an unsafe default.
+ *
+ * `auth` is read off the handler, not guessed: `requirePermission` /
+ * `requireAnyPermission` / `requireDashboardAccess` are `permission`,
+ * `requireSession` alone is `session`, and a handler that calls none of them is
+ * `public`. It is what publishes each operation's 401 and 403 in
+ * `lib/http/openapi.ts`.
  *
  * Order matters only for readability here. Elysia resolves static segments
  * before wildcards regardless of registration order, which is why
@@ -40,9 +44,12 @@ import * as meChangePhoneVerify from '@/app/api/dash/users/me/change-phone/verif
 import * as devSignUp from '@/app/api/dev/sign-up/handler';
 import * as healthStorage from '@/app/api/health/storage/handler';
 import * as uploadImage from '@/app/api/upload/image/handler';
-import { BETTER_AUTH_ALLOWED_PATHS } from '@/lib/auth/allowed-paths';
+import { BETTER_AUTH_ENDPOINTS } from '@/lib/auth/allowed-paths';
 import { openApiRouteHandler } from '@/lib/http/openapi';
-import { toPublishedManifest } from '@/lib/http/route-manifest';
+import {
+  toPublishedManifest,
+  toRegisteredRoutes,
+} from '@/lib/http/route-manifest';
 // A plain frozen object of page keys — no server library, so the framework-free
 // property above holds.
 import { DASHBOARD_PAGE_NAMES } from '@/lib/permissions/constants';
@@ -54,14 +61,22 @@ export const ROUTES: readonly RouteDefinition[] = [
     path: '/api/auth/forgot-password/reset',
     handler: authForgotReset.POST,
     preAuth: 'ip-limit',
+    auth: 'public',
+    captcha: true,
+    handlerRateLimit: true,
     body: 'json',
+    response: 'envelope',
   },
   {
     method: 'POST',
     path: '/api/auth/forgot-password/send',
     handler: authForgotSend.POST,
     preAuth: 'ip-limit',
+    auth: 'public',
+    captcha: true,
+    handlerRateLimit: true,
     body: 'json',
+    response: 'envelope',
   },
   // No pre-auth limit: the OTP endpoints carry their own per-identifier and
   // per-destination budgets, which are tighter than the coarse per-IP one.
@@ -70,21 +85,33 @@ export const ROUTES: readonly RouteDefinition[] = [
     path: '/api/auth/otp/send',
     handler: authOtpSend.POST,
     preAuth: 'none',
+    auth: 'public',
+    captcha: true,
+    handlerRateLimit: true,
     body: 'json',
+    response: 'envelope',
   },
   {
     method: 'POST',
     path: '/api/auth/otp/verify',
     handler: authOtpVerify.POST,
     preAuth: 'none',
+    auth: 'public',
+    captcha: true,
+    handlerRateLimit: true,
     body: 'json',
+    response: 'envelope',
   },
   {
     method: 'POST',
     path: '/api/auth/passwordless/send',
     handler: authPasswordlessSend.POST,
     preAuth: 'ip-limit',
+    auth: 'public',
+    captcha: true,
+    handlerRateLimit: true,
     body: 'json',
+    response: 'envelope',
   },
 
   // ---- dashboard: permissions & roles -------------------------------------
@@ -93,42 +120,66 @@ export const ROUTES: readonly RouteDefinition[] = [
     path: '/api/dash/permissions',
     handler: dashPermissions.GET,
     preAuth: 'ip-limit',
+    auth: 'permission',
+    captcha: false,
+    handlerRateLimit: true,
     body: 'none',
+    response: 'envelope',
   },
   {
     method: 'POST',
     path: '/api/dash/permissions',
     handler: dashPermissions.POST,
     preAuth: 'ip-limit',
+    auth: 'permission',
+    captcha: false,
+    handlerRateLimit: true,
     body: 'json',
+    response: 'envelope',
   },
   {
     method: 'GET',
     path: '/api/dash/permissions/:id',
     handler: dashPermissionsId.GET,
     preAuth: 'ip-limit',
+    auth: 'permission',
+    captcha: false,
+    handlerRateLimit: true,
     body: 'none',
+    response: 'envelope',
   },
   {
     method: 'PUT',
     path: '/api/dash/permissions/:id',
     handler: dashPermissionsId.PUT,
     preAuth: 'ip-limit',
+    auth: 'permission',
+    captcha: false,
+    handlerRateLimit: true,
     body: 'json',
+    response: 'envelope',
   },
   {
     method: 'DELETE',
     path: '/api/dash/permissions/:id',
     handler: dashPermissionsId.DELETE,
     preAuth: 'ip-limit',
+    auth: 'permission',
+    captcha: false,
+    handlerRateLimit: true,
     body: 'none',
+    response: 'envelope',
   },
   {
     method: 'GET',
     path: '/api/dash/roles',
     handler: dashRoles.GET,
     preAuth: 'ip-limit',
+    auth: 'permission',
+    captcha: false,
+    handlerRateLimit: true,
     body: 'none',
+    response: 'envelope',
   },
 
   // ---- dashboard: self-service (static, so it wins over /:id) -------------
@@ -137,35 +188,55 @@ export const ROUTES: readonly RouteDefinition[] = [
     path: '/api/dash/users/me/change-email',
     handler: meChangeEmail.POST,
     preAuth: 'ip-limit',
+    auth: 'session',
+    captcha: true,
+    handlerRateLimit: true,
     body: 'json',
+    response: 'envelope',
   },
   {
     method: 'POST',
     path: '/api/dash/users/me/change-email/verify',
     handler: meChangeEmailVerify.POST,
     preAuth: 'ip-limit',
+    auth: 'session',
+    captcha: true,
+    handlerRateLimit: true,
     body: 'json',
+    response: 'envelope',
   },
   {
     method: 'POST',
     path: '/api/dash/users/me/change-password',
     handler: meChangePassword.POST,
     preAuth: 'ip-limit',
+    auth: 'session',
+    captcha: true,
+    handlerRateLimit: true,
     body: 'json',
+    response: 'envelope',
   },
   {
     method: 'POST',
     path: '/api/dash/users/me/change-phone',
     handler: meChangePhone.POST,
     preAuth: 'ip-limit',
+    auth: 'session',
+    captcha: true,
+    handlerRateLimit: true,
     body: 'json',
+    response: 'envelope',
   },
   {
     method: 'POST',
     path: '/api/dash/users/me/change-phone/verify',
     handler: meChangePhoneVerify.POST,
     preAuth: 'ip-limit',
+    auth: 'session',
+    captcha: true,
+    handlerRateLimit: true,
     body: 'json',
+    response: 'envelope',
   },
 
   // ---- dashboard: users ---------------------------------------------------
@@ -174,42 +245,66 @@ export const ROUTES: readonly RouteDefinition[] = [
     path: '/api/dash/users',
     handler: dashUsers.GET,
     preAuth: 'ip-limit',
+    auth: 'permission',
+    captcha: false,
+    handlerRateLimit: true,
     body: 'none',
+    response: 'envelope',
   },
   {
     method: 'POST',
     path: '/api/dash/users',
     handler: dashUsers.POST,
     preAuth: 'ip-limit',
+    auth: 'permission',
+    captcha: false,
+    handlerRateLimit: true,
     body: 'json',
+    response: 'envelope',
   },
   {
     method: 'GET',
     path: '/api/dash/users/:id',
     handler: dashUsersId.GET,
     preAuth: 'ip-limit',
+    auth: 'permission',
+    captcha: false,
+    handlerRateLimit: true,
     body: 'none',
+    response: 'envelope',
   },
   {
     method: 'PUT',
     path: '/api/dash/users/:id',
     handler: dashUsersId.PUT,
     preAuth: 'ip-limit',
+    auth: 'permission',
+    captcha: false,
+    handlerRateLimit: true,
     body: 'json',
+    response: 'envelope',
   },
   {
     method: 'DELETE',
     path: '/api/dash/users/:id',
     handler: dashUsersId.DELETE,
     preAuth: 'ip-limit',
+    auth: 'permission',
+    captcha: false,
+    handlerRateLimit: true,
     body: 'none',
+    response: 'envelope',
   },
   {
     method: 'GET',
     path: '/api/dash/users/:id/sessions',
     handler: dashUsersIdSessions.GET,
     preAuth: 'ip-limit',
+    auth: 'permission',
+    captcha: false,
+    handlerRateLimit: true,
     body: 'none',
+    response: 'envelope',
     query: [
       {
         name: 'limit',
@@ -229,7 +324,11 @@ export const ROUTES: readonly RouteDefinition[] = [
     path: '/api/dash/users/:id/sessions',
     handler: dashUsersIdSessions.DELETE,
     preAuth: 'ip-limit',
+    auth: 'permission',
+    captcha: false,
+    handlerRateLimit: true,
     body: 'json',
+    response: 'envelope',
   },
 
   // ---- upload -------------------------------------------------------------
@@ -246,7 +345,11 @@ export const ROUTES: readonly RouteDefinition[] = [
     path: '/api/upload/image',
     handler: uploadImage.POST,
     preAuth: 'ip-limit',
+    auth: 'permission',
+    captcha: false,
+    handlerRateLimit: true,
     body: 'multipart',
+    response: 'envelope',
     // Required, and read from the query rather than the form because the
     // permission check on it has to run before the multipart body is parsed.
     query: [
@@ -269,7 +372,11 @@ export const ROUTES: readonly RouteDefinition[] = [
     path: '/api/health/storage',
     handler: healthStorage.GET,
     preAuth: 'none',
+    auth: 'public',
+    captcha: false,
+    handlerRateLimit: false,
     body: 'none',
+    response: 'storage-health',
     query: [
       {
         name: 'deep',
@@ -281,13 +388,20 @@ export const ROUTES: readonly RouteDefinition[] = [
   },
 
   // ---- dev-only -----------------------------------------------------------
-  // TODO: remove this endpoint in production
+  // Present in the table, ABSENT from `REGISTERED_ROUTES` outside development —
+  // see `toRegisteredRoutes`. It stays here so the registration scanner can see
+  // its handler and so `bun run build` publishes the same filtered document
+  // whatever the building machine's NODE_ENV is.
   {
     method: 'POST',
     path: '/api/dev/sign-up',
     handler: devSignUp.POST,
     preAuth: 'none',
+    auth: 'public',
+    captcha: false,
+    handlerRateLimit: false,
     body: 'json',
+    response: 'envelope',
   },
 
   // ---- contract ------------------------------------------------------------
@@ -299,30 +413,39 @@ export const ROUTES: readonly RouteDefinition[] = [
   {
     method: 'GET',
     path: '/openapi.json',
-    handler: openApiRouteHandler(() => toPublishedManifest(ROUTES)),
+    handler: openApiRouteHandler(() => toPublishedManifest(REGISTERED_ROUTES)),
     preAuth: 'ip-limit',
+    auth: 'permission',
+    captcha: false,
+    handlerRateLimit: false,
     body: 'none',
+    response: 'openapi-document',
   },
 ];
+
+/**
+ * What `app.ts` actually serves.
+ *
+ * The environment decision is taken ONCE, here, rather than inside each
+ * development-only handler: outside development those paths are not registered at
+ * all, so they answer 404 on every method with no `Allow` and no OPTIONS answer,
+ * exactly like any other unknown path.
+ */
+export const REGISTERED_ROUTES = toRegisteredRoutes(ROUTES);
 
 /**
  * Better Auth owns its own sub-routing under `/api/auth`, so it is a prefix
  * rather than a set of routes.
  *
- * GET and POST only. The App Router mounted it through
- * `toNextJsHandler(auth.handler)`, which exports exactly those two, so a `PUT`
- * under `/api/auth` never reached Better Auth. Registering the prefix for every
- * method let unsupported ones in to consume Better Auth's own rate-limit budget
- * before it rejected them.
+ * The reachable surface is exact in both dimensions — path AND method — from the
+ * same table `lib/auth.ts` enforces and `lib/http/openapi.ts` publishes. Not the
+ * whole prefix and not one method set for all of it: Better Auth 404s every path
+ * outside the list and every method a path does not declare, so anything broader
+ * made the 405 boundary claim operations the handler itself rejects.
  */
 export const ROUTE_PREFIXES: readonly RoutePrefix[] = [
   {
     prefix: '/api/auth',
-    methods: ['GET', 'POST'],
-    // The exact reachable surface, from the same set `lib/auth.ts` enforces.
-    // Not the whole prefix: Better Auth 404s every path outside this list, so
-    // advertising the prefix made the 405 boundary claim paths existed that the
-    // handler itself rejects.
-    paths: [...BETTER_AUTH_ALLOWED_PATHS],
+    paths: BETTER_AUTH_ENDPOINTS,
   },
 ];

@@ -25,6 +25,7 @@ import {
   ROLE_SCOPE,
 } from '@/lib/permissions/constants';
 import {
+  collapseToNotFound,
   diffPermissionMatrices,
   PERMISSION_AUDIT_METADATA_FIELDS,
   PERMISSION_AUDIT_VERSION,
@@ -444,7 +445,17 @@ export const DELETE: Handler = async (ctx) => {
           name: p.pageName as DashboardPage,
           permissions: (p.permissions || {}) as Record<string, boolean>,
         }));
-        validatePermissionScope(actorPermissions, targetPerms);
+        try {
+          validatePermissionScope(actorPermissions, targetPerms);
+        } catch (error) {
+          // The same question the sibling PUT asks through
+          // `validateRolePermissionScope(..., 'reachability')`: a deletion grants
+          // nothing, so "this role outranks me" has to answer 404 like every
+          // other unreachable-target gate rather than "you cannot GRANT
+          // permissions you don't own". Inline because the rows above were
+          // already read `FOR SHARE`; the collapse is the shared helper.
+          collapseToNotFound(error);
+        }
       }
 
       // When REQUIRE_ROLE_FOR_LOGIN is on, the FK is RESTRICT — soft-deleted

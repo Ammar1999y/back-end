@@ -15,18 +15,27 @@
  *
  * ---
  *
- * This is the one assertion that distinguishes the current behaviour from the
- * old, and it is deliberately the *uncomfortable* half of the trade-off. Before
- * the change `sendOtp` ran inside `withTransaction`, so a delivery failure rolled
- * the session and the code back. Now it does not:
+ * The contract these tests pin, which is the CURRENT one:
  *
- *  - `processOtpSend` still throws, so the caller and the client see the failure
- *  - the verification session row SURVIVES, with its attempt spent
- *  - the code row SURVIVES, and expires on its own
+ *  - `processOtpSend` throws, so the caller and the client see the failure
+ *  - the spent attempt and the cooldown are REFUNDED (`attemptNumber` back to 0,
+ *    `nextAllowedAt` back to null), so a user whose message was never delivered
+ *    does not lose one of `OTP_MAX_ATTEMPTS`
+ *  - the undelivered code row is REMOVED, so nothing that was never sent stays
+ *    verifiable
  *
- * If someone later "fixes" the burnt attempt by moving delivery back inside the
- * transaction, or by adding a compensating decrement, these assertions fail and
- * say why. The reasoning for accepting it is at the call site in `utils/otp.ts`.
+ * `refundFailedDelivery` (`utils/otp.ts`) is what does it, and the property that
+ * has to keep holding is narrower than "a refund happens": it is keyed on the
+ * exact `(sessionId, hashedCode)` pair, so a failure arriving after the user has
+ * already requested a NEWER code must refund nothing and delete nothing. Delivery
+ * still runs after the commit — it cannot be rolled back, which is why the refund
+ * is a compensating write rather than part of the transaction.
+ *
+ * (The header here used to state the opposite — that the attempt was burnt and
+ * the code survived — and warned that adding a compensating decrement would make
+ * these assertions fail. The decrement was added, the assertions were updated,
+ * and the warning was not: this paragraph exists so the next reader knows the
+ * drift warning is now pointed at the property above.)
  *
  * Two things the port removed rather than translated: the `PROBE_STAMP`-derived
  * email (the database is per-worker and truncated, so a unique-per-run address

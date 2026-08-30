@@ -1,10 +1,13 @@
-import { db } from '@/db';
+import { eq } from 'drizzle-orm';
+
+import { db, withTransaction } from '@/db';
 import * as schema from '@/db/schema';
+import { users } from '@/db/schema';
 import { sanitizeForLog, validID } from '@/utils';
 import { betterAuth } from 'better-auth';
 import { drizzleAdapter } from 'better-auth/adapters/drizzle';
 import { APIError, createAuthMiddleware, isAPIError } from 'better-auth/api';
-import { captcha } from 'better-auth/plugins';
+import { captcha, openAPI } from 'better-auth/plugins';
 import { PUBLIC_ORIGIN } from '@/lib/env';
 
 import {
@@ -30,6 +33,7 @@ import {
 
 import {
   API_PATH_MAX,
+  auditLog,
   getClientIp,
   TRUSTED_IP_HEADERS,
   USER_AGENT_MAX,
@@ -58,6 +62,12 @@ const ALLOWED_PATHS = BETTER_AUTH_ALLOWED_PATH_SET;
 
 const CUSTOM_CODE = CUSTOM_AUTH_CODE;
 
+/** How a session came to exist, from the endpoint that created it. */
+const SESSION_METHOD_BY_PATH: Readonly<Record<string, string>> = {
+  '/sign-in/email': 'password',
+  '/passwordless/verify': 'passwordless',
+};
+
 export const auth = betterAuth({
   // `PUBLIC_ORIGIN`, not the raw environment variable. Both used to be read
   // independently — CORS took a value canonicalised to scheme + hostname while
@@ -84,7 +94,9 @@ export const auth = betterAuth({
 
   hooks: {
     before: createAuthMiddleware(async (ctx) => {
-      if (!ALLOWED_PATHS.has(ctx.path))
+      const internalSchemaGeneration =
+        ctx.path === '/open-api/generate-schema' && !ctx.request;
+      if (!internalSchemaGeneration && !ALLOWED_PATHS.has(ctx.path))
         throw new APIError(HTTP_STATUS.NOT_FOUND, {
           message: MSG_PAGE_NOT_FOUND,
           code: CUSTOM_CODE,
@@ -129,6 +141,7 @@ export const auth = betterAuth({
             email: data.email,
             password: data.password,
             auditMeta,
+            purpose: 'sign_in',
           });
         } catch (e) {
           if (e instanceof LoginRejected)
@@ -343,6 +356,77 @@ export const auth = betterAuth({
             },
           };
         },
+        /**
+         * The ONE place `loginSuccess` is written, for every method that issues
+         * a session.
+         *
+         * It used to be written by `verifyLoginAttempt`, from the `before` hook —
+         * i.e. before the `before` hook above could still reject an inactive
+         * role, a missing required role or an unverified contact, and from three
+         * already-authenticated reauthentication routes as well. So the marker
+         * could not be read as "a session was issued": a fully rejected sign-in
+         * and a routine password re-prompt produced the same row. That helper now
+         * records a purpose-labelled `passwordVerified` instead, and this hook
+         * runs only after the session row exists.
+         *
+         * Best-effort: the session is already created and the cookie already on
+         * its way, so failing the request now would log the user in and tell them
+         * it did not work. The authoritative record for what was PROVEN is the
+         * in-transaction event each method writes (`passwordVerified` for
+         * password sign-in, `passwordlessProofVerified` for the OTP path).
+         *
+         * `context.path` is the method discriminator: the only session-creating
+         * paths this deployment serves are `/sign-in/email` and
+         * `/passwordless/verify` (`BETTER_AUTH_ENDPOINTS`).
+         */
+        after: async (session, context) => {
+          try {
+            const userId = validID(session.userId);
+            if (!userId) return;
+
+            const [user] = await db
+              .select({ email: users.email })
+              .from(users)
+              .where(eq(users.id, userId))
+              .limit(1);
+            // `audit_logs.user_email` is NOT NULL, so there is nothing to write
+            // without it.
+            if (!user) return;
+
+            const path = context?.path ?? null;
+            await withTransaction((tx) =>
+              auditLog(tx, {
+                userId,
+                userEmail: user.email,
+                // INSERT, not UPDATE: the row this describes was just created,
+                // and `computeChangedFields({}, newData)` was reporting every
+                // key as changed against a prior state that never existed.
+                // `oldData: null` says the same thing honestly.
+                action: 'INSERT',
+                tableName: 'sessions',
+                recordId: session.id,
+                oldData: null,
+                newData: {
+                  loginSuccess: true,
+                  method: SESSION_METHOD_BY_PATH[path ?? ''] ?? 'unknown',
+                  authPath: path,
+                },
+                meta: {
+                  // The values Better Auth resolved for the session row itself,
+                  // so the audit row and the session agree by construction.
+                  ip: session.ipAddress ?? null,
+                  userAgent:
+                    session.userAgent?.slice(0, USER_AGENT_MAX) ?? null,
+                  apiPath: (path ?? 'session.create').slice(0, API_PATH_MAX),
+                },
+              })
+            );
+          } catch (error) {
+            console.error(
+              sanitizeForLog({ msg: 'session.loginAudit.failed', error })
+            );
+          }
+        },
       },
     },
   },
@@ -395,5 +479,6 @@ export const auth = betterAuth({
     }),
     // Passwordless sign-in (OTP → session). Verifies its own captcha/OTP.
     passwordless(),
+    openAPI({ disableDefaultReference: true }),
   ],
 });

@@ -85,6 +85,7 @@ export const POST: Handler = async (ctx) => {
         password: parsed.data.currentPassword,
         skipTimingGuard: true,
         auditMeta,
+        purpose: 'reauth_change_phone',
       });
     } catch (e) {
       if (e instanceof LoginRejected)

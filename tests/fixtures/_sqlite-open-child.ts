@@ -21,6 +21,7 @@ const store = getRateLimitStore();
 const row = store.consume.get<{ count: number; window_start: number }>(
   `probe:${process.pid}`,
   0,
+  1,
   Date.now() + 60_000,
   10
 );

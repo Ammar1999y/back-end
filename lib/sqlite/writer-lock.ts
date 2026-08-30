@@ -22,9 +22,19 @@ export interface WriterLock {
  * without holding a lock on the databases a backup needs to read.
  *
  * The consequence for deployment is stop-first, not rolling: a rolling overlap
- * puts an old release — which never called this — beside a new one, and the
- * contention is exactly the fail-closed-limiter outage below. External writers
- * are prohibited operationally, because they cannot be prohibited here.
+ * puts an old release — which never called this — beside a new one, sharing one
+ * volume with two schema expectations and two schedules.
+ *
+ * **What this does NOT rest on: a claim that concurrent SQLite writers
+ * malfunction.** They do not. Measured on Bun 1.4.0 / SQLite 3.53.2, eight
+ * separate processes driving this application's own `openDatabase({ durability:
+ * 'process-crash-safe' })` and the real limiter upsert against one shared file —
+ * 300 writes each on a single contended key, from a cold create-and-migrate
+ * race — stored an exact 2,400 with zero lost updates, zero `SQLITE_BUSY` and no
+ * 503-shaped failure. WAL multi-process writing is what the store was chosen
+ * for and it delivers it. So the reason to keep one instance per directory is
+ * the two-releases-one-volume case above and the SINGLE-OWNER requirement of the
+ * scheduled sweeps (`lib/schedule.ts`), not limiter unavailability.
  */
 export function acquireWriterLock(directory: string): WriterLock {
   // eslint-disable-next-line security/detect-non-literal-fs-filename -- deployment-configured path, not user input
@@ -40,10 +50,11 @@ export function acquireWriterLock(directory: string): WriterLock {
     db.close();
     throw new Error(
       `Another application instance already owns the SQLite directory ${directory}. ` +
-        'This deployment assumes ONE writer: a second one stalls every ' +
-        'fail-closed limiter into a 503 rather than degrading. Check for a ' +
-        'second app container mounting the same volume, a leftover process, or ' +
-        'a script pointed at the production SQLITE_DIR. ' +
+        'This deployment assumes ONE instance per directory: the scheduled sweeps ' +
+        'in lib/schedule.ts are registered per process, so a second instance runs ' +
+        'a second retention sweep against the same rows. Check for a second app ' +
+        'container mounting the same volume, a leftover process, or a script ' +
+        'pointed at the production SQLITE_DIR. ' +
         `Underlying error: ${error instanceof Error ? error.message : String(error)}`,
       { cause: error }
     );

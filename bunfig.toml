@@ -1,18 +1,16 @@
 # `bun test` configuration.
 #
-# `root` is the fix for the selection hole. `bun test <path>` treats its
-# positional arguments as filename FILTERS, not paths: with `bun test
-# scripts/probe/local`, a test file outside that directory was skipped silently
-# and the run still exited 0 — so `bun run test`, `ci.yml` and `lefthook.yml` all
-# believed they were running the suite while a whole tier could sit unexecuted.
-# With `root`, a bare `bun test` walks every tier, and `tests/helpers/run.ts`
-# selects one deliberately.
+# `root` closes a SELECTION hole: `bun test <path>` treats its positional
+# arguments as filename FILTERS, not paths, so a test file outside the filter is
+# skipped silently and the run still exits 0 — a whole tier can sit unexecuted
+# while every script reports success. With `root`, a bare `bun test` walks every
+# tier and `tests/helpers/run.ts` selects one deliberately.
 #
-# Use `bun run test`, `test:integration` or `test:process` — not a bare
-# `bun test`. `root` below makes a bare invocation walk all three tiers, and the
-# database tiers then run without the provisioning and the four safety guards
-# that `tests/helpers/run.ts` supplies; `assertHarnessDatabase()` stops them
-# writing anywhere real, but the failure is a refusal rather than a test result.
+# Use `bun run test`, `test:integration` or `test:process`, not a bare
+# `bun test`: a bare invocation walks all three tiers without the provisioning
+# and safety guards the runner supplies. `assertHarnessDatabase()` still stops
+# the database tiers writing anywhere real, but the result is a refusal rather
+# than a test result.
 [test]
 root = "tests"
 
@@ -23,7 +21,17 @@ root = "tests"
 preload = ["./tests/helpers/preload-base.ts"]
 
 coverageSkipTestFiles = true
-coverageReporter = ["text"]
+# `lcov` as well as `text`, and it has to be declared HERE: measured on Bun
+# 1.4.0, this key WINS over `--coverage-reporter` on the command line, so
+# `["text"]` alone silently produced no lcov file however CI invoked the run.
+# `text` is for a human reading the log; `lcov` is what the aggregate gate reads.
+coverageReporter = ["text", "lcov"]
+
+# No `coverageThreshold` here, and that is measured rather than an omission: on
+# Bun 1.4.0 it is applied PER FILE, so a repository with any legitimately
+# uncovered file (`utils/images/rgba.ts` is a unit-tier file, invisible to the
+# integration tier) cannot express an aggregate floor with it. The aggregate gate
+# is `scripts/check-coverage.ts`, which reads `coverage/lcov.info`.
 
 # Bun runs the tooling too, so nothing in this project needs a Node installation.
 #

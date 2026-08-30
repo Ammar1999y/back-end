@@ -36,17 +36,71 @@ export const sanitizeStrictSingleLine = (v: unknown) =>
 export const idRequired =
   'رقم المعرف غير صحيح، اعد تحميل الصفحة ثم حاول مرة اخرى';
 
+const MSG_CHECK_INPUT = 'قم بالتحقق من البيانات المدخله';
+
+/**
+ * A server-owned Arabic message per issue code, for every schema node that did
+ * not author one.
+ *
+ * No `invalid_union` entry: it mapped to `MSG_CHECK_INPUT`, which is exactly
+ * what the `?? MSG_CHECK_INPUT` below already yields — dead by the same standard
+ * as the dead message constants this map replaced.
+ *
+ * Mapped HERE rather than at each node, because a node is exactly where it gets
+ * forgotten. Measured across the dashboard write schemas, 14 client-facing
+ * messages were Zod's ASCII defaults — `"Invalid input"` from every union,
+ * `"Invalid input: expected boolean, received undefined"` from a `PUT
+ * /api/dash/users/:id` that omits `isActive`, `"Too big: expected array to have
+ * <=50 items"` — on the most common client mistakes, in an Arabic-locale
+ * dashboard.
+ */
+const ISSUE_FALLBACKS: Readonly<Record<string, string>> = {
+  invalid_type: 'قيمة الحقل مفقودة أو من نوع غير صحيح',
+  invalid_value: 'قيمة الحقل غير مسموحة',
+  invalid_format: 'تنسيق قيمة الحقل غير صحيح',
+  invalid_key: 'أحد مفاتيح الطلب غير صالح',
+  invalid_element: 'أحد عناصر القائمة غير صالح',
+  too_big: 'القيمة أكبر من الحد المسموح',
+  too_small: 'القيمة أصغر من الحد المسموح',
+  not_multiple_of: 'القيمة غير صحيحة',
+};
+
+/**
+ * Does this message come from this project, or from Zod?
+ *
+ * Every message this codebase writes is Arabic, and every Zod default is ASCII,
+ * so the script is the discriminator — and it needs no per-schema bookkeeping,
+ * which is what made the previous per-node fixes drift.
+ */
+const ARABIC_LETTER = /\p{Script=Arabic}/u;
+
+/** Path segments come from schema keys and array indices, but bound them anyway. */
+function reflectPath(path: readonly PropertyKey[]): string {
+  if (path.length === 0) return '';
+  const named = path
+    .slice(0, MAX_REFLECTED_KEYS)
+    .map((key) => String(key).slice(0, MAX_REFLECTED_KEY_LENGTH))
+    .join('.');
+  return ` (${named})`;
+}
+
 /**
  * First-issue message for a failed `safeParse`, with a localized message for
  * `.strict()` rejections. Zod's built-in unknown-key message is English and
  * would be the only non-Arabic string a client ever sees; naming the offending
  * keys is also what turns a silently-stripped typo into an actionable 422.
+ *
+ * A message the schema authored wins. Anything else is replaced from
+ * `ISSUE_FALLBACKS` and annotated with the field path, which Zod's own defaults
+ * do not name.
  */
 export function zodIssueMessage(error: z.ZodError): string {
   const issue = error.issues[0];
-  if (issue?.code === 'unrecognized_keys')
+  if (!issue) return MSG_CHECK_INPUT;
+  if (issue.code === 'unrecognized_keys')
     return `حقول غير معروفة في الطلب: ${reflectKeys(issue.keys)}`;
-  return issue?.message ?? 'قم بالتحقق من البيانات المدخله';
+  if (ARABIC_LETTER.test(issue.message)) return issue.message;
+  return `${ISSUE_FALLBACKS[issue.code] ?? MSG_CHECK_INPUT}${reflectPath(issue.path)}`;
 }
 
 /** How many unknown keys are worth naming, and how long each may be. */

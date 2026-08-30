@@ -18,49 +18,28 @@ import { Database } from 'bun:sqlite';
 
 import packageManifest from './package.json';
 import { errorClassOf } from './utils';
+import {
+  bunVersionVerdict,
+  portVerdict,
+  sqliteVersionVerdict,
+} from './utils/startup';
 
 /**
  * The three modes this application recognises.
  *
- * `next start` used to set the runtime mode itself; `bun server.ts` does not.
- * Every production-only guard in this codebase is an exact string comparison
- * against `'production'` — the Better Auth secret floor, the Turnstile secret
- * requirement, the absolute-SQLITE_DIR rule, HSTS — so `NODE_ENV=prodution`
- * silently disabled all four at once while the server still booted and served
- * traffic. Reproduced. An unset value did the same thing, because the logger
- * reported the missing value as `development` and nothing else looked.
+ * Nothing sets this for us — `bun server.ts` is the whole command. Every
+ * production-only guard in this codebase is an exact string comparison against
+ * `'production'`: the Better Auth secret floor, the Turnstile secret
+ * requirement, the absolute-SQLITE_DIR rule, HSTS. So `NODE_ENV=prodution`
+ * disables all four at once while the server boots and serves traffic
+ * (reproduced), and an unset value selects the same posture.
  *
- * So an unrecognised value is fatal, and it is fatal HERE, before the modules
- * that read it exist.
+ * An unrecognised value is therefore fatal, and fatal HERE, before the modules
+ * that read it exist. Asserted in `tests/process/startup-gates.test.ts`.
  */
 const VALID_NODE_ENV = new Set(['development', 'test', 'production']);
 
-/**
- * The tested Bun version, read from the one place it is written.
- *
- * This does not breach the rule at the top of the file: `package.json` is data,
- * not application code — importing it evaluates no module and reads no
- * environment. The literal `'1.4.0'` that used to sit here breached something
- * else, which is why it is gone: it was a third copy of the pin, alongside
- * `packageManager` and `scripts/require-bun.mjs`, and all three had to be
- * remembered together or the deployed runtime and the installed one silently
- * disagreed.
- *
- * `''` when the field is malformed — `assertBunVersion` treats that as fatal
- * rather than as "no pin", because an unparsed pin is not the same as no pin.
- */
-const EXPECTED_BUN_VERSION =
-  /^bun@(\d+\.\d+\.\d+)$/.exec(packageManifest.packageManager)?.[1] ?? '';
-
-/** Leading `major.minor.patch`, ignoring any `-canary.…` tail. */
-const VERSION_PATTERN = /^(\d+)\.(\d+)\.(\d+)/;
-
-/**
- * The conservative floor for the WAL-reset race — see the SQLite notice linked
- * from `reports/coolify-deployment.md` §6. `bun:sqlite` links SQLite into the
- * Bun binary, so this is a property of the deployed runtime rather than of a
- * pinned npm package, and nothing but an assertion can catch drift.
- */
+/** The WAL-reset floor; the reason travels with `sqliteVersionVerdict`. */
 const MIN_SQLITE_VERSION = [3, 51, 3] as const;
 
 function fail(message: string): never {
@@ -84,92 +63,30 @@ function requireNodeEnv(): string {
 }
 
 /**
- * A port, or nothing.
+ * The gate DECISIONS live in `utils/startup.ts`, as pure functions.
  *
- * `Number(process.env.PORT)` accepted `''` as 0, `'3000abc'` as NaN and
- * `'3000.5'` as a float. Bun then binds an ephemeral or clamped port while the
- * startup log reports the requested value — so the log lies to the operator
- * about where the server is.
+ * What is left here is the wiring: read the value, ask for a verdict, `fail` on
+ * a refusal. `assertBunVersion` and `assertSqliteVersion` read the running Bun
+ * and the SQLite compiled into it, so a spawned child cannot vary either input
+ * and neither had a single assertion; the verdicts are asserted in
+ * `tests/unit/startup-gates-logic.test.ts` and the exit codes in
+ * `tests/process/startup-gates.test.ts`.
+ *
+ * Importing `./utils/startup` does not breach the no-application-imports rule at
+ * the top of this file, for the same reason importing `./package.json` does
+ * not: it is a leaf with no environment reads and no module of its own to
+ * evaluate.
  */
 function requirePort(): number {
-  const raw = process.env.PORT?.trim();
-  if (!raw) return 3000;
-  if (!/^\d+$/.test(raw))
-    fail(`PORT must be a decimal integer. Received: "${raw}".`);
-  const port = Number(raw);
-  if (port < 1 || port > 65_535)
-    fail(`PORT must be between 1 and 65535. Received: ${port}.`);
-  return port;
+  const verdict = portVerdict(process.env.PORT);
+  if (!verdict.ok) fail(verdict.reason);
+  return verdict.port;
 }
 
-/** `true` when `running` is at or above `floor`, compared field by field. */
-function atLeast(running: number[], floor: number[]): boolean {
-  for (const [index, value] of floor.entries()) {
-    const actual = running[index] ?? 0;
-    if (actual > value) return true;
-    if (actual < value) return false;
-  }
-  return true;
-}
-
-/**
- * Refuses a Bun OLDER than the tested pin, and warns about anything newer.
- *
- * A FLOOR, not an equality check, and the difference is deliberate. BOTH
- * database drivers are compiled into the binary, so their transaction semantics
- * travel with the Bun version rather than with a lockfile entry. `bun:sqlite` is
- * the older reason. `bun:sql` is the sharper one: through 1.3.x a simple-protocol
- * query running concurrently with a not-yet-prepared parameterized query on the
- * same connection could deliver one query's rows to the other, and the `BEGIN`,
- * `COMMIT` and `ROLLBACK` that `db.transaction()` issues ARE simple-protocol
- * queries (Bun #32772, fixed in 1.4.0). Below the pin, every transaction in the
- * application is exposed to that — so below the pin is fatal.
- *
- * Above the pin is a warning. That is a deliberate relaxation of what this
- * function used to do, which was to refuse any differing MINOR in either
- * direction: a developer who had upgraded Bun could not boot the project, and an
- * image that moved forward turned a routine bump into an outage. Newer is
- * untested, not known-broken, and the whole install path
- * (`scripts/require-bun.mjs`) now treats the pin as a floor too — a boot check
- * that disagreed with the install check would just be a second, contradictory
- * policy. The drift is logged so the operator can read what is actually running
- * rather than infer it.
- */
 function assertBunVersion(): void {
-  if (!EXPECTED_BUN_VERSION)
-    fail(
-      `package.json declares packageManager "${packageManifest.packageManager}". ` +
-        'It must read exactly bun@<major>.<minor>.<patch> — it is the only source ' +
-        'for the tested runtime version, read here and by scripts/require-bun.mjs.'
-    );
-
-  if (bunVersion === EXPECTED_BUN_VERSION) return;
-
-  const running = VERSION_PATTERN.exec(bunVersion);
-  if (!running)
-    fail(
-      `Bun reports version "${bunVersion}", which is not major.minor.patch. ` +
-        `The tested version is ${EXPECTED_BUN_VERSION} and this cannot be compared to it.`
-    );
-
-  const parts = [Number(running[1]), Number(running[2]), Number(running[3])];
-  const floor = EXPECTED_BUN_VERSION.split('.').map(Number);
-
-  if (!atLeast(parts, floor))
-    fail(
-      `Bun ${bunVersion} is older than the tested ${EXPECTED_BUN_VERSION}. ` +
-        'Both database drivers are compiled into the runtime, so this is a ' +
-        'transaction-correctness floor and not a preference — see Bun #32772. ' +
-        `Upgrade the image, or run: bun run check:runtime`
-    );
-
-  console.warn(
-    JSON.stringify({
-      msg: 'bun version ahead of the tested pin',
-      running: bunVersion,
-      tested: EXPECTED_BUN_VERSION,
-    })
-  );
+  const verdict = bunVersionVerdict(bunVersion, packageManifest.packageManager);
+  if (!verdict.ok) fail(verdict.reason);
+  if (verdict.warning) console.warn(verdict.warning);
 }
 
 function assertSqliteVersion(): void {
@@ -185,16 +102,8 @@ function assertSqliteVersion(): void {
     db.close(true);
   }
 
-  const parts = version.split('.').map(Number);
-  for (const [index, expected] of MIN_SQLITE_VERSION.entries()) {
-    const actual = parts[index] ?? 0;
-    if (actual > expected) return;
-    if (actual < expected)
-      fail(
-        `SQLite ${version} is below the ${MIN_SQLITE_VERSION.join('.')} floor for the ` +
-          'WAL-reset race. It ships with the Bun binary; change the image, not a package.'
-      );
-  }
+  const verdict = sqliteVersionVerdict(version, MIN_SQLITE_VERSION);
+  if (!verdict.ok) fail(verdict.reason);
 }
 
 const nodeEnv = requireNodeEnv();
@@ -214,7 +123,10 @@ const { startSchedule } = await import('./lib/schedule');
 const { acquireWriterLock } = await import('./lib/sqlite/writer-lock');
 const { SQLITE_DIR } = await import('./lib/env.server');
 
-// Fail startup before synchronous SQLite contention can stall request handling.
+// One instance per SQLITE_DIR, and it has to be claimed BEFORE `startSchedule`
+// below: the two scheduled sweeps are registered per process and neither is safe
+// to run twice against the same rows, so this lock is what elects their single
+// owner. See both functions' own notes.
 const writerLock = acquireWriterLock(SQLITE_DIR);
 
 /** Keeps the global request ceiling explicit for route and shutdown coordination. */
@@ -227,7 +139,18 @@ const IDLE_TIMEOUT_SECONDS = 60;
 const SHUTDOWN_TIMEOUT_MS =
   (Math.max(IDLE_TIMEOUT_SECONDS, MAX_ROUTE_TIMEOUT_SECONDS) + 15) * 1000;
 
-const AFTER_RESPONSE_DRAIN_MS = 10_000;
+/**
+ * Sized against the WORST CASE it waits on, not on a round number.
+ *
+ * The queue carries the deferred OTP provider call every anonymous send
+ * enqueues, and `sendOtpEmail` uses Nodemailer with four independent 5 s
+ * timeouts (`utils/otp.ts`), so 10 s could expire while a delivery was still in
+ * flight — and its failure handler is `refundFailedDelivery`, a PostgreSQL
+ * transaction. Expiring early meant the refund could not run: the stored code
+ * and the consumed send attempt survived, so a user whose message was never
+ * delivered lost one of `OTP_MAX_ATTEMPTS`.
+ */
+const AFTER_RESPONSE_DRAIN_MS = 25_000;
 
 // Half-sent requests can hold graceful stop open, so force-close after this grace.
 const GRACEFUL_STOP_MS = 5000;
@@ -299,14 +222,43 @@ async function shutdown(signal: string, exitCode = 0): Promise<void> {
     process.exit(1);
   }, SHUTDOWN_TIMEOUT_MS);
 
+  /**
+   * Whether each queue is known to be EMPTY, not merely waited on.
+   *
+   * Both drains are advisory: neither cancels the work it waits for, so a
+   * timeout means a callback is still running and may still touch a store.
+   * Closing anyway is what made a slow retention sweep die with
+   * `Statement has finalized`, and what left `refundFailedDelivery` opening a
+   * transaction on a pool `closeStores` had just closed. So the stores are
+   * closed ONLY on positive proof that nothing is in flight; anything else keeps
+   * them open and lets the forced-exit timer end the process, non-zero, which is
+   * the honest report for an unclean shutdown.
+   */
+  const quiesced = { sweeps: false, afterResponse: false };
+
+  // Its own boundary, so a faulted stop cannot skip the drains below. It used to
+  // share one `try` with them, and the consequence was out of all proportion to
+  // the fault: `quiesced` stayed `{false, false}` because the drains never RAN,
+  // the guard below then held the stores open, and the forced-exit timer ended
+  // the process non-zero a full SHUTDOWN_TIMEOUT_MS later — with no sweep and no
+  // post-response task ever in flight. Half-closed connections are what the
+  // forced-exit timer is for; they are not a reason to stop asking the queues
+  // whether they are empty.
   try {
     await stopServer();
-    const sweepDrained = await schedule.stopAndDrain(SWEEP_DRAIN_MS);
-    if (!sweepDrained) return;
-    const drained = await drainAfterResponse(AFTER_RESPONSE_DRAIN_MS);
-    // Post-response loss is logged but does not turn a completed drain into a
-    // failed deployment.
-    if (!drained)
+  } catch (error) {
+    console.error(
+      JSON.stringify({
+        msg: 'server stop failed',
+        errorClass: errorClassOf(error),
+      })
+    );
+  }
+
+  try {
+    quiesced.sweeps = await schedule.stopAndDrain(SWEEP_DRAIN_MS);
+    quiesced.afterResponse = await drainAfterResponse(AFTER_RESPONSE_DRAIN_MS);
+    if (!quiesced.afterResponse)
       console.error(
         JSON.stringify({
           msg: 'after-response drain timed out',
@@ -320,9 +272,23 @@ async function shutdown(signal: string, exitCode = 0): Promise<void> {
         errorClass: errorClassOf(error),
       })
     );
-  } finally {
-    await closeStores();
   }
+
+  if (!quiesced.sweeps || !quiesced.afterResponse) {
+    console.error(
+      JSON.stringify({
+        msg: 'stores left open for forced exit',
+        signal,
+        sweepsDrained: quiesced.sweeps,
+        afterResponseDrained: quiesced.afterResponse,
+        pendingAfterResponse: pendingAfterResponse(),
+        forcedInMs: SHUTDOWN_TIMEOUT_MS,
+      })
+    );
+    return;
+  }
+
+  await closeStores();
 
   clearTimeout(forced);
   console.log(JSON.stringify({ msg: 'server stopped', signal, exitCode }));

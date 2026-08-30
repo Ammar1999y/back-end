@@ -20,12 +20,37 @@
  * asserted to be CONSISTENT with `checks` rather than pinned to `ok`. Pinning it
  * would make this a database test, which is what the tiered suites are for.
  */
+// The LEAF, not `@/lib/audit`: that module pulls `db/schema`, zod and the OTP
+// config into this parent for one constant, and printed the OTP-disabled notice
+// into the smoke output whenever `NEXT_PUBLIC_ENABLED_OTP_CHANNELS` was unset.
+import { TRUSTED_IP_HEADERS } from '@/lib/audit/constants';
 import { SECURITY_HEADERS } from '@/lib/http/security-headers';
 
 const PORT = Number(process.env.SMOKE_PORT ?? 3999);
 const BASE = `http://127.0.0.1:${PORT}`;
 const BOOT_TIMEOUT_MS = 30_000;
 const POLL_INTERVAL_MS = 250;
+
+/**
+ * The trusted edge header every real request carries.
+ *
+ * Sent on every probe below because `ipIdentifier` fails CLOSED without it: in
+ * production `getClientIp` has no development fallback, so each `preAuth:
+ * 'ip-limit'` route answers 503 and the boundary the check is aiming at is never
+ * reached. Omitting it makes a production-posture run assert nothing about
+ * routing or authorisation — it tests a deployment shape this application does
+ * not support. Harmless in development, where the same admission path runs with
+ * a loopback fallback.
+ */
+const EDGE_HEADERS: Record<string, string> = {
+  [TRUSTED_IP_HEADERS[0]]: '203.0.113.7',
+};
+
+const probe = (path: string, init: RequestInit = {}): Promise<Response> =>
+  fetch(`${BASE}${path}`, {
+    ...init,
+    headers: { ...EDGE_HEADERS, ...init.headers },
+  });
 
 interface Check {
   name: string;
@@ -45,7 +70,7 @@ async function waitForBoot(): Promise<Response | null> {
   while (Date.now() < deadline) {
     if (server.exitCode !== null) return null;
     try {
-      return await fetch(`${BASE}/api/health/storage`);
+      return await probe('/api/health/storage');
     } catch {
       await Bun.sleep(POLL_INTERVAL_MS);
     }
@@ -69,13 +94,13 @@ async function runChecks(health: Response): Promise<Check[]> {
   const expectedStatus = Object.values(checks).every(Boolean)
     ? 'ok'
     : 'degraded';
-  const missing = await fetch(`${BASE}/api/definitely-not-a-route`);
+  const missing = await probe('/api/definitely-not-a-route');
   const missingBody = (await missing.json()) as { success?: boolean };
   // Rejected by Better Auth's own path allowlist, so 404 is the expected
   // answer. A 500 or a connection error is the failure this catches.
-  const authProbe = await fetch(`${BASE}/api/auth/not-an-endpoint`);
+  const authProbe = await probe('/api/auth/not-an-endpoint');
   // The `/api/internal/*` prefix must be unrouted, not merely guarded.
-  const internal = await fetch(`${BASE}/api/internal/sqlite-sweep`, {
+  const internal = await probe('/api/internal/sqlite-sweep', {
     method: 'POST',
   });
   // The upload route's authentication gate, checked here because it is the only
@@ -89,7 +114,7 @@ async function runChecks(health: Response): Promise<Check[]> {
     'files',
     new File(['x'], 'probe.png', { type: 'image/png' })
   );
-  const upload = await fetch(`${BASE}/api/upload/image?resource=users`, {
+  const upload = await probe('/api/upload/image?resource=users', {
     method: 'POST',
     body: uploadForm,
   });
@@ -99,7 +124,7 @@ async function runChecks(health: Response): Promise<Check[]> {
   // which only a real request can show: the document maps every path, method,
   // status code and query parameter this server serves, and an anonymous caller
   // must not receive it.
-  const contract = await fetch(`${BASE}/openapi.json`);
+  const contract = await probe('/openapi.json');
   const contractText = await contract.text();
 
   const wrongHeaders = Object.entries(SECURITY_HEADERS)

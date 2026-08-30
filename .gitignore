@@ -12,6 +12,12 @@
 /coverage
 # Written by the CI reporter flags; never committed.
 reports/junit-*.xml
+# Backstop for `tests/unit/lint-security-gate.test.ts`, which writes a
+# deliberately rule-violating probe into the tree and removes it in a `finally`.
+# If a removal ever fails (a Windows handle held by a just-exited grandchild did
+# it once), `git add -A` would commit source that fails everyone's lint gate.
+security-lint-probe-*.ts
+lib/floating-promise-probe-*.ts
 TODO*.md
 # next.js
 /.next/

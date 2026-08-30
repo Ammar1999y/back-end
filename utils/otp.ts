@@ -11,7 +11,11 @@ import { users, verificationCodes, verificationSessions } from '@/db/schema';
 import { sanitizeForLog } from '@/utils';
 import { createTransport } from 'nodemailer';
 import { auditLog } from '@/lib/audit';
-import { hashOtpCode, verifyOtpCode } from '@/lib/auth/otp-hash';
+import {
+  canEvaluateOtp,
+  hashOtpCode,
+  verifyOtpCode,
+} from '@/lib/auth/otp-hash';
 import { enforceOtpGlobalSendBudget, otpContactKind } from '@/lib/rate-limit';
 
 import { HTTP_STATUS } from '@/utils/api-messages';
@@ -97,12 +101,48 @@ const VERIFY_BLOCK_CLEARED_BY_RESEND = {
   verifyAttemptNumber: 0,
 } as const;
 
+/**
+ * Marks a 429 that came from PROOF-ROW state rather than from a limiter.
+ *
+ * The distinction is a disclosure boundary. A proof row exists only for an
+ * account that exists, so its throttle is account-dependent: measured on both
+ * anonymous verification endpoints, four wrong codes for a real address answered
+ * `400` and the fifth answered `429` with `Retry-After: 21600` and the block
+ * message, while an unknown address answered the generic `400` throughout — an
+ * exact, CAPTCHA-solvable existence test in five requests. The pre-lookup IP and
+ * destination limiters carry no marker and keep their 429, because they fire for
+ * real and fake identifiers alike.
+ */
+const OTP_PROOF_THROTTLE_CODE = 'otp_proof_throttle';
+
 function blockedError(message: string, until: Date | null): CustomError {
-  const error = new CustomError(message, HTTP_STATUS.TOO_MANY_REQUESTS);
+  const error = new CustomError(
+    message,
+    HTTP_STATUS.TOO_MANY_REQUESTS,
+    OTP_PROOF_THROTTLE_CODE
+  );
   const seconds = until
     ? Math.max(1, Math.ceil((until.getTime() - Date.now()) / 1000))
     : OTP_BLOCK_DURATION_HOURS * 3600;
   error.responseHeaders = { 'Retry-After': String(seconds) };
+  return error;
+}
+
+/**
+ * Collapse an account-dependent proof throttle to the generic invalid-code
+ * rejection, for use at every ANONYMOUS verification boundary.
+ *
+ * Returns the error unchanged when it is not one, so a call site can hand it
+ * whatever it caught. Authenticated boundaries deliberately do NOT call this —
+ * there is no account to reveal to a caller who already holds its session, and
+ * the accurate `Retry-After` is worth more there.
+ */
+export function collapseProofThrottle(
+  error: unknown,
+  genericMessage: string
+): unknown {
+  if (error instanceof CustomError && error.code === OTP_PROOF_THROTTLE_CODE)
+    return new CustomError(genericMessage, HTTP_STATUS.BAD_REQUEST);
   return error;
 }
 
@@ -876,6 +916,12 @@ export async function processOtpVerify({
         isBlocked: verificationSessions.isBlocked,
         blockedUntil: verificationSessions.blockedUntil,
         targetIdentifier: verificationSessions.targetIdentifier,
+        // The transport the code was actually SENT over, for the audit payload
+        // below. The request's `channel` is client-supplied and only has to agree
+        // with the proof's `contactKind` — `sms` and `whatsapp` both reach the
+        // same row — so recording it could misreport how the message was
+        // delivered.
+        channel: verificationSessions.channel,
       })
       .from(verificationSessions)
       .where(
@@ -938,6 +984,27 @@ export async function processOtpVerify({
 
     if (!activeCode) return { kind: 'no-code' };
 
+    // An OTP hashed under a key generation that is no longer configured can
+    // never match. Checked HERE — before the attempt counters, so an operator's
+    // mis-timed rotation cannot spend a user's budget — and answered as an
+    // expired code, because that is exactly what it is: the code is unusable and
+    // requesting a new one fixes it. Letting `verifyOtpCode` throw instead rolled
+    // the transaction back into a 500, which distinguished a real live proof from
+    // an unknown account on both anonymous verification endpoints.
+    if (!canEvaluateOtp(activeCode.code)) {
+      // No identifier and no secret: the key id is the actionable part and it is
+      // already stored in every envelope.
+      console.error(
+        JSON.stringify({
+          msg: 'otp.verify.keyUnavailable',
+          effect: 'live codes under a retired key cannot be verified',
+          purpose,
+          contactKind,
+        })
+      );
+      return { kind: 'no-code' };
+    }
+
     const auditBlockTransition = async (reason: string) => {
       // Only audit the FIRST transition into blocked. If the session was
       // already blocked, this update is a no-op and would emit a misleading
@@ -950,7 +1017,7 @@ export async function processOtpVerify({
         tableName: 'verification_sessions',
         recordId: session.id,
         oldData: { isBlocked: false },
-        newData: { isBlocked: true, channel, reason },
+        newData: { isBlocked: true, channel: session.channel, reason },
         meta: auditMeta,
       });
     };

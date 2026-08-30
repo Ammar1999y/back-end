@@ -48,23 +48,76 @@ const PHONE_CHANNEL_SET = new Set<OtpChannel>(PHONE_OTP_CHANNELS);
 export const isPhoneChannel = (c: OtpChannel): c is PhoneOtpChannel =>
   PHONE_CHANNEL_SET.has(c);
 
-// Channels listed in the env, filtered to real ones and — when phone is
-// disabled (PHONE_NUMBER_MODE) — with the phone channels stripped so the
-// config can't contradict itself.
-const envChannels: OtpChannel[] = (
-  process.env.NEXT_PUBLIC_ENABLED_OTP_CHANNELS
-    ? process.env.NEXT_PUBLIC_ENABLED_OTP_CHANNELS.split(',')
-        .map((c) => c.trim())
-        .filter((c): c is OtpChannel =>
-          (OTP_CHANNELS as readonly string[]).includes(c)
-        )
-    : []
-).filter((c) => PHONE_ENABLED || !isPhoneChannel(c));
+/**
+ * The credentials each channel's provider needs, and it is a startup
+ * requirement rather than a runtime one.
+ *
+ * Names live here, beside the channel list, because this module is the single
+ * place that answers "is this OTP configuration coherent?" — `lib/env.server.ts`
+ * is the natural home for a required-variable list, but importing this module
+ * there would pull jsdom and DOMPurify into the startup gate. The variables
+ * themselves are read in `utils/otp.ts`.
+ */
+const CHANNEL_CREDENTIALS: Readonly<Record<OtpChannel, readonly string[]>> = {
+  // `SMTP_FROM` is optional: `sendOtpEmail` falls back to `SMTP_USER` as the
+  // sender, so `SMTP_USER` covers both the login and the envelope.
+  email: ['SMTP_USER', 'SMTP_PASS'],
+  sms: ['DEEWAN_SMS_TOKEN', 'DEEWAN_SENDER_NAME'],
+  whatsapp: ['WHATSAPP_API_KEY'],
+};
 
-// When OTP is bypassed (OTP_AUTO_VERIFY), no real delivery happens, but the
-// verification UI still needs channels to offer and the flag-flip endpoints
-// must stay reachable. Email is always available; phone channels only when
-// phone is enabled.
+/**
+ * Channels listed in the env — parsed STRICTLY, because the two failure modes it
+ * used to absorb are both silent deploys of a broken feature.
+ *
+ * An unknown entry was filtered out and the resulting empty set was then read as
+ * "OTP intentionally disabled": measured, `NEXT_PUBLIC_ENABLED_OTP_CHANNELS=emial`
+ * logged the disabled notice and every send and verify surface answered 404, in
+ * a deployment that otherwise passed every boot check. Duplicates and empty
+ * entries are rejected for the same reason — they are always a typo, never an
+ * intention.
+ *
+ * Phone channels are still STRIPPED rather than rejected when
+ * `PHONE_NUMBER_MODE` disables phone: that is a coherent configuration (the
+ * whole phone feature is off) rather than a mistake in this variable.
+ */
+function parseEnvChannels(): OtpChannel[] {
+  const raw = process.env.NEXT_PUBLIC_ENABLED_OTP_CHANNELS?.trim();
+  if (!raw) return [];
+
+  const seen = new Set<string>();
+  const channels: OtpChannel[] = [];
+  for (const entry of raw.split(',')) {
+    const name = entry.trim();
+    if (!name)
+      throw new Error(
+        'NEXT_PUBLIC_ENABLED_OTP_CHANNELS contains an empty entry; write it as a ' +
+          `comma-separated list of ${OTP_CHANNELS.join(', ')}.`
+      );
+    if (!(OTP_CHANNELS as readonly string[]).includes(name))
+      throw new Error(
+        `NEXT_PUBLIC_ENABLED_OTP_CHANNELS names an unknown channel "${name}". ` +
+          `Valid channels: ${OTP_CHANNELS.join(', ')}. Leave the variable unset to ` +
+          'disable OTP entirely.'
+      );
+    if (seen.has(name))
+      throw new Error(
+        `NEXT_PUBLIC_ENABLED_OTP_CHANNELS lists "${name}" more than once.`
+      );
+    seen.add(name);
+    channels.push(name as OtpChannel);
+  }
+  return channels.filter((c) => PHONE_ENABLED || !isPhoneChannel(c));
+}
+
+const envChannels: OtpChannel[] = parseEnvChannels();
+
+// `OTP_AUTO_VERIFY` skips code entry on contact verification and the
+// authenticated contact-change endpoints, so their channels have to stay
+// offered even with none configured. It does NOT stop delivery: recovery and
+// passwordless never consult the flag and always issue a real code, which is
+// why the credential gate below reads this widened set rather than the
+// environment variable alone.
 const bypassChannels: readonly OtpChannel[] = OTP_AUTO_VERIFY
   ? [...EMAIL_OTP_CHANNELS, ...(PHONE_ENABLED ? PHONE_OTP_CHANNELS : [])]
   : [];
@@ -96,6 +149,36 @@ if (!OTP_ENABLED)
     })
   );
 
+/**
+ * Every ENABLED channel must have its provider credentials, in production.
+ *
+ * Fatal at load, alongside the other production-only requirements in
+ * `lib/env.server.ts`, because the failure it prevents is invisible until a real
+ * user needs it: measured, a deployment satisfying every declared production
+ * requirement with `NEXT_PUBLIC_ENABLED_OTP_CHANNELS=email` and no `SMTP_USER` /
+ * `SMTP_PASS` started, passed storage readiness, and then ACCEPTED and PERSISTED
+ * every send request before delivery failed. Recovery and passwordless login are
+ * both unusable in that state.
+ *
+ * Not gated on `OTP_AUTO_VERIFY`: that bypass never reaches
+ * `passwordless_login` or `forgot_password`, both of which always issue a real
+ * code, so a channel that is enabled still has to be deliverable.
+ *
+ * Production only — a developer running with `OTP_AUTO_VERIFY` and no mail
+ * provider is a supported local configuration.
+ */
+if (process.env.NODE_ENV === 'production') {
+  const missing = ENABLED_OTP_CHANNELS.flatMap((channel) =>
+    CHANNEL_CREDENTIALS[channel]
+      .filter((name) => !process.env[name]?.trim())
+      .map((name) => `${name} (required by the "${channel}" OTP channel)`)
+  );
+  if (missing.length > 0)
+    throw new Error(
+      `Missing required server env var${missing.length > 1 ? 's' : ''}: ${missing.join(', ')}`
+    );
+}
+
 /** Narrows unvalidated input to a channel that is enabled right now. */
 export function isChannelEnabled(channel: string): channel is OtpChannel {
   return (ENABLED_OTP_CHANNELS as readonly string[]).includes(channel);
@@ -107,11 +190,20 @@ export const PHONE_OTP_AVAILABLE = PHONE_OTP_CHANNELS.some(isChannelEnabled);
 
 const MSG_CHANNEL_DISABLED = 'طريقة الإرسال غير مسموحة حالياً';
 
-/** Shared superRefine: the requested channel must be currently enabled. */
-export function channelEnabledRefine(
-  data: { channel: string },
-  ctx: z.RefinementCtx
-) {
+/**
+ * Shared superRefine: the requested channel must be currently enabled.
+ *
+ * Module-private, and it applies to the SEND schemas ONLY. A send is the act the
+ * channel decides — it selects a provider and spends money at one. A VERIFY does
+ * not: `processOtpVerify` selects the proof row by `contactKind` and the verify
+ * quota buckets by it, and both collapse `sms` and `whatsapp` onto `'phone'`, so
+ * the channel is not part of the proof's identity. Checking it there refused the
+ * honest caller who named the transport their code actually arrived on — after
+ * ops disabled it inside the code's lifetime — while the identical request
+ * naming the sibling channel verified the SAME row and committed the same
+ * change. See `changePhoneVerifySchema`, which reached this conclusion first.
+ */
+function channelEnabledRefine(data: { channel: string }, ctx: z.RefinementCtx) {
   if (!isChannelEnabled(data.channel)) {
     ctx.addIssue({
       code: z.ZodIssueCode.custom,
@@ -146,9 +238,9 @@ const sendOtpSmsSchema = z.object({
   phoneNumber: phoneSchema,
 });
 
-// Enabled-channel enforcement: sendOtpSchema and verifyOtpSchema both validate
-// that the requested channel is in ENABLED_OTP_CHANNELS. This is the single
-// source of truth — route-level checks are not needed.
+// Enabled-channel enforcement lives on the SEND schemas and nowhere else — see
+// `channelEnabledRefine`. This is the single source of truth for it;
+// route-level checks are not needed.
 export const sendOtpSchema = z
   .discriminatedUnion('channel', [
     sendOtpPhoneSchema,
@@ -176,23 +268,25 @@ const verifyOtpSmsSchema = z.object({
   code: codeSchema,
 });
 
-export const verifyOtpSchema = z
-  .discriminatedUnion('channel', [
-    verifyOtpPhoneSchema,
-    verifyOtpEmailSchema,
-    verifyOtpSmsSchema,
-  ])
-  .superRefine(channelEnabledRefine);
+// No `channelEnabledRefine` on either schema below, and these are the ANONYMOUS
+// surfaces where it mattered most: `/api/auth/otp/verify`,
+// `/api/auth/passwordless/verify` and `/api/auth/forgot-password/reset` all
+// parse through them, so a caller holding a real code delivered over a
+// since-disabled channel got 422 while the same code named `sms` verified. See
+// `channelEnabledRefine`.
+export const verifyOtpSchema = z.discriminatedUnion('channel', [
+  verifyOtpPhoneSchema,
+  verifyOtpEmailSchema,
+  verifyOtpSmsSchema,
+]);
 
 // ── Reset-Password Schema (forgot-password) ──
 // Same shape as verify (channel + identifier + code) plus the new password.
-export const resetPasswordSchema = z
-  .discriminatedUnion('channel', [
-    verifyOtpPhoneSchema.extend({ newPassword: passwordSchema }),
-    verifyOtpEmailSchema.extend({ newPassword: passwordSchema }),
-    verifyOtpSmsSchema.extend({ newPassword: passwordSchema }),
-  ])
-  .superRefine(channelEnabledRefine);
+export const resetPasswordSchema = z.discriminatedUnion('channel', [
+  verifyOtpPhoneSchema.extend({ newPassword: passwordSchema }),
+  verifyOtpEmailSchema.extend({ newPassword: passwordSchema }),
+  verifyOtpSmsSchema.extend({ newPassword: passwordSchema }),
+]);
 
 // used in the front end
 // type ResetPasswordInput = z.infer<typeof resetPasswordSchema>;

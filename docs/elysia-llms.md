@@ -54,6 +54,7 @@
 ### Integration
 
 - [Better Auth - ElysiaJS](https://elysiajs.com/integrations/better-auth.md)
+- [Better Auth - ElysiaJS - 2](https://better-auth.com/llms.txt/docs/integrations/elysia.md)
 - [Integration with Drizzle - ElysiaJS](https://elysiajs.com/integrations/drizzle.md)
 
 ### Internal

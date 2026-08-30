@@ -45,6 +45,17 @@ export const MSG_TOO_MANY_REQUESTS = 'طلبات كثيرة جدًا، حاول 
 export const MSG_SERVICE_UNAVAILABLE =
   'الخدمة غير متاحة مؤقتًا، حاول مرة أخرى بعد قليل';
 
+/**
+ * One definition, read by the validation schema and by the users handler.
+ *
+ * There were three copies: a literal in `utils/validation/auth.ts` plus a
+ * constant in each of the two message modules, two of which had no caller. Both
+ * live readers are in different layers, which is what puts it here — `utils` must
+ * not import from `app/`.
+ */
+export const MSG_CUSTOM_ROLE_NEEDS_PERMISSIONS =
+  'يجب تحديد صلاحيات للدور المخصص';
+
 export const MSG_PASSWORD_COMPROMISED =
   'هذه الكلمة مستخدمة بكثرة أو مُسرّبة سابقًا، لذلك لا تُعد آمنة. يرجى اختيار كلمة مرور مختلفة.';
 

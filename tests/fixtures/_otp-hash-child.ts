@@ -6,7 +6,11 @@
  * JSON on stdout; a configuration failure is left to escape, so the test can
  * assert on a non-zero exit and the message on stderr.
  */
-import { hashOtpCode, verifyOtpCode } from '@/lib/auth/otp-hash';
+import {
+  canEvaluateOtp,
+  hashOtpCode,
+  verifyOtpCode,
+} from '@/lib/auth/otp-hash';
 import { hashPassword } from '@/lib/auth/password';
 
 const CODE = '123456';
@@ -35,6 +39,13 @@ switch (mode) {
     console.log(
       JSON.stringify({ valid: await verifyOtpCode(CODE, argument ?? '') })
     );
+    break;
+  }
+
+  case 'evaluable': {
+    // The question the anonymous verification boundary asks BEFORE it charges an
+    // attempt: can this stored value be compared at all?
+    console.log(JSON.stringify({ evaluable: canEvaluateOtp(argument ?? '') }));
     break;
   }
 

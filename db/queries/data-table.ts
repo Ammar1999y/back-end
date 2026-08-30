@@ -37,7 +37,7 @@ interface DataTableQueryParams<T extends Table> {
   defaultSort?: ExtendedColumnSort<T>;
 }
 
-interface DataTableQueryResult<T extends Table> {
+interface DataTableQueryResult {
   where: SQL | undefined;
   orderBy: ReturnType<typeof asc>[];
   limit: number;
@@ -45,7 +45,6 @@ interface DataTableQueryResult<T extends Table> {
   page: number;
   perPage: number;
   buildPageCount: (total: number) => number;
-  applySorting: (table: T) => ReturnType<typeof asc>[];
 }
 
 /**
@@ -60,7 +59,7 @@ export function parseDataTableParams<T extends Table>(
     searchableColumns,
     defaultSort,
   }: DataTableQueryParams<T>
-): DataTableQueryResult<T> {
+): DataTableQueryResult {
   const { searchParams } = new URL(url);
 
   // Unknown as well as repeated. An ignored `serach=` returned an unfiltered
@@ -128,8 +127,11 @@ export function parseDataTableParams<T extends Table>(
   }
 
   // Combine: filters and search are mutually exclusive on the client,
-  // but we handle both defensively with AND.
-  const where = and(filterWhere, searchWhere) || filterWhere || searchWhere;
+  // but we handle both defensively with AND. No `|| filterWhere || searchWhere`
+  // fallback chain: drizzle-orm's `and` already drops `undefined` inputs and
+  // returns a single condition unwrapped, so both arms were unreachable — `and`
+  // yields `undefined` only when both inputs are, and then so do they.
+  const where = and(filterWhere, searchWhere);
 
   // --- Sorting ---
   // Sorting stays lenient: an unknown sort key only changes row ORDER, never
@@ -170,6 +172,5 @@ export function parseDataTableParams<T extends Table>(
     perPage: safePerPage,
     buildPageCount: (total: number) =>
       Math.max(1, Math.ceil(total / safePerPage)),
-    applySorting,
   };
 }

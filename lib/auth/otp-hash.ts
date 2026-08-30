@@ -39,6 +39,37 @@ export function hashOtpCode(code: string): string {
 }
 
 /**
+ * Can this stored value be compared against a submitted code AT ALL?
+ *
+ * `false` means only one thing: an `o1:` envelope whose key generation is no
+ * longer configured. `verifyOtpCode` deliberately THROWS there — an operator has
+ * to see it — but a throw on an anonymous verification path is a 500, and an
+ * unknown identifier takes the generic 400 path, so the pair distinguishes a real
+ * live proof from a nonexistent account. Callers on those paths ask this first
+ * and answer "invalid or expired", which is the truth: the code can never match
+ * again, and requesting a new one fixes it.
+ *
+ * A malformed envelope returns `true` — it IS evaluable, and `verifyOtpCode`
+ * answers `false` for it without throwing.
+ */
+export function canEvaluateOtp(stored: string): boolean {
+  if (stored.startsWith(LEGACY_PASSWORD_ENVELOPE)) return true;
+
+  const parts = stored.split(':');
+  if (parts.length !== 3) return true;
+  const [version, keyId] = parts;
+  if (version !== ENVELOPE_VERSION || !keyId) return true;
+  if (!KEY_ID_PATTERN.test(keyId)) return true;
+
+  try {
+    getOtpKey(keyId);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Constant-time comparison against the stored value.
  *
  * A malformed `o1:` value returns false rather than throwing. A stored value

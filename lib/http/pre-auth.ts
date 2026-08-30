@@ -58,7 +58,8 @@ export interface PreAuthLimitOptions {
    * it: those four paths need budgets an order of magnitude apart (a session
    * read on every dashboard navigation versus a credential submission), and
    * routing them through this function rather than a second limiter is what
-   * keeps auth admission in ONE place — see `AUTH_PATH_LIMITS` in `app.ts`.
+   * keeps auth admission in ONE place — see `RoutePrefixPath.preAuthLimit`,
+   * declared per path in `lib/auth/allowed-paths.ts`.
    */
   limit?: number;
   /**

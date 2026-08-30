@@ -82,18 +82,26 @@ if (RATE_LIMIT_SCHEMA_VERSION !== MIGRATIONS.length)
  * current window, and is already at `max` — so the caller computes `retryAfter`
  * from the `windowStart` it bound, with no follow-up read.
  *
- * Binds, in order: key, windowStart, expiresAt, limit.
+ * `cost` is how many units this admission spends, so a request whose work is
+ * known to be N times an ordinary one can be charged as such (the image upload
+ * charges its megapixels). At `cost = 1` the statement is exactly what it was:
+ * `count + 1 <= max` is `count < max`. The caller must reject `cost > max`
+ * BEFORE calling — neither the INSERT nor the window-rollover branch can refuse,
+ * so a cost over the whole budget would be admitted and stored.
+ *
+ * Binds, in order: key, windowStart, cost, expiresAt, limit.
  */
 const SQL_CONSUME = `
   INSERT INTO rate_limit (key, window_start, count, expires_at)
-  VALUES (?, ?, 1, ?)
+  VALUES (?, ?, ?, ?)
   ON CONFLICT(key) DO UPDATE SET
     count        = CASE WHEN rate_limit.window_start = excluded.window_start
-                        THEN rate_limit.count + 1 ELSE 1 END,
+                        THEN rate_limit.count + excluded.count
+                        ELSE excluded.count END,
     window_start = excluded.window_start,
     expires_at   = excluded.expires_at
   WHERE rate_limit.window_start <> excluded.window_start
-     OR rate_limit.count < ?
+     OR rate_limit.count + excluded.count <= ?
   RETURNING count, window_start`;
 
 /**

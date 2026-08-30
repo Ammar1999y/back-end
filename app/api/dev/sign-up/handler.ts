@@ -17,7 +17,6 @@ import {
   MSG_CREATED,
 } from '@/utils/api-messages';
 import {
-  apiError,
   apiSuccess,
   handleApiError,
   handleUserUniqueViolation,
@@ -41,14 +40,20 @@ export const devSignUpSchema = z.object({
   password: passwordSchema,
 });
 
+/**
+ * No environment gate here, deliberately — the decision moved UP.
+ *
+ * `toRegisteredRoutes` (`lib/http/route-manifest.ts`) removes every `/api/dev/*`
+ * entry from the table `app.ts` registers outside development, so this path is
+ * genuinely unrouted there: 404 on every method, no `Allow`, no OPTIONS answer,
+ * and this function is never reached. The per-handler `NODE_ENV !==
+ * 'development'` check it replaces confirmed the endpoint's existence by status
+ * code and by `Allow`, and it was one forgotten or misspelled comparison away
+ * from shipping live — which matters, because on the development branch below
+ * this mints a `ROLE_SCOPE.SYSTEM` role with every permission of every page from
+ * an unauthenticated request.
+ */
 export const POST: Handler = async (ctx) => {
-  if (process.env.NODE_ENV !== 'development') {
-    return apiError({
-      message: 'هذه النقطة متاحة فقط في بيئة التطوير',
-      status: HTTP_STATUS.FORBIDDEN,
-    });
-  }
-
   try {
     const body = requireJsonBody(await ctx.readJson());
 

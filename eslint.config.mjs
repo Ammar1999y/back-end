@@ -12,37 +12,19 @@ const compat = new FlatCompat({
   baseDirectory: import.meta.dirname,
 });
 
-// `eslint-config-next` is gone with Next itself. Audited against
-// `docs/next-config-eslint.md` and against the 16.3.1 package's own source
-// (`dist/index.js`, `dist/typescript.js`): one rule had to be carried over by
-// hand, the rest has nothing left to lint.
+// This config is server-only, and that has one consequence worth stating: the
+// React, React-Hooks, JSX-a11y and `@next/next` rule sets are NOT registered and
+// their plugins are NOT installed (nothing in `bun.lock`; any copy in
+// `node_modules` is a leftover). Every rule in them needs JSX, a `next/*` import
+// or a Pages-Router export, so registering them would read as coverage while
+// never firing.
 //
-//   * `eslint-config-next/typescript` was `typescript-eslint.configs.recommended`
-//     with `no-unused-vars` and `no-unused-expressions` downgraded to warnings.
-//     `...tseslintConfigs.recommended` below is that same config: it names 39
-//     `@typescript-eslint/*` rules, 19 of them active, the remainder switched
-//     off by `prettier` (verified with `eslint --print-config`).
-//     `no-unused-expressions` therefore lands on `error` here rather than
-//     `warn` — stricter than Next was, deliberately left alone.
-//   * Its base config added exactly ONE rule that is not JSX-bound:
-//     `import/no-anonymous-default-export`. `plugin:import/recommended` does
-//     not include it, so it is re-declared below.
-//   * Everything else in that base config — the 21 `@next/next/*` rules, the
-//     `eslint-plugin-react` and `eslint-plugin-react-hooks` recommended sets,
-//     and the six `jsx-a11y` rules it enabled by hand — needs JSX, an import
-//     from `next/*`, or a Pages-Router data-fetching export. There is no
-//     `.tsx` file, no `pages/` directory and no `next` import in this
-//     repository. `no-assign-module-variable` is the only Next rule that could
-//     fire without JSX, and nothing here assigns to `module`. Registering the
-//     set anyway would read as coverage while never firing.
-//
-// IF a front-end is ever added: `eslint-plugin-react`,
-// `eslint-plugin-react-hooks`, `eslint-plugin-jsx-a11y` and
-// `@next/eslint-plugin-next` are NOT installed — none of them appears in
-// `bun.lock`, and any copy still sitting in `node_modules` is a leftover of an
-// install that predates the migration. Add them as devDependencies, scope them
-// to the front-end files, and re-read `docs/next-config-eslint.md` for the
+// IF a front-end is ever added: install those four as devDependencies, scope
+// them to the front-end files, and read `docs/next-config-eslint.md` for the
 // core-web-vitals severity upgrades.
+//
+// `import-x/no-anonymous-default-export` below is re-declared by hand because
+// `plugin:import/recommended` does not include it.
 const eslintConfig = [
   {
     // `bench/**` is tracked project code but deliberately outside this config: it
@@ -62,10 +44,8 @@ const eslintConfig = [
   eslintPluginImportX.flatConfigs.typescript,
   {
     languageOptions: {
-      // `eslint-config-next` used to declare these. Without them `unicorn`
-      // reports `process` as an undeclared variable in every module that reads
-      // an env var. Bun implements the Node globals plus its own `Bun`; Next
-      // also declared `globals.browser`, which is left out on purpose so a
+      // Without these `unicorn` reports `process` as undeclared in every module
+      // that reads an env var. `globals.browser` is left out on purpose, so a
       // stray `window` or `document` in server code is still an error.
       globals: { ...globals.node, ...globals.builtin, Bun: 'readonly' },
     },

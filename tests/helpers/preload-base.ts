@@ -64,20 +64,15 @@ process.env.SQLITE_DIR = sqliteDir;
 /**
  * **No `DATABASE_URL` rewrite here, deliberately.**
  *
- * This file used to point `DATABASE_URL` at a dead port whenever
- * `HARNESS_RUN_TOKEN` was absent, to stop a unit test from reaching the
- * developer's data. `bunfig.toml`'s `[test] preload` applies to EVERY `bun test`
- * in this directory, not only to the three tiers — so `bun run probe:db` went
- * from 8 passing assertions to 17 connection failures, and the output named a
- * refused port rather than this file. Any command that shells out to `bun test`
- * hit the same wall.
+ * `bunfig.toml`'s `[test] preload` applies to EVERY `bun test` under this
+ * directory, not only to the three tiers, so redirecting the variable from here
+ * breaks any command that shells out to `bun test` — with an error naming a
+ * refused port rather than this file.
  *
- * The protection it was reaching for now lives at the point of danger:
- * `assertHarnessDatabase()` in `./database.ts` refuses to truncate or seed a
- * database the harness did not create, asked of the server. That is strictly
- * stronger — it holds for a bare `bun test`, a hand-run of one file, and a
- * mis-set `TEST_DATABASE_URL` alike — and it costs nothing to anything that is
- * not a harness write.
+ * The protection lives at the point of danger instead: `assertHarnessDatabase()`
+ * in `./database.ts` refuses to truncate or seed a database the harness did not
+ * create, asked of the server. That holds for a bare `bun test`, a hand-run of
+ * one file and a mis-set `TEST_DATABASE_URL` alike.
  */
 
 installEgressGuard();

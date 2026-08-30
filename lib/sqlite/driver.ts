@@ -118,11 +118,17 @@ export interface SqliteConnection {
  * deep health check leaked one statement per poll for the same reason.
  *
  * So: every native statement is tracked here, `close()` finalizes all of them
- * first, and only then closes with `throwOnError = true`. Measured: `close(true)`
- * with an outstanding statement throws `database is locked` and leaves the
- * database open — which is exactly the signal wanted. Finalizing first means the
- * throw can only mean a statement this connection does not know about, and that
- * is a bug worth surfacing rather than deferring.
+ * first, and only then closes with `throwOnError = true`.
+ *
+ * The tracking `Set` earns its place from `close(false)`, which is the half that
+ * still holds: re-measured on Bun 1.4.0, a `prepare()`d statement kept returning
+ * rows after it (`{"afterRead":{"a":1}}`). `close(true)` no longer throws for an
+ * outstanding statement — 1.4.0 made it finalize every statement including the
+ * cached `query()` ones, where before it threw `database is locked` — so it is
+ * strictly stronger than it was, and the throw this design once used as a
+ * leak SIGNAL is gone. Nothing here depended on that throw for correctness; if
+ * leak detection is wanted, assert it directly rather than expecting the driver
+ * to raise it.
  */
 export function openConnection(path: string): SqliteConnection {
   // The path comes from SQLITE_DIR (deployment configuration), never a request.
@@ -154,9 +160,11 @@ export function openConnection(path: string): SqliteConnection {
     },
     pragmaValue: (name) => {
       // `prepare` + immediate finalize, not `query`. `query` caches the compiled
-      // statement inside the Database, and that cached statement is invisible to
-      // the tracking above — it would make the strict `close(true)` throw on a
-      // connection with no real leak.
+      // statement inside the Database, and this is a one-off read of a fixed set
+      // of pragma names, so the cache is pure growth. (It used to be justified by
+      // the cached statement making a strict `close(true)` throw; Bun 1.4.0
+      // finalizes cached statements too, so that reason is retired — this one is
+      // not.)
       const statement = db.prepare<Record<string, unknown>, []>(
         `PRAGMA ${name}`
       );
@@ -172,9 +180,9 @@ export function openConnection(path: string): SqliteConnection {
     close: () => {
       for (const statement of live) statement.finalize();
       live.clear();
-      // `true`, not `false`. With every statement this connection handed out
-      // already finalized, a throw here means an untracked one exists — a real
-      // leak, and better as an error than as a close that silently did nothing.
+      // `true`, not `false`: `close(false)` is the form that leaves a prepared
+      // statement live and the handle open (measured above), and this is the path
+      // that has to actually release the file.
       db.close(true);
     },
   };

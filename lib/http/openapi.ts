@@ -6,14 +6,16 @@
 import { existsSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import type { Handler } from './contract';
-import type { RouteManifestEntry } from './route-manifest';
+import type { HttpMethod, RouteManifestEntry } from './route-manifest';
 
 import { deleteSessionsSchema } from '@/app/api/dash/users/[id]/sessions/handler';
 import { devSignUpSchema } from '@/app/api/dev/sign-up/handler';
 import * as z from 'zod';
+import { auth } from '@/lib/auth';
 import {
   BETTER_AUTH_ALLOWED_PATH_SET,
-  BETTER_AUTH_ALLOWED_PATHS,
+  BETTER_AUTH_ENDPOINTS,
+  betterAuthServes,
 } from '@/lib/auth/allowed-paths';
 
 import { apiRaw } from '@/utils/api-response';
@@ -38,10 +40,13 @@ import {
   createPermissionSchema,
 } from '@/utils/validation/permissions';
 
-import { isUndocumentedPath } from './route-manifest';
+import { isDevelopmentOnlyPath } from './route-manifest';
 import { requireDashboardAccess } from './session';
 
 type JsonSchema = Record<string, unknown>;
+
+const BETTER_AUTH_OPENAPI = await auth.api.generateOpenAPISchema();
+const BETTER_AUTH_CONTEXT = await auth.$context;
 
 /**
  * Request bodies, keyed by `METHOD path` exactly as the manifest spells them.
@@ -53,24 +58,25 @@ type JsonSchema = Record<string, unknown>;
  * reported by `openApiDocument`'s own consistency check rather than silently
  * ignored.
  */
-const REQUEST_BODIES: Record<string, z.ZodType | readonly z.ZodType[]> = {
-  'POST /api/auth/forgot-password/reset': resetPasswordSchema,
-  'POST /api/auth/forgot-password/send': sendOtpSchema,
-  'POST /api/auth/otp/send': sendOtpSchema,
-  'POST /api/auth/otp/verify': verifyOtpSchema,
-  'POST /api/auth/passwordless/send': sendOtpSchema,
-  'POST /api/dash/permissions': createPermissionSchema,
-  'PUT /api/dash/permissions/:id': adminUpdatePermissionSchema,
-  'POST /api/dash/users': createUserSchema,
-  'PUT /api/dash/users/:id': [adminUpdateUserSchema, selfUpdateUserSchema],
-  'POST /api/dash/users/me/change-email': changeEmailSchema,
-  'POST /api/dash/users/me/change-email/verify': changeEmailVerifySchema,
-  'POST /api/dash/users/me/change-password': changePasswordSchema,
-  'POST /api/dash/users/me/change-phone': changePhoneSchema,
-  'POST /api/dash/users/me/change-phone/verify': changePhoneVerifySchema,
-  'DELETE /api/dash/users/:id/sessions': deleteSessionsSchema,
-  'POST /api/dev/sign-up': devSignUpSchema,
-};
+export const REQUEST_BODIES: Record<string, z.ZodType | readonly z.ZodType[]> =
+  {
+    'POST /api/auth/forgot-password/reset': resetPasswordSchema,
+    'POST /api/auth/forgot-password/send': sendOtpSchema,
+    'POST /api/auth/otp/send': sendOtpSchema,
+    'POST /api/auth/otp/verify': verifyOtpSchema,
+    'POST /api/auth/passwordless/send': sendOtpSchema,
+    'POST /api/dash/permissions': createPermissionSchema,
+    'PUT /api/dash/permissions/:id': adminUpdatePermissionSchema,
+    'POST /api/dash/users': createUserSchema,
+    'PUT /api/dash/users/:id': [adminUpdateUserSchema, selfUpdateUserSchema],
+    'POST /api/dash/users/me/change-email': changeEmailSchema,
+    'POST /api/dash/users/me/change-email/verify': changeEmailVerifySchema,
+    'POST /api/dash/users/me/change-password': changePasswordSchema,
+    'POST /api/dash/users/me/change-phone': changePhoneSchema,
+    'POST /api/dash/users/me/change-phone/verify': changePhoneVerifySchema,
+    'DELETE /api/dash/users/:id/sessions': deleteSessionsSchema,
+    'POST /api/dev/sign-up': devSignUpSchema,
+  };
 
 /**
  * Routes whose success status is not 200.
@@ -85,9 +91,36 @@ const CREATED_ROUTES = new Set([
   'POST /api/dev/sign-up',
 ]);
 
-/** Better Auth request bodies for the paths this deployment actually serves. */
+/** Routes whose database constraint mapping can return a deliberate 409. */
+const CONFLICT_ROUTES = new Set([
+  'POST /api/dash/permissions',
+  'PUT /api/dash/permissions/:id',
+  'POST /api/dash/users',
+  'PUT /api/dash/users/:id',
+  'POST /api/dash/users/me/change-email',
+  'POST /api/dash/users/me/change-email/verify',
+  'POST /api/dash/users/me/change-phone',
+  'POST /api/dash/users/me/change-phone/verify',
+  'POST /api/dev/sign-up',
+]);
+
+/** Bodyless operations with a reachable handler-level 400. */
+const BODYLESS_BAD_REQUEST_ROUTES = new Set([
+  'DELETE /api/dash/permissions/:id',
+  'DELETE /api/dash/users/:id',
+]);
+
+/**
+ * Better Auth request bodies for the paths this deployment actually serves.
+ *
+ * `/passwordless/verify` is here because its body is OURS, not Better Auth's:
+ * `lib/auth/passwordless.ts` validates `verifyOtpSchema`. Omitting it published
+ * a POST with no documented body for an endpoint that rejects an empty one.
+ * `/sign-out` and `/get-session` take no body, so they have no entry.
+ */
 const BETTER_AUTH_BODIES: Record<string, z.ZodType> = {
-  '/sign-in/email': loginSchema,
+  '/sign-in/email': loginSchema.omit({ captcha: true }),
+  '/passwordless/verify': verifyOtpSchema,
 };
 
 /**
@@ -248,6 +281,14 @@ function toOpenApiPath(path: string): {
  * TypeScript interface and types do not survive to runtime. It is the one piece
  * of this document that can drift from the code; `lib/http/contract.ts` is the
  * definition it must match.
+ *
+ * And it HAD drifted: `meta` declared `pageSize`, a name that appears nowhere
+ * else in the repository, and omitted `pageCount`. Both paginated endpoints emit
+ * `PaginationMeta` (`utils/api-response.ts`), so a client generated from this
+ * document read `undefined` for the page size and could not build a pager.
+ * `tests/unit/openapi-contract.test.ts` now asserts these property names against
+ * a real `PaginationMeta` value, which is what closes the drift the comment above
+ * could only warn about.
  */
 const ENVELOPE_SCHEMA: JsonSchema = {
   type: 'object',
@@ -259,8 +300,9 @@ const ENVELOPE_SCHEMA: JsonSchema = {
       type: 'object',
       properties: {
         page: { type: 'integer' },
-        pageSize: { type: 'integer' },
+        perPage: { type: 'integer' },
         total: { type: 'integer' },
+        pageCount: { type: 'integer' },
       },
     },
   },
@@ -272,28 +314,205 @@ const ENVELOPE_RESPONSE = {
   content: { 'application/json': { schema: ENVELOPE_SCHEMA } },
 };
 
-/**
- * Better Auth does NOT return this API's envelope.
- *
- * Its shapes are its own — a session object, `{ success: true }`, `null`, or
- * `{ message, code }` on an error — and claiming the envelope for them would
- * make the document actively wrong for the four paths a front-end depends on
- * most. The body is left unconstrained rather than guessed: Better Auth owns it,
- * its own documentation describes it, and an unconstrained schema is honest
- * where a fabricated one is not.
- */
-const BETTER_AUTH_RESPONSES: JsonSchema = {
-  '200': {
-    description:
-      "Better Auth's own response shape for this endpoint — not this API's envelope.",
-    content: { 'application/json': { schema: {} } },
+const STORAGE_CHECKS_SCHEMA: JsonSchema = {
+  type: 'object',
+  properties: {
+    journalModeWal: { type: 'boolean' },
+    schemaVersion: { type: 'boolean' },
+    busyTimeout: { type: 'boolean' },
+    synchronousNormal: { type: 'boolean' },
+    postgres: { type: 'boolean' },
+    quickCheck: { type: 'boolean' },
+    writable: { type: 'boolean' },
   },
-  '404': {
+  required: [
+    'journalModeWal',
+    'schemaVersion',
+    'busyTimeout',
+    'synchronousNormal',
+    'postgres',
+  ],
+  additionalProperties: false,
+};
+
+const STORAGE_RESPONSES: JsonSchema = {
+  '200': {
+    description: 'Every configured storage readiness check passed.',
+    content: {
+      'application/json': {
+        schema: {
+          type: 'object',
+          properties: {
+            status: { const: 'ok' },
+            checks: STORAGE_CHECKS_SCHEMA,
+          },
+          required: ['status', 'checks'],
+          additionalProperties: false,
+        },
+      },
+    },
+  },
+  '401': {
     description:
-      'Path outside the allowlist, or no such Better Auth endpoint. The body is Better Auth’s own error shape.',
-    content: { 'application/json': { schema: {} } },
+      'The deep probe was requested without the configured maintenance token.',
+    content: {
+      'application/json': {
+        schema: {
+          type: 'object',
+          properties: { status: { const: 'unauthorized' } },
+          required: ['status'],
+          additionalProperties: false,
+        },
+      },
+    },
+  },
+  '503': {
+    description: 'A readiness check failed or the storage probe errored.',
+    content: {
+      'application/json': {
+        schema: {
+          oneOf: [
+            {
+              type: 'object',
+              properties: {
+                status: { const: 'degraded' },
+                checks: STORAGE_CHECKS_SCHEMA,
+              },
+              required: ['status', 'checks'],
+              additionalProperties: false,
+            },
+            {
+              type: 'object',
+              properties: { status: { const: 'error' } },
+              required: ['status'],
+              additionalProperties: false,
+            },
+          ],
+        },
+      },
+    },
   },
 };
+
+const OPENAPI_DOCUMENT_RESPONSE: JsonSchema = {
+  description: 'The OpenAPI 3.1 contract for this deployment.',
+  content: {
+    'application/json': {
+      schema: {
+        type: 'object',
+        properties: {
+          openapi: { const: '3.1.0' },
+          info: { type: 'object' },
+          components: { type: 'object' },
+          paths: { type: 'object' },
+        },
+        required: ['openapi', 'info', 'paths'],
+        additionalProperties: true,
+      },
+    },
+  },
+};
+
+/**
+ * The two responses the pre-auth admission limiter produces.
+ *
+ * Shared, because the limiter is: `enforcePreAuthIpLimit` runs for every
+ * `preAuth: 'ip-limit'` route AND for every path under the Better Auth prefix
+ * (`app.ts`), and both call sites hand the failure to `handleApiError` — so the
+ * body is this API's envelope even where the handler's own body is not.
+ */
+const PRE_AUTH_RESPONSES: JsonSchema = {
+  '429': {
+    description: 'Per-IP admission limit. See `Retry-After`.',
+    content: { 'application/json': { schema: ENVELOPE_SCHEMA } },
+  },
+  '503': {
+    description: 'The admission limiter store is unavailable and fails closed.',
+    content: { 'application/json': { schema: ENVELOPE_SCHEMA } },
+  },
+};
+
+const BETTER_AUTH_STATUS_DESCRIPTIONS = {
+  '404':
+    'The Better Auth endpoint is unavailable in the current feature configuration.',
+  '500': 'Better Auth, or one of its dependencies, failed.',
+  '400': 'Required request input was absent or invalid for this endpoint.',
+  '401':
+    'Credentials refused, or the session this request would create is not allowed to exist (inactive user, inactive role).',
+  '403':
+    'Captcha verification failed, the request origin is not trusted, or the account has an unverified contact channel.',
+  '422':
+    'The submitted fields failed this project’s own schema for the endpoint.',
+} as const;
+
+function generatedBetterAuthOperation(
+  path: string,
+  method: HttpMethod
+): JsonSchema | null {
+  const pathItem = BETTER_AUTH_OPENAPI.paths[path];
+  if (!isJsonSchema(pathItem)) return null;
+  const operation = pathItem[method.toLowerCase()];
+  return isJsonSchema(operation) ? operation : null;
+}
+
+function generatedBetterAuthResponse(
+  path: string,
+  method: HttpMethod,
+  status: string
+): JsonSchema | null {
+  const operation = generatedBetterAuthOperation(path, method);
+  if (!operation || !isJsonSchema(operation.responses)) return null;
+  const response = operation.responses[status];
+  return isJsonSchema(response) ? response : null;
+}
+
+/**
+ * Statuses reachable on SOME allowlisted paths only.
+ *
+ * Per path, keyed exactly like `BETTER_AUTH_BODIES`, because the reachable set
+ * genuinely differs. `/get-session` is a GET, so the origin check that produces
+ * 403 does not apply and an absent session is a 200 carrying `null`, not a 401;
+ * `/sign-in/email` and `/passwordless/verify` both create a session and so run
+ * the `session.create` database hook in `lib/auth.ts`, which is what can refuse
+ * 401 or 403. One set for all four would advertise refusals `/get-session`
+ * cannot make.
+ */
+const BETTER_AUTH_PATH_STATUSES: Record<
+  string,
+  readonly (keyof typeof BETTER_AUTH_STATUS_DESCRIPTIONS)[]
+> = {
+  '/sign-in/email': ['400', '401', '403', '422'],
+  '/sign-out': ['400', '403'],
+  '/passwordless/verify': ['400', '401', '403', '422'],
+};
+
+function betterAuthResponses(path: string, method: HttpMethod): JsonSchema {
+  const statuses = [
+    '200',
+    '404',
+    '500',
+    ...(BETTER_AUTH_PATH_STATUSES[path] ?? []),
+  ];
+  const responses: JsonSchema = { ...PRE_AUTH_RESPONSES };
+
+  for (const status of statuses) {
+    const generated = generatedBetterAuthResponse(
+      path,
+      method,
+      status === '422' ? '400' : status
+    );
+    responses[status] = {
+      ...generated,
+      ...(status in BETTER_AUTH_STATUS_DESCRIPTIONS && {
+        description:
+          BETTER_AUTH_STATUS_DESCRIPTIONS[
+            status as keyof typeof BETTER_AUTH_STATUS_DESCRIPTIONS
+          ],
+      }),
+    };
+  }
+  return responses;
+}
 
 /**
  * The responses every route can produce regardless of its handler, because the
@@ -301,11 +520,9 @@ const BETTER_AUTH_RESPONSES: JsonSchema = {
  * fail-closed limiter store.
  */
 function commonResponses(entry: RouteManifestEntry): JsonSchema {
-  const success = CREATED_ROUTES.has(`${entry.method} ${entry.path}`)
-    ? '201'
-    : '200';
+  const key = `${entry.method} ${entry.path}`;
+  const success = CREATED_ROUTES.has(key) ? '201' : '200';
   const responses: JsonSchema = {
-    [success]: ENVELOPE_RESPONSE,
     '404': ENVELOPE_RESPONSE,
     '405': {
       description: 'The path exists under a different method. See `Allow`.',
@@ -314,12 +531,29 @@ function commonResponses(entry: RouteManifestEntry): JsonSchema {
     '500': ENVELOPE_RESPONSE,
   };
 
+  if (entry.response === 'storage-health')
+    return { ...responses, ...STORAGE_RESPONSES };
+
+  responses[success] =
+    entry.response === 'openapi-document'
+      ? OPENAPI_DOCUMENT_RESPONSE
+      : ENVELOPE_RESPONSE;
+
   // A body route rejects an absent or malformed body with 400 (`requireJsonBody`,
   // `utils/api-response.ts`) before its schema ever runs. Documented because it
   // is the response a client gets for the mistake it is most likely to make.
-  if (entry.body !== 'none')
+  if (entry.body !== 'none' || BODYLESS_BAD_REQUEST_ROUTES.has(key))
     responses['400'] = {
-      description: 'The request body is absent, empty or not parseable.',
+      description:
+        entry.body === 'none'
+          ? 'The operation violates a handler-level business rule.'
+          : 'The request body is absent, empty, not parseable, or violates a handler-level business rule.',
+      content: { 'application/json': { schema: ENVELOPE_SCHEMA } },
+    };
+
+  if (CONFLICT_ROUTES.has(key))
+    responses['409'] = {
+      description: 'A unique value or permission assignment already exists.',
       content: { 'application/json': { schema: ENVELOPE_SCHEMA } },
     };
 
@@ -335,17 +569,35 @@ function commonResponses(entry: RouteManifestEntry): JsonSchema {
       content: { 'application/json': { schema: ENVELOPE_SCHEMA } },
     };
 
-  if (entry.preAuth === 'ip-limit') {
-    responses['429'] = {
-      description: 'Per-IP admission limit. See `Retry-After`.',
-      content: { 'application/json': { schema: ENVELOPE_SCHEMA } },
-    };
-    responses['503'] = {
-      description:
-        'The admission limiter store is unavailable and fails closed.',
+  // The refusals the route's own authorisation produces, from the one field that
+  // states them. Measured unauthenticated, every one of `GET /api/dash/users`,
+  // `POST /api/dash/users/me/change-password`, `POST /api/upload/image` and
+  // `GET /openapi.json` answers 401 — and none of them said so.
+  if (entry.auth !== 'public') {
+    responses['401'] = {
+      description: 'No session, or the session row is no longer live.',
       content: { 'application/json': { schema: ENVELOPE_SCHEMA } },
     };
   }
+
+  // Two unrelated routes to the same status, so it is derived from both fields.
+  // A captcha refusal reaches `public` routes that no session guards at all —
+  // measured, `POST /api/auth/otp/send` with no `x-captcha-response` answers 403
+  // in this envelope — and the five `/api/dash/users/me/*` routes answer it
+  // after their session check passes.
+  if (entry.auth === 'permission' || entry.captcha)
+    responses['403'] = {
+      description:
+        entry.auth === 'permission'
+          ? entry.captcha
+            ? 'The caller lacks the required authority or failed the required captcha.'
+            : 'The caller lacks the grant, scope or role authority this route requires.'
+          : 'The captcha this route requires was absent or rejected.',
+      content: { 'application/json': { schema: ENVELOPE_SCHEMA } },
+    };
+
+  if (entry.preAuth === 'ip-limit' || entry.handlerRateLimit)
+    Object.assign(responses, PRE_AUTH_RESPONSES);
 
   return responses;
 }
@@ -375,7 +627,7 @@ function openApiConsistencyProblems(
   // routes the production filter withholds are not leftovers — the route still
   // exists, it is only unpublished — so they are exempt rather than reported.
   const isLeftover = (key: string): boolean =>
-    !keys.has(key) && !isUndocumentedPath(key.slice(key.indexOf(' ') + 1));
+    !keys.has(key) && !isDevelopmentOnlyPath(key.slice(key.indexOf(' ') + 1));
 
   for (const key of Object.keys(REQUEST_BODIES))
     if (isLeftover(key))
@@ -383,11 +635,44 @@ function openApiConsistencyProblems(
   for (const key of CREATED_ROUTES)
     if (isLeftover(key))
       problems.push(`CREATED_ROUTES has '${key}', which is not a route`);
+  for (const key of CONFLICT_ROUTES)
+    if (isLeftover(key))
+      problems.push(`CONFLICT_ROUTES has '${key}', which is not a route`);
+  for (const key of BODYLESS_BAD_REQUEST_ROUTES)
+    if (isLeftover(key))
+      problems.push(
+        `BODYLESS_BAD_REQUEST_ROUTES has '${key}', which is not a route`
+      );
+  // A body belongs to a POST. Checked against the endpoint table rather than
+  // against the paths alone, so a body declared for a GET-only path — a request
+  // no client can make — is reported instead of published.
   for (const key of Object.keys(BETTER_AUTH_BODIES))
+    if (!betterAuthServes(key, 'POST'))
+      problems.push(
+        `BETTER_AUTH_BODIES has '${key}', which BETTER_AUTH_ENDPOINTS does not serve under POST`
+      );
+  // The same leftover check for the per-path status table. A key naming a path
+  // the allowlist no longer carries publishes nothing, so nothing else notices.
+  for (const key of Object.keys(BETTER_AUTH_PATH_STATUSES))
     if (!BETTER_AUTH_ALLOWED_PATH_SET.has(key))
       problems.push(
-        `BETTER_AUTH_BODIES has '${key}', which is not in BETTER_AUTH_ALLOWED_PATHS`
+        `BETTER_AUTH_PATH_STATUSES has '${key}', which is not a Better Auth endpoint`
       );
+
+  for (const endpoint of BETTER_AUTH_ENDPOINTS)
+    for (const method of endpoint.methods) {
+      const operation = generatedBetterAuthOperation(endpoint.path, method);
+      if (operation) {
+        for (const status of ['200', '400', '404', '500'])
+          if (!generatedBetterAuthResponse(endpoint.path, method, status))
+            problems.push(
+              `Better Auth's generated schema has no ${status} response for ${method} ${endpoint.path}`
+            );
+      } else
+        problems.push(
+          `Better Auth's generated schema has no ${method} ${endpoint.path}`
+        );
+    }
 
   return problems;
 }
@@ -434,11 +719,28 @@ export function openApiDocument(
           ? { type: 'string', enum: [...param.enum] }
           : { type: 'string' },
       });
+    if (entry.captcha)
+      parameters.push({
+        name: 'x-captcha-response',
+        in: 'header',
+        required: true,
+        description: 'Cloudflare Turnstile response token.',
+        schema: { type: 'string', minLength: 1 },
+      });
+    if (entry.response === 'storage-health')
+      parameters.push({
+        name: 'x-maintenance-token',
+        in: 'header',
+        required: false,
+        description: 'Required when `deep=1`; ignored by the cheap probe.',
+        schema: { type: 'string', minLength: 1 },
+      });
 
     const operation: JsonSchema = {
       operationId: `${entry.method.toLowerCase()}${entry.path.replaceAll(/[^a-zA-Z0-9]/g, '_')}`,
       responses: commonResponses(entry),
     };
+    if (entry.auth !== 'public') operation.security = [{ sessionCookie: [] }];
     if (parameters.length > 0) operation.parameters = parameters;
 
     const schemas = REQUEST_BODIES[`${entry.method} ${entry.path}`];
@@ -465,36 +767,61 @@ export function openApiDocument(
     paths[path] = { ...paths[path], [entry.method.toLowerCase()]: operation };
   }
 
-  for (const authPath of BETTER_AUTH_ALLOWED_PATHS) {
-    const full = `/api/auth${authPath}`;
-    const schema = BETTER_AUTH_BODIES[authPath];
-    const slug = authPath.replaceAll(/[^a-zA-Z0-9]/g, '_');
+  for (const endpoint of BETTER_AUTH_ENDPOINTS) {
+    const full = `/api/auth${endpoint.path}`;
+    const schema = BETTER_AUTH_BODIES[endpoint.path];
+    const slug = endpoint.path.replaceAll(/[^a-zA-Z0-9]/g, '_');
 
     // A FRESH operation object per method, with the method in the id.
     // `operationId` must be unique across the whole document (OpenAPI 3.1
     // §4.8.10); sharing one object between `get` and `post` emitted four
     // duplicate ids and made the document invalid for every generator.
-    const build = (method: 'get' | 'post'): JsonSchema => {
+    const build = (method: HttpMethod): JsonSchema => {
+      const generated = generatedBetterAuthOperation(endpoint.path, method);
       const operation: JsonSchema = {
-        operationId: `betterAuth_${method}${slug}`,
+        operationId: `betterAuth_${method.toLowerCase()}${slug}`,
         description:
           'Served by Better Auth, which owns its own routing, validation and ' +
           'response shapes under this prefix. Every Better Auth path outside ' +
           'this list is answered 404 by the before-hook in lib/auth.ts.',
-        responses: BETTER_AUTH_RESPONSES,
+        responses: betterAuthResponses(endpoint.path, method),
       };
+      if (endpoint.captcha)
+        operation.parameters = [
+          {
+            name: 'x-captcha-response',
+            in: 'header',
+            required: true,
+            description: 'Cloudflare Turnstile response token.',
+            schema: { type: 'string', minLength: 1 },
+          },
+        ];
       // Only the method that carries it. A documented request body on `GET`
       // describes a request no client can make.
-      if (schema && method === 'post') {
+      if (schema && method === 'POST') {
         const body = requestBody(schema);
         if (body) operation.requestBody = body;
-      }
+      } else if (method === 'POST' && isJsonSchema(generated?.requestBody))
+        operation.requestBody = generated.requestBody;
       return operation;
     };
 
-    // GET and POST are the only methods registered for the prefix; Better Auth
-    // rejects the wrong one itself, so both are advertised.
-    paths[full] = { get: build('get'), post: build('post') };
+    // Only the methods this path DECLARES. Emitting `get` and `post` for all of
+    // them told generated clients that `GET /sign-out`, `GET /sign-in/email` and
+    // `GET /passwordless/verify` were supported operations; the first and third
+    // answer 404 and the second reaches the captcha plugin before its method is
+    // rejected.
+    paths[full] = Object.fromEntries(
+      endpoint.methods.map((method) => {
+        // `toLowerCase()` on a literal union widens to `string`, so the type has
+        // to be restated. `Lowercase<HttpMethod>` rather than `'get' | 'post'`:
+        // `methods` admits PUT and DELETE, and the narrower cast made a future
+        // entry silently MISLABELLED in the published document instead of
+        // failing the build.
+        const verb = method.toLowerCase() as Lowercase<HttpMethod>;
+        return [verb, build(method)];
+      })
+    );
   }
 
   return {
@@ -504,6 +831,16 @@ export function openApiDocument(
       version: '0.1.0',
       description:
         'Generated from the route manifest in `routes.ts` and the Zod schemas the handlers validate with. Not hand-maintained.',
+    },
+    components: {
+      schemas: BETTER_AUTH_OPENAPI.components.schemas,
+      securitySchemes: {
+        sessionCookie: {
+          type: 'apiKey',
+          in: 'cookie',
+          name: BETTER_AUTH_CONTEXT.authCookies.sessionToken.name,
+        },
+      },
     },
     paths,
   };

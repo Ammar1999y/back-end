@@ -62,6 +62,33 @@ function toUploadError(error: unknown): CustomError {
   return new CustomError(uploadMsg.uploadFailed, HTTP_STATUS.INTERNAL_ERROR);
 }
 
+/**
+ * Megapixels of decode work one admitted request costs, from the header alone.
+ *
+ * The admission gate below bounds CONCURRENCY and nothing bounded the WORK per
+ * admitted request, so the two were never sized against each other: measured, a
+ * 4999x4999 block-noise PNG (536 KB, inside every constant) held the
+ * process-global encoder for 4,550 ms across 7 full decodes, and the per-user
+ * budget admitted 20 of those per 60-second window. That is ~91 s of exclusive
+ * encoder demand per minute from one account, which every other uploader then
+ * queues behind or is refused with `processingBusy`.
+ *
+ * `metadata()` decodes the header only, so this is cheap and runs BEFORE the
+ * encoder slot is taken — which also moves the pixel-bomb rejection ahead of the
+ * queue instead of behind it. Rounded up and floored at 1 so a thumbnail still
+ * costs one unit.
+ */
+export async function measureEncodeCost(input: Buffer): Promise<number> {
+  try {
+    const { width, height } = await new Bun.Image(input, {
+      maxPixels: MAX_IMAGE_PIXELS,
+    }).metadata();
+    return Math.max(1, Math.ceil((width * height) / 1_000_000));
+  } catch (error) {
+    throw toUploadError(error);
+  }
+}
+
 export type OptimizeImageOptions = {
   /**
    * Target file size in bytes

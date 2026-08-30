@@ -25,6 +25,8 @@ import type { SignedInSession } from '../helpers/session';
 import { app } from '@/app';
 import { auth } from '@/lib/auth';
 
+import { HTTP_STATUS } from '@/utils/api-messages';
+
 import { resetTables } from '../helpers/database';
 import { authedRequest, signedInUser } from '../helpers/session';
 
@@ -143,5 +145,82 @@ describe('every site that reads it', () => {
     expect(response.status).toBe(200);
     expect(body.success).toBe(true);
     expect(typeof body.data?.updatedAt).toBe('string');
+  });
+});
+
+describe('DELETE /api/dash/users/:id/sessions authorises before it answers', () => {
+  /**
+   * The subresource contract, from `app/api/dash/users/[id]/target-user.ts`: "a
+   * subresource must never be reachable when its parent is not."
+   *
+   * The empty-set short-circuit used to precede the transaction entirely, so a
+   * request naming ONLY the actor's own current session — the id this endpoint
+   * always filters out — answered `200 "deleted"` for a target user that does not
+   * exist, while the same request naming any other id answered 404. Two false
+   * successes in one branch: that, and a user selecting the row the list flags
+   * `isCurrent: true` ("log out this device") being declined with a response
+   * indistinguishable from a revocation.
+   */
+  const ABSENT_ID = '01a02581-a7ee-723b-8000-0000000000ff';
+
+  function revoke(
+    session: SignedInSession,
+    targetId: string,
+    body: unknown
+  ): Promise<Response> {
+    return app.handle(
+      authedRequest(session, `/api/dash/users/${targetId}/sessions`, {
+        method: 'DELETE',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+      })
+    );
+  }
+
+  async function currentSessionId(session: SignedInSession): Promise<string> {
+    const response = await app.handle(
+      authedRequest(session, `/api/dash/users/${session.user.userId}/sessions`)
+    );
+    const body = (await response.json()) as {
+      data?: { sessions?: { id: string; isCurrent?: boolean }[] };
+    };
+    const current = body.data?.sessions?.find((item) => item.isCurrent);
+    if (!current) throw new Error('no session flagged isCurrent');
+    return current.id;
+  }
+
+  test('a nonexistent target is 404 even when the id list filters to empty', async () => {
+    const actor = granted();
+    const own = await currentSessionId(actor);
+
+    const response = await revoke(actor, ABSENT_ID, { sessionIds: [own] });
+
+    expect(response.status).toBe(HTTP_STATUS.NOT_FOUND);
+  });
+
+  test('the same body against a reachable target succeeds and revokes nothing', async () => {
+    // The acting session is always preserved, so "revoked" is empty — and the
+    // response says so, rather than reporting a deletion that did not happen.
+    const actor = granted();
+    const own = await currentSessionId(actor);
+
+    const response = await revoke(actor, actor.user.userId, {
+      sessionIds: [own],
+    });
+    const body = (await response.json()) as {
+      success?: boolean;
+      data?: { revoked?: string[] };
+    };
+
+    expect(response.status).toBe(HTTP_STATUS.OK);
+    expect(body.success).toBe(true);
+    expect(body.data?.revoked).toEqual([]);
+
+    // And the session is still usable, which is what makes the empty list the
+    // honest answer.
+    const stillLive = await app.handle(
+      authedRequest(actor, `/api/dash/users/${actor.user.userId}/sessions`)
+    );
+    expect(stillLive.status).toBe(HTTP_STATUS.OK);
   });
 });

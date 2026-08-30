@@ -99,14 +99,35 @@ interface SweepCount {
   hasMore: boolean;
 }
 
+/**
+ * The temp-file sweep is the only one that can be CONTAINED rather than
+ * complete: an R2 delete that throws is absorbed by `Promise.allSettled`.
+ */
+interface TempFileSweepCount extends SweepCount {
+  /** True when at least one object-store delete failed during this run. */
+  degraded: boolean;
+}
+
 export interface DatabaseSweepResult {
-  status: 'ok';
+  /**
+   * `degraded` when a store this run was asked to sweep was not swept, matching
+   * the rule `lib/sqlite/maintenance.ts` states for the sibling job: containment
+   * is not the same as success.
+   *
+   * It used to be the literal `'ok'`, so this job could not express the state at
+   * all — during an R2 outage the nightly pass deleted no objects and removed no
+   * `files` rows while `logRun` wrote `scheduled sweep completed, status: "ok"`.
+   * `hasMore` was the only signal, and it is indistinguishable from an ordinary
+   * backlog. That matters here more than anywhere: nothing else in the codebase
+   * deletes a temporary upload, so the objects accumulate and are paid for.
+   */
+  status: 'ok' | 'degraded';
   durationMs: number;
   removed: {
     sessions: SweepCount;
     verificationSessions: SweepCount;
     verificationCodes: SweepCount;
-    tempFiles: SweepCount;
+    tempFiles: TempFileSweepCount;
   };
   hasMore: boolean;
 }
@@ -254,7 +275,7 @@ function sweepVerificationCodes(): Promise<SweepCount> {
  * later claims an upload must clear the flag inside the same transaction that
  * writes the owning record, or this will delete images out from under it.
  */
-async function sweepTempFiles(): Promise<SweepCount> {
+async function sweepTempFiles(): Promise<TempFileSweepCount> {
   let removed = 0;
 
   for (let batch = 0; batch < MAX_BATCHES; batch++) {
@@ -273,7 +294,8 @@ async function sweepTempFiles(): Promise<SweepCount> {
       )
       .limit(BATCH_SIZE);
 
-    if (doomed.length === 0) return { removed, hasMore: false };
+    if (doomed.length === 0)
+      return { removed, hasMore: false, degraded: false };
 
     const outcomes = await Promise.allSettled(
       doomed.map((file) =>
@@ -313,13 +335,14 @@ async function sweepTempFiles(): Promise<SweepCount> {
     // dead keys — MAX_BATCHES x BATCH_SIZE failing R2 calls against a provider
     // that is already refusing. `hasMore: true` is what schedules the retry, and
     // it is the honest answer: rows remain.
-    if (failed > 0) return { removed, hasMore: true };
+    if (failed > 0) return { removed, hasMore: true, degraded: true };
 
-    if (doomed.length < BATCH_SIZE) return { removed, hasMore: false };
+    if (doomed.length < BATCH_SIZE)
+      return { removed, hasMore: false, degraded: false };
     await yieldToEventLoop();
   }
 
-  return { removed, hasMore: true };
+  return { removed, hasMore: true, degraded: false };
 }
 
 /**
@@ -343,7 +366,7 @@ export async function runDatabaseSweep(
   };
 
   return {
-    status: 'ok',
+    status: removed.tempFiles.degraded ? 'degraded' : 'ok',
     durationMs: Date.now() - startedAt,
     removed,
     // Reported rather than hidden, for the same reason as the SQLite sweep: a run

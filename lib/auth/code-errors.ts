@@ -1,4 +1,7 @@
-import { MSG_INVALID_CREDENTIALS } from '@/utils/api-messages';
+import {
+  MSG_INVALID_CREDENTIALS,
+  MSG_INVALID_INPUT,
+} from '@/utils/api-messages';
 
 const MSG_UNTRUSTED_ORIGIN =
   'تعذر إكمال الطلب من هذا الموقع. أعد تحميل الصفحة من الرابط الرسمي ثم حاول مرة أخرى.';
@@ -51,11 +54,12 @@ export const BASE_ERROR_CODES: Record<string, string> = {
   MISSING_OR_NULL_ORIGIN: MSG_UNTRUSTED_ORIGIN,
   CROSS_SITE_NAVIGATION_LOGIN_BLOCKED: MSG_UNTRUSTED_ORIGIN,
 
-  // `POST /get-session` always answers 405 with this code unless
-  // `session.deferSessionRefresh` is enabled, and `ROUTE_PREFIXES` registers
-  // POST for the whole `/api/auth/*` prefix, so the path is reachable. Nothing
-  // the caller can act on beyond retrying with GET.
-  METHOD_NOT_ALLOWED_DEFER_SESSION_REQUIRED: 'حاول مجددا، او اعد تحميل الصفحة',
+  // No `METHOD_NOT_ALLOWED_DEFER_SESSION_REQUIRED` here. Better Auth throws it
+  // for `POST /get-session` unless `session.deferSessionRefresh` is enabled, and
+  // `BETTER_AUTH_ENDPOINTS` records that path as GET-only — so `app.ts` answers
+  // 405 from the manifest and `auth.handler` never runs (measured: 405,
+  // `Allow: GET, HEAD, OPTIONS`). A mapping for a code this deployment cannot
+  // produce is the dead-entry shape the audit already objected to.
 
   USER_ALREADY_EXISTS:
     'المستخدم موجود بالفعل، استخدم بريد الكتروني اخر لإنشاء الحساب',
@@ -63,6 +67,22 @@ export const BASE_ERROR_CODES: Record<string, string> = {
     'المستخدم موجود بالفعل، استخدم بريد الكتروني اخر لإنشاء الحساب',
 
   ux_users_phone_number: 'رقم الهاتف موجود من قبل، استخدم رقم هاتف اخر',
+
+  // Better Auth's own request-shape rejections, and the only two of its 49 codes
+  // still unmapped that this deployment can actually PRODUCE — measured by
+  // driving hostile bodies at all four allowlisted paths and collecting every
+  // `code` this map does not carry. Both put a raw English internal on the wire
+  // in an Arabic-locale API: `POST /api/auth/passwordless/verify` with `[]`
+  // answered `"[body] Invalid input: expected record, received array"`, and any
+  // malformed JSON answered `"Invalid JSON in request body"`.
+  //
+  // The other 18 unmapped codes belong to endpoints this deployment does not
+  // mount (social linking, email verification, callback URLs), so mapping them
+  // would be the dead-entry shape removed above. `tests/integration/
+  // auth-error-localisation.test.ts` is what keeps that judgement honest: it
+  // fails if any unmapped code becomes reachable.
+  VALIDATION_ERROR: MSG_INVALID_INPUT,
+  BAD_REQUEST: MSG_INVALID_INPUT,
 
   MISSING_RESPONSE:
     'تعذر التحقق من أنك لست روبوتاً. أعد تحميل الصفحة وحاول مرة أخرى',

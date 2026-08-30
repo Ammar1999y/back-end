@@ -1,4 +1,8 @@
-# Smoke runs in CI because it needs a production-shaped environment.
+# Smoke runs in CI, twice: once in the job's own `development` environment and
+# once with a production-shaped one, because those evaluate different module
+# graphs. Neither belongs here — a pre-push hook that needs a full production
+# environment is a pre-push hook that gets disabled. The fail-closed startup
+# gates ARE asserted locally, in `tests/process/startup-gates.test.ts`.
 # Scanners run through mise so local checks use the pinned toolchain.
 
 pre-commit:
@@ -23,50 +27,64 @@ pre-commit:
     secrets:
       run: mise exec -- gitleaks git --staged --redact --verbose --no-banner
 
+# Two STAGES, not one parallel group, and the split is the fix for a
+# deterministic collision rather than a preference.
+#
+# `tests/unit/lint-security-gate.test.ts` writes a deliberately rule-violating
+# probe into the tree (it has to — `eslint.config.mjs` scopes its type-aware
+# block by `files: ['lib/**/*.ts', …]`, so a probe outside the repository would
+# not be linted with a program at all). Every gate in `gates` below reads the
+# whole tree: `eslint .`, `prettier --check .` and `find-unused-files.ts` all see
+# that probe while it exists, and the last one was reproduced exiting 1 with
+# `1 unreachable file(s) of 229 scanned: security-lint-probe-10952.ts`. Running
+# them concurrently made `bun run verify` fail naming a file that no longer
+# exists by the time the developer looks — the classic reason a gate gets
+# disabled.
 pre-push: &full_verify
-  parallel: true
-  commands:
-    typecheck:
-      run: bunx tsc --noEmit
-    lint:
-      run: bunx eslint . --max-warnings 0
-    format:
-      run: bunx prettier --check .
-    audit:
-      run: bun audit
-    # The half of the Bun-only guard that a skipped `preinstall` cannot hide.
-    # `--ignore-scripts` (flag, bunfig, or .npmrc) silences the preinstall hook
-    # silently, so a foreign lockfile can reach the tree with no install-time
-    # complaint at all. Run here it costs nothing and catches that state before
-    # it is pushed.
-    runtime:
-      run: bun scripts/require-bun.mjs
-      fail_text: 'wrong package manager, an outdated Bun, or a foreign lockfile'
-    # The unit tier and the route-registration gate. Both are CI steps
-    # (.github/workflows/ci.yml) and neither needs any environment, so there was
-    # no reason for a push to reach CI before finding out.
+  jobs:
+    - name: gates
+      group:
+        parallel: true
+        jobs:
+          - name: typecheck
+            run: bunx tsc --noEmit
+          - name: lint
+            run: bunx eslint . --max-warnings 0
+          - name: format
+            run: bunx prettier --check .
+          - name: audit
+            run: bun audit
+          # The half of the Bun-only guard that a skipped `preinstall` cannot
+          # hide. `--ignore-scripts` (flag, bunfig, or .npmrc) silences the
+          # preinstall hook silently, so a foreign lockfile can reach the tree
+          # with no install-time complaint at all. Run here it costs nothing and
+          # catches that state before it is pushed.
+          - name: runtime
+            run: bun scripts/require-bun.mjs
+            fail_text: 'wrong package manager, an outdated Bun, or a foreign lockfile'
+          - name: routes
+            run: bun scripts/find-unused-files.ts
+            fail_text:
+              'unreachable file, or a handler no routes.ts entry routes (see the
+              comment in scripts/find-unused-files.ts)'
+          - name: secrets
+            run: mise exec -- gitleaks git . --redact --verbose --no-banner
+            fail_text: 'leaked secret, or tools not installed (mise install)'
+          - name: sast
+            run: mise exec -- semgrep scan --config=p/typescript
+              --config=p/secrets --error --metrics=off
+            fail_text: 'semgrep findings, or tools not installed (mise install)'
+          - name: workflows
+            run: mise exec -- actionlint
+            fail_text: 'workflow errors, or tools not installed (mise install)'
+    # AFTER the group above, because this tier writes into the tree.
     #
     # Deliberately the CHEAP tier and not `test:all`: the integration tiers need
     # a PostgreSQL server, and a pre-push hook that needs a database is a
     # pre-push hook that gets disabled. Run `bun run test:all` by hand, or let
     # the `tests` CI job do it.
-    test:
+    - name: test
       run: bun run test
-    routes:
-      run: bun scripts/find-unused-files.ts
-      fail_text:
-        'unreachable file, or a handler no routes.ts entry routes (see the
-        comment in scripts/find-unused-files.ts)'
-    secrets:
-      run: mise exec -- gitleaks git . --redact --verbose --no-banner
-      fail_text: 'leaked secret, or tools not installed (mise install)'
-    sast:
-      run: mise exec -- semgrep scan --config=p/typescript --config=p/secrets
-        --error --metrics=off
-      fail_text: 'semgrep findings, or tools not installed (mise install)'
-    workflows:
-      run: mise exec -- actionlint
-      fail_text: 'workflow errors, or tools not installed (mise install)'
 
 verify: *full_verify
 

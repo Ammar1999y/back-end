@@ -44,8 +44,10 @@ function readFile(rel: string): string {
  * `stripComments` is reused from `scripts/strip-comments.ts` — `find-unused-files.ts`
  * already imports it for exactly this reason, and writing a second stripper here
  * would be the duplicate that module's own header warns about. Its scanner
- * handles the two cases a regex gets wrong: `//` inside a string literal is not a
- * comment, and a quote inside a comment does not open a string.
+ * handles the cases a regex gets wrong: `//` inside a string literal is not a
+ * comment, a quote inside a comment does not open a string, and a quote inside a
+ * REGEX literal does not either — which this file used to break on, at its own
+ * `IMPORTS_DB` line.
  *
  * Without it the guard detector matched its own trigger words inside prose. A
  * file whose only mention of `resetTables()` was a comment saying it is NOT
@@ -257,5 +259,76 @@ await resetTables();`;
         `tier "${tier}" is empty, so its script would run nothing`
       ).toBeGreaterThan(0);
     }
+  });
+});
+
+describe('the stripper both detectors depend on', () => {
+  /**
+   * A quote inside a REGEX literal is not a string opener, and getting that
+   * wrong is not cosmetic here: the scanner entered a fake string state that ran
+   * to the next matching quote, so every `//` in between survived as code. This
+   * file broke on its OWN source — `IMPORTS_DB` above contains both quote
+   * styles — and the ownership detector then failed to flag a synthetic file
+   * whose unguarded `db.execute` sat behind such a regex.
+   */
+  const HIDDEN_COMMENT = "// import x from './ghost';";
+
+  test.each([
+    ['an apostrophe', "const re = /it's/;"],
+    ['a double quote', 'const re = /a"b/;'],
+    ['a backtick', 'const re = /a`b/;'],
+    ['an escaped slash', String.raw`const re = /a\/b/;`],
+    ['a character class holding a slash', 'const re = /[/]/;'],
+    [
+      'both quote styles, as IMPORTS_DB does',
+      String.raw`const re = /['"]@\/db/;`,
+    ],
+  ])(
+    'a regex containing %s does not hide the comment after it',
+    (_label, code) => {
+      const stripped = stripComments(
+        [code, HIDDEN_COMMENT, 'const y = 1;'].join('\n')
+      );
+
+      expect(stripped).not.toInclude('ghost');
+      // The regex itself is preserved verbatim — a stripper that ate it would
+      // break the detectors in the other direction.
+      expect(stripped).toInclude(code);
+      expect(stripped).toInclude('const y = 1;');
+    }
+  );
+
+  test('division is not mistaken for a regex', () => {
+    const stripped = stripComments(
+      ['const b = a / 2; // tail', 'const c = a/2/1; // tail', ''].join('\n')
+    );
+
+    expect(stripped).not.toInclude('tail');
+    expect(stripped).toInclude('const b = a / 2;');
+    expect(stripped).toInclude('const c = a/2/1;');
+  });
+
+  test('a comment naming a module produces no import edge', () => {
+    // The live instance: `utils/images/svg-optimizer.ts` said "use
+    // sanitizeSvgServer from './server'" in a doc comment, and
+    // `find-unused-files.ts` extracted `./server` from it as a real specifier.
+    const stripped = stripComments(
+      [
+        '/**',
+        " * use sanitizeSvgServer from './server'",
+        ' */',
+        "import { a } from './real';",
+      ].join('\n')
+    );
+
+    expect(stripped).not.toInclude('./server');
+    expect(stripped).toInclude("'./real'");
+  });
+
+  test('a string containing // is still a string', () => {
+    const stripped = stripComments("const u = 'https://x'; // tail");
+
+    expect(stripped).toInclude("'https://x'");
+    expect(stripped).not.toInclude('tail');
   });
 });
