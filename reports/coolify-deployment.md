@@ -325,21 +325,59 @@ or image history shows Coolify fell back to `--build-arg`.
 
 ### Required
 
-| Variable                           | Secret | Notes                                                                                                                                                                                                                                                        |
-| ---------------------------------- | ------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `NODE_ENV=production`              | No     | Enforced at boot — see §2.                                                                                                                                                                                                                                   |
-| `TZ=UTC`                           | No     | Optional hygiene, not a control. It was load-bearing until the `timestamptz` columns dropped `mode: 'string'` (gate 1); no security decision reads the host zone now. Unrelated to `NEXT_PUBLIC_BUSINESS_TIMEZONE`, which is display only.                   |
-| `PUBLIC_URL=https://<domain>`      | No     | Absolute origin: scheme required, no path/query/fragment/credentials, HTTPS in production. Used for both CORS and Better Auth's `baseURL`. `NEXT_PUBLIC_URL` is a legacy alias; setting both to different values is a boot failure.                          |
-| `DATABASE_URL`                     | Yes    | PostgreSQL connection string for `bun:sql`. Put `sslmode` in the URL — see §3.1.                                                                                                                                                                             |
-| `BETTER_AUTH_SECRET`               | Yes    | ≥32 chars, no surrounding whitespace.                                                                                                                                                                                                                        |
-| `PASSWORD_PEPPER_ACTIVE_ID`        | Yes    | Must name a key in the keyring.                                                                                                                                                                                                                              |
-| `PASSWORD_PEPPER_KEYRING`          | Yes    | One-line JSON; retain old keys still referenced by stored hashes.                                                                                                                                                                                            |
-| `OTP_HMAC_ACTIVE_ID`               | Yes    | Must name a key in `OTP_HMAC_KEYRING`.                                                                                                                                                                                                                       |
-| `OTP_HMAC_KEYRING`                 | Yes    | Same shape as the pepper keyring: `{"<id>":{"generation":1,"secret":"<32 bytes, unpadded base64url>"}}`. Generate with `openssl rand -base64 32 \| tr '+/' '-_' \| tr -d '='`. Malformed is a **boot** failure.                                              |
-| `TURNSTILE_SECRET_KEY`             | Yes    | Production Cloudflare secret.                                                                                                                                                                                                                                |
-| `SQLITE_DIR=/app/data`             | No     | Absolute; no production default — the app refuses to boot without it.                                                                                                                                                                                        |
-| `SQLITE_MAINTENANCE_TOKEN`         | No     | Gates `GET /api/health/storage?deep=1` and nothing else. `openssl rand -hex 32`. **At least 32 characters when set** — a shorter value refuses to boot. Leave unset to disable the deep probe; every path fails closed. Failed attempts are logged by class. |
-| `NEXT_PUBLIC_ENABLED_OTP_CHANNELS` | No     | Comma list: `email`, `sms`, `whatsapp`.                                                                                                                                                                                                                      |
+| Variable                               | Secret | Notes                                                                                                                                                                                                                                                        |
+| -------------------------------------- | ------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `NODE_ENV=production`                  | No     | Enforced at boot — see §2.                                                                                                                                                                                                                                   |
+| `TZ=UTC`                               | No     | Optional hygiene, not a control. It was load-bearing until the `timestamptz` columns dropped `mode: 'string'` (gate 1); no security decision reads the host zone now. Unrelated to `NEXT_PUBLIC_BUSINESS_TIMEZONE`, which is display only.                   |
+| `PUBLIC_URL=https://<domain>`          | No     | Absolute origin: scheme required, no path/query/fragment/credentials, HTTPS in production. Used for both CORS and Better Auth's `baseURL`. `NEXT_PUBLIC_URL` is a legacy alias; setting both to different values is a boot failure.                          |
+| `DATABASE_URL`                         | Yes    | PostgreSQL connection string for `bun:sql`. Put `sslmode` in the URL — see §3.1.                                                                                                                                                                             |
+| `BETTER_AUTH_SECRET`                   | Yes    | ≥32 chars, no surrounding whitespace.                                                                                                                                                                                                                        |
+| `PASSWORD_PEPPER_ACTIVE_ID`            | Yes    | Must name a key in the keyring.                                                                                                                                                                                                                              |
+| `PASSWORD_PEPPER_KEYRING`              | Yes    | One-line JSON; retain old keys still referenced by stored hashes.                                                                                                                                                                                            |
+| `OTP_HMAC_ACTIVE_ID`                   | Yes    | Must name a key in `OTP_HMAC_KEYRING`.                                                                                                                                                                                                                       |
+| `OTP_HMAC_KEYRING`                     | Yes    | Same shape as the pepper keyring: `{"<id>":{"generation":1,"secret":"<32 bytes, unpadded base64url>"}}`. Generate with `openssl rand -base64 32 \| tr '+/' '-_' \| tr -d '='`. Malformed is a **boot** failure.                                              |
+| `TURNSTILE_SECRET_KEY`                 | Yes    | Production Cloudflare secret.                                                                                                                                                                                                                                |
+| `SQLITE_DIR=/app/data`                 | No     | Absolute; no production default — the app refuses to boot without it.                                                                                                                                                                                        |
+| `SQLITE_MAINTENANCE_TOKEN`             | No     | Gates `GET /api/health/storage?deep=1` and nothing else. `openssl rand -hex 32`. **At least 32 characters when set** — a shorter value refuses to boot. Leave unset to disable the deep probe; every path fails closed. Failed attempts are logged by class. |
+| `NEXT_PUBLIC_ENABLED_OTP_CHANNELS`     | No     | Comma list: `email`, `sms`, `whatsapp`.                                                                                                                                                                                                                      |
+| `NEXT_PUBLIC_ENABLED_2FA_METHODS`      | No     | Comma list: `totp`, `otp`, `backup_code`, `passkey`. Unset disables two-factor entirely and every `/two-factor/*` and `/passkey/*` path answers 404. Parsed strictly — an unknown name, a duplicate or a trailing comma is a **boot** failure.               |
+| `NEXT_PUBLIC_ENABLED_2FA_OTP_CHANNELS` | No     | Comma list from the same set as the OTP channels, and deliberately a SEPARATE variable. Where the second-factor codes go. Required when `otp` is in the methods list; a missing provider credential for an enabled channel is a boot failure in production.  |
+
+### Two-factor configuration
+
+Three rules the boot enforces, each of which fails the deploy rather than
+degrading quietly:
+
+1. `otp` in `NEXT_PUBLIC_ENABLED_2FA_METHODS` with no
+   `NEXT_PUBLIC_ENABLED_2FA_OTP_CHANNELS` is refused — the method would be
+   offered in settings, enabled by users, and then fail to deliver at the one
+   moment it is needed, at their next sign-in, with no session to fix it from.
+2. `NEXT_PUBLIC_ENABLED_2FA_METHODS=otp` **alone**, with every 2FA OTP channel
+   reaching a contact kind `NEXT_PUBLIC_ENABLED_OTP_CHANNELS` also reaches, is
+   refused. Whoever controls that mailbox or number takes the recovery code and
+   the second-factor code from the same place, so the deployment would have one
+   factor while believing it had two.
+3. Every enabled 2FA OTP channel must have its provider credentials in
+   production, exactly as the account-verification channels must.
+
+**Recommended shape.** Keep `backup_code` enabled: it is the only method that
+survives an operator removing another one, and the only self-service recovery
+from a lost authenticator. Point `NEXT_PUBLIC_ENABLED_2FA_OTP_CHANNELS` at a
+DIFFERENT contact kind from account recovery — recovery on `email`, second
+factor on `sms` — which is what the separate variable exists for. `totp` and
+`passkey` need no delivery provider; `passkey` additionally needs nothing beyond
+`PUBLIC_URL`, whose hostname becomes the WebAuthn Relying Party id.
+
+**Changing `PUBLIC_URL`'s hostname invalidates every registered passkey.** A
+credential is scoped to the RP id it was registered under, so a domain move is a
+re-enrolment for every passkey user. Plan it with a notice, or leave `passkey`
+out of the method list until the domain is final.
+
+**`BETTER_AUTH_SECRET` encrypts TOTP secrets and backup codes.** Rotating it
+strands every enrolled authenticator and every backup-code set — the same
+one-way property the password pepper keyring exists to avoid, and there is no
+keyring for this value. Treat it as unrotatable once users have enrolled, or
+plan a forced re-enrolment.
 
 A missing `SQLITE_MAINTENANCE_TOKEN` does **not** stop boot and does **not**
 fail readiness. It gates the optional `?deep=1` probe alone, which answers 401
