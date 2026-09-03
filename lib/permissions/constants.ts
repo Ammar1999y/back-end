@@ -57,6 +57,12 @@ export const PERMISSION_ACTIONS = {
   delete: 'حذف الكل',
   deleteOwn: 'حذف الخاص',
   create: 'إنشاء',
+  /**
+   * Page-scoped to `users`, so `sanitizePermissions` resolves it to `false`
+   * everywhere else. Its own action rather than part of `edit`: an admin who may
+   * correct a name should not thereby be able to disarm someone's 2FA.
+   */
+  resetTwoFactor: 'إعادة تعيين التحقق بخطوتين',
 } as const;
 
 export type DashboardPage = keyof typeof DASHBOARD_PAGES;
@@ -119,6 +125,7 @@ export const DEFAULT_PAGE_PERMISSIONS: Array<{
       'delete',
       'deleteOwn',
       'create',
+      'resetTwoFactor',
     ],
   },
   {

@@ -230,12 +230,30 @@ describe('a sub-path outside the allowlist', () => {
       const response = await callAuth(endpoint.path, 'HEAD');
       const servesGet = endpoint.methods.includes('GET');
 
+      if (servesGet) {
+        // The property is that HEAD is not refused AS A METHOD where GET is
+        // served — so anything but 405/404 satisfies it. Not `toBe(200)`: that
+        // held only while every GET path here was anonymous, and
+        // `/two-factor/trusted-devices` requires a session, so it answers 401
+        // — which is the handler having been reached, not the method being
+        // rejected. Asserting 200 would force a session-gated GET to either
+        // leak or be excluded from this guarantee.
+        expect(
+          response.status,
+          `HEAD ${endpoint.path} where GET is served`
+        ).not.toBe(HTTP_STATUS.METHOD_NOT_ALLOWED);
+        expect(
+          response.status,
+          `HEAD ${endpoint.path} where GET is served`
+        ).not.toBe(HTTP_STATUS.NOT_FOUND);
+        continue;
+      }
+
       expect(
         response.status,
-        `HEAD ${endpoint.path} where GET is ${servesGet ? '' : 'not '}served`
-      ).toBe(servesGet ? HTTP_STATUS.OK : HTTP_STATUS.METHOD_NOT_ALLOWED);
+        `HEAD ${endpoint.path} where GET is not served`
+      ).toBe(HTTP_STATUS.METHOD_NOT_ALLOWED);
 
-      if (servesGet) continue;
       const allow = (response.headers.get('allow') ?? '')
         .split(',')
         .map((value) => value.trim())

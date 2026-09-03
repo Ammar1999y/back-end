@@ -29,6 +29,25 @@ export const MSG_PHONE_NOT_VERIFIED = 'يجب تفعيل رقم الهاتف ق�
 
 /** Distinct code for the phone-verification login gate (REQUIRE_PHONE_VERIFICATION). */
 export const PHONE_NOT_VERIFIED_CODE = 'PHONE_NOT_VERIFIED' as const;
+/**
+ * The first factor succeeded but the account has no second factor it can
+ * complete, so the login is refused rather than downgraded. The frontend routes
+ * on this to an account-recovery page rather than a retry.
+ */
+export const TWO_FACTOR_UNAVAILABLE_CODE = 'TWO_FACTOR_UNAVAILABLE' as const;
+/**
+ * The administrative action needs a fresh password proof, not just a session.
+ * The frontend routes on this to a re-authentication prompt and then retries
+ * with the header, rather than treating it as a sign-in failure.
+ */
+export const REAUTH_REQUIRED_CODE = 'REAUTH_REQUIRED' as const;
+export const MSG_REAUTH_GRANTED = 'تم تأكيد كلمة المرور';
+export const MSG_REAUTH_REQUIRED =
+  'هذا الإجراء يتطلب تأكيد كلمة المرور. أعد إدخال كلمة المرور ثم حاول مرة أخرى';
+
+// Two-factor MESSAGES live in `app/api/auth/otp/messages.ts` (`twoFactorMsg`),
+// which is the one home for that family. Only the CODES are here, because they
+// are part of the HTTP contract this module defines rather than copy.
 
 export const MSG_FETCHED = 'تم جلب البيانات بنجاح';
 export const MSG_CREATED = 'تم الإنشاء بنجاح';

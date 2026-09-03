@@ -17,6 +17,7 @@ import { auth } from '@/lib/auth';
 import {
   BETTER_AUTH_ALLOWED_PATH_SET,
   BETTER_AUTH_ENDPOINTS,
+  BETTER_AUTH_KNOWN_PATHS,
   betterAuthServes,
 } from '@/lib/auth/allowed-paths';
 import { CAPTCHA_TOKEN_MAX_LENGTH } from '@/lib/captcha';
@@ -29,6 +30,7 @@ import { ALLOWED_IMAGE_TYPES } from '@/lib/r2/upload-helper';
 import { apiRaw } from '@/utils/api-response';
 import { PHONE_ENABLED, PHONE_REQUIRED } from '@/utils/config';
 import {
+  adminReauthSchema,
   adminUpdateUserBodySchema,
   changeEmailSchema,
   changeEmailVerifySchema,
@@ -46,6 +48,9 @@ import {
 } from '@/utils/validation/constants';
 import {
   isChannelEnabled,
+  passwordlessVerifySchema,
+  recoveryCompleteSchema,
+  recoverySecondFactorSendSchema,
   resetPasswordSchema,
   sendOtpSchema,
   verifyOtpSchema,
@@ -54,6 +59,16 @@ import {
   adminUpdatePermissionBodySchema,
   createPermissionSchema,
 } from '@/utils/validation/permissions';
+import {
+  ownedRowSchema,
+  twoFactorMethodDisableSchema,
+  twoFactorMethodOptionSchema,
+  twoFactorOtpSendSchema,
+  twoFactorOtpVerifySchema,
+  twoFactorPasskeyVerifySchema,
+  twoFactorPasswordSchema,
+  twoFactorTotpConfirmSchema,
+} from '@/utils/validation/two-factor';
 
 import { isDevelopmentOnlyPath } from './route-manifest';
 import { requireDashboardAccess } from './session';
@@ -76,10 +91,14 @@ const BETTER_AUTH_CONTEXT = await auth.$context;
 export const REQUEST_BODIES: Record<string, z.ZodType | readonly z.ZodType[]> =
   {
     'POST /api/auth/forgot-password/reset': resetPasswordSchema,
+    'POST /api/auth/forgot-password/second-factor/send':
+      recoverySecondFactorSendSchema,
+    'POST /api/auth/forgot-password/complete': recoveryCompleteSchema,
     'POST /api/auth/forgot-password/send': sendOtpSchema,
     'POST /api/auth/otp/send': sendOtpSchema,
     'POST /api/auth/otp/verify': verifyOtpSchema,
     'POST /api/auth/passwordless/send': sendOtpSchema,
+    'POST /api/dash/auth/reauth': adminReauthSchema,
     'POST /api/dash/permissions': createPermissionSchema,
     'PUT /api/dash/permissions/:id': adminUpdatePermissionBodySchema,
     'POST /api/dash/users': createUserSchema,
@@ -131,6 +150,8 @@ const BODYLESS_BAD_REQUEST_ROUTES = new Set([
 /** Correct-method operations whose own handler can deliberately answer 404. */
 const NOT_FOUND_ROUTES = new Set([
   'POST /api/auth/forgot-password/reset',
+  'POST /api/auth/forgot-password/second-factor/send',
+  'POST /api/auth/forgot-password/complete',
   'POST /api/auth/forgot-password/send',
   'POST /api/auth/otp/send',
   'POST /api/auth/otp/verify',
@@ -174,6 +195,14 @@ const OPERATION_DOCS: Record<string, { summary: string; tag: string }> = {
     summary: 'Send a password-reset code',
     tag: 'Authentication',
   },
+  'POST /api/auth/forgot-password/second-factor/send': {
+    summary: 'Send the second-factor code for a password reset',
+    tag: 'Authentication',
+  },
+  'POST /api/auth/forgot-password/complete': {
+    summary: 'Finish a password reset with a proven second factor',
+    tag: 'Authentication',
+  },
   'POST /api/auth/otp/send': {
     summary: 'Send a one-time code',
     tag: 'Authentication',
@@ -184,6 +213,10 @@ const OPERATION_DOCS: Record<string, { summary: string; tag: string }> = {
   },
   'POST /api/auth/passwordless/send': {
     summary: 'Send a passwordless sign-in code',
+    tag: 'Authentication',
+  },
+  'POST /api/dash/auth/reauth': {
+    summary: 'Open the administrator re-authentication window',
     tag: 'Authentication',
   },
   'GET /api/dash/permissions': {
@@ -258,6 +291,10 @@ const OPERATION_DOCS: Record<string, { summary: string; tag: string }> = {
     summary: 'Revoke a user’s sessions',
     tag: 'Sessions',
   },
+  'POST /api/dash/users/:id/two-factor/reset': {
+    summary: 'Clear a user’s two-factor enrolment',
+    tag: 'Users',
+  },
   'POST /api/upload/image': {
     summary: 'Upload an image',
     tag: 'Uploads',
@@ -281,6 +318,31 @@ const BETTER_AUTH_SUMMARIES: Record<string, string> = {
   'POST /sign-out': 'Sign out the current session',
   'POST /sign-in/email': 'Sign in with email and password',
   'POST /passwordless/verify': 'Verify a passwordless sign-in code',
+  'POST /two-factor/disable': 'Disable two-factor authentication',
+  'POST /two-factor/get-totp-uri': 'Get the TOTP enrolment URI',
+  'POST /two-factor/totp/start': 'Begin authenticator-app enrolment',
+  'POST /two-factor/totp/confirm': 'Confirm authenticator-app enrolment',
+  'POST /two-factor/verify-totp': 'Verify a TOTP code',
+  'POST /two-factor/generate-backup-codes': 'Generate new backup codes',
+  'POST /two-factor/verify-backup-code': 'Verify a backup code',
+  'POST /two-factor/otp/send': 'Send a second-factor code',
+  'POST /two-factor/otp/verify': 'Verify a second-factor code',
+  'POST /two-factor/passkey/options': 'Start a passkey second-factor ceremony',
+  'POST /two-factor/passkey/verify': 'Verify a passkey second factor',
+  'POST /two-factor/trust-device': 'Trust this device for two-factor',
+  'GET /two-factor/trusted-devices': 'List trusted devices',
+  'POST /two-factor/trusted-devices/revoke': 'Revoke a trusted device',
+  'GET /two-factor/methods': 'List enrolled second factors',
+  'POST /two-factor/methods/disable': 'Remove one second factor',
+  'POST /two-factor/methods/default': 'Choose the default second factor',
+  'POST /two-factor/passkey/grant': 'Re-authenticate before a passkey ceremony',
+  'POST /two-factor/backup-codes/acknowledge':
+    'Confirm the backup codes were saved',
+  'GET /passkey/generate-register-options': 'Start passkey registration',
+  'POST /passkey/verify-registration': 'Complete passkey registration',
+  'GET /passkey/list-user-passkeys': 'List the user’s passkeys',
+  'POST /passkey/delete-passkey': 'Delete a passkey',
+  'POST /passkey/update-passkey': 'Rename a passkey',
 };
 
 /**
@@ -293,7 +355,23 @@ const BETTER_AUTH_SUMMARIES: Record<string, string> = {
  */
 const BETTER_AUTH_BODIES: Record<string, z.ZodType> = {
   '/sign-in/email': loginSchema.omit({ captcha: true }),
-  '/passwordless/verify': verifyOtpSchema,
+  '/passwordless/verify': passwordlessVerifySchema,
+  // This deployment's own two-factor endpoints declare `z.record` to Better
+  // Call and parse these; publishing the same schemas is what keeps the
+  // document and the handler from drifting apart.
+  '/two-factor/disable': twoFactorPasswordSchema,
+  '/two-factor/totp/start': twoFactorPasswordSchema,
+  '/two-factor/totp/confirm': twoFactorTotpConfirmSchema,
+  '/two-factor/generate-backup-codes': twoFactorPasswordSchema,
+  '/two-factor/backup-codes/acknowledge': twoFactorPasswordSchema,
+  '/two-factor/passkey/grant': twoFactorPasswordSchema,
+  '/two-factor/otp/send': twoFactorOtpSendSchema,
+  '/two-factor/otp/verify': twoFactorOtpVerifySchema,
+  '/two-factor/passkey/verify': twoFactorPasskeyVerifySchema,
+  '/two-factor/methods/disable': twoFactorMethodDisableSchema,
+  '/two-factor/methods/default': twoFactorMethodOptionSchema,
+  '/two-factor/trusted-devices/revoke': ownedRowSchema,
+  '/passkey/delete-passkey': ownedRowSchema,
 };
 
 /**
@@ -798,8 +876,67 @@ const CONTACT_CHANGE_SCHEMA: JsonSchema = {
   ],
 };
 
+/**
+ * The two ends of a reset. An account with a second factor never gets `reset:
+ * true` from `/reset` — it gets a grant, and the password is written by
+ * `/complete` against a proven factor. Published as a union so a generated
+ * client can represent both, rather than treating the challenge branch as a
+ * completed reset.
+ */
+const RECOVERY_OPTION_SCHEMA: JsonSchema = {
+  type: 'object',
+  properties: {
+    id: { type: 'string' },
+    method: { type: 'string', enum: ['totp', 'otp', 'backup_code'] },
+    contactKind: {
+      anyOf: [{ type: 'string', enum: ['email', 'phone'] }, { type: 'null' }],
+    },
+    channel: {
+      anyOf: [
+        { type: 'string', enum: ['email', 'sms', 'whatsapp'] },
+        { type: 'null' },
+      ],
+    },
+  },
+  required: ['id', 'method', 'contactKind', 'channel'],
+  additionalProperties: false,
+};
+
+const RESET_OUTCOME_SCHEMA: JsonSchema = {
+  anyOf: [
+    {
+      type: 'object',
+      properties: { reset: { const: true } },
+      required: ['reset'],
+      additionalProperties: false,
+    },
+    {
+      type: 'object',
+      properties: {
+        reset: { const: false },
+        twoFactorRequired: { const: true },
+        grant: { type: 'string' },
+        options: { type: 'array', items: RECOVERY_OPTION_SCHEMA },
+        defaultMethod: {
+          anyOf: [{ type: 'string' }, { type: 'null' }],
+        },
+      },
+      required: [
+        'reset',
+        'twoFactorRequired',
+        'grant',
+        'options',
+        'defaultMethod',
+      ],
+      additionalProperties: false,
+    },
+  ],
+};
+
 const SUCCESS_DATA_SCHEMAS: Record<string, JsonSchema> = {
-  'POST /api/auth/forgot-password/reset': {
+  'POST /api/auth/forgot-password/reset': RESET_OUTCOME_SCHEMA,
+  'POST /api/auth/forgot-password/second-factor/send': OTP_SENT_SCHEMA,
+  'POST /api/auth/forgot-password/complete': {
     type: 'object',
     properties: { reset: { const: true } },
     required: ['reset'],
@@ -809,6 +946,18 @@ const SUCCESS_DATA_SCHEMAS: Record<string, JsonSchema> = {
   'POST /api/auth/otp/send': OTP_SENT_SCHEMA,
   'POST /api/auth/otp/verify': VERIFIED_SCHEMA,
   'POST /api/auth/passwordless/send': OTP_SENT_SCHEMA,
+  'POST /api/dash/auth/reauth': {
+    type: 'object',
+    properties: {
+      expiresIn: {
+        type: 'integer',
+        description:
+          'Seconds the window lasts. It is bound to THIS session — there is no token to send back, the same cookie carries it.',
+      },
+    },
+    required: ['expiresIn'],
+    additionalProperties: false,
+  },
   'GET /api/dash/permissions': {
     type: 'array',
     items: {
@@ -852,6 +1001,7 @@ const SUCCESS_DATA_SCHEMAS: Record<string, JsonSchema> = {
   'GET /api/dash/roles': { type: 'array', items: ROLE_SUMMARY_SCHEMA },
   'POST /api/dash/users/me/change-email': CONTACT_CHANGE_SCHEMA,
   'POST /api/dash/users/me/change-email/verify': VERIFIED_SCHEMA,
+  'POST /api/dash/users/:id/two-factor/reset': NULL_SCHEMA,
   'POST /api/dash/users/me/change-password': NULL_SCHEMA,
   'POST /api/dash/users/me/change-phone': CONTACT_CHANGE_SCHEMA,
   'POST /api/dash/users/me/change-phone/verify': VERIFIED_SCHEMA,
@@ -1136,6 +1286,8 @@ const BETTER_AUTH_STATUS_DESCRIPTIONS = {
     'Captcha verification failed, the request origin is not trusted, or the account has an unverified contact channel.',
   '422':
     'The submitted fields failed this project’s own schema for the endpoint.',
+  '409':
+    'The request would leave the account in a state this application refuses — removing the only enrolled second factor.',
 } as const;
 
 function generatedBetterAuthOperation(
@@ -1179,6 +1331,37 @@ const BETTER_AUTH_PATH_STATUSES: Record<
   '/sign-in/email': ['400', '401', '403', '422'],
   '/sign-out': ['400', '403'],
   '/passwordless/verify': ['400', '401', '403', '422'],
+  // 403 across the POST paths is Better Auth's own origin check, which engages
+  // on any request carrying a cookie (`validateOrigin`) and so refuses a
+  // session-bearing call with no `origin` header before the handler runs. It is
+  // absent from the GET paths, where that check is skipped.
+  '/two-factor/disable': ['401', '403', '422'],
+  '/two-factor/get-totp-uri': ['401', '403', '422'],
+  // 409 is the refusal to replace an authenticator that already works.
+  '/two-factor/totp/start': ['401', '403', '404', '409', '422'],
+  '/two-factor/totp/confirm': ['400', '401', '403', '404', '409', '422'],
+  '/two-factor/verify-totp': ['400', '403', '422'],
+  '/two-factor/generate-backup-codes': ['401', '403', '404', '422'],
+  '/two-factor/verify-backup-code': ['400', '403', '422'],
+  '/two-factor/otp/send': ['400', '401', '403', '422'],
+  '/two-factor/otp/verify': ['400', '401', '403', '422'],
+  '/two-factor/passkey/options': ['400', '401', '403', '422'],
+  '/two-factor/passkey/verify': ['400', '401', '403', '422'],
+  '/two-factor/trust-device': ['401', '403', '422'],
+  '/two-factor/trusted-devices': ['401'],
+  '/two-factor/trusted-devices/revoke': ['401', '403', '422'],
+  '/two-factor/methods': ['401'],
+  // 409 is the last-method refusal.
+  '/two-factor/methods/disable': ['401', '403', '404', '409', '422'],
+  '/two-factor/methods/default': ['401', '403', '404', '422'],
+  '/two-factor/passkey/grant': ['401', '403', '404', '422'],
+  '/two-factor/backup-codes/acknowledge': ['401', '403', '422'],
+  '/passkey/generate-register-options': ['401'],
+  '/passkey/verify-registration': ['400', '401', '403', '422'],
+  '/passkey/list-user-passkeys': ['401'],
+  // 404 is a passkey that is not the caller's; 409 the last-method refusal.
+  '/passkey/delete-passkey': ['400', '401', '403', '404', '409', '422'],
+  '/passkey/update-passkey': ['400', '401', '403', '422'],
 };
 
 /** What an `APIError` serialises to. `code` is not required — the shape is the dependency's. */
@@ -1195,7 +1378,14 @@ const BETTER_AUTH_ERROR_SCHEMA: JsonSchema = {
  * `toAuthApiError`. Only `/passwordless/verify` has an inner limiter, and
  * Better Auth's own `rateLimit` is disabled.
  */
-const BETTER_AUTH_LOCAL_THROTTLE_PATHS = new Set(['/passwordless/verify']);
+const BETTER_AUTH_LOCAL_THROTTLE_PATHS = new Set([
+  '/passwordless/verify',
+  // Both reach `enforceOtpSurfaceSendQuota` / `enforceOtpVerifyQuota`, whose
+  // `CustomError` becomes a 429 with `Retry-After` — or a 503 when the limiter
+  // store itself is unavailable — through `toAuthApiError`.
+  '/two-factor/otp/send',
+  '/two-factor/otp/verify',
+]);
 
 /** Widen one admission-limiter response to admit Better Call's shape too. */
 function withBetterAuthErrorShape(
@@ -1217,6 +1407,110 @@ function withBetterAuthErrorShape(
         // `anyOf`: the envelope satisfies the Better Call shape too, so
         // exactly-one would fail on the body the limiter actually sends.
         schema: { anyOf: [json.schema, BETTER_AUTH_ERROR_SCHEMA] },
+      },
+    },
+  };
+}
+
+/**
+ * The second 200 both first-factor endpoints can answer.
+ *
+ * ⚠️ Neither is derivable from Better Auth's generated contract: the plugin's own
+ * challenge hook is replaced (`twoFactorSignInGuard`), and `/passwordless/verify`
+ * is this project's endpoint. A client generated from a document without this
+ * reads the challenge branch as a completed session and treats a user who has
+ * NOT finished signing in as signed in.
+ */
+const TWO_FACTOR_OPTION_SCHEMA: JsonSchema = {
+  type: 'object',
+  properties: {
+    id: {
+      type: 'string',
+      description:
+        'Stable option identity: `totp`, `backup_code`, `passkey`, `otp:email` or `otp:phone`.',
+    },
+    method: {
+      type: 'string',
+      enum: ['totp', 'otp', 'backup_code', 'passkey'],
+    },
+    contactKind: {
+      anyOf: [{ type: 'string', enum: ['email', 'phone'] }, { type: 'null' }],
+    },
+    channel: {
+      anyOf: [
+        { type: 'string', enum: ['email', 'sms', 'whatsapp'] },
+        { type: 'null' },
+      ],
+    },
+    nextAllowedIn: {
+      type: 'integer',
+      minimum: 0,
+      description:
+        '`otp` options only: seconds before a code may be sent to this contact. `0` means a send is allowed now.',
+    },
+  },
+  required: ['id', 'method', 'contactKind', 'channel'],
+};
+
+const TWO_FACTOR_CHALLENGE_SCHEMA: JsonSchema = {
+  type: 'object',
+  description:
+    'The first factor succeeded and the login is NOT complete: no session cookie is set, and one of the options below has to be verified next.',
+  properties: {
+    twoFactorRedirect: { const: true },
+    twoFactorMethods: {
+      type: 'array',
+      items: {
+        type: 'string',
+        enum: ['totp', 'otp', 'backup_code', 'passkey'],
+      },
+      description:
+        'Distinct method names. Two OTP channels collapse into one entry here, so it cannot drive a choice — use `twoFactorOptions`.',
+    },
+    twoFactorOptions: { type: 'array', items: TWO_FACTOR_OPTION_SCHEMA },
+    defaultMethod: {
+      anyOf: [{ type: 'string' }, { type: 'null' }],
+      description:
+        '`null` means ask: only recovery material is left, and a backup code is never auto-routed to.',
+    },
+  },
+  required: [
+    'twoFactorRedirect',
+    'twoFactorMethods',
+    'twoFactorOptions',
+    'defaultMethod',
+  ],
+};
+
+/** The paths whose 200 is a union of "signed in" and "challenged". */
+const TWO_FACTOR_CHALLENGE_PATHS: ReadonlySet<string> = new Set([
+  '/sign-in/email',
+  '/passwordless/verify',
+]);
+
+/** Widens one 200 to admit the challenge branch alongside the completed one. */
+function withTwoFactorChallengeBranch(response: unknown): JsonSchema {
+  if (!isJsonSchema(response))
+    return {
+      content: {
+        'application/json': { schema: TWO_FACTOR_CHALLENGE_SCHEMA },
+      },
+    };
+  const content = isJsonSchema(response.content) ? response.content : {};
+  const json = isJsonSchema(content['application/json'])
+    ? content['application/json']
+    : {};
+  return {
+    ...response,
+    description:
+      `${String(response.description ?? '')} A two-factor account is answered with the challenge branch instead, and no session cookie.`.trim(),
+    content: {
+      ...content,
+      'application/json': {
+        ...json,
+        // `anyOf`: the two shapes share no required key, so a client can tell
+        // them apart on `twoFactorRedirect` alone.
+        schema: { anyOf: [json.schema, TWO_FACTOR_CHALLENGE_SCHEMA] },
       },
     },
   };
@@ -1258,6 +1552,10 @@ function betterAuthResponses(path: string, method: HttpMethod): JsonSchema {
       }),
     };
   }
+
+  if (method === 'POST' && TWO_FACTOR_CHALLENGE_PATHS.has(path))
+    responses['200'] = withTwoFactorChallengeBranch(responses['200']);
+
   return responses;
 }
 
@@ -1440,20 +1738,39 @@ function openApiConsistencyProblems(
       problems.push(
         `PAGINATED_SUCCESS_ROUTES has '${key}', which is not a route`
       );
-  // A body belongs to a POST. Checked against the endpoint table rather than
-  // against the paths alone, so a body declared for a GET-only path — a request
-  // no client can make — is reported instead of published.
-  for (const key of Object.keys(BETTER_AUTH_BODIES))
-    if (!betterAuthServes(key, 'POST'))
+  // A body belongs to a POST, but most of these paths are gated on a method
+  // flag, so the enabled table cannot be the reference: under an empty
+  // `NEXT_PUBLIC_ENABLED_2FA_METHODS` every two-factor body would be reported
+  // as a defect. Same distinction the statuses check below makes — existence
+  // against the servable-under-any-configuration set, and the method dimension
+  // only where the current configuration actually serves the path.
+  for (const key of Object.keys(BETTER_AUTH_BODIES)) {
+    if (!BETTER_AUTH_KNOWN_PATHS.has(key))
       problems.push(
-        `BETTER_AUTH_BODIES has '${key}', which BETTER_AUTH_ENDPOINTS does not serve under POST`
+        `BETTER_AUTH_BODIES has '${key}', which is not a Better Auth endpoint`
       );
-  // The same leftover check for the per-path status table. A key naming a path
-  // the allowlist no longer carries publishes nothing, so nothing else notices.
+    else if (
+      BETTER_AUTH_ALLOWED_PATH_SET.has(key) &&
+      !betterAuthServes(key, 'POST')
+    )
+      problems.push(
+        `BETTER_AUTH_BODIES has '${key}', which is served but not under POST`
+      );
+  }
+  // Against the paths servable under ANY configuration: a documented path a
+  // method flag switched off is correct, one that exists nowhere is a typo.
   for (const key of Object.keys(BETTER_AUTH_PATH_STATUSES))
-    if (!BETTER_AUTH_ALLOWED_PATH_SET.has(key))
+    if (!BETTER_AUTH_KNOWN_PATHS.has(key))
       problems.push(
         `BETTER_AUTH_PATH_STATUSES has '${key}', which is not a Better Auth endpoint`
+      );
+
+  // The catalogue must cover the enabled set, or the leftover checks above stop
+  // meaning anything.
+  for (const endpoint of BETTER_AUTH_ENDPOINTS)
+    if (!BETTER_AUTH_KNOWN_PATHS.has(endpoint.path))
+      problems.push(
+        `BETTER_AUTH_KNOWN_PATHS is missing '${endpoint.path}', which is served`
       );
 
   for (const endpoint of BETTER_AUTH_ENDPOINTS)
@@ -1476,10 +1793,8 @@ function openApiConsistencyProblems(
     }
 
   for (const key of Object.keys(BETTER_AUTH_SUMMARIES)) {
-    const separator = key.indexOf(' ');
-    const method = key.slice(0, separator) as HttpMethod;
-    const path = key.slice(separator + 1);
-    if (!betterAuthServes(path, method))
+    const path = key.slice(key.indexOf(' ') + 1);
+    if (!BETTER_AUTH_KNOWN_PATHS.has(path))
       problems.push(
         `BETTER_AUTH_SUMMARIES has '${key}', which is not a Better Auth endpoint`
       );

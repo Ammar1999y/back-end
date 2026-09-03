@@ -262,6 +262,19 @@ describe('the production environment gate refuses a missing variable', () => {
     expect(outcome.output).toInclude('SMTP_PASS');
   }, 60_000);
 
+  test('the OTP test outbox fails a production boot', async () => {
+    // `OTP_DELIVERY=outbox` makes every send succeed and deliver nothing. It
+    // exists for the matrix tier, and a production process must refuse it for
+    // the same reason it refuses an enabled channel with no credentials.
+    const outcome = await bootWith({
+      ...productionEnv(tempSqliteDir()),
+      OTP_DELIVERY: 'outbox',
+    });
+
+    expect(outcome.exitCode).not.toBe(0);
+    expect(outcome.output).toInclude('OTP_DELIVERY');
+  }, 60_000);
+
   test('a relative SQLITE_DIR fails the boot', async () => {
     const outcome = await bootWith({
       ...productionEnv(tempSqliteDir()),
@@ -309,6 +322,130 @@ describe('the OTP channel list is parsed strictly, in every environment', () => 
   // refused a supported list would fail those instead. A case that boots
   // successfully costs this file the full spawn timeout, because a listening
   // child never exits.
+});
+
+describe('the two-factor configuration is parsed strictly, in every environment', () => {
+  // Same posture as the OTP channel list above and for the same reason: an
+  // unknown entry filtered to an empty set reads as "the feature is
+  // intentionally off", which deploys a broken second factor that passes every
+  // other boot check.
+  test.each([
+    ['a misspelled method', 'totp,bakcup_code', /unknown method "bakcup_code"/],
+    ['a duplicate entry', 'totp,totp', /lists "totp" more than once/],
+    ['a trailing comma', 'totp,', /contains an empty entry/],
+  ])(
+    '%s fails the boot',
+    async (_label, methods, expected) => {
+      const outcome = await bootWith({
+        ...baseEnv(tempSqliteDir()),
+        NEXT_PUBLIC_ENABLED_2FA_METHODS: methods,
+      });
+
+      expect(outcome.exitCode).not.toBe(0);
+      expect(outcome.output).toMatch(expected);
+    },
+    60_000
+  );
+
+  test('enabling the OTP method with no channel fails the boot', async () => {
+    // The method would be advertised in settings, enabled by users, and then
+    // fail to deliver at their next sign-in — with no session left to fix it
+    // from. Refusing the deploy is the only place this can still be corrected.
+    const outcome = await bootWith({
+      ...baseEnv(tempSqliteDir()),
+      NEXT_PUBLIC_ENABLED_2FA_METHODS: 'otp',
+      NEXT_PUBLIC_ENABLED_2FA_OTP_CHANNELS: '',
+    });
+
+    expect(outcome.exitCode).not.toBe(0);
+    expect(outcome.output).toMatch(/NEXT_PUBLIC_ENABLED_2FA_OTP_CHANNELS/);
+  }, 60_000);
+
+  test('a second factor that reuses the recovery contact WARNS and boots', async () => {
+    // ⚠️ This used to fail the boot, and the refusal was the wrong control in
+    // the wrong place. Disjointness is a property of the authentication CHAIN:
+    // password recovery proves a second factor from a set that excludes the
+    // contact its own code arrived on, and refuses outright when nothing
+    // survives. Enforcing it again at configuration time only made a supported
+    // deployment unstartable — the chain, not the environment, is what has to
+    // hold the guarantee.
+    //
+    // The warning is still required: it names the population that will be sent
+    // to the administrative reset.
+    const dir = tempSqliteDir();
+    const child = Bun.spawn(['bun', '--no-env-file', SERVER], {
+      cwd: REPO_ROOT,
+      env: {
+        ...baseEnv(dir),
+        PORT: String(BOOT_PORT + 7),
+        NEXT_PUBLIC_ENABLED_OTP_CHANNELS: 'email',
+        NEXT_PUBLIC_ENABLED_2FA_METHODS: 'otp',
+        NEXT_PUBLIC_ENABLED_2FA_OTP_CHANNELS: 'email',
+      },
+      stdout: 'pipe',
+      stderr: 'pipe',
+    });
+    try {
+      const deadline = Date.now() + 30_000;
+      let listening = false;
+      while (Date.now() < deadline) {
+        if (child.exitCode !== null) break;
+        try {
+          await fetch(`http://127.0.0.1:${BOOT_PORT + 7}/api/health/storage`);
+          listening = true;
+          break;
+        } catch {
+          await Bun.sleep(200);
+        }
+      }
+      expect(listening).toBe(true);
+    } finally {
+      child.kill();
+      await child.exited;
+    }
+    const output = await new Response(child.stderr).text();
+    expect(output).toMatch(/twoFactor\.otpOverlapsRecovery/);
+  }, 60_000);
+
+  test('the same overlap is ALLOWED when another method exists', async () => {
+    // The narrowness partner. `totp` is a real second factor that recovery
+    // cannot reach, so the overlap no longer collapses anything and refusing it
+    // would block a reasonable deployment.
+    const dir = tempSqliteDir();
+    const child = Bun.spawn(['bun', '--no-env-file', SERVER], {
+      cwd: REPO_ROOT,
+      env: {
+        ...baseEnv(dir),
+        PORT: String(BOOT_PORT + 3),
+        NEXT_PUBLIC_ENABLED_OTP_CHANNELS: 'email',
+        NEXT_PUBLIC_ENABLED_2FA_METHODS: 'totp,otp',
+        NEXT_PUBLIC_ENABLED_2FA_OTP_CHANNELS: 'email',
+      },
+      stdout: 'pipe',
+      stderr: 'pipe',
+    });
+    try {
+      // A boot that reaches the listening state has passed every module-load
+      // gate. It is killed rather than probed: this asserts the configuration
+      // is accepted, not what it then serves.
+      const deadline = Date.now() + 30_000;
+      let listening = false;
+      while (Date.now() < deadline) {
+        if (child.exitCode !== null) break;
+        try {
+          await fetch(`http://127.0.0.1:${BOOT_PORT + 3}/api/health/storage`);
+          listening = true;
+          break;
+        } catch {
+          await Bun.sleep(250);
+        }
+      }
+      expect(listening).toBe(true);
+    } finally {
+      child.kill();
+      await child.exited;
+    }
+  }, 60_000);
 });
 
 describe('a production-posture boot serves the production header set', () => {

@@ -44,6 +44,8 @@ const SEND_SURFACES = [
   'recovery',
   'passwordless',
   'contact_change',
+  'two_factor',
+  'recovery_second_factor',
 ] as const;
 /** `as const` is load-bearing: `OtpSendSurface[]` would widen the element type
  *  back to the whole union and make both checks below vacuously pass. */

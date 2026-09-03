@@ -38,6 +38,22 @@ export const OTP_MAX_DAILY_VERIFY_ATTEMPTS = 15;
 export const OTP_EXPIRY_MINUTES = 10;
 export const OTP_BLOCK_DURATION_HOURS = 6;
 
+// Two-factor
+/**
+ * Bound on `verifications.identifier` and `trusted_devices.trust_identifier`.
+ * The values are library-shaped, and headroom matters: truncating an identifier
+ * would silently collide two challenges instead of failing.
+ *
+ * ⚠️ Changing this value requires a new migration.
+ */
+export const VERIFICATION_IDENTIFIER_MAX = 160;
+/**
+ * Bound on `passkeys.credential_id`, base64url of at most 1023 bytes by spec.
+ *
+ * ⚠️ Changing this value requires a new migration.
+ */
+export const CREDENTIAL_ID_MAX = 1400;
+
 // Roles & Permissions
 export const ROLE_NAME_MIN = 1;
 export const ROLE_NAME_MAX = 100;

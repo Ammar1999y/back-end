@@ -27,7 +27,7 @@ import { stripComments } from '@/scripts/strip-comments';
 const TESTS_ROOT = path.join(import.meta.dir, '..');
 
 /** The directories `tests/helpers/run.ts` knows how to run. */
-const TIERS = ['unit', 'integration', 'process'] as const;
+const TIERS = ['unit', 'integration', 'process', 'matrix'] as const;
 
 /** Directories that hold code the tiers import rather than tests. */
 const SUPPORT = ['helpers', 'fixtures'] as const;

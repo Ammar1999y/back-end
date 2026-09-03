@@ -2,6 +2,7 @@ import * as z from 'zod';
 
 import { OTP_AUTO_VERIFY, PHONE_ENABLED } from '../config';
 import { OTP_CODE_LENGTH } from './constants';
+import { parseEnvEnumList } from './env-list';
 import {
   emailSchema,
   passwordSchema,
@@ -36,6 +37,7 @@ export const OTP_PURPOSES = [
   'change_password',
   'change_email',
   'change_phone',
+  'two_factor',
 ] as const;
 export type OtpPurpose = (typeof OTP_PURPOSES)[number];
 
@@ -58,7 +60,9 @@ export const isPhoneChannel = (c: OtpChannel): c is PhoneOtpChannel =>
  * there would pull jsdom and DOMPurify into the startup gate. The variables
  * themselves are read in `utils/otp.ts`.
  */
-const CHANNEL_CREDENTIALS: Readonly<Record<OtpChannel, readonly string[]>> = {
+export const CHANNEL_CREDENTIALS: Readonly<
+  Record<OtpChannel, readonly string[]>
+> = {
   // `SMTP_FROM` is optional: `sendOtpEmail` falls back to `SMTP_USER` as the
   // sender, so `SMTP_USER` covers both the login and the envelope.
   email: ['SMTP_USER', 'SMTP_PASS'],
@@ -82,32 +86,12 @@ const CHANNEL_CREDENTIALS: Readonly<Record<OtpChannel, readonly string[]>> = {
  * whole phone feature is off) rather than a mistake in this variable.
  */
 function parseEnvChannels(): OtpChannel[] {
-  const raw = process.env.NEXT_PUBLIC_ENABLED_OTP_CHANNELS?.trim();
-  if (!raw) return [];
-
-  const seen = new Set<string>();
-  const channels: OtpChannel[] = [];
-  for (const entry of raw.split(',')) {
-    const name = entry.trim();
-    if (!name)
-      throw new Error(
-        'NEXT_PUBLIC_ENABLED_OTP_CHANNELS contains an empty entry; write it as a ' +
-          `comma-separated list of ${OTP_CHANNELS.join(', ')}.`
-      );
-    if (!(OTP_CHANNELS as readonly string[]).includes(name))
-      throw new Error(
-        `NEXT_PUBLIC_ENABLED_OTP_CHANNELS names an unknown channel "${name}". ` +
-          `Valid channels: ${OTP_CHANNELS.join(', ')}. Leave the variable unset to ` +
-          'disable OTP entirely.'
-      );
-    if (seen.has(name))
-      throw new Error(
-        `NEXT_PUBLIC_ENABLED_OTP_CHANNELS lists "${name}" more than once.`
-      );
-    seen.add(name);
-    channels.push(name as OtpChannel);
-  }
-  return channels.filter((c) => PHONE_ENABLED || !isPhoneChannel(c));
+  return parseEnvEnumList({
+    name: 'NEXT_PUBLIC_ENABLED_OTP_CHANNELS',
+    allowed: OTP_CHANNELS,
+    noun: 'channel',
+    unsetMeans: 'disable OTP entirely',
+  }).filter((c) => PHONE_ENABLED || !isPhoneChannel(c));
 }
 
 const envChannels: OtpChannel[] = parseEnvChannels();
@@ -178,6 +162,28 @@ if (process.env.NODE_ENV === 'production') {
       `Missing required server env var${missing.length > 1 ? 's' : ''}: ${missing.join(', ')}`
     );
 }
+
+/**
+ * Where a code goes: the channel's provider, or — for a test process — an
+ * in-memory outbox the test reads back (`utils/otp-outbox.ts`). A channel can
+ * then be exercised end to end, and the delivered text asserted, with no
+ * provider account.
+ *
+ * Refused in production at load: a deployment set to `outbox` would accept every
+ * send and deliver nothing, which is the failure the credential gate above exists
+ * to prevent.
+ */
+const OTP_DELIVERY_MODES = ['provider', 'outbox'] as const;
+const otpDelivery = process.env.OTP_DELIVERY?.trim() || 'provider';
+if (!(OTP_DELIVERY_MODES as readonly string[]).includes(otpDelivery))
+  throw new Error(
+    `OTP_DELIVERY must be one of ${OTP_DELIVERY_MODES.join(', ')}; got "${otpDelivery}"`
+  );
+export const OTP_DELIVERY_OUTBOX = otpDelivery === 'outbox';
+if (OTP_DELIVERY_OUTBOX && process.env.NODE_ENV === 'production')
+  throw new Error(
+    'OTP_DELIVERY=outbox is a test transport: no code would ever reach a user. Unset it in production.'
+  );
 
 /** Narrows unvalidated input to a channel that is enabled right now. */
 export function isChannelEnabled(channel: string): channel is OtpChannel {
@@ -280,6 +286,17 @@ export const verifyOtpSchema = z.discriminatedUnion('channel', [
   verifyOtpSmsSchema,
 ]);
 
+/**
+ * `/passwordless/verify` issues a session, so it carries the same `rememberMe`
+ * `/sign-in/email` does. Absent means remembered — see `submittedRememberMe`.
+ */
+const rememberMeField = { rememberMe: z.boolean().optional() };
+export const passwordlessVerifySchema = z.discriminatedUnion('channel', [
+  verifyOtpPhoneSchema.extend(rememberMeField),
+  verifyOtpEmailSchema.extend(rememberMeField),
+  verifyOtpSmsSchema.extend(rememberMeField),
+]);
+
 // ── Reset-Password Schema (forgot-password) ──
 // Same shape as verify (channel + identifier + code) plus the new password.
 export const resetPasswordSchema = z.discriminatedUnion('channel', [
@@ -287,6 +304,33 @@ export const resetPasswordSchema = z.discriminatedUnion('channel', [
   verifyOtpEmailSchema.extend({ newPassword: passwordSchema }),
   verifyOtpSmsSchema.extend({ newPassword: passwordSchema }),
 ]);
+
+/**
+ * The second half of a reset for an account that holds a second factor.
+ *
+ * `grant` is the token `/forgot-password/reset` answered with; `option` is one
+ * of the identities it listed. Neither is a credential on its own — the grant
+ * proves the recovery contact and nothing else, and `option` only names which
+ * factor the `code` below is for.
+ */
+const recoveryGrantSchema = z.object({
+  grant: z.string().min(1).max(200),
+  option: z.string().min(1).max(40),
+});
+
+export const recoverySecondFactorSendSchema = recoveryGrantSchema;
+
+export const recoveryCompleteSchema = recoveryGrantSchema.extend({
+  code: otpCodeSchema.or(
+    // A backup code is not a six-digit OTP: `xxxxx-xxxxx` from the generated
+    // set. Bounded rather than free text.
+    z
+      .string()
+      .trim()
+      .regex(/^[A-Za-z0-9]{5}-[A-Za-z0-9]{5}$/u, 'رمز الاسترجاع غير صحيح')
+  ),
+  newPassword: passwordSchema,
+});
 
 // used in the front end
 // type ResetPasswordInput = z.infer<typeof resetPasswordSchema>;

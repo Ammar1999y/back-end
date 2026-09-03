@@ -174,7 +174,7 @@ export const emailSchema = z.preprocess(
  * and then normalize into a breached credential. NFKC is idempotent, so the
  * storage-layer normalization stays as defense in depth for non-schema callers.
  */
-const normalizePasswordInput = (v: string) =>
+export const normalizePasswordInput = (v: string) =>
   typeof v === 'string' ? v.normalize('NFKC') : v;
 
 export const passwordSchema = z.preprocess(

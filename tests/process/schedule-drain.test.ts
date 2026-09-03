@@ -27,6 +27,22 @@ interface Outcome {
   lines: Record<string, unknown>[];
 }
 
+/**
+ * Notices emitted at MODULE LOAD when a feature is unconfigured, which every
+ * assertion below has to look past.
+ *
+ * They are ordinary correct behaviour for a deployment that does not use the
+ * feature — a 404 from a missing configuration is otherwise indistinguishable
+ * in an access log from a 404 on an unrouted path, so each is announced once.
+ * They are not part of the shutdown sequence this file is about, and the
+ * alternative — configuring every feature in this child's environment just to
+ * silence them — would make the boot under test less like a real one, not more.
+ */
+const LOAD_TIME_NOTICES: ReadonlySet<string> = new Set([
+  'otp.disabled no channel configured',
+  'twoFactor.disabled no method configured',
+]);
+
 function runChild(mode: 'drain' | 'timeout'): Promise<Outcome> {
   const child = Bun.spawn(['bun', '--no-env-file', CHILD, mode], {
     cwd: path.join(import.meta.dir, '..', '..'),
@@ -55,7 +71,18 @@ function runChild(mode: 'drain' | 'timeout'): Promise<Outcome> {
           return [];
         }
       });
-    return { exitCode, lines, messages: lines.map((l) => String(l.msg)) };
+    // Filtered on the LINES, not only on the derived messages: the assertions
+    // below index this array positionally (`lines.at(-2)`), and a load-time
+    // notice arrives on stderr — which this join appends after the whole of
+    // stdout — so leaving it in shifts those indices.
+    const kept = lines.filter(
+      (line) => !LOAD_TIME_NOTICES.has(String(line.msg))
+    );
+    return {
+      exitCode,
+      lines: kept,
+      messages: kept.map((line) => String(line.msg)),
+    };
   });
 }
 

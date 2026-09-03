@@ -8,7 +8,7 @@ import { userContactColumn } from '@/db/queries';
 import { users } from '@/db/schema';
 import { sanitizeForLog } from '@/utils';
 import { APIError, createAuthEndpoint } from 'better-auth/api';
-import { setSessionCookie } from 'better-auth/cookies';
+import { expireCookie, setSessionCookie } from 'better-auth/cookies';
 import * as z from 'zod';
 
 import {
@@ -16,18 +16,24 @@ import {
   HTTP_STATUS,
   MSG_PAGE_NOT_FOUND,
 } from '@/utils/api-messages';
+import { PASSWORDLESS_ENABLED } from '@/utils/config';
 import { CustomError } from '@/utils/error-class';
 import {
   collapseProofThrottle,
   markContactVerified,
   processOtpVerify,
 } from '@/utils/otp';
-import { OTP_ENABLED, verifyOtpSchema } from '@/utils/validation/otp';
+import { OTP_ENABLED, passwordlessVerifySchema } from '@/utils/validation/otp';
 
 import { API_PATH_MAX, auditLog, getClientIp, USER_AGENT_MAX } from '../audit';
 import { verifyTurnstileRequest } from '../captcha';
-import { enforceOtpVerifyQuota } from '../rate-limit';
+import { enforceOtpVerifyQuota, otpContactKind } from '../rate-limit';
 import { toAuthApiError } from './api-error';
+import { submittedRememberMe } from './remember-me';
+import {
+  issueTwoFactorChallenge,
+  twoFactorUnavailableError,
+} from './two-factor-challenge';
 
 /**
  * Records that a just-issued session was withdrawn before its cookie shipped.
@@ -133,7 +139,9 @@ export const passwordless = () =>
           // an APIError and Better Call turns it into an empty 500.
           try {
             // Surfaced directly (not account-specific → no enumeration risk).
-            if (!OTP_ENABLED)
+            // Both gates: the machinery has to exist AND this entry point has to
+            // be switched on. See `PASSWORDLESS_ENABLED`.
+            if (!OTP_ENABLED || !PASSWORDLESS_ENABLED)
               throw new APIError(HTTP_STATUS.NOT_FOUND, {
                 message: MSG_PAGE_NOT_FOUND,
                 code: CUSTOM_AUTH_CODE,
@@ -146,7 +154,7 @@ export const passwordless = () =>
                 code: CUSTOM_AUTH_CODE,
               });
 
-            const parsed = verifyOtpSchema.safeParse(ctx.body);
+            const parsed = passwordlessVerifySchema.safeParse(ctx.body);
             if (!parsed.success)
               throw new APIError(HTTP_STATUS.UNPROCESSABLE, {
                 message: otpMsg.invalidInput,
@@ -156,6 +164,7 @@ export const passwordless = () =>
             const { channel, code } = parsed.data;
             const identifier =
               channel === 'email' ? parsed.data.email : parsed.data.phoneNumber;
+            const rememberMe = submittedRememberMe(parsed.data);
 
             await enforceOtpVerifyQuota({
               channel,
@@ -251,8 +260,10 @@ export const passwordless = () =>
             // databaseHook (active/role/verification gates + permission
             // metadata), so passwordless logins are gated exactly like password
             // logins. A gate failure surfaces as its own APIError.
+            const dontRememberMe = !rememberMe;
             const session = await ctx.context.internalAdapter.createSession(
-              userData.id
+              userData.id,
+              dontRememberMe
             );
             if (!session)
               throw new CustomError(
@@ -260,8 +271,38 @@ export const passwordless = () =>
                 HTTP_STATUS.BAD_REQUEST
               );
 
+            // The plugin's own challenge hook matches only the credential
+            // sign-in paths, so without this a 2FA user signs in here with one
+            // code and receives a full session.
+            //
+            // The contact kind just proved is excluded: a second code to the
+            // mailbox this login already read one from proves nothing. When that
+            // leaves nothing to ask for the login is REFUSED, not completed —
+            // this path mints a session outright, so a downgrade here is worth
+            // more to an attacker than the password reset it replaces. The
+            // password route still exists for this population.
+            const outcome = await issueTwoFactorChallenge(ctx, {
+              userId: userData.id,
+              userEmail: userData.email,
+              session: { id: session.id, token: session.token },
+              firstFactor: 'passwordless',
+              rememberMe,
+              excludeContactKind: otpContactKind(channel),
+              auditMeta,
+            });
+            if (outcome.kind !== 'proceed') {
+              await ensureMinDelay(Date.now() - start);
+              if (outcome.kind === 'refused') throw twoFactorUnavailableError();
+              return ctx.json(outcome.body);
+            }
+
             try {
-              await setSessionCookie(ctx, { session, user });
+              // The submitted choice, on both the row and the cookie, exactly as
+              // `/sign-in/email` applies it — and the positive case clears a
+              // marker an earlier "do not remember" login left behind.
+              await setSessionCookie(ctx, { session, user }, dontRememberMe);
+              if (!dontRememberMe)
+                expireCookie(ctx, ctx.context.authCookies.dontRememberToken);
             } catch (cookieError) {
               // The row exists but its token was never delivered. Leaving it
               // would put a session the user cannot see or use into their

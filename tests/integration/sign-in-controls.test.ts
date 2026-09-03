@@ -47,7 +47,7 @@ import { PRE_AUTH_LIMIT } from '@/lib/http/pre-auth';
 
 import { CUSTOM_AUTH_CODE, HTTP_STATUS } from '@/utils/api-messages';
 import { hashOtpCode } from '@/utils/otp';
-import { OTP_EXPIRY_MINUTES } from '@/utils/validation/constants';
+import { OTP_EXPIRY_MINUTES, PASSWORD_MAX } from '@/utils/validation/constants';
 
 import { resetTables } from '../helpers/database';
 import { egressCallsTo, scriptEgress } from '../helpers/egress';
@@ -173,6 +173,52 @@ afterEach(() => {
   // is not a top-level `bun:test` export (checked in `bun-types/test.d.ts`); it
   // exists only under the `jest`/`vi` compatibility namespaces.
   setSystemTime();
+});
+
+/**
+ * The `before` hook substitutes a one-shot proof for the plaintext before Better
+ * Auth's handler runs (`lib/auth/password-proof.ts`), and bounds any inbound
+ * `password` so that no value a client can send is proof-shaped.
+ *
+ * Both halves are asserted against the LIVE endpoint rather than the module,
+ * because the property is about what survives the whole chain: the substitution
+ * must be invisible to a correct sign-in, and the bound must apply on a path
+ * whose Better Auth schema declares an unbounded `z.string()`.
+ */
+describe('the password proof that replaces the plaintext', () => {
+  const fixture: { user: SeededUser | null } = { user: null };
+
+  function actor(): SeededUser {
+    if (!fixture.user) throw new Error('fixture not seeded');
+    return fixture.user;
+  }
+
+  beforeAll(async () => {
+    acceptCaptcha();
+    fixture.user = await seedUser();
+  });
+
+  test('a correct password still signs in, so the substitution is invisible', async () => {
+    const response = await attempt(actor().email, actor().password);
+    expect(response.status).toBe(HTTP_STATUS.OK);
+    expect(response.headers.getSetCookie().length).toBeGreaterThan(0);
+  });
+
+  test('a password over PASSWORD_MAX is refused before any credential work', async () => {
+    // Longer than a proof, so it also covers the shape an attacker would try if
+    // they were guessing at the marker rather than at the password.
+    const response = await attempt(actor().email, 'A1!a'.repeat(PASSWORD_MAX));
+    expect(response.status).toBe(HTTP_STATUS.UNPROCESSABLE);
+    // Refused, not merely failed: a rejection that had reached
+    // `verifyLoginAttempt` would have charged the account a failed attempt, and
+    // an unauthenticated caller must not be able to drive a victim toward the
+    // lockout with input the schema was always going to reject.
+    expect(await lockRow(actor().userId)).toEqual({
+      failedLoginAttempts: 0,
+      lockedUntil: null,
+    });
+    expect(response.headers.getSetCookie()).toEqual([]);
+  });
 });
 
 describe('the per-account login lockout', () => {

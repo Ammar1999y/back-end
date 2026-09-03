@@ -26,7 +26,17 @@ export const loginSchema = z.object({
     .string()
     .min(1, 'الرجاء التحقق من أنك لست روبوت')
     .max(1000, 'الرجاء التحقق من أنك لست روبوت'),
+  // Validated and published rather than read straight off the body: the value
+  // decides a session lifetime, and it survives a two-factor challenge in the
+  // companion record. `HONOUR_REMEMBER_ME` decides whether it is obeyed.
+  rememberMe: z.boolean().optional(),
 });
+
+/**
+ * The administrator re-authentication body. Only the password: the actor comes
+ * from the session, and letting a body name one would make this a login.
+ */
+export const adminReauthSchema = z.object({ password: passwordSchema });
 
 const userRoleSchema = z.object({
   email: emailSchema,

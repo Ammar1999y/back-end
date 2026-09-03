@@ -79,6 +79,36 @@ export interface SeedOptions {
   /** Sets `users.created_by`, which the `own`-scoped permission paths read. */
   createdBy?: string;
   emailVerified?: boolean;
+  /**
+   * A Saudi number matching `chk_phone_number_format`. Omitted leaves the column
+   * null, which is what `PHONE_NUMBER_MODE: 'optional'` allows and what every
+   * fixture predating the second factor assumes.
+   */
+  phoneNumber?: string;
+  phoneNumberVerified?: boolean;
+}
+
+/**
+ * Sequential, not derived from a UUID: the last eight digits of a v7 collide at
+ * roughly 10^4 seeds per table reset, and `ux_users_phone_number` turns that into
+ * a flake nobody can reproduce.
+ */
+const nextPhoneSuffix = (() => {
+  let n = 0;
+  return () => {
+    n += 1;
+    return String(n).padStart(8, '0');
+  };
+})();
+
+/**
+ * Unique per call, in the one shape `chk_phone_number_format` accepts.
+ *
+ * `ux_users_phone_number` is unique over live rows, so two seeds in one file
+ * would collide on a fixed value the same way a fixed email would.
+ */
+export function uniquePhone(): string {
+  return `9665${nextPhoneSuffix()}`;
 }
 
 /** Unique per call, so two seeds in one file cannot collide on the email index. */
@@ -147,6 +177,8 @@ export async function seedUser(options: SeedOptions = {}): Promise<SeededUser> {
     roleId,
     isActive: options.isActive ?? true,
     emailVerified: options.emailVerified ?? true,
+    phoneNumber: options.phoneNumber ?? null,
+    phoneNumberVerified: options.phoneNumberVerified ?? false,
     createdBy: options.createdBy ?? null,
   });
 
@@ -215,11 +247,59 @@ export async function signIn(user: SeededUser): Promise<SignedInSession> {
   return { user, cookie, setCookie };
 }
 
-/** Seed and sign in, which is what most `beforeAll` blocks want. */
+/**
+ * Opens the administrator re-authentication window on an existing session.
+ *
+ * ⚠️ Needed by every test that performs an action in the `D12` class — the user
+ * edit, the user delete, permission mutation, the two-factor reset. Those all
+ * require a password proof that is FRESH, not merely a session, and it is bound
+ * to the session so there is nothing to thread through the request: the same
+ * cookie carries it afterwards.
+ */
+export async function openReauthWindow(
+  user: SeededUser,
+  cookie: string
+): Promise<void> {
+  const response = await app.handle(
+    new Request('http://localhost/api/dash/auth/reauth', {
+      method: 'POST',
+      headers: baseHeaders({
+        'content-type': 'application/json',
+        cookie,
+      }),
+      body: JSON.stringify({ password: user.password }),
+    })
+  );
+  if (response.status !== 200)
+    throw new Error(
+      `re-authentication returned ${response.status}: ${await response.text()}`
+    );
+}
+
+/**
+ * Sign in AND open the re-authentication window, for a fixture that is going to
+ * perform an action in the `D12` class.
+ */
+export async function signInAsAdmin(
+  user: SeededUser
+): Promise<SignedInSession> {
+  const session = await signIn(user);
+  await openReauthWindow(user, session.cookie);
+  return session;
+}
+
+/**
+ * Seed, sign in, and open the re-authentication window — which is what most
+ * `beforeAll` blocks want, because most of them go on to perform an action in
+ * the `D12` class.
+ *
+ * ⚠️ A test that asserts the re-authentication REFUSAL must not use this. Use
+ * `seedUser` + `signIn` and leave the window closed.
+ */
 export async function signedInUser(
   options: SeedOptions = {}
 ): Promise<SignedInSession> {
-  return signIn(await seedUser(options));
+  return signInAsAdmin(await seedUser(options));
 }
 
 /** An authenticated request against the real route table. */
@@ -269,6 +349,32 @@ export async function signUpThroughDevRoute(): Promise<{
     email,
     password: TEST_PASSWORD,
   };
+}
+
+/**
+ * Merges new `Set-Cookie` values over an existing jar, the way a browser would.
+ *
+ * A plain replace loses state the flows here accumulate across responses: the
+ * challenge flow clears the session cookie and sets its own, a remembered login
+ * clears the `dont_remember` marker, and a trusted device adds a cookie the next
+ * sign-in has to carry. An empty value deletes the entry.
+ */
+export function mergeCookies(jar: string, setCookie: string[]): string {
+  const map = new Map<string, string>();
+  for (const pair of jar.split('; ')) {
+    if (!pair) continue;
+    const [name, ...rest] = pair.split('=');
+    if (name) map.set(name, rest.join('='));
+  }
+  for (const raw of setCookie) {
+    const [pair] = raw.split(';', 1);
+    const [name, ...rest] = (pair ?? '').split('=');
+    if (!name) continue;
+    const value = rest.join('=');
+    if (value === '') map.delete(name);
+    else map.set(name, value);
+  }
+  return [...map].map(([name, value]) => `${name}=${value}`).join('; ');
 }
 
 /** The account row Better Auth's sign-in lookup matches on. */

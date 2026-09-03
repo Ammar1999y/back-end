@@ -20,6 +20,7 @@ import {
   handleApiError,
   requireJsonBody,
 } from '@/utils/api-response';
+import { PASSWORDLESS_ENABLED } from '@/utils/config';
 import { CustomError } from '@/utils/error-class';
 import { processOtpSend } from '@/utils/otp';
 import { OTP_ENABLED, sendOtpSchema } from '@/utils/validation/otp';
@@ -37,7 +38,9 @@ const GENERIC_SEND_DATA = { nextAllowedIn: 30 };
 export const POST: Handler = async (ctx) => {
   const start = Date.now();
   try {
-    if (!OTP_ENABLED)
+    // Both gates: the machinery has to exist AND this entry point has to be
+    // switched on. See `PASSWORDLESS_ENABLED`.
+    if (!OTP_ENABLED || !PASSWORDLESS_ENABLED)
       throw new CustomError(MSG_PAGE_NOT_FOUND, HTTP_STATUS.NOT_FOUND);
 
     // Per-IP cap BEFORE captcha so the outbound siteverify call is bounded per

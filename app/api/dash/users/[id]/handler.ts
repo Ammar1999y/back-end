@@ -11,6 +11,10 @@ import { auditLog, getAuditMeta } from '@/lib/audit';
 import { checkPasswordCompromise } from '@/lib/auth/check-password';
 import { hashPassword } from '@/lib/auth/password';
 import { revokeOtherSessions, revokePendingProofs } from '@/lib/auth/rotation';
+import {
+  contactChangeStrandsTwoFactor,
+  removeMethodIntent,
+} from '@/lib/auth/two-factor-challenge';
 import { requirePermission } from '@/lib/http/session';
 import { CUSTOM_ROLE_VALUE, ROLE_SCOPE } from '@/lib/permissions/constants';
 import {
@@ -54,6 +58,7 @@ import {
 import { EMAIL_MAX } from '@/utils/validation/constants';
 import { idRequired, zodIssueMessage } from '@/utils/validation/rules';
 
+import { twoFactorMsg } from '../../../auth/otp/messages';
 import { userMsg } from '../messages';
 import { SESSIONS_PAGE_SIZE } from './sessions/handler';
 import { formatCursor } from './sessions/pagination';
@@ -619,6 +624,26 @@ async function handleAdminEdit(
       phoneProvided &&
       lockedUser.phoneNumber !== newPhoneNumber;
 
+    // A contact change clears that contact's verified flag, which takes the OTP
+    // second factor bound to it out of the offered set. When that was the
+    // target's last usable factor the edit would leave them unable to sign in at
+    // all, so it is refused and the operator is pointed at `resetTwoFactor` —
+    // the permission that exists for disarming 2FA, rather than achieving it as
+    // a side effect of `users.edit`. Mirrors the last-method rule that
+    // `/two-factor/methods/disable` already applies to the user themselves.
+    //
+    // ONE question over BOTH changed kinds — see the predicate. `tx`, not the
+    // pool: this runs inside the locked transaction.
+    const changedContactKinds = [
+      ...(emailChanged ? (['email'] as const) : []),
+      ...(phoneChanged ? (['phone'] as const) : []),
+    ];
+    if (await contactChangeStrandsTwoFactor(userId, changedContactKinds, tx))
+      throw new CustomError(
+        twoFactorMsg.contactChangeStrands,
+        HTTP_STATUS.CONFLICT
+      );
+
     const [userUpdated] = await tx
       .update(users)
       .set({
@@ -645,6 +670,13 @@ async function handleAdminEdit(
 
     if (!userUpdated)
       throw new CustomError(MSG_NOT_FOUND, HTTP_STATUS.NOT_FOUND);
+
+    // ⚠️ The OTP enrolment bound to a contact does NOT follow that contact to a
+    // new address. `two_factor_enabled` is deliberately left alone: clearing it
+    // would make `users.edit` a 2FA disarm, which is the grant `resetTwoFactor`
+    // exists to hold. The refusal above is what stops this stranding anyone.
+    for (const kind of changedContactKinds)
+      await removeMethodIntent(tx, userId, 'otp', kind);
 
     if (isCurrentlyCustom && lockedUser.roleId !== assignedRoleId) {
       const oldCustomPerms = await tx
@@ -782,6 +814,9 @@ export const PUT: Handler = async (ctx) => {
       resource: 'users',
       action: 'edit',
       throwError: false,
+      // `D12`: this action lowers ANOTHER account's security posture, so it is
+      // in the re-authentication class. Either all of them are or none are.
+      reauth: true,
     });
 
     await enforceRateLimit({
@@ -843,7 +878,13 @@ export const DELETE: Handler = async (ctx) => {
       userId: actorUserId,
       permissions: actorPermissions,
       scope: deleteScope,
-    } = await requirePermission(ctx, { resource: 'users', action: 'delete' });
+    } = await requirePermission(ctx, {
+      resource: 'users',
+      action: 'delete',
+      // `D12`: this action lowers ANOTHER account's security posture, so it is
+      // in the re-authentication class. Either all of them are or none are.
+      reauth: true,
+    });
 
     await enforceRateLimit({
       scope: 'users.id.delete',

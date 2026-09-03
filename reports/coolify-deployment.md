@@ -189,6 +189,12 @@ comment; no code reads it.)
 - Before routing traffic, run `bun run preflight:credentials` with production
   `DATABASE_URL` and password-pepper variables. It fails if any credential uses
   a malformed envelope or a pepper ID missing from the deployed keyring.
+- Before NARROWING `NEXT_PUBLIC_ENABLED_2FA_METHODS` or
+  `NEXT_PUBLIC_ENABLED_2FA_OTP_CHANNELS` on an existing deployment, run
+  `bun run preflight:two-factor -- <methods> [channels]`. It counts the accounts
+  the change would leave two-factor-enabled with nothing to prove it with — each
+  one an administrative reset — and exits non-zero when that count is not zero.
+  See the two-factor section below.
 - Image encoding admits one active job and four queued jobs per process. Benchmark
   on the VPS before increasing either limit; raising them is capacity tuning, not
   required deployment configuration.
@@ -345,28 +351,79 @@ or image history shows Coolify fell back to `--build-arg`.
 
 ### Two-factor configuration
 
-Three rules the boot enforces, each of which fails the deploy rather than
+Two rules the boot enforces, each of which fails the deploy rather than
 degrading quietly:
 
 1. `otp` in `NEXT_PUBLIC_ENABLED_2FA_METHODS` with no
    `NEXT_PUBLIC_ENABLED_2FA_OTP_CHANNELS` is refused — the method would be
    offered in settings, enabled by users, and then fail to deliver at the one
    moment it is needed, at their next sign-in, with no session to fix it from.
-2. `NEXT_PUBLIC_ENABLED_2FA_METHODS=otp` **alone**, with every 2FA OTP channel
-   reaching a contact kind `NEXT_PUBLIC_ENABLED_OTP_CHANNELS` also reaches, is
-   refused. Whoever controls that mailbox or number takes the recovery code and
-   the second-factor code from the same place, so the deployment would have one
-   factor while believing it had two.
-3. Every enabled 2FA OTP channel must have its provider credentials in
+2. Every enabled 2FA OTP channel must have its provider credentials in
    production, exactly as the account-verification channels must.
 
-**Recommended shape.** Keep `backup_code` enabled: it is the only method that
-survives an operator removing another one, and the only self-service recovery
-from a lost authenticator. Point `NEXT_PUBLIC_ENABLED_2FA_OTP_CHANNELS` at a
+And one it now **warns** about rather than refusing. `NEXT_PUBLIC_ENABLED_2FA_METHODS=otp`
+alone, with every 2FA OTP channel reaching a contact kind
+`NEXT_PUBLIC_ENABLED_OTP_CHANNELS` also reaches, logs
+`twoFactor.otpOverlapsRecovery` and boots. It used to fail the boot; that was the
+right rule in the wrong place. Disjointness is enforced on the authentication
+CHAIN — password recovery now proves a second factor from a set that excludes the
+contact its own code arrived on, and refuses outright when nothing survives — so
+refusing to start only made a supported deployment unstartable. **Read the
+warning:** in that configuration recovery refuses for every enrolled user, and
+the administrative reset is their only route back.
+
+**Recommended shape.** Keep `backup_code` enabled: it is the only self-service
+recovery from a lost authenticator, and without it the administrative reset is
+the only exit. Point `NEXT_PUBLIC_ENABLED_2FA_OTP_CHANNELS` at a
 DIFFERENT contact kind from account recovery — recovery on `email`, second
 factor on `sms` — which is what the separate variable exists for. `totp` and
 `passkey` need no delivery provider; `passkey` additionally needs nothing beyond
 `PUBLIC_URL`, whose hostname becomes the WebAuthn Relying Party id.
+
+### Before narrowing the 2FA method or channel list — run the preflight
+
+```bash
+# inside the container, or anywhere DATABASE_URL reaches the production database
+bun run preflight:two-factor -- totp,backup_code            # methods only
+bun run preflight:two-factor -- totp,otp sms                # methods + 2FA OTP channels
+```
+
+Read-only. It counts the accounts that hold `two_factor_enabled` and would have
+NO usable method left under the **proposed** configuration, prints a bounded
+sample, and exits non-zero when that count is greater than zero.
+
+This is not advisory. Removing a method or a channel does not downgrade the
+accounts that used it — it makes their next sign-in a hard `403`, and each one
+then needs `POST /api/dash/users/:id/two-factor/reset` performed by an
+administrator. An unsized narrowing is an outage whose size you learn from
+support tickets. Run it, resolve the listed accounts, then change the variable.
+
+The one exception is emptying `NEXT_PUBLIC_ENABLED_2FA_METHODS` completely: with
+no method configured there is no second factor to enforce, so every enrolled
+account signs in with its first factor alone. That is a **downgrade**, not a
+lockout, it is recorded per account in `audit_logs` under
+`two_factor_downgraded_feature_disabled`, and the boot logs it as well.
+
+### `OTP_DELIVERY` must be unset in production
+
+`OTP_DELIVERY=outbox` is the test transport: every OTP "send" succeeds and the
+code goes to an in-memory outbox instead of a provider, which is how the
+`matrix` test tier exercises every channel and purpose without a provider
+account. The boot **refuses** it under `NODE_ENV=production` — leave the variable
+unset (or `provider`). If it ever appears in a Coolify environment, the deploy
+fails at startup with `OTP_DELIVERY=outbox is a test transport`, which is the
+intended outcome: a deployment that accepts sends and delivers nothing is worse
+than one that does not start.
+
+### Application-level switches with no environment variable
+
+These are code constants in `utils/config.ts`, not env vars, and each needs a
+deploy to change. Listed here because each is an operational decision:
+
+| Constant               | Default | What it decides                                                                                                                                                                                          |
+| ---------------------- | ------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `PASSWORDLESS_ENABLED` | `true`  | Serves `/api/auth/passwordless/*`. Turn it OFF to remove the weakest first-factor route without switching off the OTP machinery that contact verification, recovery and the second factor all depend on. |
+| `HONOUR_REMEMBER_ME`   | `true`  | Whether a submitted `rememberMe: false` shortens the session. `false` pins every session to the long lifetime regardless of what the client asks for.                                                    |
 
 **Changing `PUBLIC_URL`'s hostname invalidates every registered passkey.** A
 credential is scoped to the RP id it was registered under, so a domain move is a

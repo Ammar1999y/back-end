@@ -20,6 +20,7 @@ import { enforceOtpGlobalSendBudget, otpContactKind } from '@/lib/rate-limit';
 
 import { HTTP_STATUS } from '@/utils/api-messages';
 import { CustomError } from '@/utils/error-class';
+import { recordOutboxDelivery } from '@/utils/otp-outbox';
 import {
   OTP_BLOCK_DURATION_HOURS,
   OTP_EXPIRY_MINUTES,
@@ -27,6 +28,7 @@ import {
   OTP_MAX_DAILY_VERIFY_ATTEMPTS,
   OTP_MAX_VERIFY_ATTEMPTS,
 } from '@/utils/validation/constants';
+import { OTP_DELIVERY_OUTBOX } from '@/utils/validation/otp';
 
 const PROVIDER_TIMEOUT_MS = 5000;
 
@@ -115,6 +117,32 @@ const VERIFY_BLOCK_CLEARED_BY_RESEND = {
  */
 const OTP_PROOF_THROTTLE_CODE = 'otp_proof_throttle';
 
+/**
+ * Errors that represent a code that was actually COMPARED and rejected, as
+ * opposed to a request that never reached a comparison.
+ *
+ * A `WeakSet` rather than another `code` value because `blockedError` already
+ * spends `CustomError.code` on the disclosure marker, and both facts have to
+ * travel on the same throw. Nothing here reaches the wire.
+ *
+ * The distinction exists for callers holding a budget of their own — the 2FA
+ * challenge's five attempts — which must be charged for guesses and refunded
+ * for everything else. See `spendChallengeAttempt`.
+ */
+const evaluatedGuesses = new WeakSet<object>();
+
+function markEvaluatedGuess<E extends object>(error: E): E {
+  evaluatedGuesses.add(error);
+  return error;
+}
+
+/** Did `error` come from a submitted code losing a comparison? */
+export function otpGuessWasEvaluated(error: unknown): boolean {
+  return (
+    typeof error === 'object' && error !== null && evaluatedGuesses.has(error)
+  );
+}
+
 function blockedError(message: string, until: Date | null): CustomError {
   const error = new CustomError(
     message,
@@ -176,6 +204,31 @@ function describeProviderFailure(channel: OtpChannel, response: Response) {
   });
 }
 
+/**
+ * What the code is FOR, in the message that carries it: a user who cannot tell a
+ * login code from a password-reset code will approve whichever an attacker
+ * triggered.
+ */
+const OTP_PURPOSE_LABEL: Readonly<Record<OtpPurpose, string>> = {
+  verify_contact: 'تأكيد وسيلة التواصل',
+  forgot_password: 'إعادة تعيين كلمة المرور',
+  change_password: 'تغيير كلمة المرور',
+  passwordless_login: 'تسجيل الدخول',
+  change_email: 'تغيير البريد الإلكتروني',
+  change_phone: 'تغيير رقم الهاتف',
+  two_factor: 'التحقق بخطوتين',
+};
+
+/** The body a phone channel sends. One line, because SMS is billed per segment. */
+export function otpTextFor(purpose: OtpPurpose, code: string): string {
+  return `رمز ${OTP_PURPOSE_LABEL[purpose]}: ${code}\nلا تشارك هذا الرمز مع أي شخص`;
+}
+
+/** The subject an email carries, which is what a user sees before opening it. */
+export function otpSubjectFor(purpose: OtpPurpose): string {
+  return `${OTP_PURPOSE_LABEL[purpose]} — رمز التحقق`;
+}
+
 async function sendOtpSms(
   phoneNumber: string,
   code: string,
@@ -192,7 +245,7 @@ async function sendOtpSms(
     body: JSON.stringify({
       senderName: process.env.DEEWAN_SENDER_NAME,
       messageType: 'text',
-      messageText: messageText ?? `رمز التحقق هو: ${code}`,
+      messageText: messageText ?? otpTextFor('verify_contact', code),
       recipients: phoneNumber,
     }),
   });
@@ -203,11 +256,15 @@ async function sendOtpSms(
   }
 }
 
-async function sendOtpWhatsApp(phoneNumber: string, code: string) {
+async function sendOtpWhatsApp(
+  phoneNumber: string,
+  code: string,
+  purpose: OtpPurpose
+) {
   const formData = new FormData();
   formData.append('message_type', 'text');
   formData.append('recipients', phoneNumber);
-  formData.append('content', `رمز التحقق هو: ${code}`);
+  formData.append('content', otpTextFor(purpose, code));
 
   const response = await fetch('https://services.rmz.one/api/whatsapp/send', {
     signal: AbortSignal.timeout(PROVIDER_TIMEOUT_MS),
@@ -305,15 +362,15 @@ function readErrorField(
   return typeof value === 'string' ? value : null;
 }
 
-async function sendOtpEmail(email: string, code: string) {
+async function sendOtpEmail(email: string, code: string, purpose: OtpPurpose) {
   let info: Awaited<ReturnType<Transporter['sendMail']>>;
 
   try {
     info = await getTransporter().sendMail({
       from: process.env.SMTP_FROM || process.env.SMTP_USER,
       to: email,
-      subject: 'رمز التحقق - مجتمع الوقف',
-      text: `رمز التحقق هو: ${code}`,
+      subject: otpSubjectFor(purpose),
+      text: otpTextFor(purpose, code),
       html: `<div dir="rtl" style="font-family: sans-serif; text-align: center; padding: 20px;">
       <h2>رمز التحقق</h2>
       <p style="font-size: 32px; font-weight: bold; letter-spacing: 8px; margin: 20px 0;">${code}</p>
@@ -372,13 +429,29 @@ async function sendOtp(
   channel: OtpChannel,
   identifier: string,
   code: string,
+  purpose: OtpPurpose,
   smsMessage?: (code: string) => string
 ) {
   try {
-    if (channel === 'sms')
-      return await sendOtpSms(identifier, code, smsMessage?.(code));
-    if (channel === 'whatsapp') return await sendOtpWhatsApp(identifier, code);
-    return await sendOtpEmail(identifier, code);
+    const text =
+      channel === 'sms'
+        ? (smsMessage?.(code) ?? otpTextFor(purpose, code))
+        : otpTextFor(purpose, code);
+    if (OTP_DELIVERY_OUTBOX) {
+      recordOutboxDelivery({
+        channel,
+        destination: identifier,
+        purpose,
+        code,
+        subject: channel === 'email' ? otpSubjectFor(purpose) : null,
+        text,
+      });
+      return;
+    }
+    if (channel === 'sms') return await sendOtpSms(identifier, code, text);
+    if (channel === 'whatsapp')
+      return await sendOtpWhatsApp(identifier, code, purpose);
+    return await sendOtpEmail(identifier, code, purpose);
   } catch (error) {
     const message = readErrorField(error, 'message');
 
@@ -725,7 +798,7 @@ export async function processOtpSend({
     throw new CustomError(MSG_OTP_SEND_FAILED, HTTP_STATUS.INTERNAL_ERROR);
   const deliver = async () => {
     try {
-      await sendOtp(channel, sendTo, otpCode, smsMessage);
+      await sendOtp(channel, sendTo, otpCode, purpose, smsMessage);
     } catch (error) {
       try {
         await refundFailedDelivery(result.sessionId, hashedCode);
@@ -877,7 +950,12 @@ type VerifyOutcome =
    * recorded, which the writes below never produce — `blockedError` falls back
    * to the full duration rather than omitting the header.
    */
-  | { kind: 'blocked'; blockedUntil: Date | null };
+  | {
+      kind: 'blocked';
+      blockedUntil: Date | null;
+      /** Whether a submitted code was compared before the block was raised. */
+      evaluated: boolean;
+    };
 
 export async function processOtpVerify({
   userId,
@@ -947,7 +1025,11 @@ export async function processOtpVerify({
     if (session.isBlocked && session.blockedUntil) {
       // Already locked — no code is looked at, so nothing is charged.
       if (session.blockedUntil > new Date())
-        return { kind: 'blocked', blockedUntil: session.blockedUntil };
+        return {
+          kind: 'blocked',
+          blockedUntil: session.blockedUntil,
+          evaluated: false,
+        };
 
       // Block expired — same reset as the send path. Clearing only the verify
       // counter here would unblock verification while leaving a send-cap block
@@ -1061,7 +1143,7 @@ export async function processOtpVerify({
           .where(eq(verificationSessions.id, session.id));
         await auditBlockTransition('daily_cap_reached');
       }
-      return { kind: 'blocked', blockedUntil };
+      return { kind: 'blocked', blockedUntil, evaluated: false };
     }
 
     // The per-cycle bound stays in the WHERE clause as defense in depth if the
@@ -1106,7 +1188,7 @@ export async function processOtpVerify({
         await auditBlockTransition('cap_reached');
       }
       // Cap was already spent before this request; the code is never read.
-      return { kind: 'blocked', blockedUntil };
+      return { kind: 'blocked', blockedUntil, evaluated: false };
     }
 
     const shouldBlock =
@@ -1196,7 +1278,7 @@ export async function processOtpVerify({
     // (`no-code`, already-blocked, budget spent) return before it.
     if (shouldBlock) {
       await auditBlockTransition('threshold_crossed');
-      return { kind: 'blocked', blockedUntil: blockUntil };
+      return { kind: 'blocked', blockedUntil: blockUntil, evaluated: true };
     }
     return { kind: 'mismatch' };
   });
@@ -1208,15 +1290,19 @@ export async function processOtpVerify({
       'انتهت صلاحية رمز التحقق. يرجى طلب رمز جديد',
       HTTP_STATUS.BAD_REQUEST
     );
-  if (outcome.kind === 'blocked')
+  if (outcome.kind === 'blocked') {
     // Says it is a block, and carries how long it lasts — see `blockedError`.
     // The message also tells the caller a NEW code will lift it, which is true
     // now that a resend clears a verify-side block.
-    throw blockedError(
+    const blocked = blockedError(
       'تم حظر التحقق مؤقتاً بعد تجاوز عدد المحاولات. يرجى طلب رمز جديد',
       outcome.blockedUntil
     );
-  throw new CustomError('رمز التحقق غير صحيح', HTTP_STATUS.BAD_REQUEST);
+    throw outcome.evaluated ? markEvaluatedGuess(blocked) : blocked;
+  }
+  throw markEvaluatedGuess(
+    new CustomError('رمز التحقق غير صحيح', HTTP_STATUS.BAD_REQUEST)
+  );
 }
 
 export { hashOtpCode } from '@/lib/auth/otp-hash';

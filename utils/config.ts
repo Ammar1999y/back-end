@@ -97,3 +97,28 @@ export const REQUIRE_PHONE_VERIFICATION = false as boolean;
  * ⚠️ when change it, you need to update NEXT_PUBLIC_OTP_AUTO_VERIFY in .env to update the UI
  */
 export const OTP_AUTO_VERIFY = false;
+
+/**
+ * Whether a submitted `rememberMe` is honoured.
+ *
+ * `false` pins every session to the short lifetime regardless of what the client
+ * asked for, which is what a deployment that wants uniform session expiry needs.
+ * `true` — the default — means the choice reaches session creation and the
+ * cookie, instead of being read and dropped.
+ */
+export const HONOUR_REMEMBER_ME = true as boolean;
+
+/**
+ * Whether passwordless sign-in (`/api/auth/passwordless/*`) is served.
+ *
+ * ⚠️ SEPARATE from `OTP_ENABLED`, and that is the whole point. Passwordless is
+ * the weakest first-factor route this deployment has — one emailed code and you
+ * are in — and it could previously only be switched off by switching off the OTP
+ * machinery that contact verification, account recovery and the second factor
+ * all depend on. That matters most in exactly the situation where an operator
+ * would want it: abuse on this path, or the population whose only second factor
+ * is a code to the contact this login just proved.
+ *
+ * A disabled surface answers 404, matching how a disabled 2FA method behaves.
+ */
+export const PASSWORDLESS_ENABLED = true as boolean;

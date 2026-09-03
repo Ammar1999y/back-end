@@ -25,11 +25,14 @@
  */
 import type { RouteDefinition, RoutePrefix } from '@/lib/http/route-manifest';
 
+import * as authForgotComplete from '@/app/api/auth/forgot-password/complete/handler';
 import * as authForgotReset from '@/app/api/auth/forgot-password/reset/handler';
+import * as authForgotSecondFactorSend from '@/app/api/auth/forgot-password/second-factor/send/handler';
 import * as authForgotSend from '@/app/api/auth/forgot-password/send/handler';
 import * as authOtpSend from '@/app/api/auth/otp/send/handler';
 import * as authOtpVerify from '@/app/api/auth/otp/verify/handler';
 import * as authPasswordlessSend from '@/app/api/auth/passwordless/send/handler';
+import * as dashAuthReauth from '@/app/api/dash/auth/reauth/handler';
 import * as dashPermissionsId from '@/app/api/dash/permissions/[id]/handler';
 import * as dashPermissions from '@/app/api/dash/permissions/handler';
 import * as dashRoles from '@/app/api/dash/roles/handler';
@@ -40,6 +43,7 @@ import {
   SESSION_CURSOR_PATTERN,
   SESSIONS_MAX_PAGE_SIZE,
 } from '@/app/api/dash/users/[id]/sessions/pagination';
+import * as dashUsersIdTwoFactor from '@/app/api/dash/users/[id]/two-factor/handler';
 import * as dashUsers from '@/app/api/dash/users/handler';
 import * as meChangeEmail from '@/app/api/dash/users/me/change-email/handler';
 import * as meChangeEmailVerify from '@/app/api/dash/users/me/change-email/verify/handler';
@@ -134,6 +138,31 @@ export const ROUTES: readonly RouteDefinition[] = [
     preAuth: 'ip-limit',
     auth: 'public',
     captcha: true,
+    handlerRateLimit: true,
+    body: 'json',
+    response: 'envelope',
+  },
+  // The two halves of a reset for an account that holds a second factor. No
+  // captcha: reaching either needs a recovery grant, which follows a solved
+  // captcha and a verified code, so the gate in front is stronger than one.
+  {
+    method: 'POST',
+    path: '/api/auth/forgot-password/second-factor/send',
+    handler: authForgotSecondFactorSend.POST,
+    preAuth: 'ip-limit',
+    auth: 'public',
+    captcha: false,
+    handlerRateLimit: true,
+    body: 'json',
+    response: 'envelope',
+  },
+  {
+    method: 'POST',
+    path: '/api/auth/forgot-password/complete',
+    handler: authForgotComplete.POST,
+    preAuth: 'ip-limit',
+    auth: 'public',
+    captcha: false,
     handlerRateLimit: true,
     body: 'json',
     response: 'envelope',
@@ -398,6 +427,31 @@ export const ROUTES: readonly RouteDefinition[] = [
         pattern: SESSION_CURSOR_PATTERN,
       },
     ],
+  },
+  // Opens the administrator re-authentication window the `D12` class reads.
+  // `auth: 'session'`: it is not itself a permission-bearing action — it only
+  // proves the caller is still who their session says.
+  {
+    method: 'POST',
+    path: '/api/dash/auth/reauth',
+    handler: dashAuthReauth.POST,
+    preAuth: 'ip-limit',
+    auth: 'session',
+    captcha: false,
+    handlerRateLimit: true,
+    body: 'json',
+    response: 'envelope',
+  },
+  {
+    method: 'POST',
+    path: '/api/dash/users/:id/two-factor/reset',
+    handler: dashUsersIdTwoFactor.POST,
+    preAuth: 'ip-limit',
+    auth: 'permission',
+    captcha: false,
+    handlerRateLimit: true,
+    body: 'none',
+    response: 'envelope',
   },
   // The only DELETE with a body: it takes the session ids to revoke.
   {

@@ -34,7 +34,9 @@ import { db } from './index';
 import {
   files,
   sessions,
+  trustedDevices,
   verificationCodes,
+  verifications,
   verificationSessions,
 } from './schema';
 
@@ -75,10 +77,14 @@ const BATCH_SIZE = 500;
 const MAX_BATCHES = 40;
 
 /**
- * **Every select below is a sequential scan, and that is knowingly accepted.**
+ * **Every select below is a sequential scan, and that is knowingly accepted** —
+ * except the two newest, `verifications` and `trusted_devices`, which have a
+ * leading index on the column they filter (`expires_at`) because both are
+ * high-churn enough that a nightly scan would be the wrong shape from the start.
+ *
  * Verified with `EXPLAIN`, not assumed: no existing index has a usable leading
- * column for these predicates — `idx_sessions_user_expires_created` leads with
- * `user_id`, and the verification and files tables have nothing on the columns
+ * column for the other predicates — `idx_sessions_user_expires_created` leads
+ * with `user_id`, and the OTP proof and files tables have nothing on the columns
  * being filtered.
  *
  * Fine as things stand: this is one nightly job, `LIMIT 500` stops the scan early
@@ -127,6 +133,8 @@ export interface DatabaseSweepResult {
     sessions: SweepCount;
     verificationSessions: SweepCount;
     verificationCodes: SweepCount;
+    verifications: SweepCount;
+    trustedDevices: SweepCount;
     tempFiles: TempFileSweepCount;
   };
   hasMore: boolean;
@@ -249,6 +257,50 @@ function sweepVerificationCodes(): Promise<SweepCount> {
 }
 
 /**
+ * Not a correctness boundary: `consumeVerificationValue` deletes a row past its
+ * `expiresAt` and returns null, so an unswept row can never be redeemed. The
+ * sweep reclaims disk on what is otherwise the fastest-growing table here.
+ */
+function sweepVerifications(): Promise<SweepCount> {
+  return sweepBatched(async () => {
+    const doomed = db
+      .select({ id: verifications.id })
+      .from(verifications)
+      .where(lt(verifications.expiresAt, sql`now()`))
+      .limit(BATCH_SIZE);
+
+    const deleted = await db
+      .delete(verifications)
+      .where(inArray(verifications.id, doomed))
+      .returning({ id: verifications.id });
+
+    return deleted.length;
+  });
+}
+
+/**
+ * Also not a correctness boundary — the sign-in check filters on `expiresAt`. It
+ * matters for the settings screen, which is user-visible: a list padded with
+ * devices that already stopped working teaches users to ignore it.
+ */
+function sweepTrustedDevices(): Promise<SweepCount> {
+  return sweepBatched(async () => {
+    const doomed = db
+      .select({ id: trustedDevices.id })
+      .from(trustedDevices)
+      .where(lt(trustedDevices.expiresAt, sql`now()`))
+      .limit(BATCH_SIZE);
+
+    const deleted = await db
+      .delete(trustedDevices)
+      .where(inArray(trustedDevices.id, doomed))
+      .returning({ id: trustedDevices.id });
+
+    return deleted.length;
+  });
+}
+
+/**
  * Abandoned temporary uploads, from R2 and then from `files`.
  *
  * **R2 first, database row second, and never the other way round.** An S3 DELETE
@@ -361,6 +413,8 @@ export async function runDatabaseSweep(
     // sweep that follows has less to look at.
     verificationSessions: await sweepVerificationSessions(),
     verificationCodes: await sweepVerificationCodes(),
+    verifications: await sweepVerifications(),
+    trustedDevices: await sweepTrustedDevices(),
     sessions: await sweepSessions(),
     tempFiles: await sweepTempFiles(),
   };

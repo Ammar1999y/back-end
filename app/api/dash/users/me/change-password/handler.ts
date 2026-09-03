@@ -134,7 +134,13 @@ export const POST: Handler = async (ctx) => {
       // Revoking sessions alone is not enough: an unconsumed forgot-password
       // or passwordless proof issued before this change would still reset the
       // NEW password. Rotation invalidates every pending proof.
-      await revokePendingProofs(tx, userId);
+      //
+      // Trusted devices are KEPT. This caller proved the old password on a live
+      // session — they are the owner, and a routine password change that also
+      // un-remembered every device they had deliberately remembered is a
+      // surprise, not a control. Recovery, where the person may NOT be the
+      // owner, revokes them.
+      await revokePendingProofs(tx, userId, null, 'keep');
 
       await auditLog(tx, {
         userId,

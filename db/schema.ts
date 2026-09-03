@@ -40,6 +40,7 @@ import {
 import { CREDENTIAL_ISSUER } from '@/utils/api-messages';
 import { PHONE_NUMBER_MODE, PHONE_REQUIRED } from '@/utils/config';
 import {
+  CREDENTIAL_ID_MAX,
   EMAIL_MAX,
   NAME_MAX,
   OTP_IDENTIFIER_MAX,
@@ -50,8 +51,10 @@ import {
   ROLE_DESCRIPTION_MAX,
   ROLE_NAME_MAX,
   URL_MAX,
+  VERIFICATION_IDENTIFIER_MAX,
 } from '@/utils/validation/constants';
 import { OTP_CHANNELS, OTP_PURPOSES } from '@/utils/validation/otp';
+import { TWO_FACTOR_METHODS } from '@/utils/validation/two-factor';
 
 /**
  * `jsonb`, replacing `drizzle-orm/pg-core`'s — which double-encodes under
@@ -160,6 +163,10 @@ export const pageName = pgEnum('page_name', pageNameValues);
 export const roleScope = pgEnum('role_scope', roleScopeValues);
 export const otpChannel = pgEnum('otp_channel', OTP_CHANNELS);
 export const otpPurpose = pgEnum('otp_purpose', OTP_PURPOSES);
+// The full method set, not the env-enabled subset: a deployment turning a method
+// off must not make existing rows unreadable.
+// ⚠️ Changing this list requires a DB migration (two_factor_method pgEnum).
+export const twoFactorMethod = pgEnum('two_factor_method', TWO_FACTOR_METHODS);
 // Whitelist of supported auth providers — extend here when adding OAuth.
 // Constraining the column to a known set prevents direct writes from
 // introducing provider IDs that downstream code cannot handle.
@@ -196,6 +203,12 @@ export const users = pgTable(
     phoneNumberVerified: boolean('phone_number_verified')
       .default(false)
       .notNull(),
+    // The property name is what Better Auth reads (not the SQL column), so it
+    // must stay `twoFactorEnabled`.
+    //
+    // "The user turned 2FA on", not "the user has a usable second factor" — see
+    // the downgrade path in lib/auth/two-factor-challenge.ts.
+    twoFactorEnabled: boolean('two_factor_enabled').default(false).notNull(),
     isActive: boolean('is_active').default(true).notNull(),
     roleId: uuid('role_id').references(() => roles.id, {
       onDelete: REQUIRE_ROLE_FOR_LOGIN ? 'restrict' : 'set null',
@@ -375,6 +388,265 @@ export const accounts = pgTable(
       'chk_credential_issuer',
       sql`provider_id <> 'credential' OR issuer = 'local:credential'`
     ),
+  ]
+);
+
+/**
+ * Better Auth's generic single-use key/value store, reached only through
+ * `internalAdapter.{create,find,consume,delete}VerificationValue`.
+ *
+ * Carries three unrelated lifetimes keyed by `identifier`: `2fa-<random>` (the
+ * pending challenge, value = user id), `2fa-attempts-<key>` (that challenge's
+ * failure counter), and the passkey plugin's WebAuthn ceremonies. Trusted
+ * devices are NOT here — they are ours, in `trusted_devices`.
+ *
+ * ⚠️ `identifier` is indexed but NOT unique. `consumeVerificationValue` returns
+ * the latest row for an identifier, and the attempt counter is re-armed by
+ * INSERTING a fresh row, so a unique index turns a concurrent 2FA retry into a
+ * constraint violation.
+ *
+ * `value` is `text` because the passkey ceremony stores a JSON document whose
+ * length the library decides.
+ */
+export const verifications = pgTable(
+  'verifications',
+  {
+    id: uuid('id').primaryKey().$defaultFn(generateId),
+    identifier: varchar('identifier', {
+      length: VERIFICATION_IDENTIFIER_MAX,
+    }).notNull(),
+    value: text('value').notNull(),
+    expiresAt: timestamp('expires_at', {
+      withTimezone: true,
+      precision: 2,
+    }).notNull(),
+    ...timestamps,
+  },
+  (t) => [
+    index('idx_verifications_identifier').on(t.identifier),
+    index('idx_verifications_expires_at').on(t.expiresAt),
+  ]
+);
+
+/**
+ * The TOTP secret and the encrypted backup-code set, one row per user, written
+ * only by the plugin's own endpoints.
+ *
+ * Both secrets are encrypted under `BETTER_AUTH_SECRET`, so rotating that key
+ * strands every row here — the reason it has no rotation story in
+ * `lib/env.server.ts`.
+ *
+ * ⚠️ The export name must match `twoFactorTable` in `lib/auth.ts`: the adapter
+ * resolves the plugin's `twoFactor` model as `schema[modelName]`, and renaming
+ * one without the other makes every 2FA read throw.
+ *
+ * ⚠️ A row here does NOT mean 2FA is on, and its absence does NOT mean it is
+ * off: enabling OTP-only creates no row, which is why the plugin's lockout
+ * columns below never engage for an OTP-only user.
+ */
+export const twoFactorCredentials = pgTable(
+  'two_factor_credentials',
+  {
+    id: uuid('id').primaryKey().$defaultFn(generateId),
+    userId: uuid('user_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'cascade' }),
+    secret: text('secret').notNull(),
+    backupCodes: text('backup_codes').notNull(),
+    // `false` until an enrolment code proves the authenticator. Defaulting it
+    // true made an unconfirmed secret a usable factor the moment the row
+    // existed.
+    verified: boolean('verified').default(false).notNull(),
+    failedVerificationCount: integer('failed_verification_count')
+      .default(0)
+      .notNull(),
+    lockedUntil: timestamp('locked_until', {
+      withTimezone: true,
+      precision: 2,
+    }),
+    // Ours: until the user confirms they stored the codes, `backup_code` is not
+    // offered as a method.
+    backupCodesAcknowledgedAt: timestamp('backup_codes_acknowledged_at', {
+      withTimezone: true,
+      precision: 2,
+    }),
+    // ⚠️ Acknowledgement is bound to a SET, not to the column above. Regenerating
+    // replaces every code and bumps `backupCodesVersion`; an acknowledgement of
+    // the previous set then no longer matches, so the method stops being offered
+    // until the user confirms the new codes. Without the pairing, one
+    // acknowledgement in 2023 kept advertising whatever set exists today.
+    backupCodesVersion: integer('backup_codes_version').default(0).notNull(),
+    backupCodesAcknowledgedVersion: integer(
+      'backup_codes_acknowledged_version'
+    ),
+    // How many of that set are unspent. An exhausted set is not recovery
+    // material, and the encrypted blob cannot be counted without the key, so the
+    // count is kept here. See `lib/auth/two-factor-enrolment.ts` for who writes
+    // it and which direction it fails in.
+    backupCodesRemaining: integer('backup_codes_remaining')
+      .default(0)
+      .notNull(),
+    ...timestamps,
+  },
+  (t) => [
+    uniqueIndex('ux_two_factor_credentials_user').on(t.userId),
+    check(
+      'chk_two_factor_failed_count_non_negative',
+      sql`failed_verification_count >= 0`
+    ),
+    check(
+      'chk_two_factor_backup_codes_remaining_non_negative',
+      sql`backup_codes_remaining >= 0`
+    ),
+  ]
+);
+
+/**
+ * Which second factors a user has TURNED ON. Ours entirely: the plugin models
+ * one boolean and re-derives the method list from server configuration, so
+ * enabling OTP server-side would otherwise add an email/SMS fallback to every
+ * user who deliberately enrolled only TOTP.
+ *
+ * **A row is INTENT, not capability.** A challenge offers the intersection of
+ * three independent terms: server-enabled (`NEXT_PUBLIC_ENABLED_2FA_METHODS`),
+ * user intent (this table), and capability (a verified TOTP secret, an
+ * acknowledged backup-code set, a registered passkey, a verified contact).
+ *
+ * Keeping them separate is what makes a stale row harmless, and it is what the
+ * "cannot remove your last method" rule counts — a transient capability loss
+ * must not silently un-enrol anyone.
+ *
+ * `channel` carries where the user chose to receive codes, which is what lets a
+ * passwordless sign-in compare possessions.
+ */
+export const twoFactorMethods = pgTable(
+  'two_factor_methods',
+  {
+    id: uuid('id').primaryKey().$defaultFn(generateId),
+    userId: uuid('user_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'cascade' }),
+    method: twoFactorMethod('method').notNull(),
+    channel: otpChannel('channel'),
+    // What an OTP row actually proves, derived from its transport exactly as
+    // `verification_sessions.contact_kind` is. `sms` and `whatsapp` reach one
+    // phone, so they are ONE enrolment with a delivery preference, while email
+    // is a second, independent one. Generated, so no insert can contradict it.
+    contactKind: text('contact_kind').generatedAlwaysAs(
+      sql`CASE WHEN channel IS NULL THEN NULL WHEN channel = 'email' THEN 'email' ELSE 'phone' END`
+    ),
+    // The method the challenge routes to first. At most one row per user, and
+    // only ever a reorder WITHIN what the user has enrolled — see `D9`.
+    isDefault: boolean('is_default').default(false).notNull(),
+    ...timestamps,
+  },
+  (t) => [
+    // ⚠️ Two partial indexes, not one over `(user_id, method)`. A user may hold
+    // an OTP enrolment per CONTACT KIND — email and phone are different
+    // possessions — but only one row of every other method. A single key on
+    // `(user_id, method)` made a second OTP channel REPLACE the first through
+    // `recordMethodIntent`'s upsert. Both conflict targets in that function must
+    // stay in step with these two predicates.
+    uniqueIndex('ux_two_factor_methods_user_otp_contact')
+      .on(t.userId, t.contactKind)
+      .where(sql`method = 'otp'`),
+    uniqueIndex('ux_two_factor_methods_user_method')
+      .on(t.userId, t.method)
+      .where(sql`method <> 'otp'`),
+    uniqueIndex('ux_two_factor_methods_default')
+      .on(t.userId)
+      .where(sql`is_default`),
+    // An equivalence so neither direction can drift: no channel on a TOTP row,
+    // and no OTP row without a destination to send to.
+    check(
+      'chk_two_factor_method_channel',
+      sql`(method = 'otp') = (channel IS NOT NULL)`
+    ),
+  ]
+);
+
+/**
+ * WebAuthn credentials, used in this deployment ONLY as a second factor.
+ *
+ * ⚠️ The plugin's own authentication endpoints
+ * (`/passkey/generate-authenticate-options`, `/passkey/verify-authentication`)
+ * must stay absent from `BETTER_AUTH_ENDPOINTS`: they resolve a credential by
+ * `credentialID` alone and issue a session to whoever owns it. The second factor
+ * is proven through `/two-factor/passkey/*`, which binds the assertion to the
+ * pending challenge's user.
+ *
+ * `aaguid` identifies the authenticator MODEL, not the device or the user.
+ */
+export const passkeys = pgTable(
+  'passkeys',
+  {
+    id: uuid('id').primaryKey().$defaultFn(generateId),
+    userId: uuid('user_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'cascade' }),
+    name: varchar('name', { length: NAME_MAX }),
+    publicKey: text('public_key').notNull(),
+    credentialID: varchar('credential_id', {
+      length: CREDENTIAL_ID_MAX,
+    }).notNull(),
+    counter: integer('counter').default(0).notNull(),
+    deviceType: varchar('device_type', { length: 32 }).notNull(),
+    backedUp: boolean('backed_up').default(false).notNull(),
+    transports: varchar('transports', { length: 255 }),
+    aaguid: varchar('aaguid', { length: 64 }),
+    ...timestamps,
+  },
+  (t) => [
+    // Unique, not indexed: a duplicate would make which account an assertion
+    // proves depend on row order.
+    uniqueIndex('ux_passkeys_credential_id').on(t.credentialID),
+    index('idx_passkeys_user_id').on(t.userId),
+    check('chk_passkeys_counter_non_negative', sql`counter >= 0`),
+  ]
+);
+
+/**
+ * Devices allowed to skip the second factor, and the ONLY mechanism in this
+ * application that does so. Entirely ours — see `lib/auth/trusted-device.ts`.
+ *
+ * `trustIdentifier` is the random half of the signed cookie, whose other half is
+ * an HMAC over `<userId>!<trustIdentifier>`, so the cookie alone does not let a
+ * holder name a different user's row.
+ *
+ * Revoked by the user from settings, and by every credential rotation
+ * (`lib/auth/rotation.ts`).
+ */
+export const trustedDevices = pgTable(
+  'trusted_devices',
+  {
+    id: uuid('id').primaryKey().$defaultFn(generateId),
+    userId: uuid('user_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'cascade' }),
+    trustIdentifier: varchar('trust_identifier', {
+      length: VERIFICATION_IDENTIFIER_MAX,
+    }).notNull(),
+    userAgent: varchar('user_agent', { length: USER_AGENT_MAX }),
+    ipAddress: varchar('ip_address', { length: 45 }),
+    lastUsedAt: timestamp('last_used_at', {
+      withTimezone: true,
+      precision: 2,
+    })
+      .defaultNow()
+      .notNull(),
+    expiresAt: timestamp('expires_at', {
+      withTimezone: true,
+      precision: 2,
+    }).notNull(),
+    ...timestamps,
+  },
+  (t) => [
+    uniqueIndex('ux_trusted_devices_identifier').on(t.trustIdentifier),
+    index('idx_trusted_devices_user').on(t.userId, t.expiresAt),
+    // Leading `expires_at`, for the retention sweep, which filters on it alone.
+    // `idx_trusted_devices_user` cannot serve that scan: its leading column is
+    // `user_id`.
+    index('idx_trusted_devices_expires_at').on(t.expiresAt),
   ]
 );
 

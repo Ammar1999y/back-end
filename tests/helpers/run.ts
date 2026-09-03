@@ -50,6 +50,13 @@ interface Tier {
   /** How many worker databases to provision. */
   workers: 'auto' | 1;
   /**
+   * Extra environment for the child, layered UNDER `NODE_ENV`.
+   *
+   * For configuration a test cannot set for itself because it is read at module
+   * load — the two-factor method list is the case that needed it.
+   */
+  env?: Readonly<Record<string, string>>;
+  /**
    * `development` for the database tiers: it is what makes `/api/dev/sign-up`
    * reachable (the real seeding path), what lets `lib/captcha.ts` accept a token
    * against Cloudflare's published test secret, and what matches the branch a
@@ -58,7 +65,37 @@ interface Tier {
    * (measured), so it has to be passed here.
    */
   nodeEnv: string;
+  /**
+   * Run the tier once PER configuration, in one child each.
+   *
+   * The two-factor configuration is read at module load — the allow-list, and
+   * therefore which paths exist at all, is derived from it — so a test cannot
+   * change it and a single child can only ever exercise one deployment. That is
+   * exactly how an empty method list came to remove enforcement from
+   * `/sign-in/email` while `/passwordless/verify` kept refusing, with every
+   * suite green: the suite proved ONE deployment works.
+   */
+  configurations?: readonly { name: string; env: Record<string, string> }[];
 }
+
+/**
+ * The two-factor configuration both code tiers run under.
+ *
+ * Declared once and shared, because a tier that disagreed with another about
+ * which methods exist would make the same assertion pass in one and fail in the
+ * other for a reason no test names.
+ *
+ * Both OTP channels while account recovery stays on `email`, so the tier covers
+ * BOTH sides of the recovery-overlap rule with one configuration: an `otp/sms`
+ * enrolment is a different possession from an emailed recovery code and an
+ * `otp/email` one is not. `sms` alone made the overlap unreachable — every
+ * `otp/email` fixture was outside the enabled channel list, so the refusal it
+ * asserted came from the method never being offered at all.
+ */
+const TWO_FACTOR_TEST_ENV: Readonly<Record<string, string>> = {
+  NEXT_PUBLIC_ENABLED_2FA_METHODS: 'totp,backup_code,otp,passkey',
+  NEXT_PUBLIC_ENABLED_2FA_OTP_CHANNELS: 'email,sms',
+};
 
 const TIERS: Record<string, Tier> = {
   /**
@@ -68,7 +105,16 @@ const TIERS: Record<string, Tier> = {
    * 1.4.0). It costs a preload run per file, which is free without a database and
    * would be a clone per file with one.
    */
-  unit: { database: false, flags: ['--isolate'], workers: 1, nodeEnv: 'test' },
+  unit: {
+    database: false,
+    flags: ['--isolate'],
+    workers: 1,
+    nodeEnv: 'test',
+    // Same reason as the integration tier: read at module load, so it cannot be
+    // set per test. The offered-method intersection has the enabled set as one
+    // of its three terms, and with none configured every case is vacuously empty.
+    env: TWO_FACTOR_TEST_ENV,
+  },
   /**
    * `--parallel` for wall-clock, `--no-isolate` so the preload — and therefore
    * the database handshake — runs once per worker instead of once per file.
@@ -83,6 +129,18 @@ const TIERS: Record<string, Tier> = {
     flags: ['--no-isolate'],
     workers: 'auto',
     nodeEnv: 'development',
+    /**
+     * Two-factor configuration is read at MODULE LOAD — the allow-list, and
+     * therefore which Better Auth paths exist at all, is derived from it — so it
+     * cannot be set per file or per test. It is declared here, in committed
+     * code, rather than in the gitignored `.env.test`: the suite asserts the
+     * behaviour of a configured deployment, and a machine-local file would let
+     * that behaviour differ between developers.
+     *
+     * Existing tests are unaffected because a seeded user has
+     * `two_factor_enabled = false`, so no challenge is issued for them.
+     */
+    env: TWO_FACTOR_TEST_ENV,
   },
   /**
    * Serial. Every test here owns a real socket, a real child process or a real
@@ -90,6 +148,70 @@ const TIERS: Record<string, Tier> = {
    * do with the assertion.
    */
   process: { database: true, flags: [], workers: 1, nodeEnv: 'development' },
+  /**
+   * The configuration matrix. One child per row, serially, against one worker
+   * database that each row resets.
+   *
+   * The rows are the SUPPORTED deployments, not a sample: an empty method list,
+   * each method alone, and each OTP channel. `TWO_FACTOR_MATRIX` names the row
+   * to the test file, which is what lets one file assert a different contract
+   * per configuration rather than the intersection of all of them.
+   */
+  matrix: {
+    database: true,
+    flags: ['--no-isolate'],
+    workers: 1,
+    nodeEnv: 'development',
+    // The outbox, not stubbed providers: this is the tier that runs every OTP
+    // channel, so it is where the delivered text per channel and purpose is
+    // asserted. The integration tier keeps the provider stubs, because several
+    // of its files assert on the provider CALL itself.
+    env: { OTP_DELIVERY: 'outbox' },
+    configurations: [
+      {
+        name: 'disabled',
+        env: {
+          NEXT_PUBLIC_ENABLED_2FA_METHODS: '',
+          NEXT_PUBLIC_ENABLED_2FA_OTP_CHANNELS: '',
+        },
+      },
+      {
+        name: 'totp-only',
+        env: {
+          NEXT_PUBLIC_ENABLED_2FA_METHODS: 'totp',
+          NEXT_PUBLIC_ENABLED_2FA_OTP_CHANNELS: '',
+        },
+      },
+      {
+        name: 'backup-only',
+        env: {
+          NEXT_PUBLIC_ENABLED_2FA_METHODS: 'backup_code',
+          NEXT_PUBLIC_ENABLED_2FA_OTP_CHANNELS: '',
+        },
+      },
+      {
+        name: 'passkey-only',
+        env: {
+          NEXT_PUBLIC_ENABLED_2FA_METHODS: 'passkey',
+          NEXT_PUBLIC_ENABLED_2FA_OTP_CHANNELS: '',
+        },
+      },
+      {
+        name: 'otp-email',
+        env: {
+          NEXT_PUBLIC_ENABLED_2FA_METHODS: 'otp,totp',
+          NEXT_PUBLIC_ENABLED_2FA_OTP_CHANNELS: 'email',
+        },
+      },
+      {
+        name: 'otp-whatsapp',
+        env: {
+          NEXT_PUBLIC_ENABLED_2FA_METHODS: 'otp,totp',
+          NEXT_PUBLIC_ENABLED_2FA_OTP_CHANNELS: 'whatsapp',
+        },
+      },
+    ],
+  },
 };
 
 const [tierName, ...forwarded] = process.argv.slice(2);
@@ -193,25 +315,39 @@ try {
     flags.push('--preload', './tests/helpers/preload-database.ts');
   }
 
-  const child = Bun.spawn(
-    ['bun', 'test', '--no-env-file', ...flags, ...forwardedFlags, selection],
-    {
-      cwd: REPO_ROOT,
-      env: {
-        ...process.env,
-        NODE_ENV: tier.nodeEnv,
-        ...(tier.database && { HARNESS_RUN_TOKEN: runToken }),
-      },
-      stdio: ['inherit', 'inherit', 'inherit'],
-    }
-  );
+  // One child per configuration, or one child. A row is a whole `bun test`
+  // process because the configuration is read at module load.
+  const rows = tier.configurations ?? [{ name: '', env: {} }];
+  exitCode = 0;
+  for (const row of rows) {
+    if (row.name) console.log(`\n── configuration: ${row.name} ──`);
+    const child = Bun.spawn(
+      ['bun', 'test', '--no-env-file', ...flags, ...forwardedFlags, selection],
+      {
+        cwd: REPO_ROOT,
+        env: {
+          ...process.env,
+          ...tier.env,
+          ...row.env,
+          ...(row.name && { TWO_FACTOR_MATRIX: row.name }),
+          NODE_ENV: tier.nodeEnv,
+          ...(tier.database && { HARNESS_RUN_TOKEN: runToken }),
+        },
+        stdio: ['inherit', 'inherit', 'inherit'],
+      }
+    );
 
-  // Ctrl-C must still reach the teardown below rather than orphaning N databases.
-  const forward = (signal: NodeJS.Signals) => () => child.kill(signal);
-  process.on('SIGINT', forward('SIGINT'));
-  process.on('SIGTERM', forward('SIGTERM'));
+    // Ctrl-C must still reach the teardown below rather than orphaning N
+    // databases.
+    const forward = (signal: NodeJS.Signals) => () => child.kill(signal);
+    process.on('SIGINT', forward('SIGINT'));
+    process.on('SIGTERM', forward('SIGTERM'));
 
-  exitCode = await child.exited;
+    const code = await child.exited;
+    // Every row runs: stopping at the first failure hides which OTHER
+    // configurations are broken, and that inventory is the whole point.
+    if (code !== 0) exitCode = code;
+  }
 } finally {
   await teardown();
 }

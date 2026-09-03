@@ -1,3 +1,4 @@
+import type { OfferedOption } from '@/lib/auth/two-factor-challenge';
 import type { Handler } from '@/lib/http/contract';
 
 import { and, eq, isNull } from 'drizzle-orm';
@@ -8,12 +9,20 @@ import { accounts, users } from '@/db/schema';
 import { auditLog, getAuditMeta } from '@/lib/audit';
 import { checkPasswordCompromise } from '@/lib/auth/check-password';
 import { hashPassword } from '@/lib/auth/password';
+import { issueRecoveryGrant } from '@/lib/auth/recovery-grant';
 import { revokeOtherSessions, revokePendingProofs } from '@/lib/auth/rotation';
+import {
+  defaultOption,
+  readEnrollmentState,
+  recoveryDefeatsTwoFactor,
+  recoveryOptions,
+} from '@/lib/auth/two-factor-challenge';
 import { verifyTurnstileRequest } from '@/lib/captcha';
 import {
   enforceOtpVerifyQuota,
   enforceRateLimit,
   ipIdentifier,
+  otpContactKind,
 } from '@/lib/rate-limit';
 
 import {
@@ -37,6 +46,13 @@ import { ensureMinDelay, otpMsg } from '../../otp/messages';
  * same transaction, set the new password and revoke ALL of the user's sessions.
  * Always uses a real code (no OTP_AUTO_VERIFY bypass for recovery). Failures
  * collapse to a single generic error so the endpoint can't enumerate accounts.
+ *
+ * ⚠️ For an account with a second factor this endpoint DOES NOT write the
+ * password. A recovery code proves one contact, and the account's own rule is
+ * that no single possession satisfies both proofs in one chain — so the code
+ * verification commits a short-lived recovery grant instead, and
+ * `/forgot-password/complete` writes the password against a proven second
+ * factor.
  */
 export const POST: Handler = async (ctx) => {
   const start = Date.now();
@@ -99,6 +115,11 @@ export const POST: Handler = async (ctx) => {
       throw new CustomError(otpMsg.invalidOrExpired, HTTP_STATUS.BAD_REQUEST);
 
     const auditMeta = getAuditMeta(ctx);
+    const contactKind = otpContactKind(channel);
+    // Populated inside the proof transaction and acted on after it commits: the
+    // grant cannot be minted in there, because a failure to mint it must not
+    // roll back the consumption of a recovery code that WAS presented.
+    let pendingSecondFactor: OfferedOption[] | null = null;
 
     await processOtpVerify({
       userId: userData.id,
@@ -109,6 +130,42 @@ export const POST: Handler = async (ctx) => {
       code,
       auditMeta,
       onVerified: async (tx, matched) => {
+        // Refused, not gated: if every second factor reaches the contact this
+        // recovery code arrived on — or is one this flow cannot check — then
+        // requiring it here proves nothing or cannot be done at all. Checked
+        // inside the proof transaction so the decision and the write cannot
+        // separate.
+        if (await recoveryDefeatsTwoFactor(userData.id, contactKind, tx))
+          throw new CustomError(
+            otpMsg.recoveryBlockedByTwoFactor,
+            HTTP_STATUS.FORBIDDEN
+          );
+
+        // The second-factor branch. Nothing about the password is written here.
+        const state = await readEnrollmentState(userData.id, tx);
+        if (state.enabled) {
+          const options = recoveryOptions(state, contactKind);
+          if (options.length > 0) {
+            pendingSecondFactor = options;
+            await auditLog(tx, {
+              userId: userData.id,
+              userEmail: userData.email,
+              action: 'UPDATE',
+              tableName: 'verification_sessions',
+              recordId: matched.verificationSessionId,
+              oldData: {},
+              newData: {
+                recoveryProofVerified: true,
+                recoverySecondFactorRequired: options.map(
+                  (option) => option.id
+                ),
+              },
+              meta: auditMeta,
+            });
+            return;
+          }
+        }
+
         const [account] = await tx
           .select({ id: accounts.id })
           .from(accounts)
@@ -155,6 +212,26 @@ export const POST: Handler = async (ctx) => {
       },
     });
 
+    if (pendingSecondFactor) {
+      const options = pendingSecondFactor as OfferedOption[];
+      const grant = await issueRecoveryGrant({
+        userId: userData.id,
+        excludeContactKind: contactKind,
+        options,
+      });
+      await ensureMinDelay(Date.now() - start);
+      return apiSuccess({
+        message: otpMsg.recoverySecondFactorRequired,
+        data: {
+          reset: false,
+          twoFactorRequired: true,
+          grant,
+          options,
+          defaultMethod: defaultOption(options),
+        },
+      });
+    }
+
     await ensureMinDelay(Date.now() - start);
     return apiSuccess({
       message: otpMsg.passwordResetSuccess,
@@ -174,7 +251,11 @@ export const POST: Handler = async (ctx) => {
       error.status !== HTTP_STATUS.TOO_MANY_REQUESTS &&
       error.status !== HTTP_STATUS.SERVICE_UNAVAILABLE &&
       error.status !== HTTP_STATUS.INTERNAL_ERROR &&
-      error.status !== HTTP_STATUS.UNPROCESSABLE
+      error.status !== HTTP_STATUS.UNPROCESSABLE &&
+      // The two-factor refusal must reach the user: collapsing it to "invalid
+      // or expired code" would leave someone holding a CORRECT code retrying
+      // forever. Safe because the branch is only reachable after a valid code.
+      error.status !== HTTP_STATUS.FORBIDDEN
     ) {
       const generic = new CustomError(
         otpMsg.invalidOrExpired,

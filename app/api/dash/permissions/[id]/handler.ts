@@ -131,6 +131,9 @@ export const PUT: Handler = async (ctx) => {
     } = await requirePermission(ctx, {
       resource: 'permissions',
       action: 'edit',
+      // `D12`: this action lowers ANOTHER account's security posture, so it is
+      // in the re-authentication class. Either all of them are or none are.
+      reauth: true,
     });
 
     await enforceRateLimit({
@@ -399,6 +402,9 @@ export const DELETE: Handler = async (ctx) => {
     } = await requirePermission(ctx, {
       resource: 'permissions',
       action: 'delete',
+      // `D12`: this action lowers ANOTHER account's security posture, so it is
+      // in the re-authentication class. Either all of them are or none are.
+      reauth: true,
     });
 
     await enforceRateLimit({

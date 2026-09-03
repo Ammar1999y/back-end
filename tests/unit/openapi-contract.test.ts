@@ -22,6 +22,7 @@ import {
 } from '@/lib/http/route-manifest';
 
 import { isChannelEnabled, OTP_CHANNELS } from '@/utils/validation/otp';
+import { isTwoFactorMethodEnabled } from '@/utils/validation/two-factor';
 
 const REPO_ROOT = path.join(import.meta.dir, '..', '..');
 
@@ -341,7 +342,20 @@ describe('request and response contract fidelity', () => {
       expect(operationIds.has(operation.operationId as string)).toBe(false);
       operationIds.add(operation.operationId as string);
     }
-    expect(operationIds.size).toBe(30);
+    // Derived, not a literal. It used to be `30`, which meant every route added
+    // to the table failed this assertion for a reason that had nothing to do
+    // with what it tests — and the fix was always "bump the number", which is
+    // the shape of an assertion nobody reads. What it should say is that the
+    // document covers the served surface EXACTLY: one operation per table
+    // route, plus one per Better Auth method. `true` because this document is
+    // the PRODUCTION one, where `/api/dev/*` is not served.
+    const expectedOperations =
+      toPublishedManifest(ROUTES, true).length +
+      BETTER_AUTH_ENDPOINTS.reduce(
+        (total, endpoint) => total + endpoint.methods.length,
+        0
+      );
+    expect(operationIds.size).toBe(expectedOperations);
   });
 
   test('no subschema carries $schema', () => {
@@ -666,7 +680,17 @@ describe('request and response contract fidelity', () => {
     const components = (document as { components: Record<string, unknown> })
       .components;
     const schemas = components.schemas as Record<string, unknown>;
-    expect(Object.keys(schemas).toSorted(byText)).toEqual(['Session', 'User']);
+    // `Passkey` is contributed by the passkey plugin, so the set depends on
+    // which 2FA methods this deployment enables. Asserted against that rather
+    // than against a fixed list, which would fail for a correct configuration
+    // with passkey off.
+    expect(Object.keys(schemas).toSorted(byText)).toEqual(
+      [
+        'Session',
+        'User',
+        ...(isTwoFactorMethodEnabled('passkey') ? ['Passkey'] : []),
+      ].toSorted(byText)
+    );
     const user = schemas.User as Record<string, unknown>;
     expect(
       Object.keys(user.properties as Record<string, unknown>)
@@ -783,12 +807,29 @@ describe('the Better Auth surface, per endpoint', () => {
       ).toBeGreaterThan(0);
     }
 
+    // ⚠️ The 200 is a UNION, and both branches have to be there. A sign-in
+    // against a two-factor account answers `twoFactorRedirect` and NO session
+    // cookie; a document that published only the completed shape told a
+    // generated client that a user who has not finished signing in is signed in.
     const ok = responses['200'] as Record<string, unknown>;
     const content = ok.content as Record<string, unknown>;
     const json = content['application/json'] as Record<string, unknown>;
-    const schema = json.schema as Record<string, unknown>;
-    expect(Object.keys(schema.properties as Record<string, unknown>)).toContain(
-      'token'
+    const schema = json.schema as { anyOf?: Record<string, unknown>[] };
+    expect(schema.anyOf).toHaveLength(2);
+    const [completed, challenged] = schema.anyOf ?? [];
+    expect(
+      Object.keys(completed?.properties as Record<string, unknown>)
+    ).toContain('token');
+    const challengeKeys = Object.keys(
+      challenged?.properties as Record<string, unknown>
+    );
+    expect(challengeKeys).toEqual(
+      expect.arrayContaining([
+        'twoFactorRedirect',
+        'twoFactorMethods',
+        'twoFactorOptions',
+        'defaultMethod',
+      ])
     );
 
     const components = (document as { components: Record<string, unknown> })
@@ -856,10 +897,17 @@ describe('the Better Auth surface, per endpoint', () => {
     const response = responses['200'] as Record<string, unknown>;
     const content = response.content as Record<string, unknown>;
     const json = content['application/json'] as Record<string, unknown>;
-    const schema = json.schema as Record<string, unknown>;
-    expect(Object.keys(schema.properties as Record<string, unknown>)).toEqual(
-      expect.arrayContaining(['success', 'message', 'data'])
-    );
+    // The same union as `/sign-in/email`: this endpoint issues the same
+    // challenge, which the plugin's own hook never would.
+    const schema = json.schema as { anyOf?: Record<string, unknown>[] };
+    expect(schema.anyOf).toHaveLength(2);
+    const [completed, challenged] = schema.anyOf ?? [];
+    expect(
+      Object.keys(completed?.properties as Record<string, unknown>)
+    ).toEqual(expect.arrayContaining(['success', 'message', 'data']));
+    expect(
+      Object.keys(challenged?.properties as Record<string, unknown>)
+    ).toContain('twoFactorRedirect');
   });
 
   test('betterAuthServes answers on the method, not only the path', () => {
@@ -1251,6 +1299,252 @@ describe('the statuses each Better Auth operation declares', () => {
    * `/get-session` is the one that has to differ: an absent session is a 200
    * carrying `null`, and Better Auth's origin check does not run on a GET.
    */
+  /**
+   * The two-factor and passkey surface, probed the same way and written out
+   * INDEPENDENTLY of `BETTER_AUTH_PATH_STATUSES`.
+   *
+   * Deriving these from the production table was tried and rejected: it would
+   * make this test assert that one list equals itself, and a path added to the
+   * allow-list with a guessed status set would pass. Two lists written from the
+   * same measurement, which must agree, is the whole mechanism.
+   *
+   * Three statuses repeat and are worth naming once. 401: no session where one
+   * is required, no challenge where one is, or a refused password. 403: Better
+   * Auth's origin check, which engages on any request carrying a COOKIE, so a
+   * session-bearing call without an `origin` header never reaches the handler —
+   * absent from the GET paths, where that check is skipped. 422: the generic
+   * over-length `password` guard.
+   */
+  const TWO_FACTOR_MEASURED: Record<string, readonly string[]> = {
+    '/two-factor/disable': [
+      '200',
+      '404',
+      '429',
+      '500',
+      '503',
+      '401',
+      '403',
+      '422',
+    ],
+    '/two-factor/get-totp-uri': [
+      '200',
+      '404',
+      '429',
+      '500',
+      '503',
+      '401',
+      '403',
+      '422',
+    ],
+    '/two-factor/totp/start': [
+      '200',
+      '404',
+      '429',
+      '500',
+      '503',
+      '401',
+      '403',
+      '409',
+      '422',
+    ],
+    '/two-factor/totp/confirm': [
+      '200',
+      '404',
+      '429',
+      '500',
+      '503',
+      '400',
+      '401',
+      '403',
+      '409',
+      '422',
+    ],
+    '/two-factor/verify-totp': [
+      '200',
+      '404',
+      '429',
+      '500',
+      '503',
+      '400',
+      '403',
+      '422',
+    ],
+    '/two-factor/generate-backup-codes': [
+      '200',
+      '404',
+      '429',
+      '500',
+      '503',
+      '401',
+      '403',
+      '422',
+    ],
+    '/two-factor/passkey/grant': [
+      '200',
+      '404',
+      '429',
+      '500',
+      '503',
+      '401',
+      '403',
+      '422',
+    ],
+    '/two-factor/verify-backup-code': [
+      '200',
+      '404',
+      '429',
+      '500',
+      '503',
+      '400',
+      '403',
+      '422',
+    ],
+    '/two-factor/otp/send': [
+      '200',
+      '404',
+      '429',
+      '500',
+      '503',
+      '400',
+      '401',
+      '403',
+      '422',
+    ],
+    '/two-factor/otp/verify': [
+      '200',
+      '404',
+      '429',
+      '500',
+      '503',
+      '400',
+      '401',
+      '403',
+      '422',
+    ],
+    '/two-factor/passkey/options': [
+      '200',
+      '404',
+      '429',
+      '500',
+      '503',
+      '400',
+      '401',
+      '403',
+      '422',
+    ],
+    '/two-factor/passkey/verify': [
+      '200',
+      '404',
+      '429',
+      '500',
+      '503',
+      '400',
+      '401',
+      '403',
+      '422',
+    ],
+    '/two-factor/trust-device': [
+      '200',
+      '404',
+      '429',
+      '500',
+      '503',
+      '401',
+      '403',
+      '422',
+    ],
+    '/two-factor/trusted-devices': ['200', '404', '429', '500', '503', '401'],
+    '/two-factor/trusted-devices/revoke': [
+      '200',
+      '404',
+      '429',
+      '500',
+      '503',
+      '401',
+      '403',
+      '422',
+    ],
+    '/two-factor/methods': ['200', '404', '429', '500', '503', '401'],
+    // 409 is the last-method refusal; the 404 already in the base set is a
+    // method the caller has not enrolled.
+    '/two-factor/methods/disable': [
+      '200',
+      '404',
+      '429',
+      '500',
+      '503',
+      '401',
+      '403',
+      '409',
+      '422',
+    ],
+    '/two-factor/methods/default': [
+      '200',
+      '404',
+      '429',
+      '500',
+      '503',
+      '401',
+      '403',
+      '422',
+    ],
+    '/two-factor/backup-codes/acknowledge': [
+      '200',
+      '404',
+      '429',
+      '500',
+      '503',
+      '401',
+      '403',
+      '422',
+    ],
+    '/passkey/generate-register-options': [
+      '200',
+      '404',
+      '429',
+      '500',
+      '503',
+      '401',
+    ],
+    '/passkey/verify-registration': [
+      '200',
+      '404',
+      '429',
+      '500',
+      '503',
+      '400',
+      '401',
+      '403',
+      '422',
+    ],
+    '/passkey/list-user-passkeys': ['200', '404', '429', '500', '503', '401'],
+    // Ours now, not the plugin's: 404 for a passkey that is not the caller's,
+    // 409 for the last-method refusal.
+    '/passkey/delete-passkey': [
+      '200',
+      '404',
+      '429',
+      '500',
+      '503',
+      '400',
+      '401',
+      '403',
+      '409',
+      '422',
+    ],
+    '/passkey/update-passkey': [
+      '200',
+      '404',
+      '429',
+      '500',
+      '503',
+      '400',
+      '401',
+      '403',
+      '422',
+    ],
+  };
+
   const MEASURED: Record<string, readonly string[]> = {
     '/get-session': ['200', '404', '429', '500', '503'],
     '/sign-out': ['200', '400', '403', '404', '429', '500', '503'],
@@ -1276,6 +1570,7 @@ describe('the statuses each Better Auth operation declares', () => {
       '500',
       '503',
     ],
+    ...TWO_FACTOR_MEASURED,
   };
 
   test('every allowlisted path declares exactly what was measured on it', () => {

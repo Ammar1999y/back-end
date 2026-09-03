@@ -59,7 +59,8 @@ type PasswordProofPurpose =
   | 'sign_in'
   | 'reauth_change_password'
   | 'reauth_change_email'
-  | 'reauth_change_phone';
+  | 'reauth_change_phone'
+  | 'reauth_two_factor';
 
 interface VerifyAttemptBase {
   password: string;
@@ -104,6 +105,14 @@ export interface VerifiedPasswordProof {
   readonly expectedHash: string;
 }
 
+/**
+ * Every stored hash the just-verified password may be checked against by a later
+ * reader of the account row in this same request: two entries whenever a pepper
+ * upgrade replaced the hash after the verification committed, since a reader can
+ * legitimately see either. Oldest first, so `[0]` is the hash that was verified.
+ */
+export type AcceptedPasswordHashes = readonly [string, ...string[]];
+
 type RejectedOutcome =
   'reject_unknown_or_inactive' | 'reject_locked' | 'reject_bad_password';
 
@@ -134,19 +143,19 @@ type AttemptResult =
  * commits so the failed-attempt increment and lockout audit persist
  * (a throw inside withTransaction would roll the writes back).
  *
- * Returns true on successful verification and throws LoginRejected on any
- * credential rejection. The explicit proof mode returns a compare-and-swap
- * proof instead and suppresses the automatic hash upgrade.
+ * Returns the hashes the verified password is now valid against, and throws
+ * LoginRejected on any credential rejection. The explicit proof mode returns a
+ * compare-and-swap proof instead and suppresses the automatic hash upgrade.
  */
 export function verifyLoginAttempt(
   options: VerifyAttemptOptions & { returnPasswordProof: true }
 ): Promise<VerifiedPasswordProof>;
 export function verifyLoginAttempt(
   options: VerifyAttemptOptions & { returnPasswordProof?: false }
-): Promise<true>;
+): Promise<AcceptedPasswordHashes>;
 export async function verifyLoginAttempt(
   options: VerifyAttemptOptions
-): Promise<true | VerifiedPasswordProof> {
+): Promise<AcceptedPasswordHashes | VerifiedPasswordProof> {
   const {
     password,
     email,
@@ -377,13 +386,38 @@ export async function verifyLoginAttempt(
   if (result.outcome === 'success') {
     if (returnPasswordProof) return result.passwordProof;
 
+    const verifiedHash = result.passwordProof.expectedHash;
+
     if (!externalTx && result.passwordUpgrade) {
       try {
-        await upgradePasswordHash({
+        const upgradedHash = await upgradePasswordHash({
           password,
           upgrade: result.passwordUpgrade,
           auditMeta,
         });
+        // Only when the compare-and-swap landed: a lost CAS means a concurrent
+        // writer replaced the row with a hash that is neither of these.
+        if (upgradedHash) return [verifiedHash, upgradedHash];
+
+        // ⚠️ The proof now carries a hash the row no longer holds, so
+        // `password.verify` rejects a CORRECT password and this login answers
+        // 401. That is ACCEPTED, and the obvious repair is worse than the
+        // defect: re-reading the row and minting the proof from the stored hash
+        // would accept whatever the concurrent writer put there — and that
+        // writer may have been a password CHANGE, which turns a narrow 401 into
+        // the old password minting a session. Verifying the re-read hash against
+        // the plaintext still in scope would be correct and is not worth the
+        // complexity for a race that needs two concurrent logins during a pepper
+        // rotation. Logged so it is diagnosable rather than mysterious.
+        console.error(
+          JSON.stringify({
+            msg: 'auth.passwordHashUpgrade raceLost',
+            effect:
+              'this login answers 401 on a correct password; a retry succeeds',
+            previousPepperId: result.passwordUpgrade.previousPepperId,
+            activePepperId: result.passwordUpgrade.activePepperId,
+          })
+        );
       } catch (error) {
         // Structured, like every other log call in this codebase: a
         // two-argument `console.error` emits two values, and the second never
@@ -397,7 +431,7 @@ export async function verifyLoginAttempt(
         );
       }
     }
-    return true;
+    return [verifiedHash];
   }
 
   // Any branch that did not verify a PHC hash pays the active Argon2 cost after
@@ -408,6 +442,10 @@ export async function verifyLoginAttempt(
   throw new LoginRejected();
 }
 
+/**
+ * The hash it stored, or `null` when the compare-and-swap found the row already
+ * changed — the caller needs the distinction to build `AcceptedPasswordHashes`.
+ */
 async function upgradePasswordHash({
   password,
   upgrade,
@@ -416,10 +454,10 @@ async function upgradePasswordHash({
   password: string;
   upgrade: PendingPasswordUpgrade;
   auditMeta?: AuditMeta;
-}): Promise<void> {
+}): Promise<string | null> {
   const upgradedHash = await hashPassword(password);
 
-  await withTransaction(async (tx) => {
+  return withTransaction(async (tx) => {
     const [updated] = await tx
       .update(accounts)
       .set({ password: upgradedHash })
@@ -431,7 +469,7 @@ async function upgradePasswordHash({
       )
       .returning({ id: accounts.id });
 
-    if (!updated) return;
+    if (!updated) return null;
 
     await auditLog(tx, {
       userId: upgrade.userId,
@@ -450,6 +488,8 @@ async function upgradePasswordHash({
       safeFields: ['passwordPepperId'],
       meta: auditMeta ?? PASSWORD_UPGRADE_AUDIT_META,
     });
+
+    return upgradedHash;
   });
 }
 

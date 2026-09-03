@@ -124,7 +124,15 @@ export const otpContactKind = (channel: OtpChannel): OtpContactKind =>
 
 /** Independent send budgets so one surface can't starve another. */
 export type OtpSendSurface =
-  'verify_contact' | 'recovery' | 'passwordless' | 'contact_change';
+  | 'verify_contact'
+  | 'recovery'
+  | 'passwordless'
+  | 'contact_change'
+  | 'two_factor'
+  // The second factor asked for DURING a password reset. Its own budget on
+  // purpose: it is the only channel a locked-out user has left, so a shared one
+  // would let the anonymous contact-verification surface exhaust it for them.
+  | 'recovery_second_factor';
 
 /** Aggregate outbound send ATTEMPTS per contact kind per day. */
 const OTP_GLOBAL_SEND_CAP_PER_DAY = 2000;
@@ -196,15 +204,17 @@ export async function enforceOtpGlobalSendBudget(opts: {
 /**
  * Verify-side quota against one destination.
  *
- * **Recovery gets its own key, for the reason the send side already states.**
- * One shared key across every purpose looked like the stricter design — "rotating
- * the purpose can't multiply the per-identifier attempt budget" — but it made
- * password recovery deniable for the price of ten HTTP requests: an attacker who
- * knows an address POSTs `/api/auth/otp/verify` ten times with a junk code, the
- * 10/600 s budget is spent, and for the rest of the window the victim's
- * `/api/auth/forgot-password/reset` throws 429 BEFORE the account lookup, so a
- * CORRECT recovery code cannot be redeemed. Sustained cost: one request per
- * minute per victim; one IP's 60/min covers sixty victims at once.
+ * **Every surface gets its own key, for the reason the send side already
+ * states.** One shared key across every purpose looked like the stricter design
+ * — "rotating the purpose can't multiply the per-identifier attempt budget" —
+ * but it made the security-critical surfaces deniable for the price of ten HTTP
+ * requests: an attacker who knows an address POSTs the anonymous
+ * `/api/auth/otp/verify` ten times with a junk code, the 10/600 s budget is
+ * spent, and for the rest of the window the victim's
+ * `/api/auth/forgot-password/reset` and `/two-factor/otp/verify` throw 429
+ * BEFORE reaching their own proof rows, so a CORRECT code cannot be redeemed.
+ * Sustained cost: one request per minute per victim; one IP's 60/min covers
+ * sixty victims at once.
  *
  * Splitting it costs nothing in brute-force resistance, because this limiter was
  * never the authority on that. The authority is the per-proof database counter
@@ -221,10 +231,7 @@ export async function enforceOtpVerifyQuota(opts: {
 }): Promise<void> {
   const kind = otpContactKind(opts.channel);
   await enforceRateLimit({
-    scope:
-      opts.surface === 'recovery'
-        ? `otp.verify.dest.recovery.${kind}`
-        : `otp.verify.dest.${kind}`,
+    scope: `otp.verify.dest.${opts.surface}.${kind}`,
     identifier: opts.identifier.toLowerCase(),
     limit: OTP_DESTINATION_VERIFY_CAP,
     window: OTP_DESTINATION_VERIFY_WINDOW_S,

@@ -6,6 +6,7 @@ import type {
 
 import { validID } from '@/utils';
 import { auth } from '@/lib/auth';
+import { hasAdminReauth } from '@/lib/auth/admin-reauth';
 import { assertLiveSession } from '@/lib/auth/live-session';
 import {
   checkMultiplePermissions,
@@ -17,6 +18,8 @@ import {
   HTTP_STATUS,
   MSG_INSUFFICIENT_PERMISSIONS,
   MSG_LOGIN_REQUIRED,
+  MSG_REAUTH_REQUIRED,
+  REAUTH_REQUIRED_CODE,
 } from '@/utils/api-messages';
 import { CustomError } from '@/utils/error-class';
 
@@ -25,22 +28,48 @@ import { CustomError } from '@/utils/error-class';
  * `HandlerInput`. Delegates to `checkUserPermission` — same return shape,
  * just a thinner call site for handlers.
  */
-export function requirePermission(
+export async function requirePermission(
   ctx: HandlerInput,
   opts: {
     resource: DashboardPage;
     action: PermissionAction;
     forceDB?: boolean;
     throwError?: boolean;
+    /**
+     * ⚠️ The `D12` class: an action that lowers ANOTHER account's security
+     * posture. A permission grant says the actor may do it; this says the
+     * person at the keyboard is still that actor. Set it on the whole class or
+     * on none of it — the failure it exists to stop was the most dangerous
+     * action in the family (`resetTwoFactor`) sitting behind nothing while
+     * `users/me/change-password` re-authenticated for far less.
+     *
+     * A short WINDOW, minted by `POST /api/dash/auth/reauth`, so a batch does
+     * not prompt per row.
+     */
+    reauth?: boolean;
   }
 ) {
-  return checkUserPermission({
+  const result = await checkUserPermission({
     headers: ctx.headers,
     resource: opts.resource,
     action: opts.action,
     forceDB: opts.forceDB,
     throwError: opts.throwError,
   });
+
+  // AFTER the permission check, so a caller with no grant learns nothing about
+  // whether a proof would have helped.
+  if (opts.reauth && result.userId && result.sessionId) {
+    const proven = await hasAdminReauth(result.sessionId, result.userId);
+    if (!proven)
+      throw new CustomError(
+        MSG_REAUTH_REQUIRED,
+        HTTP_STATUS.UNAUTHORIZED,
+        REAUTH_REQUIRED_CODE
+      );
+  }
+
+  return result;
 }
 
 /**

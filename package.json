@@ -10,7 +10,7 @@
     "test": "bun tests/helpers/run.ts unit",
     "test:integration": "bun tests/helpers/run.ts integration",
     "test:process": "bun tests/helpers/run.ts process",
-    "test:all": "bun tests/helpers/run.ts unit && bun tests/helpers/run.ts integration && bun tests/helpers/run.ts process",
+    "test:all": "bun tests/helpers/run.ts unit && bun tests/helpers/run.ts integration && bun tests/helpers/run.ts process && bun tests/helpers/run.ts matrix",
     "test:db:reset": "bun tests/helpers/reset.ts",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
@@ -28,7 +28,9 @@
     "db:migrate": "bun scripts/migrate.ts",
     "smoke": "bun scripts/smoke.ts",
     "check:runtime": "bun scripts/require-bun.mjs",
-    "preflight:credentials": "bun scripts/check-password-peppers.ts"
+    "preflight:credentials": "bun scripts/check-password-peppers.ts",
+    "preflight:two-factor": "bun scripts/check-two-factor-rollout.ts",
+    "test:matrix": "bun tests/helpers/run.ts matrix"
   },
   "packageManager": "bun@1.4.0",
   "engines": {
@@ -42,10 +44,13 @@
   "dependencies": {
     "@aws-sdk/client-s3": "^3",
     "@aws-sdk/s3-request-presigner": "^3",
+    "@better-auth/passkey": "1.7.2",
+    "@better-auth/utils": "0.4.2",
     "@better-fetch/fetch": "^1.3",
     "@elysia/cors": "^1.4",
+    "@simplewebauthn/server": "^13.3.3",
     "argon2": "^0.45",
-    "better-auth": "^1.7",
+    "better-auth": "^1.7.2",
     "blurhash": "^2",
     "drizzle-orm": "^0.45",
     "elysia": "^1.4",
@@ -56,6 +61,7 @@
     "zod": "^4.5.2"
   },
   "devDependencies": {
+    "@better-auth/core": "1.7.2",
     "@eslint/eslintrc": "^3",
     "@ianvs/prettier-plugin-sort-imports": "^4.7",
     "@types/bun": "^1.4.0",

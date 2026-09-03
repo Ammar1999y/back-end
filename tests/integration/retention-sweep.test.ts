@@ -42,8 +42,10 @@ import {
   auditLogs,
   files,
   sessions,
+  trustedDevices,
   users,
   verificationCodes,
+  verifications,
   verificationSessions,
 } from '@/db/schema';
 import { startSchedule } from '@/lib/schedule';
@@ -72,6 +74,14 @@ const KEY = {
   permanent: 'perm/sweep-permanent.webp',
   /** A SECOND expired temporary file, for the partial-failure pass only. */
   siblingPastTtl: 'temp/sweep-past-ttl-sibling.webp',
+} as const;
+
+/** Both new sweeps cut on `expires_at` against `now()`, with no grace window. */
+const IDENTIFIER = {
+  expiredChallenge: '2fa-sweep-expired-challenge',
+  liveChallenge: '2fa-sweep-live-challenge',
+  expiredDevice: 'trust-device-sweep-expired',
+  liveDevice: 'trust-device-sweep-live',
 } as const;
 
 /**
@@ -144,6 +154,24 @@ async function proofExists(id: string): Promise<boolean> {
     .from(verificationSessions)
     .where(eq(verificationSessions.id, id));
   return rows.length === 1;
+}
+
+/**
+ * The identifiers still present in one of the two tables keyed by one.
+ *
+ * Both columns are named differently by design — `verifications.identifier` is
+ * Better Auth's, `trusted_devices.trust_identifier` is ours — so the table
+ * supplies its own column rather than the caller naming it twice.
+ */
+async function survivingIdentifiers(
+  table: typeof verifications | typeof trustedDevices
+): Promise<string[]> {
+  const column =
+    table === verifications
+      ? verifications.identifier
+      : trustedDevices.trustIdentifier;
+  const rows = await db.select({ identifier: column }).from(table);
+  return rows.map((row) => row.identifier).toSorted(byText);
 }
 
 async function codeCount(sessionId: string): Promise<number> {
@@ -315,6 +343,39 @@ describe('a pass with a healthy object store', () => {
       },
     ]);
 
+    // Both new sweeps filter on `expires_at` alone, so their "stays" partner is
+    // a row a minute the other side of now — the margin an inverted comparison
+    // or a missing sign has to cross.
+    await db.insert(verifications).values([
+      // GOES: a 2FA challenge nobody completed.
+      {
+        identifier: IDENTIFIER.expiredChallenge,
+        value: userId,
+        expiresAt: sql`now() - interval '1 minute'`,
+      },
+      // STAYS: a challenge still in flight.
+      {
+        identifier: IDENTIFIER.liveChallenge,
+        value: userId,
+        expiresAt: sql`now() + interval '9 minutes'`,
+      },
+    ]);
+
+    await db.insert(trustedDevices).values([
+      // GOES: past `trustDeviceMaxAge`; it already grants no skip.
+      {
+        userId,
+        trustIdentifier: IDENTIFIER.expiredDevice,
+        expiresAt: sql`now() - interval '1 minute'`,
+      },
+      // STAYS: a device the user would expect to still see listed.
+      {
+        userId,
+        trustIdentifier: IDENTIFIER.liveDevice,
+        expiresAt: sql`now() + interval '29 days'`,
+      },
+    ]);
+
     // `db/maintenance.ts` names two tables it deliberately skips. Ancient, so
     // "nothing qualified" cannot be the reason it survives.
     await db.insert(auditLogs).values({
@@ -340,6 +401,8 @@ describe('a pass with a healthy object store', () => {
       sessions: { removed: 1, hasMore: false },
       verificationSessions: { removed: 2, hasMore: false },
       verificationCodes: { removed: 1, hasMore: false },
+      verifications: { removed: 1, hasMore: false },
+      trustedDevices: { removed: 1, hasMore: false },
       tempFiles: { removed: 1, hasMore: false, degraded: false },
     });
     // The "stays" partner of the backlog signal asserted under a failing R2
@@ -370,6 +433,18 @@ describe('a pass with a healthy object store', () => {
   test('an expired code is removed without taking its still-live session', async () => {
     expect(await codeCount(proofs.freshWithExpiredCode)).toBe(0);
     expect(await proofExists(proofs.freshWithExpiredCode)).toBe(true);
+  });
+
+  test('an expired 2FA challenge is removed; one still in flight stays', async () => {
+    expect(await survivingIdentifiers(verifications)).toEqual([
+      IDENTIFIER.liveChallenge,
+    ]);
+  });
+
+  test('an expired trusted device is removed; a live one stays listed', async () => {
+    expect(await survivingIdentifiers(trustedDevices)).toEqual([
+      IDENTIFIER.liveDevice,
+    ]);
   });
 
   test('the temp file past its TTL loses its object and then its row; the recent, near-boundary and non-temporary rows keep both', async () => {

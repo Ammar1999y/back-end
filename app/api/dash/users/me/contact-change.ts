@@ -9,6 +9,10 @@ import { sanitizeForLog } from '@/utils';
 import { auditLog, getAuditMeta } from '@/lib/audit';
 import { auth } from '@/lib/auth';
 import { revokeOtherSessions, revokePendingProofs } from '@/lib/auth/rotation';
+import {
+  contactChangeStrandsTwoFactor,
+  removeMethodIntent,
+} from '@/lib/auth/two-factor-challenge';
 import { parseSetCookieHeaders } from '@/lib/http/contract';
 
 import {
@@ -19,7 +23,41 @@ import {
 import { CustomError } from '@/utils/error-class';
 import { markContactVerified } from '@/utils/otp';
 
+import { twoFactorMsg } from '../../../auth/otp/messages';
+
 type AuditMeta = ReturnType<typeof getAuditMeta>;
+
+/**
+ * The second-factor half of a contact change, at the boundary BOTH commits pass
+ * through.
+ *
+ * ⚠️ Three rules, and the first is the one that turns this into the bug it
+ * repairs if it is missed.
+ *
+ *  1. `two_factor_enabled` is never touched. Invalidating the dependent `otp`
+ *     enrolment can leave a user enabled with an empty offered set, and the
+ *     obvious tidy-up is to clear the flag — which makes an ordinary contact
+ *     edit a 2FA disarm.
+ *  2. The change is REFUSED when it would remove the last usable factor, which
+ *     is what keeps rule 1 from stranding anyone. The route out is the
+ *     administrative reset, with the permission and the audit trail that carries.
+ *  3. Otherwise the change is accepted and the OTP enrolment bound to the OLD
+ *     contact is invalidated. Without this the factor silently follows the
+ *     address: the commit flips the NEW contact's verified flag, and the stale
+ *     enrolment re-arms at a destination the user never chose as a second factor.
+ */
+async function detachTwoFactorFromContact(
+  tx: Tx,
+  userId: EntityID,
+  contactKind: 'email' | 'phone'
+): Promise<void> {
+  if (await contactChangeStrandsTwoFactor(userId, [contactKind], tx))
+    throw new CustomError(
+      twoFactorMsg.contactChangeStrands,
+      HTTP_STATUS.CONFLICT
+    );
+  await removeMethodIntent(tx, userId, 'otp', contactKind);
+}
 
 /**
  * Refresh the cookie-cached session after an identity field (email) changed so
@@ -124,6 +162,8 @@ export async function commitEmailChange({
     return;
   }
 
+  await detachTwoFactorFromContact(tx, userId, 'email');
+
   await tx
     .update(users)
     .set({ email: newEmail, emailVerified: true })
@@ -195,6 +235,8 @@ export async function commitPhoneChange({
     });
     return;
   }
+
+  await detachTwoFactorFromContact(tx, userId, 'phone');
 
   await tx
     .update(users)
