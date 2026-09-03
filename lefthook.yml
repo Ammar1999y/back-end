@@ -62,11 +62,18 @@ pre-push: &full_verify
           - name: runtime
             run: bun scripts/require-bun.mjs
             fail_text: 'wrong package manager, an outdated Bun, or a foreign lockfile'
+          # The whole `find:unused-files` script, not just its first half: the
+          # `bunx knip` behind the `&&` is what checks dependencies, exports and
+          # types, and running only the scanner here let an unlisted dependency
+          # reach CI. Whatever CI runs under this name, this gate runs too.
           - name: routes
-            run: bun scripts/find-unused-files.ts
+            run: bun run find:unused-files
             fail_text:
-              'unreachable file, or a handler no routes.ts entry routes (see the
-              comment in scripts/find-unused-files.ts)'
+              'unreachable file, a handler no routes.ts entry routes (see the
+              comment in scripts/find-unused-files.ts), or a knip finding'
+          - name: dedupe
+            run: bun dedupe --check
+            fail_text: 'a dependency resolves to more than one version'
           - name: secrets
             run: mise exec -- gitleaks git . --redact --verbose --no-banner
             fail_text: 'leaked secret, or tools not installed (mise install)'

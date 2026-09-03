@@ -55,6 +55,13 @@
     // Optional dependencies used only by manually run benchmarks.
     "sharp",
     "uuid",
+    // `bench/sqlite/better-sqlite3` carries its own package.json and lockfile
+    // and is installed by hand with npm, never by the root `bun install`. On a
+    // machine that has run that benchmark the import resolves through the
+    // nested `node_modules` and knip stays quiet; on a clean checkout — CI —
+    // it does not, and knip attributes it to the ROOT package.json. Listing it
+    // here is what makes the two agree.
+    "better-sqlite3",
   ],
   // `mise` is invoked by the `scan:*` scripts and installed by `mise.toml`
   // rather than by `bun install`, so it is deliberately not a dependency.
