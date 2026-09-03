@@ -238,4 +238,7 @@ jobs:
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
       - run: bun install --frozen-lockfile
       - name: Dependency audit
-        run: bun audit
+        # `scripts/audit.ts`, not `bun audit`: it retries a registry 5xx and
+        # passes a real advisory straight through. Same command as the pre-push
+        # gate.
+        run: bun run audit

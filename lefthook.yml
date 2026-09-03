@@ -53,7 +53,10 @@ pre-push: &full_verify
           - name: format
             run: bunx prettier --check .
           - name: audit
-            run: bun audit
+            run: bun run audit
+            fail_text:
+              'a vulnerable dependency, or the advisories registry is down (the
+              script retries a 5xx three times before giving up)'
           # The half of the Bun-only guard that a skipped `preinstall` cannot
           # hide. `--ignore-scripts` (flag, bunfig, or .npmrc) silences the
           # preinstall hook silently, so a foreign lockfile can reach the tree

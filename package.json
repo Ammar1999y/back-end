@@ -14,7 +14,7 @@
     "test:db:reset": "bun tests/helpers/reset.ts",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
-    "audit": "bun audit",
+    "audit": "bun scripts/audit.ts",
     "find:unused-files": "bun scripts/find-unused-files.ts && bunx knip",
     "find:non-null": "bun scripts/find-non-null-assertions.ts",
     "check:coverage": "bun scripts/check-coverage.ts",
