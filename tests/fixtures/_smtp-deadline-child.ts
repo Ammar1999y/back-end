@@ -201,10 +201,12 @@ async function selfSignedCertificate(): Promise<{ cert: string; key: string }> {
   };
 }
 
+const loopbackCertificate = await selfSignedCertificate();
+
 const secure = Bun.listen<Peer>({
   hostname: '127.0.0.1',
   port: 0,
-  tls: await selfSignedCertificate(),
+  tls: loopbackCertificate,
   socket: smtpHandlers,
 });
 
@@ -227,8 +229,12 @@ async function drive(mode: Mode, port: number, tls: boolean): Promise<void> {
         host: '127.0.0.1',
         port,
         secure: tls,
-        // Self-signed loopback certificate; production leaves this unset.
-        ...(tls && { tls: { rejectUnauthorized: false } }),
+        // The peer's own certificate as the trust root, rather than disabling
+        // verification: the deadline is what this fixture measures, and a
+        // handshake that skips validation is not the handshake production runs.
+        // Its SAN is the loopback IP, so the identity check passes. Production
+        // leaves this unset and uses the system roots.
+        ...(tls && { tls: { ca: loopbackCertificate.cert } }),
         auth: { user: 'probe', pass: 'probe' },
         connectionTimeout: PHASE_TIMEOUT_MS,
         greetingTimeout: PHASE_TIMEOUT_MS,

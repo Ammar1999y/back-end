@@ -2,7 +2,7 @@
 
 Status: plan, no production code yet. v3 incorporates the owner's answers of 2026-09-04 (both public and private files; same-origin UI; Arabic messages; documents in the first release; freedom to spike) and one repository invariant v2 violated (section 6.0). Section 12 records review dispositions; section 13 records what was measured in the spike.
 
-Backend: this repository (Bun + Elysia, route table in `routes.ts`). UI: `../soft-house-dash-2` (Next 16 pages router, TanStack Query + Table, Radix, dnd-kit, react-dropzone, zustand, sonner), served from the same origin as the API.
+Backend: this repository (Bun + Elysia, route table in `routes.ts`). UI: `../soft-house-dash-4` (Next 16 pages router, TanStack Query + Table, Radix, dnd-kit, react-dropzone, zustand, sonner), served from the same origin as the API.
 
 **measured** = verified against the real public bucket (2026-09-03/04, throwaway prefixes, deleted) or against the harness PostgreSQL (2026-09-04, scratch tables, spike file deleted — section 13). **unverified** = a claim I could not test.
 
