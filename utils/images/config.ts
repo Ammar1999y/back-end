@@ -25,10 +25,6 @@ export const svgoConfig: Config = {
   ],
 } as const;
 
-// ─────────────────────────────────────────────────────────────────────────────
-// SVG Sanitizer Config
-// ─────────────────────────────────────────────────────────────────────────────
-
 export type SanitizeResult =
   | {
       isValid: true;

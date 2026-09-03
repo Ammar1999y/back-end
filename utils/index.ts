@@ -27,7 +27,6 @@ export const humanReadableNumber = (
     maximumFractionDigits: numberOfDigits,
   });
 
-// ---- Log serialization ----------------------------------------------
 // Diagnostic call sites pass structured objects (`{ msg, attempt, error }`).
 // `String(obj)` would collapse those to "[object Object]" and destroy the
 // context incident response needs, so they are serialized field by field with

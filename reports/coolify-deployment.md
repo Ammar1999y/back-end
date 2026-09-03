@@ -304,7 +304,8 @@ Two things the operator must know about it:
   "idleTimeoutSeconds": 60,
   "maxRouteTimeoutSeconds": 120,
   "maxRequestBodyBytes": 8388608,
-  "shutdownTimeoutMs": 135000
+  "shutdownTimeoutMs": 135000,
+  "gracefulStopMs": 5000
 }
 ```
 
@@ -496,12 +497,15 @@ backend PID, advisory transaction locks, `FOR UPDATE`/`FOR SHARE`, `RETURNING`,
 savepoints, the `pg_trgm` indexes, and the pool close. **Not verified against
 Coolify.**
 
-**a. `DATABASE_URL` is not proven at boot.** Bun opens the pool lazily, on the
-first query (an unreachable host constructs in ~1 ms). So a wrong or unreachable
-value is **not** a startup rejection and **not** a health-check failure —
-`/api/health/storage` reads SQLite only. It is a 500 on the first request that
-queries PostgreSQL. Verify explicitly during first deploy (§8), and treat
-"container healthy" as saying nothing about the database.
+**a. `DATABASE_URL` is not proven at boot, but it is proven by the health
+check.** Bun opens the pool lazily, on the first query (an unreachable host
+constructs in ~1 ms), so a wrong or unreachable value is **not** a startup
+rejection — the container starts. It IS a health-check failure:
+`/api/health/storage` runs a bounded `SELECT 1` on every poll and reports it as
+`checks.postgres` (§7), so the orchestrator marks the container unhealthy within
+the health check's retries rather than routing traffic to it. Verify explicitly
+during first deploy (§8) all the same; a healthy body says the database
+answered, not that the schema matches.
 
 **b. Put `sslmode` in the URL.** Bun honours `PGSSLMODE`, but `?sslmode=` in the
 URL wins, so the environment cannot move it. `require` against a server without
@@ -510,8 +514,9 @@ Docker network: decide deliberately. Remote: `require` or stricter.
 
 **c. Pool size against `max_connections`.** `MAX_POOL_CONNECTIONS` in
 `db/index.ts` is 10. That is the number of concurrent **transactions**, not a
-throughput knob — `withTransaction` reserves a connection for the whole block,
-and `processOtpSend` holds one across the provider HTTP call (`TODO.md` §2.1).
+throughput knob — `withTransaction` reserves a connection for the whole block.
+`processOtpSend` commits before it calls the provider, so delivery latency holds
+no connection; a failed delivery opens a short refund transaction afterwards.
 Callers beyond 10 queue, then fail on Bun's 30 s `connectionTimeout`. Confirm
 the server's `max_connections` leaves headroom for a migration run and a `psql`
 session on top of the app's 10.
@@ -926,32 +931,85 @@ On signal:
 1. logs `{"msg":"server stopping","signal":"SIGTERM"}`
 2. `app.stop()` — **drains** in-flight requests rather than aborting them
    (measured: a request 300 ms into a 2 s handler completed with 200, and
-   `stop()` resolved only afterwards)
-3. waits up to 10 s for queued post-response work
-   (`lib/http/after-response.ts`)
-4. closes PostgreSQL first, then the SQLite stores this process actually opened
-5. logs `{"msg":"server stopped",…}` and exits 0
+   `stop()` resolved only afterwards); a connection that sent half a request
+   holds this open, so after the `SHUTDOWN_POLICY.gracefulStopMs` grace (policy
+   table below) it escalates to `app.stop(true)`. A stop that REJECTS does not
+   abort the sequence: `Bun.Server.stop()` closes the listening socket when it
+   is called, not when its promise settles (measured on Bun 1.4.0 — a connection
+   attempted while the promise was still pending was refused), so the drains and
+   the store close still run; the failure is logged and forces exit **1**
+3. waits for a running scheduled sweep to reach its next batch boundary
+   (`lib/schedule.ts`), for as long as the shutdown budget allows
+4. waits for queued post-response work (`lib/http/after-response.ts`), again
+   for the remainder of the budget. There is no fixed per-queue slice and no
+   reserved tail: both drains share the one deadline, `shutdownTimeoutMs`. The
+   contract is exactly this — the stop is clean when both drains have
+   **positively reported** quiescence and the stores have closed before that
+   deadline; anything unproven at the deadline is reported and the exit is 1.
+   "Positively reported" is the drain's own proof, not the moment the work ended:
+   the post-response queue has to observe itself empty for
+   `AFTER_RESPONSE_SETTLE_MS` before it says so, so work that ends inside that
+   last interval is still a forced exit. Every anonymous OTP send enqueues its
+   provider call here (5 s deadline, then a refund transaction on failure), so
+   this queue is never empty on a busy deploy.
+5. **only if both drains reported empty**: closes PostgreSQL first, then the
+   SQLite stores this process actually opened, logs
+   `{"msg":"server stopped",…}` and exits with the highest code any caller asked
+   for — **0** for a signal, **1** if an escaped fault arrived at any point,
+   including during the drain, or if a phase failed. Every store close is
+   attempted even when an earlier one throws; the failures are then raised
+   together (`{"msg":"store close failed","store":…}` per store, then
+   `{"msg":"stores did not close cleanly",…}`) and the exit is **1** — a store
+   the process could not close is not a clean stop
+6. **otherwise**: logs `{"msg":"stores left open for forced exit",…}`, leaves
+   every store open, and lets the forced-exit timer end the process at
+   `shutdownTimeoutMs` with exit **1**. Deliberate: a sweep or a delivery that
+   is still running may still touch a store, and closing underneath it produced
+   `Statement has finalized` and refunds opening transactions on a closed pool.
+   Exit 1 is the honest report of an unclean stop.
 
 **Set Coolify's stop grace period longer than the `shutdownTimeoutMs` in the
 startup log — currently 135 s.** A shorter grace period means the orchestrator
 kills the container mid-drain and the drain buys nothing.
 
-The bound is **derived**:
-`(max(IDLE_TIMEOUT_SECONDS, MAX_ROUTE_TIMEOUT_SECONDS) + 15) * 1000`. Both terms
-matter — a route without its own `timeoutSeconds` may still run for the 60 s
+The bound is **derived** by `shutdownTimeoutMs()` in `lib/shutdown.ts`:
+`(max(IDLE_TIMEOUT_SECONDS, MAX_ROUTE_TIMEOUT_SECONDS) + SHUTDOWN_POLICY.headroomSeconds) * 1000`.
+Both terms matter — a route without its own `timeoutSeconds` may still run for the 60 s
 global ceiling. **If a 135 s deploy window is unacceptable, the lever is the
 route ceilings, not the bound.** Lowering the bound directly reintroduces the
 abort. Note that ONE route sits at 120 s (`/api/upload/image`), and below 75 s
 the 60 s global ceiling becomes binding — meaning `IDLE_TIMEOUT_SECONDS` too. Both
-depend on the VPS measurement in `TODO.md` EM-1. The test suite asserts the
-formula rather than the number, so changing a route ceiling will not silently
-invalidate it — but re-read `shutdownTimeoutMs` from the startup log afterwards.
+depend on the VPS measurement in `TODO.md` EM-1. `lib/shutdown.ts` owns the
+formula and `tests/unit/shutdown-coordinator.test.ts` asserts it, so changing a
+route ceiling will not silently invalidate it — but re-read `shutdownTimeoutMs`
+from the startup log afterwards.
 
-A drain that times out logs `after-response drain timed out` and still **exits
-0** — `app.stop()` has already resolved, so every request completed and only
-post-response work (today, access-log lines) was abandoned. Exiting non-zero
-would make a routine deploy look like a crash. Revisit if real post-response
-work is ever added; nothing calls `enqueueAfterResponse` yet.
+**The drift control for this section.** The coordinator itself is
+`lib/shutdown.ts`, wired by `server.ts` with the real stop, sweep, queue and
+store functions, and `tests/unit/shutdown-coordinator.test.ts` drives that same
+coordinator through the clean path, a task that finishes late but inside the
+budget, a task idle just before the deadline, a task that never finishes
+(stores left open, forced exit 1), a fault arriving mid-shutdown, a faulted
+`app.stop()`, and a store that fails to close. `tests/process/shutdown-lifecycle.test.ts` and
+`tests/process/schedule-drain.test.ts` cover the real store close and sweep
+drain, `tests/process/smtp-deadline.test.ts` and
+`tests/process/postgres-probe.test.ts` the two deadlines this section cites.
+
+The timing policy is `SHUTDOWN_POLICY` in `lib/shutdown.ts` plus the queue's
+settle proof in `lib/http/after-response.ts`; the same unit test reads this
+table AND the startup-log example above back, and fails when either disagrees
+with the code. Prose in this document names these rows rather than repeating the
+numbers, so there is no third copy:
+
+| Policy value                      | Current | Meaning                                                                 |
+| --------------------------------- | ------- | ----------------------------------------------------------------------- |
+| `SHUTDOWN_POLICY.gracefulStopMs`  | 5000    | how long `app.stop()` may wait on half-sent connections                 |
+| `SHUTDOWN_POLICY.headroomSeconds` | 15      | added to the longest request ceiling to form `shutdownTimeoutMs`        |
+| `AFTER_RESPONSE_SETTLE_MS`        | 50      | how long the post-response queue must stay empty before it reports idle |
+
+The derived budget (135 s today) depends on the route table as well, so it is
+not in the table; the startup log prints both `shutdownTimeoutMs` and
+`gracefulStopMs`, and the log is authoritative when this page disagrees.
 
 ### Two stop-phase hazards, both now closed in code
 
@@ -969,10 +1027,12 @@ will be looking for.
   the full `shutdownTimeoutMs` and exited **1** — a routine deploy reported as a
   crash, from a cause outside the application.
 
-  `server.ts` now escalates: `app.stop()` under a 5 s grace period, then
-  `app.stop(true)`. Well-behaved clients keep the drain semantics; a stalled
-  socket no longer holds the deploy. The forced-shutdown timer also closes the
-  stores before exiting, because `process.exit` does not run `finally`.
+  `server.ts` now escalates: `app.stop()` under the `SHUTDOWN_POLICY.gracefulStopMs`
+  grace, then `app.stop(true)`. Well-behaved clients keep the drain semantics; a stalled
+  socket no longer holds the deploy. A stop that faults is contained to its own
+  step, so the queue drains still run and the stores still close on a quiet
+  queue. The forced-exit timer does NOT close the stores — see step 6 above for
+  why leaving them open is the deliberate choice.
   `{"msg":"graceful stop timed out, closing active connections"}` is the tell
   that the escalation fired — informational, not a failure.
   Covered by `tests/process/shutdown-lifecycle.test.ts`.
@@ -993,7 +1053,7 @@ will be looking for.
 
 The one measured caveat that **is** handled: post-response work can still be
 queued while the drain runs, so the drain waits for the queue to be _observably
-empty for 50 ms_ rather than checking once.
+empty for `AFTER_RESPONSE_SETTLE_MS`_ (policy table above) rather than checking once.
 
 ### Rolling updates
 

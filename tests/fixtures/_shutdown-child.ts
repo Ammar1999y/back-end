@@ -4,6 +4,7 @@ import { app } from '@/app';
 import { closeDatabase } from '@/db';
 import { closeCacheStore } from '@/lib/cache';
 import { closeRateLimitStore } from '@/lib/rate-limit/store';
+import { SHUTDOWN_POLICY } from '@/lib/shutdown';
 
 app.listen({ port: 0 });
 const server = app.server;
@@ -12,7 +13,6 @@ const { port } = server;
 if (typeof port !== 'number')
   throw new Error('child listener bound no TCP port');
 
-const GRACEFUL_STOP_MS = 5000;
 const mode = process.argv[2];
 
 if (mode === 'half-sent') {
@@ -28,7 +28,7 @@ if (mode === 'half-sent') {
 const timedOut = Symbol('graceful-stop-timeout');
 const raced = await Promise.race([
   app.stop(),
-  Bun.sleep(GRACEFUL_STOP_MS).then(() => timedOut),
+  Bun.sleep(SHUTDOWN_POLICY.gracefulStopMs).then(() => timedOut),
 ]);
 if (raced === timedOut) {
   console.log(JSON.stringify({ msg: 'graceful stop timed out' }));

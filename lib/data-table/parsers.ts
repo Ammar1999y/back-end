@@ -57,8 +57,6 @@ function toKeySet(
   return columnIds instanceof Set ? columnIds : new Set(columnIds);
 }
 
-// ─── Sorting ────────────────────────────────────────────────────────
-
 interface ParsedSortItem {
   id: string;
   desc: boolean;
@@ -141,8 +139,6 @@ function parseSortingState<TData>(
 
   return items;
 }
-
-// ─── Filters ────────────────────────────────────────────────────────
 
 export interface FilterItemSchema {
   id: string;
@@ -283,8 +279,6 @@ function parseFiltersState<TData>(
 
   return items;
 }
-
-// ─── Search Params ──────────────────────────────────────────────────
 
 export const MAX_PAGE = 10_000;
 export const MAX_PER_PAGE = 100;

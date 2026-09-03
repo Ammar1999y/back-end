@@ -38,7 +38,7 @@ import { LoginRejected, verifyLoginAttempt } from './login-guard';
 const GRANT_BYTES = 24;
 
 /** Long enough for a WebAuthn ceremony a user has to walk through, and no longer. */
-export const REAUTH_GRANT_MAX_AGE_S = 600;
+const REAUTH_GRANT_MAX_AGE_S = 600;
 
 export type ReauthPurpose = 'two_factor_enrolment';
 

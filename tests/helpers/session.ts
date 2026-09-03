@@ -256,7 +256,7 @@ export async function signIn(user: SeededUser): Promise<SignedInSession> {
  * to the session so there is nothing to thread through the request: the same
  * cookie carries it afterwards.
  */
-export async function openReauthWindow(
+async function openReauthWindow(
   user: SeededUser,
   cookie: string
 ): Promise<void> {
@@ -280,9 +280,7 @@ export async function openReauthWindow(
  * Sign in AND open the re-authentication window, for a fixture that is going to
  * perform an action in the `D12` class.
  */
-export async function signInAsAdmin(
-  user: SeededUser
-): Promise<SignedInSession> {
+async function signInAsAdmin(user: SeededUser): Promise<SignedInSession> {
   const session = await signIn(user);
   await openReauthWindow(user, session.cookie);
   return session;

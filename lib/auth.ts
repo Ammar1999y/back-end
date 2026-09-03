@@ -11,7 +11,12 @@ import { users } from '@/db/schema';
 import { sanitizeForLog, validID } from '@/utils';
 import { betterAuth } from 'better-auth';
 import { drizzleAdapter } from 'better-auth/adapters/drizzle';
-import { APIError, createAuthMiddleware, isAPIError } from 'better-auth/api';
+import {
+  APIError,
+  createAuthMiddleware,
+  formCsrfMiddleware,
+  isAPIError,
+} from 'better-auth/api';
 import { captcha, openAPI } from 'better-auth/plugins';
 import { PUBLIC_ORIGIN } from '@/lib/env';
 
@@ -324,6 +329,19 @@ function rejectOverlongPassword(body: unknown): void {
   });
 }
 
+/**
+ * The paths a browser reaches with no cookie at all, where Better Auth's
+ * router-level origin check is skipped and its `formCsrfMiddleware` runs on the
+ * endpoint itself — AFTER this hook. Anything the hook does for these paths
+ * before that check runs against an unvalidated origin, so the check is run
+ * here first. Every other listed path needs a session or a challenge cookie,
+ * which the router-level check already validates.
+ */
+const FIRST_LOGIN_PATHS: ReadonlySet<string> = new Set([
+  '/sign-in/email',
+  '/passwordless/verify',
+]);
+
 /** How a session came to exist, from the endpoint that created it. */
 const SESSION_METHOD_BY_PATH: Readonly<Record<string, string>> = {
   '/sign-in/email': 'password',
@@ -507,6 +525,8 @@ export const auth = betterAuth({
           code: CUSTOM_CODE,
         });
 
+      if (FIRST_LOGIN_PATHS.has(ctx.path)) await formCsrfMiddleware(ctx);
+
       rejectOverlongPassword(ctx.body);
 
       const twoFactorContext = await enforceTwoFactorPathPolicy(ctx);
@@ -522,7 +542,9 @@ export const auth = betterAuth({
           email,
           password,
           rememberMe,
-          captcha: 'success', // captcha plugin runs before this middleware, so we can assume it's always valid here
+          // Already verified by the captcha plugin's `onRequest`, which runs
+          // ahead of every hook.
+          captcha: 'success',
         });
 
         if (!success) {
@@ -532,13 +554,7 @@ export const auth = betterAuth({
           });
         }
 
-        // Build audit metadata so login success / lockout transitions are
-        // recorded inside verifyLoginAttempt's transaction.
-        const reqHeaders =
-          (ctx as { headers?: Headers }).headers ??
-          (ctx as { request?: Request }).request?.headers ??
-          new Headers();
-
+        const reqHeaders = requestHeaders(ctx);
         const auditMeta = {
           ip: getClientIp(reqHeaders),
           userAgent:
@@ -546,8 +562,6 @@ export const auth = betterAuth({
           apiPath: ctx.path.slice(0, API_PATH_MAX),
         };
 
-        // Atomic: lock row → check lock → verify password → update attempts
-        // All in one transaction — eliminates the TOCTOU race condition
         let acceptedHashes: AcceptedPasswordHashes;
         try {
           acceptedHashes = await verifyLoginAttempt({
@@ -646,12 +660,13 @@ export const auth = betterAuth({
   },
 
   session: {
-    expiresIn: 2_419_200, // 28 days
-    updateAge: 86_400, // 1 day
-    freshAge: 60 * 60 * 10, // 10 hours
+    expiresIn: 28 * 24 * 60 * 60,
+    updateAge: 24 * 60 * 60,
+    freshAge: 10 * 60 * 60,
     cookieCache: {
       enabled: true,
-      maxAge: 300, // 5 minutes, TODO: change it depending on the app security policy
+      // TODO: set from the deployment's security policy.
+      maxAge: 5 * 60,
     },
     additionalFields: {
       metadata: {
@@ -778,16 +793,10 @@ export const auth = betterAuth({
         },
         /**
          * The ONE place `loginSuccess` is written, for every method that issues
-         * a session.
-         *
-         * It used to be written by `verifyLoginAttempt`, from the `before` hook —
-         * i.e. before the `before` hook above could still reject an inactive
-         * role, a missing required role or an unverified contact, and from three
-         * already-authenticated reauthentication routes as well. So the marker
-         * could not be read as "a session was issued": a fully rejected sign-in
-         * and a routine password re-prompt produced the same row. That helper now
-         * records a purpose-labelled `passwordVerified` instead, and this hook
-         * runs only after the session row exists.
+         * a session: it runs only after the session row exists, so the marker
+         * means exactly that. Password proofs are a different event
+         * (`passwordVerified`, labelled by purpose), written by
+         * `verifyLoginAttempt`, and a rejected sign-in produces only that one.
          *
          * Best-effort: the session is already created and the cookie already on
          * its way, so failing the request now would log the user in and tell them

@@ -80,7 +80,7 @@ function userIdOf(returned: unknown): unknown {
  * directly, keeps refusing the same account. `issueTwoFactorChallenge` owns the
  * empty-list decision; this plugin only has to be present for it to be asked.
  */
-export const twoFactorSignInGuard = () =>
+const twoFactorSignInGuard = () =>
   ({
     id: 'two-factor-sign-in-guard',
     hooks: {
@@ -121,7 +121,7 @@ export const twoFactorSignInGuard = () =>
     },
   }) satisfies BetterAuthPlugin;
 
-export const twoFactorAuth = () => {
+const twoFactorAuth = () => {
   // Destructured rather than deleted so a second hook added upstream lands in
   // this binding instead of slipping in unnoticed.
   const { hooks: _pluginSignInHook, ...core } = twoFactor({

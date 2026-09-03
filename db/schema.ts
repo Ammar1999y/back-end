@@ -115,10 +115,6 @@ const jsonb = customType<{ data: unknown; driverData: unknown }>({
 
 export type PermissionActions = Record<PermissionAction, boolean>;
 
-// ================================
-// Common Fields Helpers
-// ================================
-
 // bun:sql returns `timestamptz` as Date; string mode would reapply host offset.
 const timestamps = {
   createdAt: timestamp('created_at', {
@@ -135,10 +131,6 @@ const timestamps = {
     .$onUpdate(() => sql`now()`)
     .notNull(),
 };
-
-// ================================
-// Enums
-// ================================
 
 export const bucketTypeEnum = ['public', 'private'] as const;
 export const pageNameValues = Object.keys(DASHBOARD_PAGES) as unknown as [
@@ -179,15 +171,8 @@ export const fileContextTable = pgEnum(
   fileContextTablesEnum
 );
 
-// ================================
-// Type definitions for JSONB fields
-// ================================
-
 export type AuditAction = 'INSERT' | 'UPDATE' | 'DELETE';
 
-// ================================
-// Users Table (Managed by Better Auth)
-// ================================
 export const users = pgTable(
   'users',
   {
@@ -293,9 +278,6 @@ export const users = pgTable(
   ]
 );
 
-// ================================
-// Sessions Table
-// ================================
 // Retention: `db/maintenance.ts` deletes rows 30 days past `expiresAt`, on the
 // `database-retention-sweep` schedule in `lib/schedule.ts`. Not a correctness
 // boundary — every read already filters on `expiresAt` — so the sweep only
@@ -332,9 +314,6 @@ export const sessions = pgTable(
   ]
 );
 
-// ================================
-// Accounts Table
-// ================================
 export const accounts = pgTable(
   'accounts',
   {
@@ -650,13 +629,6 @@ export const trustedDevices = pgTable(
   ]
 );
 
-// ================================
-// User Tracking Fields (after users is defined)
-// ================================
-
-// ================================
-// Files Table
-// ================================
 export const files = pgTable(
   'files',
   {
@@ -694,9 +666,6 @@ export const files = pgTable(
   ]
 );
 
-// ================================
-// Audit Log Table
-// ================================
 /**
  * Retention: NOTHING deletes from this table, and that is a decision, not a gap.
  *
@@ -743,10 +712,8 @@ export const auditLogs = pgTable(
   (t) => [index('idx_audit_logs_table_record').on(t.tableName, t.recordId)]
 );
 
-// ================================
 // Roles Table (defined first for FK reference)
 // A future role-version column could invalidate assigned users after role changes.
-// ================================
 export const roles = pgTable(
   'roles',
   {
@@ -802,9 +769,6 @@ export const rolePermissions = pgTable(
   ]
 );
 
-// ================================
-// Verification Sessions (OTP rate-limiting & attempts tracking)
-// ================================
 export const verificationSessions = pgTable(
   'verification_sessions',
   {
@@ -933,9 +897,6 @@ export const verificationSessions = pgTable(
   ]
 );
 
-// ================================
-// Verification Codes (OTP codes linked to sessions)
-// ================================
 export const verificationCodes = pgTable(
   'verification_codes',
   {
@@ -958,10 +919,6 @@ export const verificationCodes = pgTable(
   },
   (t) => [uniqueIndex('ux_verification_codes_session').on(t.sessionId)]
 );
-
-// ================================
-// Relations
-// ================================
 
 export const verificationSessionsRelations = relations(
   verificationSessions,
@@ -1015,10 +972,6 @@ export const accountsRelations = relations(accounts, ({ one }) => ({
     references: [users.id],
   }),
 }));
-
-// ================================
-// TypeScript Types (inferred from schema)
-// ================================
 
 export type User = typeof users.$inferSelect;
 export type NewUser = typeof users.$inferInsert;

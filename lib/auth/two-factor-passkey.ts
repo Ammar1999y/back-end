@@ -128,7 +128,7 @@ async function userPasskeys(userId: EntityID) {
     .where(eq(passkeys.userId, userId));
 }
 
-export const twoFactorPasskey = () =>
+const twoFactorPasskey = () =>
   ({
     id: 'two-factor-passkey',
     endpoints: {

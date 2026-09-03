@@ -28,14 +28,7 @@ import { eq } from 'drizzle-orm';
 
 import { app } from '@/app';
 import { db } from '@/db';
-import {
-  auditLogs,
-  roles,
-  sessions,
-  users,
-  verificationCodes,
-  verificationSessions,
-} from '@/db/schema';
+import { auditLogs, roles, sessions, users } from '@/db/schema';
 import { BETTER_AUTH_ENDPOINTS } from '@/lib/auth/allowed-paths';
 import { BASE_ERROR_CODES } from '@/lib/auth/code-errors';
 import {
@@ -46,11 +39,11 @@ import { PUBLIC_ORIGIN } from '@/lib/env';
 import { PRE_AUTH_LIMIT } from '@/lib/http/pre-auth';
 
 import { CUSTOM_AUTH_CODE, HTTP_STATUS } from '@/utils/api-messages';
-import { hashOtpCode } from '@/utils/otp';
-import { OTP_EXPIRY_MINUTES, PASSWORD_MAX } from '@/utils/validation/constants';
+import { PASSWORD_MAX } from '@/utils/validation/constants';
 
 import { resetTables } from '../helpers/database';
 import { egressCallsTo, scriptEgress } from '../helpers/egress';
+import { seedOtpProof } from '../helpers/otp';
 import { baseHeaders, seedUser, signIn, TEST_IP } from '../helpers/session';
 import { resetSqliteStores } from '../helpers/sqlite';
 
@@ -632,39 +625,6 @@ describe('what the audit trail claims about a login', () => {
     }));
   }
 
-  /**
-   * A live `passwordless_login` proof for `user`, hashed by the production
-   * helper.
-   *
-   * Direct SQL rather than a send request: the send path defers delivery and the
-   * code it issues is never returned to the client, so a test that goes through
-   * it cannot present the right code. `hashOtpCode` is the same envelope the
-   * real send writes, so the verify path is exercised for real.
-   */
-  async function seedPasswordlessProof(
-    userId: string,
-    email: string,
-    code: string
-  ): Promise<void> {
-    const [row] = await db
-      .insert(verificationSessions)
-      .values({
-        userId,
-        channel: 'email',
-        identifier: email,
-        purpose: 'passwordless_login',
-        attemptNumber: 1,
-      })
-      .returning({ id: verificationSessions.id });
-    if (!row) throw new Error('seedPasswordlessProof inserted no session');
-
-    await db.insert(verificationCodes).values({
-      sessionId: row.id,
-      code: hashOtpCode(code),
-      expiresAt: new Date(Date.now() + OTP_EXPIRY_MINUTES * 60 * 1000),
-    });
-  }
-
   beforeEach(async () => {
     await resetTables();
     resetSqliteStores();
@@ -702,7 +662,12 @@ describe('what the audit trail claims about a login', () => {
     // back unnoticed.
     const code = '424242';
     const user = await seedUser();
-    await seedPasswordlessProof(user.userId, user.email, code);
+    await seedOtpProof({
+      userId: user.userId,
+      identifier: user.email,
+      purpose: 'passwordless_login',
+      code,
+    });
 
     const response = await app.handle(
       new Request('http://localhost/api/auth/passwordless/verify', {

@@ -33,7 +33,7 @@ import { verifications } from '@/db/schema';
 import { validID } from '@/utils';
 
 /** Long enough for a batch of related edits, short enough not to be a session. */
-export const ADMIN_REAUTH_MAX_AGE_S = 900;
+const ADMIN_REAUTH_MAX_AGE_S = 900;
 
 const identifierOf = (sessionId: string) => `admin-reauth-${sessionId}`;
 

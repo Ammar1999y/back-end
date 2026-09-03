@@ -75,21 +75,29 @@ export function pendingAfterResponse(): number {
   return inFlight.size;
 }
 
-const SETTLE_MS = 50;
+export const AFTER_RESPONSE_SETTLE_MS = 50;
 
 /**
  * Waits for queued post-response work, up to `timeoutMs`.
  *
- * The empty settle period catches a batch registered while another batch is
- * finishing. The overall deadline keeps shutdown bounded.
+ * True ONLY when the queue was observed empty for `AFTER_RESPONSE_SETTLE_MS` and
+ * that observation finished strictly before the deadline; never waits past the
+ * deadline to finish one. The settle period is the proof
+ * — it catches a batch registered while another was finishing — so an exhausted
+ * deadline is answered false even when the set happens to be empty at that
+ * instant: with no time left there is no observation, and the shutdown that asks
+ * must not close stores on an unproven answer.
  */
 export async function drainAfterResponse(timeoutMs: number): Promise<boolean> {
   const deadline = Date.now() + timeoutMs;
 
   while (Date.now() < deadline) {
     if (inFlight.size === 0) {
-      await Bun.sleep(SETTLE_MS);
-      if (inFlight.size === 0) return true;
+      // A complete observation has to fit; a partial one proves nothing, and
+      // sleeping past the deadline to finish it would break "up to timeoutMs".
+      if (deadline - Date.now() < AFTER_RESPONSE_SETTLE_MS) return false;
+      await Bun.sleep(AFTER_RESPONSE_SETTLE_MS);
+      if (inFlight.size === 0 && Date.now() < deadline) return true;
       continue;
     }
 
@@ -98,9 +106,9 @@ export async function drainAfterResponse(timeoutMs: number): Promise<boolean> {
     // A rejected batch must not abandon the rest of the drain.
     await Promise.race([
       Promise.all(inFlight).catch(() => {}),
-      Bun.sleep(Math.min(remaining, SETTLE_MS * 4)),
+      Bun.sleep(Math.min(remaining, AFTER_RESPONSE_SETTLE_MS * 4)),
     ]);
   }
 
-  return inFlight.size === 0;
+  return false;
 }

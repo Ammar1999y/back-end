@@ -184,7 +184,7 @@ export function optionId(
 }
 
 /** An option as the challenge RESPONSE carries it: the identity plus routing hints. */
-export interface OfferedOptionHint extends OfferedOption {
+interface OfferedOptionHint extends OfferedOption {
   /** `otp` only: seconds before a code may be sent to this contact. `0` is now. */
   nextAllowedIn?: number;
 }
@@ -372,9 +372,7 @@ export function offeredMethods(
  * documented and clients read it. Two OTP channels collapse to one `otp` here,
  * which is exactly why it cannot be the thing the server keys on.
  */
-export function offeredMethodNames(
-  options: OfferedOption[]
-): TwoFactorMethod[] {
+function offeredMethodNames(options: OfferedOption[]): TwoFactorMethod[] {
   return [...new Set(options.map((option) => option.method))];
 }
 
@@ -394,7 +392,7 @@ export function defaultOption(options: OfferedOption[]): string | null {
  * to an `otp` default knows whether to send or to wait without a round trip
  * that answers 429. One indexed read, skipped when nothing is an OTP.
  */
-export async function withOtpSendHints(
+async function withOtpSendHints(
   userId: EntityID,
   options: OfferedOption[],
   executor: Tx | typeof db = db
@@ -471,12 +469,7 @@ export async function resolveRequestSession(
   return { userId, sessionId, userEmail };
 }
 
-/** True when this request is finishing a sign-in rather than an enrolment. */
-export async function isSignInVerification(ctx: AuthContext): Promise<boolean> {
-  return (await resolveRequestSession(ctx)) === null;
-}
-
-export type FirstFactor = 'password' | 'passwordless';
+type FirstFactor = 'password' | 'passwordless';
 
 export interface IssueChallengeParams {
   userId: EntityID;
@@ -494,7 +487,7 @@ export interface IssueChallengeParams {
   };
 }
 
-export interface ChallengeIssued {
+interface ChallengeIssued {
   twoFactorRedirect: true;
   /**
    * Distinct method names. Documented, and what existing clients read — but two
@@ -999,7 +992,7 @@ export async function consumeTwoFactorProof(
 }
 
 /** Drops the challenge and its counter, and expires the cookie carrying it. */
-export async function invalidateChallenge(
+async function invalidateChallenge(
   ctx: AuthContext,
   challengeId: string
 ): Promise<void> {
@@ -1305,9 +1298,7 @@ export function removalStrandsTwoFactor(
 }
 
 /** The pending challenge id from the request cookie, unverified against any row. */
-export async function readChallengeCookie(
-  ctx: AuthContext
-): Promise<string | null> {
+async function readChallengeCookie(ctx: AuthContext): Promise<string | null> {
   const cookie = ctx.context.createAuthCookie(TWO_FACTOR_COOKIE_NAME);
   // `false` for a present-but-unverifiable cookie, `undefined` for an absent
   // one. Neither is a challenge.

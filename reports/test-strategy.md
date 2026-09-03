@@ -27,10 +27,6 @@ work, and correcting them is part of doing that work:
 - §7.3a's "spawn `bun run start`": `start` hardcodes `NODE_ENV=production`, so it
   cannot reproduce the absent- or misspelt-`NODE_ENV` cases. Spawn `bun server.ts`.
 - §7.5i's "rejects an uppercase variant": `validID` lowercases and accepts it.
-- §7.5l's "`parseSortingState` rejects a column outside the allowlist": it drops
-  it deliberately and silently.
-- §7.5s's "sanitizes to empty → generated id" (it returns `'unnamed'`), and its
-  Windows device-name cases (no such handling exists).
 - §7.5j's `safeStringRegex` and §7.5v's route-precedence claim: neither exists.
 - Dangling citations: `reports/claude-opus-audit.md` and
   `reports/claude-opus-autonomous-audit.md` do not exist.
@@ -533,9 +529,11 @@ keep-alive connection, on which a further request is still served. Assert both
 halves.
 
 **The forced-shutdown bound is derived; assert the invariant, not the number.**
-It is `max(IDLE_TIMEOUT_SECONDS, MAX_ROUTE_TIMEOUT_SECONDS) + 15` in
-milliseconds — 135 s with the current table. A flat 15 s bound would have aborted
-at 15 s exactly the 120 s upload the per-route ceiling exists to permit. The
+It is `shutdownTimeoutMs()` in `lib/shutdown.ts`:
+`(max(IDLE_TIMEOUT_SECONDS, MAX_ROUTE_TIMEOUT_SECONDS) + SHUTDOWN_POLICY.headroomSeconds) * 1000`
+milliseconds; the current value is in the startup log, and
+`tests/unit/shutdown-coordinator.test.ts` asserts the form. A flat headroom-only
+bound would have aborted the 120 s upload the per-route ceiling exists to permit. The
 one-term form (`MAX_ROUTE_TIMEOUT_SECONDS` alone) is also wrong and would have
 passed while the two-term invariant was violated: `reports/coolify-deployment.md`
 §12.2 tells the operator to lower the upload ceiling to 30 s for a shorter deploy
@@ -923,7 +921,9 @@ returns everything.
 **`lib/data-table/parsers.ts`.** Assert `MIN_SEARCH_LENGTH`, `MAX_SEARCH_LENGTH`,
 `MAX_PAGE` and `MAX_PER_PAGE` are enforced (an unbounded `perPage` is a denial
 vector), a non-numeric `page` falls back rather than producing `NaN` in SQL, and
-`parseSortingState` rejects a column outside the allowlist.
+`parseSortingState` silently drops a column outside the allowlist — that is the
+current contract, and the assertion is that the remaining columns survive and
+nothing unknown reaches SQL.
 
 **`lib/cache/prefix.ts` — `prefixUpperBound`.** Assert directly rather than only
 through `cacheDeletePrefix`: the empty prefix, a prefix ending in `0xFF`, and a
@@ -984,9 +984,10 @@ attacker-supplied content, so assert quoting and that a filename containing a
 quote, a newline or a non-ASCII character cannot break out of the header value.
 
 **`utils/sanitize-filename.ts`.** Path traversal (`../`, `..\`), an absolute
-path, a Windows device name (`CON`, `NUL`), a trailing dot or space, a null byte,
-an over-long name, and a name that sanitizes to **empty** — which must produce a
-generated id rather than an empty string.
+path, a trailing dot or space, a null byte, an over-long name, and a name that
+sanitizes to **empty** — which returns `'unnamed'`, never an empty string.
+Generated ids belong to the storage layer that names the object, and Windows
+device names are not handled here; neither is this function's contract.
 
 **`lib/id.ts` — `generateUuidV7`.** Format against the application's own
 `UUID_V7_REGEX`, the version nibble, the RFC 9562 variant bits, and strict
@@ -1363,6 +1364,18 @@ Use `coveragePathIgnorePatterns` to exclude everything else while the gate is
 narrow, and **verify the gate fails before trusting it** — set the threshold
 absurdly high once and confirm a non-zero exit. The singular-key trap in §2
 means a misconfigured threshold is indistinguishable from a passing one.
+
+**Decision (2026-09-03): the narrow per-module gate above is NOT implemented,
+and the aggregate ratchet in `scripts/check-coverage.ts` is what ships.** Bun's
+`coverageThreshold` is applied per file and cannot isolate a symbol such as
+`resolveActionScope`, so a path-based gate over the modules listed above would
+either fail on their legitimately uncovered branches or be loosened until it
+proved nothing. The ratchet gates the summed lcov rates AND the denominators, so
+deleting a test file cannot raise the number. Exhaustiveness for the
+security-critical functions is asserted by table-driven tests instead of by a
+coverage number. The "verify the gate fails" instruction was a one-time check,
+performed when the ratchet landed; it is not retained automation, and does not
+need to be.
 
 ---
 

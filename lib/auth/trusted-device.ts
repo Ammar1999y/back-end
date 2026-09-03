@@ -47,7 +47,7 @@ import { consumeTwoFactorProof } from './two-factor-challenge';
 const TRUST_COOKIE_NAME = 'trust_device';
 
 /** Refreshed on each use, so an active device stays trusted and an idle one lapses. */
-export const TRUST_DEVICE_MAX_AGE_S = 30 * 24 * 60 * 60;
+const TRUST_DEVICE_MAX_AGE_S = 30 * 24 * 60 * 60;
 
 const IDENTIFIER_BYTES = 24;
 
@@ -126,7 +126,7 @@ export async function consumeDeviceTrust(
   return true;
 }
 
-export async function grantDeviceTrust(
+async function grantDeviceTrust(
   ctx: AuthContext,
   userId: EntityID
 ): Promise<void> {
@@ -168,7 +168,7 @@ export async function grantDeviceTrust(
   );
 }
 
-export async function listTrustedDevices(userId: EntityID) {
+async function listTrustedDevices(userId: EntityID) {
   return db
     .select({
       id: trustedDevices.id,
@@ -192,7 +192,7 @@ export async function listTrustedDevices(userId: EntityID) {
  * The ownership predicate is in the WHERE clause rather than a prior read: a
  * check-then-delete would let a concurrent request move the row between the two.
  */
-export async function revokeTrustedDevice(
+async function revokeTrustedDevice(
   tx: Tx,
   userId: EntityID,
   deviceId: string

@@ -94,7 +94,6 @@ export function userIdentifier(userId: EntityID): string {
   return `user:${userId}`;
 }
 
-// ── OTP quotas ──────────────────────────────────────────────────────
 // Two layers, each bounding a different thing:
 //   global  -> total outbound provider spend (circuit breaker)
 //   surface -> messages to ONE destination from ONE surface

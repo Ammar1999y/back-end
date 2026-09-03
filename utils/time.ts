@@ -13,7 +13,6 @@ export function safeDate(
   }
 }
 
-// ---- Calendar dates in the business timezone -------------------------
 // Date filters are expressed as calendar days ("2026-08-02"), not instants.
 // Turning a calendar day into a UTC range has to happen in one declared zone
 // (BUSINESS_TIMEZONE); doing it with `setHours` uses the *host* zone, so the

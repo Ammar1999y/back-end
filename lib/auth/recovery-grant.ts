@@ -44,14 +44,13 @@ import { validID } from '@/utils';
 const GRANT_BYTES = 24;
 
 /** Long enough to receive a code on another channel, short enough to be useless later. */
-export const RECOVERY_GRANT_MAX_AGE_S = 900;
+const RECOVERY_GRANT_MAX_AGE_S = 900;
 
 /** Shared across every method, so switching option buys no fresh allowance. */
-export const RECOVERY_ALLOWED_ATTEMPTS = 5;
+const RECOVERY_ALLOWED_ATTEMPTS = 5;
 
-export const recoveryIdentifier = (token: string) => `recovery-${token}`;
-export const recoveryStateIdentifier = (token: string) =>
-  `recovery-state-${token}`;
+const recoveryIdentifier = (token: string) => `recovery-${token}`;
+const recoveryStateIdentifier = (token: string) => `recovery-state-${token}`;
 const recoveryAttemptsIdentifier = (token: string) =>
   `recovery-attempts-${token}`;
 
@@ -61,11 +60,6 @@ export interface RecoveryGrantState {
   excludeContactKind: ContactKind;
   /** The option identities offered at issuance, in order. */
   options: string[];
-}
-
-export interface IssuedRecoveryGrant {
-  token: string;
-  options: OfferedOption[];
 }
 
 export async function issueRecoveryGrant(params: {
@@ -257,7 +251,7 @@ export async function consumeRecoveryGrant(
   return true;
 }
 
-export async function invalidateRecoveryGrant(token: string): Promise<void> {
+async function invalidateRecoveryGrant(token: string): Promise<void> {
   await withTransaction(async (tx) => {
     for (const identifier of [
       recoveryIdentifier(token),

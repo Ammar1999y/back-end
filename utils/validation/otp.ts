@@ -10,7 +10,6 @@ import {
   sanitizeStrictSingleLine,
 } from './rules';
 
-// ── Channel Configuration ──
 // The email/phone split is declared HERE and nowhere else: `isPhoneChannel`,
 // the per-contact quota grouping, the phone-only schemas and the availability
 // flags all derive from these two lists. `OTP_CHANNELS` is the concatenation,
@@ -26,7 +25,6 @@ export const OTP_CHANNELS = [
 export type OtpChannel = (typeof OTP_CHANNELS)[number];
 export type PhoneOtpChannel = (typeof PHONE_OTP_CHANNELS)[number];
 
-// ── OTP Purpose ──
 // Every verification session is purpose-bound so a proof cannot authorize a
 // different action. All values are wired except the reserved 'change_password'.
 // ⚠️ Changing this list requires a DB migration (otp_purpose pgEnum).
@@ -228,7 +226,6 @@ export const otpCodeSchema = z.preprocess(
 
 const codeSchema = otpCodeSchema;
 
-// ── Send OTP Schemas ──
 const sendOtpPhoneSchema = z.object({
   channel: z.literal('whatsapp'),
   phoneNumber: phoneSchema,
@@ -255,7 +252,6 @@ export const sendOtpSchema = z
   ])
   .superRefine(channelEnabledRefine);
 
-// ── Verify OTP Schemas ──
 const verifyOtpPhoneSchema = z.object({
   channel: z.literal('whatsapp'),
   phoneNumber: phoneSchema,
@@ -297,7 +293,6 @@ export const passwordlessVerifySchema = z.discriminatedUnion('channel', [
   verifyOtpSmsSchema.extend(rememberMeField),
 ]);
 
-// ── Reset-Password Schema (forgot-password) ──
 // Same shape as verify (channel + identifier + code) plus the new password.
 export const resetPasswordSchema = z.discriminatedUnion('channel', [
   verifyOtpPhoneSchema.extend({ newPassword: passwordSchema }),

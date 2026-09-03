@@ -7,6 +7,7 @@ import { HTTP_STATUS } from '@/utils/api-messages';
 import { resetTables } from '../helpers/database';
 import { delayMail, settleDelivery } from '../helpers/mailbox';
 import { baseHeaders, seedUser } from '../helpers/session';
+import { resetSqliteStores } from '../helpers/sqlite';
 
 const PROVIDER_DELAY_MS = 3000;
 const FLOOR_MS = 1500;
@@ -16,6 +17,9 @@ const state: { realEmail: string } = { realEmail: '' };
 
 beforeAll(async () => {
   await resetTables();
+  // Every sample below must be ADMITTED: a per-IP window another file spent
+  // would turn a timing assertion into a 429.
+  resetSqliteStores();
   const user = await seedUser();
   state.realEmail = user.email;
 });

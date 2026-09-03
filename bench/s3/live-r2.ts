@@ -40,10 +40,6 @@ import {
 import { startFakeS3 } from './shared/fake-s3';
 import { signRequest, uriEncode } from './shared/sigv4';
 
-// ---------------------------------------------------------------------------
-// configuration and refusals
-// ---------------------------------------------------------------------------
-
 const REQUIRED = [
   'R2_ACCOUNT_ID',
   'R2_ACCESS_KEY_ID',
@@ -149,10 +145,6 @@ const bun = new S3Client({
   region: REGION,
 });
 
-// ---------------------------------------------------------------------------
-// check plumbing, same shape as bench/sqlite and bench/uuid
-// ---------------------------------------------------------------------------
-
 interface Check {
   name: string;
   pass: boolean;
@@ -217,7 +209,6 @@ console.log(
 );
 
 try {
-  // -- 0. which signing regions does R2 accept? ---------------------------
   await attempt(
     `the configured region scope (${REGION}) is accepted`,
     true,
@@ -261,7 +252,6 @@ try {
     }
   );
 
-  // -- 1. the aws-sdk baseline, on the real bucket -------------------------
   await attempt(
     'aws PutObject stores Cache-Control + metadata',
     true,
@@ -290,7 +280,6 @@ try {
     }
   );
 
-  // -- 2. the gap, confirmed on R2 rather than on a fake -------------------
   await attempt(
     'bun write drops Cache-Control and metadata',
     true,
@@ -330,7 +319,6 @@ try {
     }
   );
 
-  // -- 3. Cloudflare accepts Bun's presigned URLs --------------------------
   await attempt('R2 accepts a Bun presigned GET', true, async () => {
     const url = bun.presign(`${PREFIX}/bun-write.webp`, { expiresIn: 300 });
     const response = await fetch(url);
@@ -394,7 +382,6 @@ try {
     }
   );
 
-  // -- 4. the copy workaround, which only R2 can settle -------------------
   await attempt('a hand-signed copy succeeds on R2', true, async () => {
     const destination = key('copy-signed.webp');
     const signed = signRequest({
@@ -442,7 +429,6 @@ try {
     }
   );
 
-  // -- 5. reads ----------------------------------------------------------
   await attempt(
     'stat reports size, etag, type, lastModified',
     false,
@@ -524,7 +510,6 @@ try {
     }
   );
 
-  // -- 6. sizes and multipart -------------------------------------------
   await attempt('a 6 MB write is one PUT R2 accepts', false, async () => {
     const objectKey = key('six-megabytes.bin');
     const size = 6 * 1024 * 1024;
@@ -578,7 +563,6 @@ try {
     }
   );
 
-  // -- 7. delete --------------------------------------------------------
   await attempt('delete removes the object', true, async () => {
     const objectKey = key('to-delete.webp');
     await bun.write(objectKey, BODY);
@@ -589,9 +573,6 @@ try {
     };
   });
 } finally {
-  // -----------------------------------------------------------------------
-  // cleanup: this run's prefix, and nothing else
-  // -----------------------------------------------------------------------
   console.log(`${'-'.repeat(78)}\ncleanup`);
   let removed = 0;
   const failed: string[] = [];

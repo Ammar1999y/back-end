@@ -29,6 +29,7 @@
     "tests/unit/**/*.test.ts",
     "tests/integration/**/*.test.ts",
     "tests/process/**/*.test.ts",
+    "tests/matrix/**/*.test.ts",
     // Spawned as programs by path string from a sibling test, so no import edge
     // exists for knip to follow. They are entry points, not ignored files —
     // declaring them here keeps THEIR imports checked, which `ignore` would not.

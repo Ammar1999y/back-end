@@ -2,14 +2,13 @@ import crypto from 'node:crypto';
 import type { Tx } from '@/db';
 import type { EntityID } from '@/types';
 import type { OtpChannel, OtpPurpose } from '@/utils/validation/otp';
-import type { Transporter } from 'nodemailer';
+import type SMTPTransport from 'nodemailer/lib/smtp-transport';
 
 import { and, eq, gt, isNull, sql } from 'drizzle-orm';
 
 import { withTransaction } from '@/db';
 import { users, verificationCodes, verificationSessions } from '@/db/schema';
 import { sanitizeForLog } from '@/utils';
-import { createTransport } from 'nodemailer';
 import { auditLog } from '@/lib/audit';
 import {
   canEvaluateOtp,
@@ -17,6 +16,7 @@ import {
   verifyOtpCode,
 } from '@/lib/auth/otp-hash';
 import { enforceOtpGlobalSendBudget, otpContactKind } from '@/lib/rate-limit';
+import { sendMailWithDeadline } from '@/lib/smtp';
 
 import { HTTP_STATUS } from '@/utils/api-messages';
 import { CustomError } from '@/utils/error-class';
@@ -30,42 +30,26 @@ import {
 } from '@/utils/validation/constants';
 import { OTP_DELIVERY_OUTBOX } from '@/utils/validation/otp';
 
-const PROVIDER_TIMEOUT_MS = 5000;
+/** The wall-clock bound on one provider call, every channel. */
+export const PROVIDER_TIMEOUT_MS = 5000;
 
-// ── Email Transport (lazy-initialized to avoid crash when env vars are missing) ──
-let _transporter: Transporter | null = null;
-function getTransporter() {
-  if (!_transporter) {
-    // eslint-disable-next-line unicorn/no-top-level-assignment-in-function -- memoized lazy singleton; the assignment IS the cache
-    _transporter = createTransport({
-      service: 'gmail',
-      auth: {
-        user: process.env.SMTP_USER,
-        pass: process.env.SMTP_PASS,
-      },
-
-      connectionTimeout: PROVIDER_TIMEOUT_MS,
-      dnsTimeout: PROVIDER_TIMEOUT_MS,
-      greetingTimeout: PROVIDER_TIMEOUT_MS,
-      socketTimeout: PROVIDER_TIMEOUT_MS,
-    });
-  }
-  return _transporter;
+function smtpTransportOptions(): SMTPTransport.Options {
+  return {
+    service: 'gmail',
+    auth: {
+      user: process.env.SMTP_USER,
+      pass: process.env.SMTP_PASS,
+    },
+    connectionTimeout: PROVIDER_TIMEOUT_MS,
+    dnsTimeout: PROVIDER_TIMEOUT_MS,
+    greetingTimeout: PROVIDER_TIMEOUT_MS,
+    socketTimeout: PROVIDER_TIMEOUT_MS,
+  };
 }
-
-// ── OTP Generation & Hashing ──
 
 function generateOtpCode() {
   return crypto.randomInt(100_000, 1_000_000).toString();
 }
-
-// Re-exported, not reimplemented: the primitive and its key lifecycle live in
-// `lib/auth/otp-hash.ts`, which records why OTPs no longer share the password
-// KDF profile or the password pepper keyring. Imported as well as re-exported —
-// `export ... from` does not bind the names in this module, and both are used
-// below.
-
-// ── Time Calculations ──
 
 /** Exponential backoff: 30 * 2^(n-1) seconds (30s, 60s, 120s, 240s, 480s...) */
 function calculateNextAllowedAt(attemptNumber: number): Date {
@@ -173,8 +157,6 @@ export function collapseProofThrottle(
     return new CustomError(genericMessage, HTTP_STATUS.BAD_REQUEST);
   return error;
 }
-
-// ── Delivery Functions ──
 
 /**
  * Summarize a failed delivery for the log.
@@ -308,14 +290,16 @@ async function sendOtpWhatsApp(
 }
 
 /**
- * Nodemailer's own failure classes. These are set by the client library from a
- * fixed vocabulary — unlike `err.message` / `err.response`, which carry the
- * SMTP server's reply and can quote the rejected message, i.e. the code.
- * A hard-coded allowlist is the only safe way to keep any diagnostic value.
+ * Nodemailer's own failure classes plus `lib/smtp.ts`'s deadline. These are set
+ * by the client side from a fixed vocabulary — unlike `err.message` /
+ * `err.response`, which carry the SMTP server's reply and can quote the rejected
+ * message, i.e. the code. A hard-coded allowlist is the only safe way to keep
+ * any diagnostic value.
  */
 const SMTP_ERROR_CODES = new Set([
   'EAUTH',
   'ECONNECTION',
+  'EDEADLINE',
   'EDNS',
   'EENVELOPE',
   'EMESSAGE',
@@ -363,20 +347,24 @@ function readErrorField(
 }
 
 async function sendOtpEmail(email: string, code: string, purpose: OtpPurpose) {
-  let info: Awaited<ReturnType<Transporter['sendMail']>>;
+  let info: SMTPTransport.SentMessageInfo;
 
   try {
-    info = await getTransporter().sendMail({
-      from: process.env.SMTP_FROM || process.env.SMTP_USER,
-      to: email,
-      subject: otpSubjectFor(purpose),
-      text: otpTextFor(purpose, code),
-      html: `<div dir="rtl" style="font-family: sans-serif; text-align: center; padding: 20px;">
+    info = await sendMailWithDeadline(
+      smtpTransportOptions(),
+      {
+        from: process.env.SMTP_FROM || process.env.SMTP_USER,
+        to: email,
+        subject: otpSubjectFor(purpose),
+        text: otpTextFor(purpose, code),
+        html: `<div dir="rtl" style="font-family: sans-serif; text-align: center; padding: 20px;">
       <h2>رمز التحقق</h2>
       <p style="font-size: 32px; font-weight: bold; letter-spacing: 8px; margin: 20px 0;">${code}</p>
       <p>صالح لمدة ${OTP_EXPIRY_MINUTES} دقائق</p>
     </div>`,
-    });
+      },
+      PROVIDER_TIMEOUT_MS
+    );
   } catch (error) {
     // The transport error must NOT escape. Callers log the thrown error, and
     // an SMTP rejection quotes the message it rejected — which is the body
@@ -480,8 +468,6 @@ async function sendOtp(
     throw new CustomError(MSG_OTP_SEND_FAILED, HTTP_STATUS.INTERNAL_ERROR);
   }
 }
-
-// ── Reusable OTP Send Logic ──
 
 interface ProcessOtpSendOptions {
   /** User ID to bind the verification session to */
@@ -626,8 +612,6 @@ export async function processOtpSend({
       ? session.blockedUntil
       : null;
 
-    // ── Block check ──
-    //
     // A live block is CLEARED here, not thrown on — see
     // `VERIFY_BLOCK_CLEARED_BY_RESEND` for why that does not weaken anything.
     // A send-side block survives it, because `attemptNumber` survives it and the
@@ -653,7 +637,6 @@ export async function processOtpSend({
       session = unblocked;
     }
 
-    // ── Rate-limit check ──
     if (session?.nextAllowedAt && session.nextAllowedAt > now) {
       const waitSeconds = Math.ceil(
         (session.nextAllowedAt.getTime() - now.getTime()) / 1000
@@ -664,9 +647,9 @@ export async function processOtpSend({
       );
     }
 
-    // ── Max-attempts → block (app-level check before DB increment — prevents raw constraint violation) ──
-    // Defer the throw so the block update COMMITS with the transaction.
-    // Throwing inside withTransaction rolls back the block write.
+    // Checked before the increment, which `chk_attempt_number_max` would
+    // otherwise refuse as a raw constraint error. The throw is deferred so the
+    // block update COMMITS: throwing inside withTransaction rolls it back.
     if (session && session.attemptNumber >= OTP_MAX_ATTEMPTS) {
       // The deadline is stamped ONCE and then preserved. Re-deriving it from
       // `Date.now()` on every request turns a fixed `OTP_BLOCK_DURATION_HOURS`
@@ -702,7 +685,7 @@ export async function processOtpSend({
     const currentAttempts = session?.attemptNumber ?? 0;
     const nextAllowedAt = calculateNextAllowedAt(currentAttempts + 1);
 
-    // ── Upsert session (atomic) — reset per-cycle verifyAttemptNumber on
+    // Upsert session (atomic) — reset per-cycle verifyAttemptNumber on
     // resend, but KEEP verifyAttemptDaily so attackers can't reset the 24h
     // bound by requesting a fresh code.
     const [updatedSession] = await tx
@@ -751,7 +734,7 @@ export async function processOtpSend({
     if (!updatedSession)
       throw new CustomError(MSG_OTP_SEND_FAILED, HTTP_STATUS.INTERNAL_ERROR);
 
-    // ── Invalidate old codes by upserting the latest into the
+    // Invalidate old codes by upserting the latest into the
     //    one-row-per-session slot guarded by `ux_verification_codes_session`.
     //    Single round-trip vs DELETE+INSERT.
     await tx
@@ -823,8 +806,6 @@ export async function processOtpSend({
   };
 }
 
-// ── Contact Verified Flag ──
-
 /**
  * Idempotently flip a contact's verified flag and audit the transition, under a
  * row lock on the user. Runs inside the caller's transaction.
@@ -894,8 +875,6 @@ export async function markContactVerified(
       meta: opts.auditMeta,
     });
 }
-
-// ── Reusable OTP Verify Logic ──
 
 interface ProcessOtpVerifyOptions {
   /** User ID that owns the verification session */
@@ -975,7 +954,7 @@ export async function processOtpVerify({
   // Deferred errors: the throw must fire AFTER the transaction commits so the
   // increment/block writes persist. Throwing inside withTransaction rolls back.
   const outcome = await withTransaction<VerifyOutcome>(async (tx) => {
-    // ── Lock the user row FIRST to keep a single, consistent lock order
+    // Lock the user row FIRST to keep a single, consistent lock order
     // (users → verification_sessions) across all flows. The email-change,
     // admin-edit, and user-delete paths all lock `users` before touching
     // verification_sessions; without this, verify's reverse order
@@ -987,7 +966,7 @@ export async function processOtpVerify({
       .where(eq(users.id, userId))
       .for('update');
 
-    // ── Get session with row-level lock — serializes concurrent verifies.
+    // Get session with row-level lock — serializes concurrent verifies.
     const [session] = await tx
       .select({
         id: verificationSessions.id,
@@ -1042,7 +1021,7 @@ export async function processOtpVerify({
       session.isBlocked = false;
     }
 
-    // ── Is there anything to verify AGAINST?
+    // Is there anything to verify AGAINST?
     // This runs before the counters are touched. Incrementing first meant an
     // expired or already-consumed session charged a failed attempt for a
     // request that could not possibly be a guess — five of them imposed the

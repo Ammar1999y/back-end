@@ -49,11 +49,9 @@ import { apiRaw } from '@/utils/api-response';
 
 const PROBE_KEY = 'health:write-probe';
 
-const POSTGRES_PROBE_TIMEOUT_MS = 2000;
-
 async function postgresReachable(): Promise<boolean> {
   try {
-    return await pingDatabase(POSTGRES_PROBE_TIMEOUT_MS);
+    return await pingDatabase();
   } catch (error) {
     // Driver errors can include connection details, so log only their class.
     console.error(
