@@ -44,6 +44,8 @@ interface DataTableQueryResult {
   offset: number;
   page: number;
   perPage: number;
+  /** The quick-search term after normalisation and the length bounds; `''` when there is none. */
+  search: string;
   buildPageCount: (total: number) => number;
 }
 
@@ -170,6 +172,7 @@ export function parseDataTableParams<T extends Table>(
     offset,
     page: parsed.page,
     perPage: safePerPage,
+    search,
     buildPageCount: (total: number) =>
       Math.max(1, Math.ceil(total / safePerPage)),
   };

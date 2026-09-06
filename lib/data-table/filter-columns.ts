@@ -55,13 +55,26 @@ const STRING_LIKE_TYPES: ReadonlySet<FilterColumnSpec['type']> = new Set([
 ]);
 
 /**
- * Types whose column can actually hold an empty string. ⚠️ `select` /
- * `multiSelect` name a value set, not a storage type — every registered one is
- * text today. Backing one with a PostgreSQL enum makes `isEmpty` generate
- * `enum_column = ''`, a cast error; carry the DB type on the descriptor first.
+ * Whether the column can actually hold an empty string. `select` /
+ * `multiSelect` name a value set, not a storage type: one that declares
+ * `values` is a closed set — a PostgreSQL enum in practice — which cannot hold
+ * `''`, so `isEmpty` on it would generate `enum_column = ''`, a cast error.
  */
-function isStringLike(type: FilterColumnSpec['type']): boolean {
-  return STRING_LIKE_TYPES.has(type);
+function isStringLike(spec: FilterColumnSpec): boolean {
+  return STRING_LIKE_TYPES.has(spec.type) && spec.values === undefined;
+}
+
+/** Every supplied member of a closed-set filter is one of the set's values. */
+function membersAllowed(
+  spec: FilterColumnSpec,
+  value: unknown,
+  valueIsArray: boolean
+): boolean {
+  if (spec.values === undefined) return true;
+  const members = valueIsArray ? (value as unknown[]).filter(Boolean) : [value];
+  return members.every(
+    (member) => typeof member === 'string' && spec.values?.includes(member)
+  );
 }
 
 /**
@@ -139,6 +152,9 @@ function assertFilterAllowed(
   // Not the dropped-predicate case elsewhere in this file: there a real
   // condition vanished; an empty set was never a condition.
   if (valueIsArray && !(filter.value as string[]).some(Boolean)) return 'skip';
+
+  // A member outside a closed set is a client error, not a PostgreSQL one.
+  if (!membersAllowed(spec, filter.value, valueIsArray)) invalidFilter();
 
   if (isScanOnlyOperator(filter.operator) && !spec.allowScanOnly)
     invalidFilter();
@@ -333,10 +349,10 @@ function buildCondition(
     // syntax for type boolean: \"\"") — a 500, not a filter. For those types
     // the only meaningful emptiness is NULL.
     case 'isEmpty': {
-      return isStringLike(spec.type) ? isEmpty(column) : isNull(column);
+      return isStringLike(spec) ? isEmpty(column) : isNull(column);
     }
     case 'isNotEmpty': {
-      return isStringLike(spec.type) ? not(isEmpty(column)) : isNotNull(column);
+      return isStringLike(spec) ? not(isEmpty(column)) : isNotNull(column);
     }
 
     default: {

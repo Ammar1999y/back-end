@@ -32,11 +32,11 @@
 import { describe, expect, spyOn, test } from 'bun:test';
 import zlib from 'node:zlib';
 
+import { uploadMsg } from '@/app/api/upload/file/messages';
 import {
   UPLOAD_MEGAPIXEL_BUDGET,
   UPLOAD_REQUEST_UNIT,
-} from '@/app/api/upload/image/handler';
-import { uploadMsg } from '@/app/api/upload/image/messages';
+} from '@/lib/media/upload';
 import { measureEncodeCost, optimizeImage } from '@/lib/r2/optimize-image';
 import {
   ALLOWED_IMAGE_TYPES,
@@ -318,7 +318,7 @@ describe('the structural gates on an SVG', () => {
   });
 
   test('the SVG cap is the binding one, so it bounds what an SVG upload can carry', () => {
-    // `app/api/upload/image/handler.ts:21` rejects above `MAX_IMAGE_SIZE`; the
+    // `lib/media/upload.ts` rejects above `MAX_IMAGE_SIZE`; the
     // sanitiser rejects above half of that. Load-bearing for the entity-expansion
     // arithmetic below — the input budget for a bomb is the smaller number.
     expect(SVG_SIZE_CAP).toBeLessThan(MAX_IMAGE_SIZE * 1024 * 1024);
@@ -1660,7 +1660,7 @@ describe('the upload budget is charged in megapixels', () => {
   test('a maximum-size image still fits in one window', () => {
     // `rateLimit` refuses `cost > limit` WITHOUT a write, so a budget under the
     // cost of one legal upload is a permanent 429 rather than a slow path.
-    // `app/api/upload/image/handler.ts` throws at load if this stops holding;
+    // `lib/media/upload.ts` throws at load if this stops holding;
     // importing it above is what runs that check, and this states the number.
     const worstCase = Math.max(
       UPLOAD_REQUEST_UNIT,

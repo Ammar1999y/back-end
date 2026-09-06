@@ -74,7 +74,7 @@ const byText = (a: string, b: string) => (a === b ? 0 : a < b ? -1 : 1);
  * than a 400 on the missing parameter.
  */
 const QUERY_FOR: Readonly<Record<string, string>> = {
-  'POST /api/upload/image': '?resource=users',
+  'POST /api/upload/file': '?resource=users',
 };
 
 /** A concrete URL: every `:id` becomes a well-formed id that names nothing. */

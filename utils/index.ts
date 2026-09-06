@@ -528,9 +528,17 @@ export function isUniqueViolation(e: unknown): boolean {
   return hasSqlState(e, '23505');
 }
 
-/** PostgreSQL `foreign_key_violation`. */
+/**
+ * PostgreSQL `foreign_key_violation` — AND `restrict_violation`.
+ *
+ * A constraint declared `ON DELETE RESTRICT` / `ON UPDATE RESTRICT` refuses with
+ * SQLSTATE `23001`, not `23503` (measured on the harness database: "violates
+ * RESTRICT setting of foreign key constraint"). Several columns in `db/schema.ts`
+ * are declared that way, so a caller matching only `23503` would let a restrict
+ * refusal fall through to the 500 path while believing it was mapped.
+ */
 export function isForeignKeyViolation(e: unknown): boolean {
-  return hasSqlState(e, '23503');
+  return hasSqlState(e, '23503') || hasSqlState(e, '23001');
 }
 
 /**

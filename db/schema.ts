@@ -14,6 +14,7 @@ import type { AnyPgColumn } from 'drizzle-orm/pg-core';
 
 import { relations, sql } from 'drizzle-orm';
 import {
+  bigint,
   boolean,
   check,
   customType,
@@ -23,6 +24,7 @@ import {
   pgTable,
   text,
   timestamp,
+  unique,
   uniqueIndex,
   uuid,
   varchar,
@@ -42,6 +44,8 @@ import { PHONE_NUMBER_MODE, PHONE_REQUIRED } from '@/utils/config';
 import {
   CREDENTIAL_ID_MAX,
   EMAIL_MAX,
+  FOLDER_NAME_MAX,
+  MEDIA_DISPLAY_NAME_MAX,
   NAME_MAX,
   OTP_IDENTIFIER_MAX,
   OTP_MAX_ATTEMPTS,
@@ -164,12 +168,28 @@ export const twoFactorMethod = pgEnum('two_factor_method', TWO_FACTOR_METHODS);
 // introducing provider IDs that downstream code cannot handle.
 export const providerIdEnumValues = ['credential'] as const;
 export const providerId = pgEnum('provider_id', providerIdEnumValues);
-export const fileContextTablesEnum = [''] as const;
-
-export const fileContextTable = pgEnum(
-  'file_context_table',
-  fileContextTablesEnum
-);
+/**
+ * The upload saga's durable step marker (see `lib/media/lifecycle.ts`):
+ * `pending` between the row insert and the activation that follows the object
+ * write, `active` once listable and linkable, `deleting` once a delete has
+ * committed to removing the object. Referrers may point only at `active` rows —
+ * enforced by the composite unique below, not by application code.
+ */
+export const fileStatusEnum = ['pending', 'active', 'deleting'] as const;
+export const fileStatus = pgEnum('file_status', fileStatusEnum);
+export const fileKindEnum = ['image', 'document'] as const;
+export const fileKind = pgEnum('file_kind', fileKindEnum);
+/**
+ * A visibility change in flight: the object is being copied to the other
+ * bucket (`to_public`/`to_private`), or the copy is done and the stale one
+ * awaits deletion (`cleanup`). `NULL` is the settled state.
+ */
+export const fileTransitionEnum = [
+  'to_public',
+  'to_private',
+  'cleanup',
+] as const;
+export const fileTransition = pgEnum('file_transition', fileTransitionEnum);
 
 export type AuditAction = 'INSERT' | 'UPDATE' | 'DELETE';
 
@@ -629,40 +649,123 @@ export const trustedDevices = pgTable(
   ]
 );
 
+/**
+ * The media library's tree. Pure organisation: a folder carries no visibility
+ * and no object-store counterpart, so renaming or moving one is a single
+ * `UPDATE` and no URL changes (`reports/file-manager-plan.md`, section 1).
+ *
+ * Depth (≤ `FOLDER_MAX_DEPTH`) and fan-out (≤ `FOLDER_MAX_CHILDREN`) are
+ * enforced in `lib/media/folders.ts` under a `FOR UPDATE` on the parent — a
+ * CHECK cannot see other rows.
+ */
+export const folders = pgTable(
+  'folders',
+  {
+    id: uuid('id').primaryKey().$defaultFn(generateId),
+    parentId: uuid('parent_id').references((): AnyPgColumn => folders.id),
+    name: varchar('name', { length: FOLDER_NAME_MAX }).notNull(),
+    createdBy: uuid('created_by').references(() => users.id, {
+      onDelete: 'set null',
+    }),
+    ...timestamps,
+  },
+  (t) => [
+    // Case-insensitive within a parent; two partial indexes because NULLs are
+    // distinct to a unique index, so one over `(parent_id, lower(name))` would
+    // admit any number of root folders with the same name.
+    uniqueIndex('ux_folders_parent_name')
+      .on(t.parentId, sql`lower(${t.name})`)
+      .where(sql`parent_id IS NOT NULL`),
+    uniqueIndex('ux_folders_root_name')
+      .on(sql`lower(${t.name})`)
+      .where(sql`parent_id IS NULL`),
+    index('idx_folders_parent').on(t.parentId),
+    check(
+      'chk_folders_name',
+      sql`name = btrim(name) AND name <> '' AND position('/' in name) = 0`
+    ),
+    check('chk_folders_not_self', sql`parent_id IS NULL OR parent_id <> id`),
+  ]
+);
+
+/**
+ * One row per stored object, in whichever bucket `bucket_type` names, under the
+ * key `m/<yyyy>/<mm>/<id>.<ext>` — the same key in both buckets, so a
+ * visibility change never changes the path component of a URL.
+ *
+ * `(id, status)` is UNIQUE so that a referencing table can declare
+ * `foreign key (file_id, file_status) references files (id, status)` with a
+ * `file_status` column fixed to `'active'`. That composite FK is what makes
+ * deletion safe without a transaction open across the object store: marking a
+ * row `deleting` fails while any referrer exists, and a referrer cannot be
+ * created against a row that is not `active` — both directions measured under
+ * concurrency, see `reports/file-manager-plan.md` section 13. Every referrer in
+ * a project MUST use that shape; `lib/media/usages.ts` is where it is listed.
+ *
+ * A `pending` row past its TTL is swept by `db/maintenance.ts` together with its
+ * object. A row is `pending` between the insert and the object write's
+ * confirmation (library uploads), or until an entity form claims it
+ * (`claimFiles`). A `deleting` row is one whose delete has committed to going
+ * ahead; the sweep finishes it if the request that started it did not.
+ */
 export const files = pgTable(
   'files',
   {
     id: uuid('id').primaryKey().$defaultFn(generateId),
     r2Key: varchar('r2_key', { length: URL_MAX }).notNull(),
     bucketType: bucketType('bucket_type').notNull(),
-    contextTable: fileContextTable('context_table'),
-    contextId: uuid('context_id'),
+    status: fileStatus('status').notNull().default('pending'),
+    kind: fileKind('kind').notNull(),
+    transition: fileTransition('transition'),
+    folderId: uuid('folder_id').references(() => folders.id),
+    displayName: varchar('display_name', {
+      length: MEDIA_DISPLAY_NAME_MAX,
+    }).notNull(),
     mimeType: varchar('mime_type', { length: 100 }).notNull(),
-    sizeBytes: integer('size_bytes').notNull().default(0),
+    sizeBytes: bigint('size_bytes', { mode: 'number' }).notNull().default(0),
+    // Hex. Verifies a cross-bucket copy (an R2 ETag is not a content hash for a
+    // multipart object) and is the hook for any future duplicate detection.
+    sha256: varchar('sha256', { length: 64 }),
     width: integer('width'),
     height: integer('height'),
     blurhash: varchar('blurhash', { length: 100 }),
-    sortOrder: integer('sort_order').notNull().default(0),
-    // An upload starts unclaimed. `db/maintenance.ts` deletes rows still flagged
-    // after 24h along with their R2 objects, so whatever eventually attaches an
-    // upload to a record MUST clear this in the same transaction that writes
-    // that record — otherwise the sweep deletes the image out from under it.
-    // Nothing clears it today, which is why the sweep is currently the only
-    // thing bounding bucket growth.
-    isTemporary: boolean('is_temporary').notNull().default(true),
     uploadedBy: uuid('uploaded_by').references(() => users.id, {
       onDelete: 'set null',
     }),
+    // Stamped by the retention sweep when the file is active, in no folder and
+    // referenced by no registered owner; cleared when it is filed or linked.
+    // `UNFILED_RETENTION_DAYS` (`lib/media/lifecycle.ts`) after the stamp the
+    // sweep deletes the file.
+    unfiledAt: timestamp('unfiled_at', { withTimezone: true, precision: 2 }),
     ...timestamps,
   },
   (t) => [
     index('idx_files_uploaded_by').on(t.uploadedBy),
     uniqueIndex('ux_files_r2_key').on(t.r2Key),
-    index('idx_files_context').on(t.contextTable, t.contextId, t.sortOrder),
+    unique('ux_files_id_status').on(t.id, t.status),
+    index('idx_files_unfiled')
+      .on(t.unfiledAt)
+      .where(sql`unfiled_at IS NOT NULL`),
+    index('idx_files_folder_created').on(t.folderId, t.createdAt, t.id),
+    index('idx_files_folder_name').on(
+      t.folderId,
+      sql`lower(${t.displayName})`,
+      t.id
+    ),
+    // The sweep's two predicates: pending rows by age, deleting rows by age.
+    index('idx_files_status_created')
+      .on(t.status, t.createdAt)
+      .where(sql`status <> 'active'`),
+    index('idx_files_transition')
+      .on(t.transition, t.updatedAt)
+      .where(sql`transition IS NOT NULL`),
     check('chk_size_bytes_positive', sql`size_bytes >= 0`),
-    check('chk_sort_order_positive', sql`sort_order >= 0`),
     check('chk_width_positive', sql`width IS NULL OR width > 0`),
     check('chk_height_positive', sql`height IS NULL OR height > 0`),
+    check(
+      'chk_files_sha256_hex',
+      sql`sha256 IS NULL OR sha256 ~ '^[0-9a-f]{64}$'`
+    ),
   ]
 );
 
@@ -983,6 +1086,11 @@ export type Account = typeof accounts.$inferSelect;
 export type NewAccount = typeof accounts.$inferInsert;
 export type File = typeof files.$inferSelect;
 export type NewFile = typeof files.$inferInsert;
+export type Folder = typeof folders.$inferSelect;
+export type NewFolder = typeof folders.$inferInsert;
+export type FileStatus = (typeof fileStatusEnum)[number];
+export type FileKind = (typeof fileKindEnum)[number];
+export type FileTransition = (typeof fileTransitionEnum)[number];
 export type AuditLog = typeof auditLogs.$inferSelect;
 export type NewAuditLog = typeof auditLogs.$inferInsert;
 export type RolePermission = typeof rolePermissions.$inferSelect;

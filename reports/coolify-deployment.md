@@ -1,6 +1,6 @@
 # Coolify deployment: ElysiaJS, `bun:sql`, `bun:sqlite`
 
-Updated: 2026-08-25
+Updated: 2026-09-04
 
 > **Nothing here has been executed against a live Coolify instance since the
 > Elysia migration.** Treat it as revised instructions, not a verified
@@ -735,24 +735,26 @@ and removes the divergence from the internet's view of it.
 
 ### Proxy limits that must match the application
 
-| Setting                                                        | Must be             | Because                                                                                                                                                       |
-| -------------------------------------------------------------- | ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Cloudflare proxy read timeout, Traefik `responseHeaderTimeout` | **> 120 s**         | The upload route ceiling. Cloudflare's free-plan 100 s limit is _below_ it — raise it on a paid plan or lower the application ceiling deliberately.           |
-| Cloudflare native upload ceiling                               | **Plan ceiling**    | This is not the application limit. The `max_upload` zone setting starts at 100 MB; an exact body-size WAF rule requires Enterprise.                           |
-| Traefik `POST /api/upload/image` body limit                    | **1,114,112 bytes** | One 1 MiB file plus 64 KiB multipart overhead. The buffering middleware rejects an oversized request with 413 before forwarding it to Bun.                    |
-| Bun/Elysia server-wide body limit                              | **8 MiB**           | `MAX_REQUEST_BODY_BYTES` remains the final origin-wide ceiling. It is broader than the upload contract and does not replace the upload-specific Traefik rule. |
+| Setting                                                        | Must be              | Because                                                                                                                                                                                                                                            |
+| -------------------------------------------------------------- | -------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Cloudflare proxy read timeout, Traefik `responseHeaderTimeout` | **> 120 s**          | The upload routes' ceiling. Cloudflare's free-plan 100 s limit is _below_ it — raise it on a paid plan or lower the application ceiling deliberately.                                                                                              |
+| Cloudflare native upload ceiling                               | **Plan ceiling**     | This is not the application limit. The `max_upload` zone setting starts at 100 MB; an exact body-size WAF rule requires Enterprise.                                                                                                                |
+| Traefik upload-route body limit                                | **12,582,912 bytes** | 12 MiB: one 10 MB document plus multipart framing, the same bound as `MAX_REQUEST_BODY_BYTES`. The buffering middleware rejects an oversized request with 413 before forwarding it to Bun. Images are capped far lower (1 MiB) by the application. |
+| Bun/Elysia server-wide body limit                              | **12 MiB**           | `MAX_REQUEST_BODY_BYTES` (`app.ts`) is the final origin-wide ceiling. It is broader than any single route's contract and does not replace the upload-specific Traefik rule.                                                                        |
 
 Configure an upload-only Traefik router and attach this middleware through
 Coolify's custom labels:
 
 ```text
-traefik.http.middlewares.image-upload-body.buffering.maxRequestBodyBytes=1114112
+traefik.http.middlewares.upload-body.buffering.maxRequestBodyBytes=12582912
 ```
 
 Copy the generated host/TLS/service settings to a higher-priority router whose
-rule adds the exact `/api/upload/image` path matcher. Attach `image-upload-body`
-only to that router, and leave the generated catch-all router in place for every
-other path.
+rule matches both upload routes — ``Path(`/api/upload/file`) ||
+Path(`/api/dash/media/files`)`` — and attach `upload-body` only to that
+router, leaving the generated catch-all router in place for every other path.
+The second path also serves `DELETE`, whose JSON body is tiny; the limit is a
+ceiling, not a target.
 Coolify controls the generated router/service names, so resolve them from the
 deployment's labels or Traefik dashboard rather than copying a name from this
 runbook. Verify the effective labels after every proxy configuration change.
@@ -760,10 +762,10 @@ runbook. Verify the effective labels after every proxy configuration change.
 [Coolify custom middleware](https://coolify.io/docs/knowledge-base/proxy/traefik/custom-middlewares/redirects)
 
 Cloudflare still absorbs the public ingress and can add a path/IP rate rule for
-`/api/upload/image`, subject to the zone's plan. Do not document or rely on an
-8 MiB Cloudflare body limit: the zone-setting schema accepts values from 100 MB,
+the two upload paths, subject to the zone's plan. Do not document or rely on a
+12 MiB Cloudflare body limit: the zone-setting schema accepts values from 100 MB,
 and `http.request.body.size` is Enterprise-only. On Enterprise, an exact-path
-body-size block may duplicate the 1,114,112-byte bound at the edge; otherwise
+body-size block may duplicate the 12,582,912-byte bound at the edge; otherwise
 Traefik is the first exact byte boundary. The VPS firewall must continue blocking
 direct origin access either way.
 [Cloudflare `max_upload` schema](https://developers.cloudflare.com/api/resources/zones/subresources/settings/methods/edit/) ·
@@ -771,10 +773,10 @@ direct origin access either way.
 
 Request ceilings, for reference:
 
-| Scope                    | Value | Where                                 |
-| ------------------------ | ----- | ------------------------------------- |
-| Server-wide idle timeout | 60 s  | `IDLE_TIMEOUT_SECONDS` in `server.ts` |
-| `POST /api/upload/image` | 120 s | `timeoutSeconds` in `routes.ts`       |
+| Scope                                                 | Value | Where                                 |
+| ----------------------------------------------------- | ----- | ------------------------------------- |
+| Server-wide idle timeout                              | 60 s  | `IDLE_TIMEOUT_SECONDS` in `server.ts` |
+| `POST /api/upload/file`, `POST /api/dash/media/files` | 120 s | `timeoutSeconds` in `routes.ts`       |
 
 **Neither number is measured on the target VPS** (`TODO.md` EM-1 — note that
 `TODO.md` is gitignored and therefore absent from a fresh clone, so every
@@ -1654,6 +1656,96 @@ Two CI details that touch this server:
   Removing those two lines is what would make the timestamp class invisible to a
   green pipeline again.
 
+## 13. Object storage for the media library (Cloudflare R2)
+
+Added 2026-09-04 with the media library (`reports/file-manager-plan.md`). None
+of this has been executed against Coolify yet.
+
+### 13.1 Buckets and token
+
+Two R2 buckets, one per visibility: `dash-public` and `dash-private`. A custom
+domain publishes a WHOLE bucket (Cloudflare offers no per-object or per-prefix
+restriction), which is why public and private objects cannot share one.
+
+Create an R2 API token with **Object Read & Write** on both buckets. A
+read-only token lists fine and fails on the first upload with `AccessDenied`
+(measured). Delete the read-only token that was issued during development on
+2026-09-04.
+
+The two variables must name two different buckets; one bucket under both names
+refuses to boot, because a publish would copy an object onto itself and then
+delete the only copy. The library (`POST /api/dash/media/files`) needs the
+private bucket: a deployment with only `dash-public` answers 422 to library
+uploads and accepts uploads only through purposes declared `public` in code.
+
+### 13.2 Public custom domain
+
+Attach a custom domain on the Cloudflare zone to `dash-public` and set it as
+`R2_PUBLIC_URL` (scheme + host, no path, no trailing slash). Requirements:
+
+- **Not `r2.dev`.** Cloudflare documents the `r2.dev` URL as rate-limited and
+  for development only; the application logs a warning at boot when it sees one
+  in production and otherwise accepts it.
+- **Cookie-isolated from the dashboard host.** The public bucket serves
+  sanitised SVG inline. Put it on a separate registrable domain, or at least a
+  host that shares no cookie scope with the application origin.
+- Public objects are cached at the edge under
+  `Cache-Control: public, max-age=31536000, immutable`. A deleted or unpublished
+  object is always removed from the origin; an edge copy is evicted only when
+  the purge below is configured, and a copy already in a browser stays readable
+  until that lifetime elapses, which nothing on the server can shorten.
+
+### 13.3 Environment
+
+| Variable                                                    | Value                                    | Rule                                                                                                                                                                           |
+| ----------------------------------------------------------- | ---------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `R2_PUBLIC_BUCKET`                                          | `dash-public`                            | Optional; enables the `public` visibility and the `publish` action.                                                                                                            |
+| `R2_PUBLIC_URL`                                             | `https://<custom domain>`                | Required whenever `R2_PUBLIC_BUCKET` is set in production. Must be an https origin with no path/query/credentials.                                                             |
+| `R2_PRIVATE_BUCKET`                                         | `dash-private`                           | Optional; enables the `private` visibility. Every upload lands here by default, so a deployment without it can only accept uploads through purposes declared `public` in code. |
+| `R2_ACCOUNT_ID`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY` | from 13.1                                | Required when any bucket is set.                                                                                                                                               |
+| `CLOUDFLARE_ZONE_ID`                                        | zone of the custom domain                | Optional. Both purge variables or neither; a half-set pair refuses to boot.                                                                                                    |
+| `CLOUDFLARE_CACHE_PURGE_TOKEN`                              | API token with `Zone → Cache Purge` only | Optional. When set, deleted and unpublished public objects are purged by URL (batches of 30, best effort, logged).                                                             |
+
+Production refuses to boot with no bucket at all, with a public bucket and no
+`R2_PUBLIC_URL`, with a bucket and no credentials, or with one purge variable.
+Every environment refuses to boot with one bucket under both names.
+
+When the purge pair is set, a delete or unpublish whose purge fails keeps the
+row in its cleanup state and the nightly sweep retries both the object delete
+and the purge; the API reports such rows as `pending` (delete) or with
+`transition: "cleanup"` (unpublish). Without the pair, edge copies simply live
+out their lifetime and the API says so in its contract.
+
+### 13.4 Migration order
+
+`bun run db:migrate` applies `0008`, `0009` and `0010` (additions with
+backfills, drops, then `files.unfiled_at`) and the hand-written
+`002_media_trgm_indexes.sql` and `003_grant_media_to_system_roles.sql`. The
+grant runs in phase 2 on purpose: PostgreSQL refuses to use a new enum value
+(`media` in `page_name`) inside the transaction that added it. After the
+migration every `system`-scoped role holds the `media` page; standard roles get
+it through the permissions page.
+
+The grant file also patches the permission copy that live sessions carry in
+`sessions.metadata`, the same way the dashboard's own permission edits do, so an
+administrator signed in before the migration sees the `media` page once their
+five-minute session cookie cache refreshes, rather than after a re-login.
+
+### 13.5 Proxy limits
+
+`MAX_REQUEST_BODY_BYTES` is 12 MiB in code (10 MB documents plus multipart
+framing), and the upload-route Traefik buffering limit in §5 is set to the same
+12,582,912 bytes on both upload paths. Record the value actually applied on the
+proxy here when it is set.
+
+### 13.6 No CORS, no direct uploads
+
+Every upload goes through the application; nothing fetches objects from the
+browser with `fetch()`. No CORS rule on either bucket is needed. If a future
+change introduces direct-to-R2 uploads or `fetch()`-based downloads, add the
+bucket CORS rule in the Cloudflare console — the API token cannot (measured
+`AccessDenied` on `GetBucketCors`).
+
 ## Final checklist
 
 - [ ] Release committed, pushed, CI green.
@@ -1701,3 +1793,11 @@ Two CI details that touch this server:
       staging.
 - [ ] SQLite checks re-run against a copy of the live volume.
 - [ ] Upstash rollback window completed, credentials revoked.
+- [ ] R2: both buckets exist, the token holds Object Read & Write on both, the
+      development read-only token is deleted (§13.1).
+- [ ] `R2_PUBLIC_URL` is a custom domain, not `r2.dev`, and shares no cookie
+      scope with the dashboard host (§13.2).
+- [ ] Purge pair set together or not at all; purge verified once by deleting a
+      public file and re-fetching its URL (§13.3).
+- [ ] Traefik buffering limit raised before documents above the old cap are
+      allowed (§13.5).

@@ -23,16 +23,16 @@
  * considered and declined; the reasoning is recorded on those tables in
  * `schema.ts`.
  */
-import type { BucketType } from '@/lib/r2/client';
+import type { FileSweepCount } from '@/lib/media/lifecycle';
 
-import { and, eq, inArray, lt, or, sql } from 'drizzle-orm';
+import { inArray, lt, or, sql } from 'drizzle-orm';
 
 import { sanitizeForLog } from '@/utils';
-import { deleteFromR2 } from '@/lib/r2/client';
+import { sweepFiles } from '@/lib/media/lifecycle';
+import { retryTransitions } from '@/lib/media/visibility';
 
 import { db } from './index';
 import {
-  files,
   sessions,
   trustedDevices,
   verificationCodes,
@@ -48,14 +48,11 @@ import {
  * short tail keeps a just-expired session visible to anyone debugging why a user
  * was logged out.
  *
- * `TEMP_FILE_TTL` is the one with a real product constraint behind it — it is the
- * longest a user may take between uploading an image and saving the record that
- * claims it. 24 hours covers "started a form, came back the next morning".
- * Lowering it makes the sweep delete images out from under an open form.
+ * The file TTL lives with the file lifecycle (`PENDING_FILE_TTL` in
+ * `lib/media/lifecycle.ts`), next to the code that claims a pending upload.
  */
 const SESSION_GRACE = '30 days';
 const VERIFICATION_SESSION_TTL = '1 day';
-const TEMP_FILE_TTL = '24 hours';
 
 /**
  * Rows per statement, and a ceiling on statements per table per run — the same
@@ -105,13 +102,39 @@ interface SweepCount {
   hasMore: boolean;
 }
 
-/**
- * The temp-file sweep is the only one that can be CONTAINED rather than
- * complete: an R2 delete that throws is absorbed by `Promise.allSettled`.
- */
-interface TempFileSweepCount extends SweepCount {
-  /** True when at least one object-store delete failed during this run. */
+/** Visibility sagas a crashed request left behind, finished or reverted. */
+interface TransitionSweepCount {
+  reverted: number;
+  finished: number;
+  /** Object-store deletes that failed; the rows stay marked for the next run. */
+  failed: number;
+  /** A failed delete, or the step itself threw before it could report. */
   degraded: boolean;
+}
+
+/**
+ * One step's failure must not skip the steps after it: the file sweep and the
+ * transition retry each talk to the object store, and a throw in the first used
+ * to leave stuck transitions unrecovered for the whole run. The step reports
+ * `fallback` — degraded, with more to do — and the run goes on.
+ */
+async function guarded<T>(
+  step: string,
+  run: () => Promise<T>,
+  fallback: T
+): Promise<T> {
+  try {
+    return await run();
+  } catch (error) {
+    console.error(
+      sanitizeForLog({
+        msg: 'sweep step failed',
+        step,
+        errorClass: error instanceof Error ? error.name : typeof error,
+      })
+    );
+    return fallback;
+  }
 }
 
 export interface DatabaseSweepResult {
@@ -125,7 +148,7 @@ export interface DatabaseSweepResult {
    * `files` rows while `logRun` wrote `scheduled sweep completed, status: "ok"`.
    * `hasMore` was the only signal, and it is indistinguishable from an ordinary
    * backlog. That matters here more than anywhere: nothing else in the codebase
-   * deletes a temporary upload, so the objects accumulate and are paid for.
+   * deletes an abandoned upload, so the objects accumulate and are paid for.
    */
   status: 'ok' | 'degraded';
   durationMs: number;
@@ -135,7 +158,8 @@ export interface DatabaseSweepResult {
     verificationCodes: SweepCount;
     verifications: SweepCount;
     trustedDevices: SweepCount;
-    tempFiles: TempFileSweepCount;
+    files: FileSweepCount;
+    transitions: TransitionSweepCount;
   };
   hasMore: boolean;
 }
@@ -301,109 +325,19 @@ function sweepTrustedDevices(): Promise<SweepCount> {
 }
 
 /**
- * Abandoned temporary uploads, from R2 and then from `files`.
- *
- * **R2 first, database row second, and never the other way round.** An S3 DELETE
- * on a key that is already gone succeeds, so a repeated R2 delete is free and the
- * next run simply retries it. Deleting the row first is not recoverable: the only
- * record of the key is gone, and the object is paid for forever with nothing left
- * to find it by. So a row is removed only once its object is confirmed deleted.
- *
- * `Promise.allSettled`, not `all`: one failing key must not abandon the rest of
- * the batch, and a total R2 outage has to leave every row in place rather than
- * half of them.
- *
- * Its own loop rather than `sweepBatched`, because "rows removed" cannot express
- * this sweep's third outcome. `sweepBatched` reads a short batch as "finished",
- * but a batch where every R2 delete failed is short AND unfinished — the rows are
- * still there. Forcing it into that contract by reporting a full batch instead
- * would loop the ceiling against a provider already refusing every key, and
- * count those attempts as rows removed.
- *
- * `isTemporary` is never cleared anywhere in the codebase today, so every
- * uploaded file eventually qualifies. That is correct as the feature stands —
- * nothing yet attaches an upload to a record — and it is exactly why this sweep
- * is the only thing standing between the bucket and unbounded growth. Whatever
- * later claims an upload must clear the flag inside the same transaction that
- * writes the owning record, or this will delete images out from under it.
- */
-async function sweepTempFiles(): Promise<TempFileSweepCount> {
-  let removed = 0;
-
-  for (let batch = 0; batch < MAX_BATCHES; batch++) {
-    const doomed = await db
-      .select({
-        id: files.id,
-        r2Key: files.r2Key,
-        bucketType: files.bucketType,
-      })
-      .from(files)
-      .where(
-        and(
-          eq(files.isTemporary, true),
-          lt(files.createdAt, sql`now() - ${TEMP_FILE_TTL}::interval`)
-        )
-      )
-      .limit(BATCH_SIZE);
-
-    if (doomed.length === 0)
-      return { removed, hasMore: false, degraded: false };
-
-    const outcomes = await Promise.allSettled(
-      doomed.map((file) =>
-        deleteFromR2({
-          key: file.r2Key,
-          bucketType: file.bucketType as BucketType,
-        })
-      )
-    );
-
-    const purged = doomed.filter((_, i) => outcomes[i]?.status === 'fulfilled');
-    const failed = doomed.length - purged.length;
-    if (failed > 0)
-      // Count only. A key embeds a sanitised filename, and the error text is
-      // provider-controlled — the same boundary rule as
-      // `lib/rate-limit/store-failure.ts`.
-      console.error(
-        sanitizeForLog({ msg: 'db.sweep.r2DeleteFailed', count: failed })
-      );
-
-    if (purged.length > 0) {
-      const deleted = await db
-        .delete(files)
-        .where(
-          inArray(
-            files.id,
-            purged.map((f) => f.id)
-          )
-        )
-        .returning({ id: files.id });
-      removed += deleted.length;
-    }
-
-    // ANY R2 failure ends the run, reporting the backlog rather than chasing it.
-    // The next `select` orders no differently, so the failed rows come back
-    // first and the loop would spend its whole ceiling re-attempting the same
-    // dead keys — MAX_BATCHES x BATCH_SIZE failing R2 calls against a provider
-    // that is already refusing. `hasMore: true` is what schedules the retry, and
-    // it is the honest answer: rows remain.
-    if (failed > 0) return { removed, hasMore: true, degraded: true };
-
-    if (doomed.length < BATCH_SIZE)
-      return { removed, hasMore: false, degraded: false };
-    await yieldToEventLoop();
-  }
-
-  return { removed, hasMore: true, degraded: false };
-}
-
-/**
  * One retention pass over PostgreSQL.
  *
  * Sequential, not `Promise.all`: each table's sweep is itself a batched loop
- * yielding to the event loop, and running four of them concurrently would put
- * four long-running delete loops against live traffic instead of one. The whole
- * run is a scheduled background job, so wall-clock is not the thing to optimise.
+ * yielding to the event loop, and running them concurrently would put several
+ * long-running delete loops against live traffic instead of one. The whole run
+ * is a scheduled background job, so wall-clock is not the thing to optimise.
+ *
+ * The file half lives in `lib/media/lifecycle.ts` and `lib/media/visibility.ts`,
+ * next to the request paths whose unfinished work it completes: abandoned
+ * pending uploads, deletes that lost their request between phases, and
+ * visibility copies that never flipped or never cleaned up. Those are the only
+ * sweeps here that talk to the object store, which is why they alone can report
+ * `degraded`.
  */
 export async function runDatabaseSweep(
   startedAt = Date.now()
@@ -416,17 +350,40 @@ export async function runDatabaseSweep(
     verifications: await sweepVerifications(),
     trustedDevices: await sweepTrustedDevices(),
     sessions: await sweepSessions(),
-    tempFiles: await sweepTempFiles(),
+    files: await guarded('files', sweepFiles, {
+      removed: 0,
+      unfiled: { stamped: 0, reaped: 0 },
+      hasMore: true,
+      degraded: true,
+    }),
+    transitions: await guarded(
+      'transitions',
+      async () => {
+        const outcome = await retryTransitions();
+        return { ...outcome, degraded: outcome.failed > 0 };
+      },
+      { reverted: 0, finished: 0, failed: 0, degraded: true }
+    ),
   };
 
   return {
-    status: removed.tempFiles.degraded ? 'degraded' : 'ok',
+    status:
+      removed.files.degraded || removed.transitions.degraded
+        ? 'degraded'
+        : 'ok',
     durationMs: Date.now() - startedAt,
     removed,
     // Reported rather than hidden, for the same reason as the SQLite sweep: a run
     // that removed exactly its ceiling is otherwise indistinguishable from one
     // that finished, and a growing backlog stays invisible. Sustained `true` is
     // the signal, not a single occurrence.
-    hasMore: Object.values(removed).some((count) => count.hasMore),
+    hasMore:
+      removed.sessions.hasMore ||
+      removed.verificationSessions.hasMore ||
+      removed.verificationCodes.hasMore ||
+      removed.verifications.hasMore ||
+      removed.trustedDevices.hasMore ||
+      removed.files.hasMore ||
+      removed.transitions.degraded,
   };
 }

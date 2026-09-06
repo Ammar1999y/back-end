@@ -21,16 +21,16 @@
  * - `getR2ConfigStatus().configured`. The probe branched on whether the machine
  *   happened to hold R2 credentials, so its headline assertion — the row that
  *   must survive a failed delete — ran only on a machine with none.
- *   `failObjectStore('DeleteObject')` states that condition outright, which also
- *   buys the pass the probe could never make: one where the delete SUCCEEDS, so
- *   the object goes first and the row second.
+ *   `failObjectStore('DeleteObjects')` states that condition outright, which
+ *   also buys the pass the probe could never make: one where the delete
+ *   SUCCEEDS, so the object goes first and the row second.
  * - The clock. Every cutoff in `db/maintenance.ts` is computed in SQL
  *   (`now() - $1::interval`), so `setSystemTime` would move this process's clock
  *   and not PostgreSQL's. Ages are written into the rows instead, and the rows
  *   that must stay sit an hour or a day inside each window, so an interval
  *   written in the wrong unit fails here.
  */
-import { beforeAll, describe, expect, test } from 'bun:test';
+import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import type { StoreOp } from '../helpers/object-store';
 import type { DatabaseSweepResult } from '@/db/maintenance';
 
@@ -41,6 +41,7 @@ import { runDatabaseSweep } from '@/db/maintenance';
 import {
   auditLogs,
   files,
+  folders,
   sessions,
   trustedDevices,
   users,
@@ -57,6 +58,12 @@ import {
   storeOps,
 } from '../helpers/object-store';
 import { seedUser } from '../helpers/session';
+import {
+  createReferrerTable,
+  dropReferrerTable,
+  PUBLIC_SOURCE,
+  withSource,
+} from '../helpers/usage-registry';
 
 /** `SESSION_GRACE` is 30 days past `expires_at`. */
 const TOKEN = {
@@ -66,14 +73,19 @@ const TOKEN = {
   unexpired: 'sweep-still-valid',
 } as const;
 
-/** `TEMP_FILE_TTL` is 24 hours past `created_at`, and only for `is_temporary`. */
+/**
+ * `PENDING_FILE_TTL` is 24 hours past `created_at`, and only for `pending`
+ * rows. A `deleting` row is finished at any age: it is a delete that lost its
+ * request between phases, not a retention decision.
+ */
 const KEY = {
-  pastTtl: 'temp/sweep-past-ttl.webp',
-  edgeOfTtl: 'temp/sweep-edge-of-ttl.webp',
-  fresh: 'temp/sweep-fresh.webp',
-  permanent: 'perm/sweep-permanent.webp',
-  /** A SECOND expired temporary file, for the partial-failure pass only. */
-  siblingPastTtl: 'temp/sweep-past-ttl-sibling.webp',
+  pastTtl: 'm/2026/09/sweep-past-ttl.webp',
+  edgeOfTtl: 'm/2026/09/sweep-edge-of-ttl.webp',
+  fresh: 'm/2026/09/sweep-fresh.webp',
+  permanent: 'm/2026/09/sweep-permanent.webp',
+  orphanDeleting: 'm/2026/09/sweep-orphan-deleting.webp',
+  /** A SECOND expired pending file, for the partial-failure pass only. */
+  siblingPastTtl: 'm/2026/09/sweep-past-ttl-sibling.webp',
 } as const;
 
 /** Both new sweeps cut on `expires_at` against `now()`, with no grace window. */
@@ -182,10 +194,16 @@ async function codeCount(sessionId: string): Promise<number> {
   return rows.length;
 }
 
+/** Every key the pass asked the object store to remove, single or batched. */
 function deletedObjectKeys(ops: readonly StoreOp[]): string[] {
   return ops
-    .filter((op) => op.kind === 'DeleteObject')
-    .map((op) => op.key ?? '(no key)')
+    .flatMap((op) =>
+      op.kind === 'DeleteObjects'
+        ? (op.keys ?? [])
+        : op.kind === 'DeleteObject'
+          ? [op.key ?? '(no key)']
+          : []
+    )
     .toSorted(byText);
 }
 
@@ -196,43 +214,57 @@ async function sweepAndRecord(): Promise<Pass> {
   return { swept, ops: storeOps().slice(before) };
 }
 
+const IMAGE_ROW = {
+  bucketType: 'public',
+  kind: 'image',
+  mimeType: 'image/webp',
+} as const;
+
 async function seedFiles(userId: string): Promise<void> {
   await db.insert(files).values([
-    // GOES: temporary, and two days past a 24-hour TTL.
+    // GOES: pending, and two days past a 24-hour TTL.
     {
+      ...IMAGE_ROW,
       r2Key: KEY.pastTtl,
-      bucketType: 'public',
-      mimeType: 'image/webp',
-      isTemporary: true,
+      displayName: 'past-ttl.webp',
+      status: 'pending',
       uploadedBy: userId,
       createdAt: sql`now() - interval '2 days'`,
     },
     // STAYS: an hour short of the TTL, which is the row a mistyped interval
     // deletes out from under an open form.
     {
+      ...IMAGE_ROW,
       r2Key: KEY.edgeOfTtl,
-      bucketType: 'public',
-      mimeType: 'image/webp',
-      isTemporary: true,
+      displayName: 'edge-of-ttl.webp',
+      status: 'pending',
       uploadedBy: userId,
       createdAt: sql`now() - interval '23 hours'`,
     },
     // STAYS: the upload that is still in progress.
     {
+      ...IMAGE_ROW,
       r2Key: KEY.fresh,
-      bucketType: 'public',
-      mimeType: 'image/webp',
-      isTemporary: true,
+      displayName: 'fresh.webp',
+      status: 'pending',
       uploadedBy: userId,
     },
-    // STAYS however old: age stops applying once the flag is cleared.
+    // STAYS however old: age stops applying once the row is active.
     {
+      ...IMAGE_ROW,
       r2Key: KEY.permanent,
-      bucketType: 'public',
-      mimeType: 'image/webp',
-      isTemporary: false,
+      displayName: 'permanent.webp',
+      status: 'active',
       uploadedBy: userId,
       createdAt: sql`now() - interval '2 days'`,
+    },
+    // GOES at any age: a delete that committed phase A and lost its request.
+    {
+      ...IMAGE_ROW,
+      r2Key: KEY.orphanDeleting,
+      displayName: 'orphan-deleting.webp',
+      status: 'deleting',
+      uploadedBy: userId,
     },
   ]);
 }
@@ -403,7 +435,16 @@ describe('a pass with a healthy object store', () => {
       verificationCodes: { removed: 1, hasMore: false },
       verifications: { removed: 1, hasMore: false },
       trustedDevices: { removed: 1, hasMore: false },
-      tempFiles: { removed: 1, hasMore: false, degraded: false },
+      // `stamped: 0`, with an active row in no folder present (`KEY.permanent`):
+      // no owner table is registered here, and the unfiled guards fail closed
+      // while none is. The registered case is the `unfiled files` block below.
+      files: {
+        removed: 2,
+        unfiled: { stamped: 0, reaped: 0 },
+        hasMore: false,
+        degraded: false,
+      },
+      transitions: { reverted: 0, finished: 0, failed: 0, degraded: false },
     });
     // The "stays" partner of the backlog signal asserted under a failing R2
     // below: a completed pass must not ask to be re-run.
@@ -447,15 +488,18 @@ describe('a pass with a healthy object store', () => {
     ]);
   });
 
-  test('the temp file past its TTL loses its object and then its row; the recent, near-boundary and non-temporary rows keep both', async () => {
+  test('the pending file past its TTL and the orphaned deleting row lose their objects and then their rows; the recent, near-boundary and active rows keep both', async () => {
     expect(await survivingFileKeys()).toEqual(
       [KEY.edgeOfTtl, KEY.fresh, KEY.permanent].toSorted(byText)
     );
     // Rows alone cannot see the inverse failure: a sweep that deleted the wrong
     // OBJECT and left its row reads as "untouched" in `files` while the image is
     // gone from the bucket.
-    expect(deletedObjectKeys(healthy().ops)).toEqual([KEY.pastTtl]);
-    expect(healthy().ops.map((op) => op.kind)).toEqual(['DeleteObject']);
+    expect(deletedObjectKeys(healthy().ops)).toEqual(
+      [KEY.pastTtl, KEY.orphanDeleting].toSorted(byText)
+    );
+    // One batched call per bucket, not one round trip per row.
+    expect(healthy().ops.map((op) => op.kind)).toEqual(['DeleteObjects']);
     // The row's own `bucket_type`, not a hardcoded bucket: a sweep that always
     // addressed the private bucket would delete nothing and report success.
     expect(healthy().ops[0]?.bucket).toBe(process.env.R2_PUBLIC_BUCKET);
@@ -489,30 +533,38 @@ describe('a pass whose object-store delete fails', () => {
     await seedFiles(userId);
     // Requested, not depended on: the probe needed a machine holding no R2
     // credentials for this branch to run at all.
-    failObjectStore('DeleteObject');
+    failObjectStore('DeleteObjects');
     passes.r2Down = await sweepAndRecord();
   });
 
-  test('the row SURVIVES, so the object is never orphaned', async () => {
+  test('every row SURVIVES, so no object is ever orphaned', async () => {
     // The one case where not deleting is correct: the key is the only record of
-    // the object, and a row removed ahead of its object is unrecoverable.
+    // the object, and a row removed ahead of its object is unrecoverable. The
+    // expired row is now `deleting` — marked, so the next run finishes it — but
+    // it is still there.
     expect(await survivingFileKeys()).toEqual(
-      [KEY.pastTtl, KEY.edgeOfTtl, KEY.fresh, KEY.permanent].toSorted(byText)
+      [
+        KEY.pastTtl,
+        KEY.edgeOfTtl,
+        KEY.fresh,
+        KEY.permanent,
+        KEY.orphanDeleting,
+      ].toSorted(byText)
     );
-    expect(r2Down().swept.removed.tempFiles.removed).toBe(0);
+    expect(r2Down().swept.removed.files.removed).toBe(0);
   });
 
   test('a batch that made no progress still reports unfinished work', () => {
     // Or a total R2 outage reads as a clean sweep and nothing reschedules it.
-    expect(r2Down().swept.removed.tempFiles.hasMore).toBe(true);
+    expect(r2Down().swept.removed.files.hasMore).toBe(true);
     expect(r2Down().swept.hasMore).toBe(true);
     // And it reports DEGRADED, not `ok`. `hasMore` alone is indistinguishable
     // from an ordinary backlog, so an alert built on the sweep-level status —
     // the signal the sibling SQLite job defines and the only one either job
-    // emits — stayed quiet through a total object-store outage while temporary
+    // emits — stayed quiet through a total object-store outage while abandoned
     // uploads accumulated in the bucket and were billed.
     expect(r2Down().swept.status).toBe('degraded');
-    expect(r2Down().swept.removed.tempFiles.degraded).toBe(true);
+    expect(r2Down().swept.removed.files.degraded).toBe(true);
     // And the failure stays inside its own table: the three with nothing to do
     // must not inherit the backlog flag.
     expect(r2Down().swept.removed.sessions).toEqual({
@@ -529,12 +581,15 @@ describe('a pass whose object-store delete fails', () => {
     });
   });
 
-  test('the doomed key is attempted once, not looped against the per-run ceiling', () => {
-    // `MAX_BATCHES` is 40. A loop that re-selected the same failing row would
-    // show 40 attempts against a provider already refusing it, and the three
-    // keys that must never be addressed would still be absent — so one equality
+  test('the doomed keys are attempted once, not looped against the per-run ceiling', () => {
+    // A loop that re-selected the same failing rows would show repeated
+    // attempts against a provider already refusing them, and the three keys
+    // that must never be addressed would still be absent — so one equality
     // carries both halves.
-    expect(deletedObjectKeys(r2Down().ops)).toEqual([KEY.pastTtl]);
+    expect(deletedObjectKeys(r2Down().ops)).toEqual(
+      [KEY.pastTtl, KEY.orphanDeleting].toSorted(byText)
+    );
+    expect(r2Down().ops.map((op) => op.kind)).toEqual(['DeleteObjects']);
   });
 });
 
@@ -558,44 +613,48 @@ describe('a pass where one object fails and its sibling succeeds', () => {
     await resetTables();
     const { userId } = await seedUser();
     await seedFiles(userId);
-    // The sibling: same age, same bucket, same flag — so the ONLY difference
+    // The sibling: same age, same bucket, same status — so the ONLY difference
     // between the two is which one the object store refuses.
     await db.insert(files).values({
+      ...IMAGE_ROW,
       r2Key: KEY.siblingPastTtl,
-      bucketType: 'public',
-      mimeType: 'image/webp',
-      isTemporary: true,
+      displayName: 'past-ttl-sibling.webp',
+      status: 'pending',
       uploadedBy: userId,
       createdAt: sql`now() - interval '2 days'`,
     });
 
-    failObjectStoreKey('DeleteObject', KEY.pastTtl);
+    // Inside one `DeleteObjects` call the refused key comes back in `Errors`
+    // while its neighbours are removed — how R2 reports it, and how the stub
+    // reproduces it.
+    failObjectStoreKey('DeleteObjects', KEY.pastTtl);
     passes.partial = await sweepAndRecord();
   });
 
-  test('the sibling is swept and the failed row is kept', async () => {
+  test('the sibling and the orphan are swept and the failed row is kept', async () => {
     expect(await survivingFileKeys()).toEqual(
       [KEY.pastTtl, KEY.edgeOfTtl, KEY.fresh, KEY.permanent].toSorted(byText)
     );
-    // Exactly one, not zero and not two: zero would mean one bad object stalled
-    // the batch, two would mean a row went without its object.
-    expect(partial().swept.removed.tempFiles.removed).toBe(1);
+    // Exactly two, not zero and not three: zero would mean one bad object
+    // stalled the batch, three would mean a row went without its object.
+    expect(partial().swept.removed.files.removed).toBe(2);
   });
 
   test('unfinished work is still reported, so the failed row is retried later', () => {
-    expect(partial().swept.removed.tempFiles.hasMore).toBe(true);
+    expect(partial().swept.removed.files.hasMore).toBe(true);
     expect(partial().swept.hasMore).toBe(true);
     // Degraded on ANY failed delete, not only on a run that removed nothing:
     // partial progress still means a store this pass was asked to sweep was not
     // fully swept, and `hasMore` alone reads as an ordinary backlog.
     expect(partial().swept.status).toBe('degraded');
-    expect(partial().swept.removed.tempFiles.degraded).toBe(true);
+    expect(partial().swept.removed.files.degraded).toBe(true);
   });
 
-  test('both objects were addressed, and nothing else was', () => {
+  test('all three objects were addressed in one call, and nothing else was', () => {
     expect(deletedObjectKeys(partial().ops)).toEqual(
-      [KEY.pastTtl, KEY.siblingPastTtl].toSorted(byText)
+      [KEY.pastTtl, KEY.siblingPastTtl, KEY.orphanDeleting].toSorted(byText)
     );
+    expect(partial().ops.map((op) => op.kind)).toEqual(['DeleteObjects']);
   });
 });
 
@@ -643,5 +702,142 @@ describe('the scheduled job in front of it', () => {
 
     expect(await survivingSessionTokens()).toEqual([TOKEN.pastGrace]);
     expect(storeOps()).toEqual([]);
+  });
+});
+
+/**
+ * Unfiled files — active, in no folder, referenced by no record: the state an
+ * entity upload reaches when the record that held it is deleted. The sweep
+ * stamps one the first time it sees it and reaps it `UNFILED_RETENTION_DAYS`
+ * after the stamp; a folder (adoption) or a new owner clears the stamp.
+ */
+describe('unfiled files', () => {
+  const UNFILED = {
+    fresh: 'm/2026/09/unfiled-fresh.webp',
+    due: 'm/2026/09/unfiled-due.webp',
+    inside: 'm/2026/09/unfiled-inside.webp',
+    refiled: 'm/2026/09/unfiled-refiled.webp',
+    library: 'm/2026/09/unfiled-library.webp',
+  } as const;
+
+  const unfiledPass: { pass: Pass | null } = { pass: null };
+
+  beforeAll(async () => {
+    await resetTables();
+    const { userId } = await seedUser();
+    const [folder] = await db
+      .insert(folders)
+      .values({ name: 'Kept' })
+      .returning({ id: folders.id });
+    if (!folder) throw new Error('folder fixture missing');
+    await db.insert(files).values([
+      // STAMPED this pass, and stays: the window starts now.
+      {
+        ...IMAGE_ROW,
+        r2Key: UNFILED.fresh,
+        displayName: 'fresh.webp',
+        status: 'active',
+        uploadedBy: userId,
+      },
+      // GOES: stamped eight days ago against a seven-day window.
+      {
+        ...IMAGE_ROW,
+        r2Key: UNFILED.due,
+        displayName: 'due.webp',
+        status: 'active',
+        uploadedBy: userId,
+        unfiledAt: sql`now() - interval '8 days'`,
+      },
+      // STAYS: a day inside the window.
+      {
+        ...IMAGE_ROW,
+        r2Key: UNFILED.inside,
+        displayName: 'inside.webp',
+        status: 'active',
+        uploadedBy: userId,
+        unfiledAt: sql`now() - interval '6 days'`,
+      },
+      // STAYS, and loses its stamp: it was moved into a folder after being
+      // stamped, which is exactly the adoption the listing offers.
+      {
+        ...IMAGE_ROW,
+        r2Key: UNFILED.refiled,
+        displayName: 'refiled.webp',
+        status: 'active',
+        uploadedBy: userId,
+        folderId: folder.id,
+        unfiledAt: sql`now() - interval '8 days'`,
+      },
+      // STAYS, never stamped: a library file is not unfiled.
+      {
+        ...IMAGE_ROW,
+        r2Key: UNFILED.library,
+        displayName: 'library.webp',
+        status: 'active',
+        uploadedBy: userId,
+        folderId: folder.id,
+      },
+    ]);
+    await createReferrerTable();
+    // The unfiled scope exists for projects that hold files on their own
+    // records, and its guards match nothing until one says so.
+    unfiledPass.pass = await withSource(PUBLIC_SOURCE, sweepAndRecord);
+  });
+
+  afterAll(async () => {
+    await dropReferrerTable();
+  });
+
+  test('one stamped, one reaped, the filed one unstamped, the rest untouched', async () => {
+    const pass = unfiledPass.pass;
+    if (!pass) throw new Error('fixture not swept');
+    expect(pass.swept.removed.files).toEqual({
+      removed: 1,
+      unfiled: { stamped: 1, reaped: 1 },
+      hasMore: false,
+      degraded: false,
+    });
+    expect(pass.swept.status).toBe('ok');
+
+    const rows = await db
+      .select({ r2Key: files.r2Key, unfiledAt: files.unfiledAt })
+      .from(files);
+    const stamps = new Map(rows.map((row) => [row.r2Key, row.unfiledAt]));
+    expect(stamps.keys().toArray().toSorted(byText)).toEqual(
+      [
+        UNFILED.fresh,
+        UNFILED.inside,
+        UNFILED.refiled,
+        UNFILED.library,
+      ].toSorted(byText)
+    );
+    expect(stamps.get(UNFILED.fresh)).toBeInstanceOf(Date);
+    expect(stamps.get(UNFILED.inside)).toBeInstanceOf(Date);
+    expect(stamps.get(UNFILED.refiled)).toBeNull();
+    expect(stamps.get(UNFILED.library)).toBeNull();
+
+    // The object went with the row, and only that one.
+    expect(deletedObjectKeys(pass.ops)).toEqual([UNFILED.due]);
+  });
+
+  test('a pass with no owner table registered stamps nothing, reaps nothing, and takes the stamped rows off the clock', async () => {
+    // The shipped state of the kit: `unreferenced()` fails closed, so no row is
+    // unfiled and the reaper has nothing to collect. Answering "true" there put
+    // every claimed entity upload of every project on a seven-day clock.
+    const before = await db
+      .select({ id: files.id })
+      .from(files)
+      .where(eq(files.r2Key, UNFILED.fresh));
+    expect(before).toHaveLength(1);
+
+    const pass = await sweepAndRecord();
+    expect(pass.swept.removed.files).toMatchObject({
+      unfiled: { stamped: 0, reaped: 0 },
+    });
+    const stamps = await db
+      .select({ unfiledAt: files.unfiledAt })
+      .from(files)
+      .where(eq(files.r2Key, UNFILED.fresh));
+    expect(stamps[0]?.unfiledAt).toBeNull();
   });
 });

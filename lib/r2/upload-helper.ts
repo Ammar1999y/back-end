@@ -1,10 +1,4 @@
-import type { BucketType } from './client';
-import type { NewFile } from '@/db/schema';
-import type { EntityID } from '@/types';
-
-import { uploadMsg } from '@/app/api/upload/image/messages';
-import { db } from '@/db';
-import { files } from '@/db/schema';
+import { uploadMsg } from '@/app/api/upload/file/messages';
 import { sanitizeForLog } from '@/utils';
 import { encode } from 'blurhash';
 
@@ -17,19 +11,9 @@ import {
 } from '@/utils/images/raster-bytes';
 import { imageToRgba } from '@/utils/images/rgba';
 import { sanitizeSvgServer, svgOptimizerServer } from '@/utils/images/server';
-import { generateShortId, sanitizeFilename } from '@/utils/sanitize-filename';
-import {
-  MAX_IMAGE_EDGE,
-  MAX_IMAGE_PIXELS,
-  SERVER_MAX_IMAGE_SIZE,
-} from '@/utils/validation/constants';
+import { sanitizeFilename } from '@/utils/sanitize-filename';
+import { MAX_IMAGE_EDGE, MAX_IMAGE_PIXELS } from '@/utils/validation/constants';
 
-import {
-  deleteFromR2,
-  getCacheControlHeader,
-  getContentDisposition,
-  uploadToR2,
-} from './client';
 import { optimizeImage, shouldOptimizeImage } from './optimize-image';
 
 /**
@@ -39,6 +23,10 @@ import { optimizeImage, shouldOptimizeImage } from './optimize-image';
  * instead of a copy: the property that matters is that every admitted type has a
  * magic-byte signature (or is the SVG exemption), and a hand-written list in the
  * test would keep passing for a type added here and nowhere else.
+ *
+ * The document types live in `lib/media/allowlist.ts`, which is also where these
+ * three are listed for the upload route; this list is the IMAGE PIPELINE's own
+ * statement of what it can process.
  */
 export const ALLOWED_IMAGE_TYPES = [
   'image/png',
@@ -57,10 +45,8 @@ export function isAllowedImageType(
 /**
  * The stored extension, from the RESOLVED MIME type and never from `file.name`.
  *
- * Every other component of an R2 key is a random hex id or `sanitizeFilename`
- * output; taking this one from the client's string put attacker-chosen path
- * segments into the key — `file.name = "x.a/../../../../evil"` yields
- * `temp/<id>_x.a/../../../../evil`, escaping the `temp/` prefix.
+ * Every other component of an object key is a row id; taking this one from the
+ * client's string would put attacker-chosen path segments into the key.
  */
 const MIME_EXTENSIONS = new Map<string, string>([
   ['image/png', 'png'],
@@ -120,25 +106,18 @@ async function generateBlurhash(imageBuffer: Buffer): Promise<string> {
   return encode(new Uint8ClampedArray(rgba), width, height, 4, 3);
 }
 
-// Generate R2 key for temporary files with sanitized name
-function generateTempImageKey(originalName: string, extension: string): string {
-  const safeName = sanitizeFilename(originalName);
-  const shortId = generateShortId();
-  return `temp/${shortId}_${safeName}.${extension}`;
-}
-
-// Processed image data ready for upload
-type ProcessedImage = {
+/** An image after validation, optimisation and sanitisation, ready to store. */
+export interface ProcessedImage {
   buffer: Buffer;
-  r2Key: string;
   mimeType: string;
+  extension: string;
   sizeBytes: number;
   width?: number;
   height?: number;
   blurhash?: string;
   originalMimeType?: string;
   originalSize?: number;
-};
+}
 
 export interface ValidatedSvgUpload {
   cleanedSvg: string;
@@ -177,13 +156,19 @@ export function validateSvgUpload(
   );
 }
 
-// Process a single image (validate, optimize, sanitize, generate blurhash)
-async function processImage(
+/**
+ * Validate, optimise, sanitise and fingerprint one image.
+ *
+ * Pure with respect to storage: it neither writes an object nor a row. The
+ * store-and-record half lives in `lib/media/upload.ts`, which is what both
+ * upload routes call, so the two never diverge on what an image becomes before
+ * it is kept.
+ */
+export async function processImage(
   input: UploadImageInput,
   targetSize: number
 ): Promise<ProcessedImage> {
   const { file } = input;
-  // Validate MIME type
   if (!isAllowedImageType(file.type)) {
     throw new CustomError(
       uploadMsg.invalidMimeType(file.type),
@@ -199,7 +184,6 @@ async function processImage(
   let blurhash: string | undefined;
   let finalExtension: string;
 
-  // Handle SVG files
   if (file.type === 'image/svg+xml') {
     const sanitizeResult =
       input.validatedSvg ?? validateSvgUpload(buffer, file.name);
@@ -216,9 +200,7 @@ async function processImage(
     // minified above, and a placeholder for a file that arrives in a few
     // kilobytes buys nothing. `files.blurhash` is nullable, so consumers must
     // already tolerate its absence.
-  }
-  // Optimize raster images (PNG, WebP)
-  else if (shouldOptimizeImage(file.type)) {
+  } else if (shouldOptimizeImage(file.type)) {
     const optimized = await optimizeImage(buffer, { targetSize });
 
     // `optimized.buffer` is the result object's Buffer field, not a view's
@@ -246,8 +228,8 @@ async function processImage(
 
   return {
     buffer,
-    r2Key: generateTempImageKey(file.name, finalExtension),
     mimeType: finalMimeType,
+    extension: finalExtension,
     sizeBytes: finalSize,
     width,
     height,
@@ -257,102 +239,4 @@ async function processImage(
       originalSize: file.size,
     }),
   };
-}
-
-export async function uploadImagesToR2(params: {
-  images: UploadImageInput[];
-  targetSize?: number;
-  bucketType?: BucketType;
-  /**
-   * Who uploaded these. Optional only because the column is nullable and
-   * `onDelete: 'set null'` — every current caller passes it, and the retention
-   * sweep in `db/maintenance.ts` needs it to say WHOSE abandoned upload it
-   * removed. A temporary row with no owner is untraceable.
-   */
-  uploadedBy?: EntityID;
-}): Promise<string[]> {
-  const {
-    images,
-    bucketType = 'public',
-    targetSize = SERVER_MAX_IMAGE_SIZE * 1024 * 1024,
-    uploadedBy,
-  } = params;
-
-  let uploadedKeys: string[] = [];
-
-  try {
-    // Process all images (optimize, generate blurhash, etc.)
-    const processedImages = await Promise.all(
-      images.map((image) => processImage(image, targetSize))
-    );
-
-    // Pre-populate keys so cleanup always has the full list on partial failure
-    uploadedKeys = processedImages.map((img) => img.r2Key);
-
-    // Upload all to R2 in parallel
-    await Promise.all(
-      processedImages.map((img) =>
-        uploadToR2({
-          file: img.buffer,
-          key: img.r2Key,
-          bucketType,
-          contentType: img.mimeType,
-          cacheControl: getCacheControlHeader({
-            mimeType: img.mimeType,
-            isPublic: bucketType === 'public',
-          }),
-          contentDisposition: getContentDisposition({
-            filename: img.r2Key.slice(img.r2Key.lastIndexOf('/') + 1),
-            inline: true,
-          }),
-          metadata: {
-            ...(img.originalMimeType &&
-              img.originalSize !== undefined && {
-                originalMimeType: img.originalMimeType,
-                originalSize: img.originalSize.toString(),
-              }),
-          },
-        })
-      )
-    );
-
-    // Prepare database records
-    const dbRecords: NewFile[] = processedImages.map((img) => ({
-      r2Key: img.r2Key,
-      bucketType: bucketType as 'public',
-      contextTable: null,
-      mimeType: img.mimeType,
-      sizeBytes: img.sizeBytes,
-      width: img.width,
-      height: img.height,
-      blurhash: img.blurhash,
-      isTemporary: true,
-      uploadedBy: uploadedBy ?? null,
-    }));
-
-    try {
-      await db.insert(files).values(dbRecords);
-    } catch (dbError) {
-      // Best-effort cleanup: delete uploaded R2 objects to avoid orphans
-      await Promise.allSettled(
-        uploadedKeys.map((key) => deleteFromR2({ key, bucketType }))
-      );
-      uploadedKeys = []; // Prevent double cleanup
-      throw dbError;
-    }
-
-    return processedImages.map((img) => img.r2Key);
-  } catch (error) {
-    // Best-effort cleanup on any failure (upload or processing)
-    if (uploadedKeys.length > 0) {
-      await Promise.allSettled(
-        uploadedKeys.map((key) => deleteFromR2({ key, bucketType }))
-      );
-    }
-
-    if (error instanceof CustomError) throw error;
-
-    console.error(sanitizeForLog(error));
-    throw new CustomError(uploadMsg.uploadFailed, HTTP_STATUS.INTERNAL_ERROR);
-  }
 }

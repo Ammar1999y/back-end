@@ -28,7 +28,7 @@ running `Bun.Image` and calling it a comparison.
 
 ## Scope: only what the route does
 
-`app/api/upload/image/handler.ts` → `lib/r2/upload-helper.ts` →
+`app/api/upload/file/handler.ts` → `lib/media/upload.ts` → `lib/r2/upload-helper.ts` →
 `lib/r2/optimize-image.ts` is the whole image surface of this project. There is
 no rotate, no crop, no thumbnail set, no format negotiation, so none of that is
 measured — a benchmark of features nobody calls is a benchmark of nothing.

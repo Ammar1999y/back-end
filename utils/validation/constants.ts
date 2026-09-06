@@ -14,6 +14,23 @@ export const MAX_IMAGE_EDGE = 16_383;
 export const SERVER_MAX_IMAGE_SIZE = 0.2;
 export const NAME_MAX = 150;
 
+// Media library
+export const MAX_DOCUMENT_SIZE_MB = 10;
+// ⚠️ Baked into the `files.display_name` column width. Changing it requires a migration.
+export const MEDIA_DISPLAY_NAME_MAX = 150;
+// ⚠️ Baked into the `folders.name` column width. Changing it requires a migration.
+export const FOLDER_NAME_MAX = 100;
+export const FOLDER_MAX_DEPTH = 10;
+export const FOLDER_MAX_CHILDREN = 500;
+/**
+ * Descendants — subfolders plus the files inside them, NOT counting the folder
+ * being deleted — that one recursive folder delete may remove. The bound is
+ * what makes the operation a request rather than a job: each file costs an
+ * object delete and, for a public one, a cache purge, and the caller waits for
+ * all of them.
+ */
+export const FOLDER_RECURSIVE_DELETE_MAX = 200;
+
 // Auth
 export const PASSWORD_MIN = 8;
 export const PASSWORD_MAX = 128;

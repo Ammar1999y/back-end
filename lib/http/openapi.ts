@@ -11,6 +11,7 @@ import type { HttpMethod, RouteManifestEntry } from './route-manifest';
 import { deleteSessionsSchema } from '@/app/api/dash/users/[id]/sessions/handler';
 import { SESSION_CURSOR_PATTERN } from '@/app/api/dash/users/[id]/sessions/pagination';
 import { devSignUpSchema } from '@/app/api/dev/sign-up/handler';
+import { bucketTypeEnum, fileKindEnum, fileTransitionEnum } from '@/db/schema';
 import { UUID_V7_PATTERN } from '@/utils';
 import * as z from 'zod';
 import { auth } from '@/lib/auth';
@@ -22,10 +23,14 @@ import {
 } from '@/lib/auth/allowed-paths';
 import { CAPTCHA_TOKEN_MAX_LENGTH } from '@/lib/captcha';
 import {
+  ALLOWED_MIME_TYPES,
+  KNOWN_MIME_TYPES,
+  mimeTypesOfKind,
+} from '@/lib/media/allowlist';
+import {
   DASHBOARD_PAGE_NAMES,
   PERMISSION_ACTIONS,
 } from '@/lib/permissions/constants';
-import { ALLOWED_IMAGE_TYPES } from '@/lib/r2/upload-helper';
 
 import { apiRaw } from '@/utils/api-response';
 import { PHONE_ENABLED, PHONE_REQUIRED } from '@/utils/config';
@@ -42,10 +47,20 @@ import {
   selfUpdateUserBodySchema,
 } from '@/utils/validation/auth';
 import {
+  FOLDER_NAME_MAX,
+  MAX_DOCUMENT_SIZE_MB,
   MAX_IMAGE_EDGE,
   MAX_IMAGE_PIXELS,
   MAX_IMAGE_SIZE,
+  MEDIA_DISPLAY_NAME_MAX,
 } from '@/utils/validation/constants';
+import {
+  createFolderSchema,
+  deleteFilesSchema,
+  moveFilesSchema,
+  updateFileSchema,
+  updateFolderSchema,
+} from '@/utils/validation/media';
 import {
   isChannelEnabled,
   passwordlessVerifySchema,
@@ -112,23 +127,54 @@ export const REQUEST_BODIES: Record<string, z.ZodType | readonly z.ZodType[]> =
     'POST /api/dash/users/me/change-phone': changePhoneSchema,
     'POST /api/dash/users/me/change-phone/verify': changePhoneVerifySchema,
     'DELETE /api/dash/users/:id/sessions': deleteSessionsSchema,
+    'DELETE /api/dash/media/files': deleteFilesSchema,
+    'PUT /api/dash/media/files': moveFilesSchema,
+    'PUT /api/dash/media/files/:id': updateFileSchema,
+    'POST /api/dash/media/folders': createFolderSchema,
+    'PUT /api/dash/media/folders/:id': updateFolderSchema,
     'POST /api/dev/sign-up': devSignUpSchema,
+  };
+
+/**
+ * Multipart request bodies, keyed like `REQUEST_BODIES`.
+ *
+ * Per route rather than one block for every `multipart` policy: the two upload
+ * routes use different field names, and a client generated from a body that
+ * named the wrong field would send a form the handler answers "no file" to.
+ * The allowed types come from the allowlist itself, so a type added there is
+ * published without a second edit here.
+ */
+const MULTIPART_BODIES: Record<string, { field: string; description: string }> =
+  {
+    'POST /api/upload/file': {
+      field: 'files',
+      description:
+        'The file, for the record named by `resource` and `purpose`.',
+    },
+    'POST /api/dash/media/files': {
+      field: 'file',
+      description:
+        'The file, stored privately in the folder named by `folder`. A deployment with no private bucket answers 422.',
+    },
   };
 
 /**
  * Routes whose success status is not 200.
  *
- * Hardcoding 200 for everything made the document wrong for the three handlers
- * that return `HTTP_STATUS.CREATED` — a client generated from it would treat a
+ * Hardcoding 200 for everything made the document wrong for the handlers that
+ * return `HTTP_STATUS.CREATED` — a client generated from it would treat a
  * successful creation as unexpected.
  */
 const CREATED_ROUTES = new Set([
   'POST /api/dash/permissions',
   'POST /api/dash/users',
+  'POST /api/dash/media/files',
+  'POST /api/dash/media/folders',
+  'POST /api/upload/file',
   'POST /api/dev/sign-up',
 ]);
 
-/** Routes whose database constraint mapping can return a deliberate 409. */
+/** Routes whose database constraint mapping, or own business rule, can return a deliberate 409. */
 const CONFLICT_ROUTES = new Set([
   'POST /api/dash/permissions',
   'PUT /api/dash/permissions/:id',
@@ -138,6 +184,14 @@ const CONFLICT_ROUTES = new Set([
   'POST /api/dash/users/me/change-email/verify',
   'POST /api/dash/users/me/change-phone',
   'POST /api/dash/users/me/change-phone/verify',
+  // A referenced file, a file mid-transition, a duplicate folder name, a
+  // non-empty folder, an unpublish with a public owner.
+  'DELETE /api/dash/media/files',
+  'POST /api/dash/media/files/:id/publish',
+  'POST /api/dash/media/files/:id/unpublish',
+  'POST /api/dash/media/folders',
+  'PUT /api/dash/media/folders/:id',
+  'DELETE /api/dash/media/folders/:id',
   'POST /api/dev/sign-up',
 ]);
 
@@ -167,13 +221,34 @@ const NOT_FOUND_ROUTES = new Set([
   'DELETE /api/dash/users/:id',
   'GET /api/dash/users/:id/sessions',
   'DELETE /api/dash/users/:id/sessions',
+  // A folder or file that does not exist or is outside the caller's scope.
+  'GET /api/dash/media',
+  'POST /api/dash/media/files',
+  'DELETE /api/dash/media/files',
+  'PUT /api/dash/media/files',
+  'GET /api/dash/media/files/:id',
+  'PUT /api/dash/media/files/:id',
+  'POST /api/dash/media/files/:id/publish',
+  'POST /api/dash/media/files/:id/unpublish',
+  'POST /api/dash/media/folders',
+  'PUT /api/dash/media/folders/:id',
+  'DELETE /api/dash/media/folders/:id',
 ]);
 
-/** Bodyless routes whose query parser can reject a supplied value with 422. */
+/** Routes whose query parser can reject a supplied value with 422. */
 const QUERY_VALIDATION_ROUTES = new Set([
   'GET /api/dash/permissions',
   'GET /api/dash/users',
   'GET /api/dash/users/:id/sessions',
+  'GET /api/dash/media',
+  'POST /api/dash/media/files',
+  // `recursive` is either `true` or absent; anything else is a refusal.
+  'DELETE /api/dash/media/folders/:id',
+  // The bucket a publish needs may be disabled in this deployment.
+  'POST /api/dash/media/files/:id/publish',
+  'POST /api/dash/media/files/:id/unpublish',
+  // A purpose whose bucket is disabled.
+  'POST /api/upload/file',
 ]);
 
 /**
@@ -186,7 +261,10 @@ const CHANNEL_UNAVAILABLE_ROUTES = new Set([
   'POST /api/dash/users/me/change-phone',
 ]);
 
-const OPERATION_DOCS: Record<string, { summary: string; tag: string }> = {
+const OPERATION_DOCS: Record<
+  string,
+  { summary: string; tag: string; description?: string }
+> = {
   'POST /api/auth/forgot-password/reset': {
     summary: 'Reset a forgotten password',
     tag: 'Authentication',
@@ -295,8 +373,62 @@ const OPERATION_DOCS: Record<string, { summary: string; tag: string }> = {
     summary: 'Clear a user’s two-factor enrolment',
     tag: 'Users',
   },
-  'POST /api/upload/image': {
-    summary: 'Upload an image',
+  'GET /api/dash/media': {
+    summary: 'List a media folder, or search the library',
+    tag: 'Media',
+  },
+  'POST /api/dash/media/files': {
+    summary: 'Upload a file into a media folder',
+    tag: 'Media',
+  },
+  'DELETE /api/dash/media/files': {
+    summary: 'Delete media files',
+    tag: 'Media',
+    description:
+      'Refused as a whole (409) while any record references one of the files. Otherwise every file is committed to deletion and disappears from every listing at once; `deleted` names the ones whose object is already gone, `pending` the ones the object store or a configured cache purge refused, which the nightly sweep finishes. An unfiled file (`scope=unfiled`) is deleted by the sweep on its own after `retentionDays`.',
+  },
+  'PUT /api/dash/media/files': {
+    summary: 'Move media files into a folder',
+    tag: 'Media',
+    description:
+      'One transaction for the whole selection: every id has to be an active library file the caller may edit, or nothing moves and the answer is 404. Moving an unfiled file (`scope=unfiled`) into a folder adopts it into the library and takes it off the retention clock, exactly as the single-file route does.',
+  },
+  'GET /api/dash/media/files/:id': {
+    summary: 'Get a media file, its download URL and where it is used',
+    tag: 'Media',
+  },
+  'PUT /api/dash/media/files/:id': {
+    summary: 'Rename or move a media file',
+    tag: 'Media',
+  },
+  'POST /api/dash/media/files/:id/publish': {
+    summary: 'Move a media file to the public bucket',
+    tag: 'Media',
+    description:
+      'Copies the object to the public bucket under the same key, verifies the copy, then flips the row; `url` becomes the permanent public URL. Idempotent for a file that is already public. The returned `transition` is `cleanup` while the stale private copy is still being removed.',
+  },
+  'POST /api/dash/media/files/:id/unpublish': {
+    summary: 'Move a media file back to the private bucket',
+    tag: 'Media',
+    description:
+      'Refused (409) while a published record still references the file. Otherwise the object is copied to the private bucket, the row flips and `url` becomes a signed URL; the returned `transition` is `cleanup` until the cleanup below has finished. Three outcomes, and they are not the same: the object is ALWAYS removed from the public origin; an edge copy is evicted only when the cache purge is configured, and the nightly sweep retries that until it succeeds; a copy already in a BROWSER stays readable until its `Cache-Control` lifetime ends (up to a year for a public image) and no purge, configured or not, can reach it. Unpublishing is therefore not an access revocation for anyone who has already fetched the object.',
+  },
+  'POST /api/dash/media/folders': {
+    summary: 'Create a media folder',
+    tag: 'Media',
+  },
+  'PUT /api/dash/media/folders/:id': {
+    summary: 'Rename or move a media folder',
+    tag: 'Media',
+  },
+  'DELETE /api/dash/media/folders/:id': {
+    summary: 'Delete a media folder, empty or whole',
+    description:
+      'Without `recursive`, an empty folder only: anything inside — a subfolder, a file in any state — is a 409. With `recursive=true`, the folder and its whole subtree, bounded at 200 DESCENDANTS, subfolders plus their files, not counting the folder being deleted (422 above it), and refused outright (409) while a file inside is still uploading or still being deleted. The files go first, through the same three-phase deletion a file request uses, so a file a record references refuses the whole operation before anything is removed. An `own`-scoped grant (`deleteOwn`) reaches the files as well as the folders: a subfolder someone else created, or a file someone else uploaded, answers 404 and deletes nothing.',
+    tag: 'Media',
+  },
+  'POST /api/upload/file': {
+    summary: 'Upload a file for a dashboard record',
     tag: 'Uploads',
   },
   'GET /api/health/storage': {
@@ -556,7 +688,7 @@ function addPagePermissionRules(schema: JsonSchema): JsonSchema {
     'Page names must be unique. Unsupported actions may be omitted or false, never true.';
   permissions['x-unique-by'] = 'name';
   items.allOf = [
-    permissionDependencyRule(['edit', 'delete'], ['view']),
+    permissionDependencyRule(['edit', 'delete', 'publish'], ['view']),
     permissionDependencyRule(['editOwn', 'deleteOwn'], ['view', 'viewOwn']),
     {
       if: {
@@ -933,6 +1065,266 @@ const RESET_OUTCOME_SCHEMA: JsonSchema = {
   ],
 };
 
+const NULLABLE_UUID_SCHEMA: JsonSchema = { anyOf: [UUID_SCHEMA, NULL_SCHEMA] };
+const BUCKET_TYPE_SCHEMA: JsonSchema = {
+  type: 'string',
+  enum: [...bucketTypeEnum],
+};
+
+/**
+ * The one file shape every media route returns. `url` is the permanent public
+ * URL for a public object and a signed URL, valid for one hour, for anything
+ * else; `transition` is non-null while a publish or unpublish is still copying.
+ */
+const MEDIA_FILE_SCHEMA: JsonSchema = {
+  type: 'object',
+  properties: {
+    id: UUID_SCHEMA,
+    kind: { type: 'string', enum: [...fileKindEnum] },
+    displayName: { type: 'string', maxLength: MEDIA_DISPLAY_NAME_MAX },
+    mimeType: { type: 'string', enum: [...KNOWN_MIME_TYPES] },
+    sizeBytes: { type: 'integer', minimum: 0 },
+    bucketType: BUCKET_TYPE_SCHEMA,
+    transition: {
+      anyOf: [{ type: 'string', enum: [...fileTransitionEnum] }, NULL_SCHEMA],
+      description:
+        'Non-null while a visibility change is in flight, and each value tells a client something different: `to_public`/`to_private` mean the copy is being made and verified and `url` still answers from the OLD bucket, so the change is in progress; `cleanup` means the flip is done and `url` is final, and only the stale copy in the other bucket (and, for a public one, its edge cache) is still being removed by the nightly sweep — nothing is pending for the client. `url` always points at the current bucket. Removing the object from the origin is unconditional; evicting an edge copy needs the configured cache purge; a copy already in a browser stays readable until its `Cache-Control` lifetime ends and cannot be recalled.',
+    },
+    width: { type: ['integer', 'null'], minimum: 1 },
+    height: { type: ['integer', 'null'], minimum: 1 },
+    blurhash: NULLABLE_STRING_SCHEMA,
+    folderId: {
+      ...NULLABLE_UUID_SCHEMA,
+      description:
+        'Null for a file uploaded for a record rather than into the library.',
+    },
+    uploadedBy: NULLABLE_UUID_SCHEMA,
+    unfiledAt: {
+      anyOf: [DATE_TIME_SCHEMA, NULL_SCHEMA],
+      description:
+        'When the nightly sweep first found the file unfiled — active, in no folder, referenced by no record. It is deleted `retentionDays` (see `scope=unfiled`) after this unless moved into a folder; null otherwise.',
+    },
+    url: {
+      type: 'string',
+      format: 'uri',
+      description:
+        'Permanent public URL for a public object; otherwise a signed URL valid for one hour. Never store it.',
+    },
+    createdAt: DATE_TIME_SCHEMA,
+    updatedAt: DATE_TIME_SCHEMA,
+  },
+  required: [
+    'id',
+    'kind',
+    'displayName',
+    'mimeType',
+    'sizeBytes',
+    'bucketType',
+    'transition',
+    'width',
+    'height',
+    'blurhash',
+    'folderId',
+    'uploadedBy',
+    'unfiledAt',
+    'url',
+    'createdAt',
+    'updatedAt',
+  ],
+  additionalProperties: false,
+};
+
+const MEDIA_FOLDER_SCHEMA: JsonSchema = {
+  type: 'object',
+  properties: {
+    id: UUID_SCHEMA,
+    name: { type: 'string', minLength: 1, maxLength: FOLDER_NAME_MAX },
+    parentId: {
+      ...NULLABLE_UUID_SCHEMA,
+      description: 'Null for a root folder.',
+    },
+    createdBy: NULLABLE_UUID_SCHEMA,
+    createdAt: DATE_TIME_SCHEMA,
+    updatedAt: DATE_TIME_SCHEMA,
+  },
+  required: ['id', 'name', 'parentId', 'createdBy', 'createdAt', 'updatedAt'],
+  additionalProperties: false,
+};
+
+const MEDIA_BREADCRUMB_SCHEMA: JsonSchema = {
+  type: 'object',
+  properties: {
+    id: UUID_SCHEMA,
+    name: { type: 'string' },
+  },
+  required: ['id', 'name'],
+  additionalProperties: false,
+};
+
+const MEDIA_FOLDER_HIT_SCHEMA: JsonSchema = {
+  type: 'object',
+  properties: {
+    ...(MEDIA_FOLDER_SCHEMA.properties as Record<string, JsonSchema>),
+    breadcrumbs: {
+      type: 'array',
+      items: MEDIA_BREADCRUMB_SCHEMA,
+      description: 'Root → the folder itself.',
+    },
+  },
+  required: [...(MEDIA_FOLDER_SCHEMA.required as string[]), 'breadcrumbs'],
+  additionalProperties: false,
+};
+
+const MEDIA_USAGE_SCHEMA: JsonSchema = {
+  type: 'object',
+  properties: {
+    label: { type: 'string' },
+    resource: { type: 'string', enum: [...DASHBOARD_PAGE_NAMES] },
+    recordId: { type: 'string' },
+  },
+  required: ['label', 'resource', 'recordId'],
+  additionalProperties: false,
+};
+
+/** What every list response carries about this deployment's capabilities. */
+const MEDIA_CAPABILITY_PROPERTIES = {
+  visibilities: {
+    type: 'array',
+    items: BUCKET_TYPE_SCHEMA,
+    uniqueItems: true,
+    description: 'The buckets this deployment has configured.',
+  },
+  canPublish: {
+    type: 'boolean',
+    description: 'Whether the caller holds `media.publish`.',
+  },
+} as const;
+
+const MEDIA_LIST_SCHEMA: JsonSchema = {
+  oneOf: [
+    {
+      type: 'object',
+      description:
+        'The folder view (`scope=folder`): breadcrumbs from the root, the subfolders, and one page of files.',
+      properties: {
+        ...MEDIA_CAPABILITY_PROPERTIES,
+        breadcrumbs: { type: 'array', items: MEDIA_BREADCRUMB_SCHEMA },
+        folders: { type: 'array', items: MEDIA_FOLDER_SCHEMA },
+        files: { type: 'array', items: MEDIA_FILE_SCHEMA },
+      },
+      required: [
+        'visibilities',
+        'canPublish',
+        'breadcrumbs',
+        'folders',
+        'files',
+      ],
+      additionalProperties: false,
+    },
+    {
+      type: 'object',
+      description:
+        'The library search (`scope=all`): one page of files across every folder and, when `search` is given, up to twenty folders whose name matches, each with its path from the root.',
+      properties: {
+        ...MEDIA_CAPABILITY_PROPERTIES,
+        files: { type: 'array', items: MEDIA_FILE_SCHEMA },
+        folders: { type: 'array', items: MEDIA_FOLDER_HIT_SCHEMA },
+        foldersTruncated: {
+          type: 'boolean',
+          description:
+            'More folders match than the twenty returned. The files beside them are fully paginated through `meta`; the folder hits are a navigation aid and are capped, so a narrower `search` is the way to reach the rest.',
+        },
+      },
+      required: [
+        'visibilities',
+        'canPublish',
+        'files',
+        'folders',
+        'foldersTruncated',
+      ],
+      additionalProperties: false,
+    },
+    {
+      type: 'object',
+      description:
+        'The unfiled view (`scope=unfiled`): one page of active files in no folder that no record references — uploads whose record is gone. Each is deleted `retentionDays` after its `unfiledAt` stamp unless moved into a folder with `PUT /api/dash/media/files/{id}`.',
+      properties: {
+        ...MEDIA_CAPABILITY_PROPERTIES,
+        files: { type: 'array', items: MEDIA_FILE_SCHEMA },
+        retentionDays: {
+          type: 'integer',
+          minimum: 1,
+          description: 'Days an unfiled file survives after `unfiledAt`.',
+        },
+      },
+      required: ['visibilities', 'canPublish', 'files', 'retentionDays'],
+      additionalProperties: false,
+    },
+  ],
+};
+
+/**
+ * One shape for both delete modes, so a client reads the same answer whether it
+ * asked for an empty folder or a subtree.
+ */
+const FOLDER_DELETE_SCHEMA: JsonSchema = {
+  type: 'object',
+  properties: {
+    folders: {
+      type: 'integer',
+      minimum: 0,
+      description:
+        'Folder rows removed. `0` from a recursive delete whose FILES went but whose folders could not: something was still in the tree — a file the sweep has yet to finish removing, or an upload that arrived while the files were being deleted. Retry once it settles.',
+    },
+    deleted: {
+      type: 'array',
+      items: UUID_SCHEMA,
+      uniqueItems: true,
+      description:
+        'Files gone from the database and from the object store. Always empty for a non-recursive delete, which refuses a folder that holds anything.',
+    },
+    pending: {
+      type: 'array',
+      items: UUID_SCHEMA,
+      uniqueItems: true,
+      description:
+        'Files committed to deletion and already gone from every listing, whose object or configured cache purge the nightly sweep still has to finish.',
+    },
+  },
+  required: ['folders', 'deleted', 'pending'],
+  additionalProperties: false,
+};
+
+const MEDIA_FILE_DETAILS_SCHEMA: JsonSchema = {
+  type: 'object',
+  properties: {
+    ...(MEDIA_FILE_SCHEMA.properties as Record<string, JsonSchema>),
+    downloadUrl: {
+      type: 'string',
+      format: 'uri',
+      description:
+        'Signed URL, valid for one hour, that downloads the file under its current display name.',
+    },
+    usedBy: {
+      type: 'array',
+      items: MEDIA_USAGE_SCHEMA,
+      description: 'Owners the caller may view.',
+    },
+    hiddenUsages: {
+      type: 'integer',
+      minimum: 0,
+      description: 'Owners on pages the caller may not view.',
+    },
+  },
+  required: [
+    ...(MEDIA_FILE_SCHEMA.required as string[]),
+    'downloadUrl',
+    'usedBy',
+    'hiddenUsages',
+  ],
+  additionalProperties: false,
+};
+
 const SUCCESS_DATA_SCHEMAS: Record<string, JsonSchema> = {
   'POST /api/auth/forgot-password/reset': RESET_OUTCOME_SCHEMA,
   'POST /api/auth/forgot-password/second-factor/send': OTP_SENT_SCHEMA,
@@ -1095,13 +1487,55 @@ const SUCCESS_DATA_SCHEMAS: Record<string, JsonSchema> = {
     required: ['revoked'],
     additionalProperties: false,
   },
-  'POST /api/upload/image': { type: 'array', items: { type: 'string' } },
+  'GET /api/dash/media': MEDIA_LIST_SCHEMA,
+  'POST /api/dash/media/files': MEDIA_FILE_SCHEMA,
+  'DELETE /api/dash/media/files': {
+    type: 'object',
+    properties: {
+      deleted: {
+        type: 'array',
+        items: UUID_SCHEMA,
+        uniqueItems: true,
+        description: 'Gone from the database and from the object store.',
+      },
+      pending: {
+        type: 'array',
+        items: UUID_SCHEMA,
+        uniqueItems: true,
+        description:
+          'Committed to deletion and already gone from every listing and every media route, but the object store refused the delete or the configured cache purge failed; the nightly sweep finishes them. There is no completion signal and none is needed: these ids never come back, and no endpoint reports their progress. An edge copy is evicted only when the purge is configured; a copy already in a browser stays readable until its `Cache-Control` lifetime ends and cannot be recalled.',
+      },
+    },
+    required: ['deleted', 'pending'],
+    additionalProperties: false,
+  },
+  'GET /api/dash/media/files/:id': MEDIA_FILE_DETAILS_SCHEMA,
+  'PUT /api/dash/media/files': {
+    type: 'array',
+    items: MEDIA_FILE_SCHEMA,
+    description: 'The moved files, in their new folder.',
+  },
+  'PUT /api/dash/media/files/:id': MEDIA_FILE_SCHEMA,
+  'POST /api/dash/media/files/:id/publish': MEDIA_FILE_SCHEMA,
+  'POST /api/dash/media/files/:id/unpublish': MEDIA_FILE_SCHEMA,
+  'POST /api/dash/media/folders': MEDIA_FOLDER_SCHEMA,
+  'PUT /api/dash/media/folders/:id': MEDIA_FOLDER_SCHEMA,
+  'DELETE /api/dash/media/folders/:id': FOLDER_DELETE_SCHEMA,
+  'POST /api/upload/file': {
+    type: 'array',
+    items: MEDIA_FILE_SCHEMA,
+    minItems: 1,
+    maxItems: 1,
+    description:
+      'One pending file. It is not listable until the record it is for is saved and claims it.',
+  },
   'POST /api/dev/sign-up': CREATED_ID_SCHEMA,
 };
 
 const PAGINATED_SUCCESS_ROUTES = new Set([
   'GET /api/dash/permissions',
   'GET /api/dash/users',
+  'GET /api/dash/media',
 ]);
 
 /**
@@ -1623,7 +2057,7 @@ function commonResponses(entry: RouteManifestEntry): JsonSchema {
 
   // The refusals the route's own authorisation produces, from the one field that
   // states them. Measured unauthenticated, every one of `GET /api/dash/users`,
-  // `POST /api/dash/users/me/change-password`, `POST /api/upload/image` and
+  // `POST /api/dash/users/me/change-password`, `POST /api/upload/file` and
   // `GET /openapi.json` answers 401 — and none of them said so.
   if (entry.auth !== 'public') {
     responses['401'] = {
@@ -1663,6 +2097,17 @@ function commonResponses(entry: RouteManifestEntry): JsonSchema {
   return responses;
 }
 
+/**
+ * The limits both upload routes share, stated once in the document. A client
+ * that sends several files does so as sequential single-file requests.
+ */
+const UPLOAD_LIMITS_DESCRIPTION =
+  `Exactly one file. Images (${mimeTypesOfKind('image').join(', ')}): at most ${MAX_IMAGE_SIZE} MiB, ` +
+  `${MAX_IMAGE_PIXELS.toLocaleString('en-US')} decoded pixels and ${MAX_IMAGE_EDGE.toLocaleString('en-US')} pixels on either edge; ` +
+  `PNG is re-encoded to WebP, SVG is sanitised. Documents (${mimeTypesOfKind('document').join(', ')}): at most ${MAX_DOCUMENT_SIZE_MB} MiB, ` +
+  'byte-inspected: macro-enabled, template, encrypted and object-embedding variants are refused; field codes, external links and DDE are not inspected, and documents are always served as attachments, never rendered. ' +
+  'Upload several files as sequential single-file requests with bounded concurrency and honour `Retry-After` on 429.';
+
 function openApiConsistencyProblems(
   manifest: readonly RouteManifestEntry[]
 ): string[] {
@@ -1677,7 +2122,6 @@ function openApiConsistencyProblems(
       problems.push(`${key} has no OPERATION_DOCS entry`);
     if (entry.response === 'envelope' && !(key in SUCCESS_DATA_SCHEMAS))
       problems.push(`${key} has no concrete success data schema`);
-    // Multipart schemas come from route policy; JSON schemas are explicit.
     if (entry.body === 'json' && !(key in REQUEST_BODIES))
       problems.push(
         `${key} declares body: 'json' but has no REQUEST_BODIES entry`
@@ -1685,6 +2129,14 @@ function openApiConsistencyProblems(
     if (entry.body !== 'json' && key in REQUEST_BODIES)
       problems.push(
         `${key} has a REQUEST_BODIES entry but declares body: '${entry.body}'`
+      );
+    if (entry.body === 'multipart' && !(key in MULTIPART_BODIES))
+      problems.push(
+        `${key} declares body: 'multipart' but has no MULTIPART_BODIES entry`
+      );
+    if (entry.body !== 'multipart' && key in MULTIPART_BODIES)
+      problems.push(
+        `${key} has a MULTIPART_BODIES entry but declares body: '${entry.body}'`
       );
   }
 
@@ -1697,6 +2149,9 @@ function openApiConsistencyProblems(
   for (const key of Object.keys(REQUEST_BODIES))
     if (isLeftover(key))
       problems.push(`REQUEST_BODIES has '${key}', which is not a route`);
+  for (const key of Object.keys(MULTIPART_BODIES))
+    if (isLeftover(key))
+      problems.push(`MULTIPART_BODIES has '${key}', which is not a route`);
   for (const key of CREATED_ROUTES)
     if (isLeftover(key))
       problems.push(`CREATED_ROUTES has '${key}', which is not a route`);
@@ -1963,6 +2418,7 @@ export function openApiDocument(
     const operation: JsonSchema = {
       operationId: `${entry.method.toLowerCase()}${entry.path.replaceAll(/[^a-zA-Z0-9]/g, '_')}`,
       summary: docs.summary,
+      ...(docs.description && { description: docs.description }),
       tags: [docs.tag],
       responses: commonResponses(entry),
       security: entry.auth === 'public' ? [] : [{ sessionCookie: [] }],
@@ -1974,6 +2430,8 @@ export function openApiDocument(
       const body = requestBody(schemas, key);
       if (body) operation.requestBody = body;
     } else if (entry.body === 'multipart') {
+      const multipart = MULTIPART_BODIES[key];
+      if (!multipart) throw new Error(`No multipart body for ${key}`);
       operation.requestBody = {
         required: true,
         content: {
@@ -1981,17 +2439,15 @@ export function openApiDocument(
             schema: {
               type: 'object',
               properties: {
-                files: {
+                [multipart.field]: {
                   type: 'string',
                   format: 'binary',
-                  'x-allowed-content-types': [...ALLOWED_IMAGE_TYPES],
-                  maxLength: MAX_IMAGE_SIZE * 1024 * 1024,
-                  description:
-                    `Exactly one PNG, WebP or SVG file. Maximum ${MAX_IMAGE_SIZE} MiB, ` +
-                    `${MAX_IMAGE_PIXELS.toLocaleString('en-US')} decoded pixels, and ${MAX_IMAGE_EDGE.toLocaleString('en-US')} pixels on either edge.`,
+                  'x-allowed-content-types': [...ALLOWED_MIME_TYPES],
+                  maxLength: MAX_DOCUMENT_SIZE_MB * 1024 * 1024,
+                  description: `${multipart.description} ${UPLOAD_LIMITS_DESCRIPTION}`,
                 },
               },
-              required: ['files'],
+              required: [multipart.field],
               additionalProperties: false,
             },
           },
@@ -2128,7 +2584,16 @@ export function openApiDocument(
         name: 'Sessions',
         description: 'User session inspection and revocation.',
       },
-      { name: 'Uploads', description: 'Authorized dashboard media uploads.' },
+      {
+        name: 'Media',
+        description:
+          'The media library: folders, files, and their public/private visibility.',
+      },
+      {
+        name: 'Uploads',
+        description:
+          'Uploads made for a dashboard record, pending until that record claims them.',
+      },
       { name: 'Operations', description: 'Deployment readiness probes.' },
       {
         name: 'Development',

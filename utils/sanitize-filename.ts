@@ -1,6 +1,3 @@
-// eslint-disable-next-line unicorn/prefer-node-protocol
-import { randomBytes } from 'crypto';
-
 /**
  * Sanitizes a filename by removing potentially dangerous characters.
  * Removes extension and dots for extra security.
@@ -36,14 +33,4 @@ export function sanitizeFilename(filename: string, maxLength = 50): string {
   const sanitized = [...cleaned].slice(0, maxLength).join('').trim();
 
   return sanitized || 'unnamed';
-}
-
-/**
- * Generates a short cryptographically secure random ID.
- * Uses crypto.randomBytes for security and speed.
- *
- * @returns 16-character hex string
- */
-export function generateShortId(): string {
-  return randomBytes(8).toString('hex');
 }

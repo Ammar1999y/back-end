@@ -269,7 +269,7 @@ export async function enforceRateLimit(opts: {
    * Units this request spends against `limit`. Defaults to 1. Use it where the
    * work behind one request varies by orders of magnitude, so the budget and the
    * capacity behind it are sized against each other rather than against a
-   * request count — see `app/api/upload/image/handler.ts`.
+   * request count — see `chargeUploadBudget` in `lib/media/upload.ts`.
    */
   cost?: number;
   /**

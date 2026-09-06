@@ -107,8 +107,12 @@ function productionEnv(sqliteDir: string): Record<string, string> {
     R2_ACCOUNT_ID: 'throwaway',
     R2_ACCESS_KEY_ID: 'throwaway',
     R2_SECRET_ACCESS_KEY: 'throwaway',
-    R2_PUBLIC_BUCKET: 'throwaway',
-    R2_PRIVATE_BUCKET: 'throwaway',
+    // Two DIFFERENT names: one bucket under both is itself a refused
+    // configuration, tested below.
+    R2_PUBLIC_BUCKET: 'throwaway-public',
+    // A public bucket requires its public URL (`r2ConfigurationErrors`).
+    R2_PUBLIC_URL: 'https://media.example.invalid',
+    R2_PRIVATE_BUCKET: 'throwaway-private',
   };
 }
 
@@ -226,17 +230,40 @@ describe('the runtime gates refuse a bad configuration', () => {
 });
 
 describe('the production environment gate refuses a missing variable', () => {
-  test('an unset R2 bucket fails the boot rather than the first upload', async () => {
-    // `REQUIRED_IN_PRODUCTION` is enforced at module load, and this whole branch
+  test('no R2 bucket at all fails the boot rather than the first upload', async () => {
+    // The object-store rules are enforced at module load, and this whole branch
     // — plus `betterAuthSecretError` — was unreachable from any whole-process
     // check, because the only one there is boots in development.
     const env = productionEnv(tempSqliteDir());
     delete env.R2_PUBLIC_BUCKET;
+    delete env.R2_PRIVATE_BUCKET;
 
     const outcome = await bootWith(env);
 
     expect(outcome.exitCode).not.toBe(0);
-    expect(outcome.output).toInclude('R2_PUBLIC_BUCKET');
+    expect(outcome.output).toInclude('R2_PUBLIC_BUCKET or R2_PRIVATE_BUCKET');
+  }, 60_000);
+
+  test('one bucket under both names fails the boot before a publish can delete its only object', async () => {
+    const env = productionEnv(tempSqliteDir());
+    env.R2_PRIVATE_BUCKET = env.R2_PUBLIC_BUCKET ?? 'throwaway';
+
+    const outcome = await bootWith(env);
+
+    expect(outcome.exitCode).not.toBe(0);
+    expect(outcome.output).toInclude('different buckets');
+  }, 60_000);
+
+  test('a public bucket without its URL fails the boot rather than the first page load', async () => {
+    // Public objects are addressed by `R2_PUBLIC_URL`; a deployment with the
+    // bucket and no URL would store files nobody can load.
+    const env = productionEnv(tempSqliteDir());
+    delete env.R2_PUBLIC_URL;
+
+    const outcome = await bootWith(env);
+
+    expect(outcome.exitCode).not.toBe(0);
+    expect(outcome.output).toInclude('R2_PUBLIC_URL');
   }, 60_000);
 
   test('the Better Auth default secret fails the boot', async () => {

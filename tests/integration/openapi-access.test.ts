@@ -106,22 +106,25 @@ describe('what the document names', () => {
   });
 
   test('the upload route it names cannot be used to enumerate page names', async () => {
-    // The coupling this route has with `POST /api/upload/image`, asserted from
+    // The coupling this route has with `POST /api/upload/file`, asserted from
     // this side: closing the document is only safe because the upload route no
     // longer answers differently for a real page name than for an unknown one.
     const unknown = await app.handle(
-      new Request('http://localhost/api/upload/image?resource=nope', {
+      new Request('http://localhost/api/upload/file?resource=nope', {
         method: 'POST',
         headers: baseHeaders(),
       })
     );
     const real = await app.handle(
-      new Request('http://localhost/api/upload/image?resource=users', {
+      new Request('http://localhost/api/upload/file?resource=users', {
         method: 'POST',
         headers: baseHeaders(),
       })
     );
 
+    // The gate itself, before the equality: two 404s from a retired path would
+    // also be equal, and were, after the route moved.
+    expect(real.status).toBe(HTTP_STATUS.UNAUTHORIZED);
     expect(unknown.status).toBe(real.status);
     expect(await bodyOf(unknown)).toBe(await bodyOf(real));
   });

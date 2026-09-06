@@ -41,6 +41,10 @@ interface Outcome {
 const LOAD_TIME_NOTICES: ReadonlySet<string> = new Set([
   'otp.disabled no channel configured',
   'twoFactor.disabled no method configured',
+  // The same class, announced from `startSchedule` because the sweep is what it
+  // is about: with no owner table declared, the media library's unfiled scope
+  // and its reaper are inert.
+  'media.usage-registry is empty',
 ]);
 
 function runChild(mode: 'drain' | 'timeout'): Promise<Outcome> {

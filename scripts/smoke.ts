@@ -114,7 +114,7 @@ async function runChecks(health: Response): Promise<Check[]> {
     'files',
     new File(['x'], 'probe.png', { type: 'image/png' })
   );
-  const upload = await probe('/api/upload/image?resource=users', {
+  const upload = await probe('/api/upload/file?resource=users', {
     method: 'POST',
     body: uploadForm,
   });
@@ -196,7 +196,7 @@ async function runChecks(health: Response): Promise<Check[]> {
       detail: `HTTP ${internal.status}`,
     },
     {
-      name: 'image upload rejects an unauthenticated request',
+      name: 'file upload rejects an unauthenticated request',
       ok: upload.status === 401,
       detail: `HTTP ${upload.status}`,
     },

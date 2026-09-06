@@ -36,6 +36,13 @@ export interface FilterColumnSpec {
    * up to MAX_FILTER_ITEMS of them multiply into a very expensive query.
    */
   allowScanOnly?: boolean;
+  /**
+   * The closed set a `select`/`multiSelect` column can hold. REQUIRED for a
+   * column backed by a PostgreSQL enum: an unknown member reaches PostgreSQL as
+   * a cast error (a 500), and `''` can never be a value, so emptiness is NULL.
+   * With it, membership is checked before any SQL is built.
+   */
+  values?: readonly string[];
 }
 
 export type FilterColumnSpecs = Record<string, FilterColumnSpec>;

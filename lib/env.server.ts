@@ -3,6 +3,7 @@ import path from 'node:path';
 
 import { validateOtpKeyConfiguration } from '@/lib/auth/otp-key';
 import { validatePasswordPepperConfiguration } from '@/lib/auth/password-pepper';
+import { R2_PRIVATE_BUCKET, R2_PUBLIC_BUCKET } from '@/lib/r2/buckets';
 
 /**
  * Hard-fail at module-load time when a required server env var is missing.
@@ -27,20 +28,100 @@ const REQUIRED_SERVER_ENV = [
 // back to a Cloudflare-published TEST_SECRET_KEY in dev; keeping that path
 // usable lets local contributors run without provisioning every credential.
 
-const REQUIRED_IN_PRODUCTION = [
-  'TURNSTILE_SECRET_KEY',
+const REQUIRED_IN_PRODUCTION = ['TURNSTILE_SECRET_KEY'] as const;
+
+const R2_CREDENTIALS = [
   'R2_ACCOUNT_ID',
   'R2_ACCESS_KEY_ID',
   'R2_SECRET_ACCESS_KEY',
-  // The buckets too. Excluding them was justified on the claim that each is
-  // "read at its point of use and raises an error naming itself" — which was
-  // FALSE: `getBucketName` returned them unchecked, so an unset value reached
-  // the AWS SDK as `Bucket: undefined`. It raises now, but a boot check is the
-  // right boundary for a value that is pure deployment configuration: failing on
-  // the first upload is failing in front of a user.
-  'R2_PUBLIC_BUCKET',
-  'R2_PRIVATE_BUCKET',
 ] as const;
+
+/**
+ * The object-store contract, as rules rather than a flat required list.
+ *
+ * Each bucket is optional on its own — a deployment may hold only public media
+ * or only private files — but the combinations that cannot work are refused at
+ * boot rather than on the first upload, which is failing in front of a user:
+ *
+ * - a bucket named with no credentials to reach it;
+ * - a public bucket with no `R2_PUBLIC_URL`, whose objects nobody could load;
+ * - no bucket at all in production, where every upload path would 422;
+ * - one half of the cache-purge pair, which would look configured and do nothing;
+ * - one bucket under both names, where a publish would copy an object onto
+ *   itself and then delete the only copy (measured against the stub).
+ *
+ * `R2_PUBLIC_URL` is parsed because it is concatenated with object keys into
+ * URLs that are stored nowhere and rebuilt on every read: a trailing slash or a
+ * query string here would corrupt every one of them the same way.
+ *
+ * Only the presence rules are production-gated. The shape rules run in every
+ * environment, because a malformed value is wrong everywhere.
+ */
+function r2ConfigurationErrors(production: boolean): string[] {
+  const errors: string[] = [];
+  const publicBucket = R2_PUBLIC_BUCKET;
+  const privateBucket = R2_PRIVATE_BUCKET;
+  const publicUrl = process.env.R2_PUBLIC_URL?.trim();
+
+  if (publicUrl) {
+    let parsed: URL | null = null;
+    try {
+      parsed = new URL(publicUrl);
+    } catch {
+      parsed = null;
+    }
+    if (
+      !parsed ||
+      parsed.protocol !== 'https:' ||
+      parsed.search ||
+      parsed.hash ||
+      parsed.username ||
+      parsed.password ||
+      (parsed.pathname !== '/' && parsed.pathname !== '')
+    )
+      errors.push(
+        'R2_PUBLIC_URL must be an https origin with no path, query, fragment or credentials, e.g. "https://media.example.com"'
+      );
+    else if (production && parsed.hostname.endsWith('.r2.dev'))
+      // A warning, not a refusal: the URL works, Cloudflare only documents it as
+      // rate-limited and for development. Refusing would block a deploy over a
+      // capacity concern; saying nothing would hide it.
+      console.warn(
+        JSON.stringify({
+          msg: 'r2.public-url is an r2.dev development URL',
+          detail:
+            'Cloudflare rate-limits r2.dev and documents it as non-production. Attach a custom domain to the public bucket.',
+        })
+      );
+  }
+
+  const zoneId = process.env.CLOUDFLARE_ZONE_ID;
+  const purgeToken = process.env.CLOUDFLARE_CACHE_PURGE_TOKEN;
+  if (Boolean(zoneId) !== Boolean(purgeToken))
+    errors.push(
+      'CLOUDFLARE_ZONE_ID and CLOUDFLARE_CACHE_PURGE_TOKEN must be set together, or both left unset'
+    );
+
+  if (publicBucket && privateBucket && publicBucket === privateBucket)
+    errors.push(
+      'R2_PUBLIC_BUCKET and R2_PRIVATE_BUCKET must name different buckets'
+    );
+
+  if (!production) return errors;
+
+  if (!publicBucket && !privateBucket)
+    errors.push(
+      'At least one of R2_PUBLIC_BUCKET or R2_PRIVATE_BUCKET is required'
+    );
+  if (publicBucket && !publicUrl)
+    errors.push('R2_PUBLIC_URL is required when R2_PUBLIC_BUCKET is set');
+  if (publicBucket || privateBucket)
+    for (const key of R2_CREDENTIALS)
+      if (!process.env[key])
+        errors.push(`${key} is required when an R2 bucket is configured`);
+
+  return errors;
+}
 
 /** The value Better Auth falls back to when no secret is configured. */
 const BETTER_AUTH_DEFAULT_SECRET = 'better-auth-secret-12345678901234567890';
@@ -109,7 +190,8 @@ function assertEnv(): void {
   for (const key of REQUIRED_SERVER_ENV)
     if (!process.env[key]) missing.push(key);
 
-  if (process.env.NODE_ENV === 'production') {
+  const production = process.env.NODE_ENV === 'production';
+  if (production) {
     for (const key of REQUIRED_IN_PRODUCTION)
       if (!process.env[key]) missing.push(key);
 
@@ -121,6 +203,10 @@ function assertEnv(): void {
     throw new Error(
       `Missing required server env var${missing.length > 1 ? 's' : ''}: ${missing.join(', ')}`
     );
+
+  const r2Errors = r2ConfigurationErrors(production);
+  if (r2Errors.length > 0)
+    throw new Error(`Object store configuration: ${r2Errors.join('; ')}`);
 }
 
 assertEnv();

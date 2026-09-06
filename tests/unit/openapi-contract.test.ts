@@ -20,7 +20,9 @@ import {
   toPublishedManifest,
   toRegisteredRoutes,
 } from '@/lib/http/route-manifest';
+import { ALLOWED_MIME_TYPES } from '@/lib/media/allowlist';
 
+import { MAX_DOCUMENT_SIZE_MB } from '@/utils/validation/constants';
 import { isChannelEnabled, OTP_CHANNELS } from '@/utils/validation/otp';
 import { isTwoFactorMethodEnabled } from '@/utils/validation/two-factor';
 
@@ -712,9 +714,12 @@ describe('request and response contract fidelity', () => {
   });
 
   test('multipart limits and throttling response headers are concrete', () => {
+    // Each upload route publishes ITS field name: the record-upload route reads
+    // `files`, the library route reads `file`, and a client generated from one
+    // block for both would send a form one of them answers "no file" to.
     const upload = requestSchemaOf(
       document,
-      '/api/upload/image',
+      '/api/upload/file',
       'post',
       'multipart/form-data'
     );
@@ -723,15 +728,24 @@ describe('request and response contract fidelity', () => {
     expect(files).toMatchObject({
       type: 'string',
       format: 'binary',
-      maxLength: 1024 * 1024,
+      maxLength: MAX_DOCUMENT_SIZE_MB * 1024 * 1024,
     });
-    expect(files['x-allowed-content-types']).toEqual([
-      'image/png',
-      'image/webp',
-      'image/svg+xml',
-    ]);
+    // From the allowlist itself, not a copy: a type admitted there is published.
+    expect(files['x-allowed-content-types']).toEqual([...ALLOWED_MIME_TYPES]);
+    expect(upload.required).toEqual(['files']);
 
-    const operation = operationOf(document, '/api/upload/image', 'post');
+    const library = requestSchemaOf(
+      document,
+      '/api/dash/media/files',
+      'post',
+      'multipart/form-data'
+    );
+    expect(Object.keys(library.properties as Record<string, unknown>)).toEqual([
+      'file',
+    ]);
+    expect(library.required).toEqual(['file']);
+
+    const operation = operationOf(document, '/api/upload/file', 'post');
     const limited = (
       operation.responses as Record<string, Record<string, unknown>>
     )['429'];
@@ -929,7 +943,7 @@ describe('the refusals an operation declares for its own authorisation', () => {
    * dashboard call before sign-in, and any call by someone whose role lacks the
    * grant. Measured unauthenticated through `app.handle` on a throwaway
    * environment, `GET /api/dash/users`, `PUT /api/dash/users/abc`,
-   * `POST /api/dash/users/me/change-password`, `POST /api/upload/image` and
+   * `POST /api/dash/users/me/change-password`, `POST /api/upload/file` and
    * `GET /openapi.json` all answer 401 while the document offered 404/405/500.
    *
    * Driven off the manifest and not off a list of paths, so a route added under

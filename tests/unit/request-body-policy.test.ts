@@ -22,7 +22,7 @@ const MULTIPART_BODY =
   `hello\r\n--${BOUNDARY}--\r\n`;
 
 const multipartRequest = (contentType: string) =>
-  new Request('http://localhost/api/upload/image?resource=users', {
+  new Request('http://localhost/api/upload/file?resource=users', {
     method: 'POST',
     headers: { 'content-type': `${contentType}; boundary=${BOUNDARY}` },
     body: MULTIPART_BODY,

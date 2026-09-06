@@ -74,14 +74,6 @@ const SATISFYING_VALUE: Record<string, string> = {
   OTP_HMAC_ACTIVE_ID: '1',
   OTP_HMAC_KEYRING: `{"1":{"generation":1,"secret":"${PEPPER_SECRET}"}}`,
   TURNSTILE_SECRET_KEY: 'turnstile',
-  // R2 joined `REQUIRED_IN_PRODUCTION`: it was the one env group with no
-  // boot-time validation, so a deploy missing it booted green and failed on the
-  // first upload.
-  R2_ACCOUNT_ID: 'r2-account',
-  R2_ACCESS_KEY_ID: 'r2-access-key',
-  R2_SECRET_ACCESS_KEY: 'r2-secret-key',
-  R2_PUBLIC_BUCKET: 'r2-public',
-  R2_PRIVATE_BUCKET: 'r2-private',
 };
 
 /**
@@ -96,6 +88,14 @@ const ALSO_NEEDED_IN_PRODUCTION = {
   // 32+ characters; `resolveMaintenanceToken` rejects a shorter configured
   // value at module load.
   SQLITE_MAINTENANCE_TOKEN: 'probe-token-0123456789012345678901',
+  // The object store is validated as RULES rather than a flat list
+  // (`r2ConfigurationErrors`): production needs at least one bucket, and a
+  // bucket needs credentials. The smallest satisfying set is a private bucket
+  // with its credentials — a public one would also demand `R2_PUBLIC_URL`.
+  R2_ACCOUNT_ID: 'r2-account',
+  R2_ACCESS_KEY_ID: 'r2-access-key',
+  R2_SECRET_ACCESS_KEY: 'r2-secret-key',
+  R2_PRIVATE_BUCKET: 'r2-private',
 };
 
 /**
@@ -137,15 +137,73 @@ test('a valid environment plus a valid secret loads, so the base is honest', asy
   expect(r.message).toBe('LOADED');
 }, 30_000);
 
-test.each(['R2_PUBLIC_BUCKET', 'R2_PRIVATE_BUCKET'])(
-  '%s is independently required in production',
-  async (name) => {
-    const result = await run({ BETTER_AUTH_SECRET: VALID, [name]: '' });
-    expect(result.ok).toBe(false);
-    expect(result.message).toContain(name);
-  },
-  30_000
-);
+/**
+ * The object-store rules (`r2ConfigurationErrors`), each refused by name. The
+ * base environment holds a private bucket only, so each case below is a single
+ * change to it.
+ */
+test('no bucket at all fails a production boot', async () => {
+  const result = await run({
+    BETTER_AUTH_SECRET: VALID,
+    R2_PRIVATE_BUCKET: '',
+  });
+  expect(result.ok).toBe(false);
+  expect(result.message).toContain('R2_PUBLIC_BUCKET or R2_PRIVATE_BUCKET');
+}, 30_000);
+
+test('a public bucket without its public URL fails a production boot', async () => {
+  const result = await run({
+    BETTER_AUTH_SECRET: VALID,
+    R2_PUBLIC_BUCKET: 'r2-public',
+  });
+  expect(result.ok).toBe(false);
+  expect(result.message).toContain('R2_PUBLIC_URL');
+}, 30_000);
+
+test('a public bucket WITH its URL, and no private bucket, loads', async () => {
+  const result = await run({
+    BETTER_AUTH_SECRET: VALID,
+    R2_PRIVATE_BUCKET: '',
+    R2_PUBLIC_BUCKET: 'r2-public',
+    R2_PUBLIC_URL: 'https://media.example.invalid',
+  });
+  expect(result.message).toBe('LOADED');
+}, 30_000);
+
+test('a bucket without credentials fails a production boot, naming the credential', async () => {
+  const result = await run({ BETTER_AUTH_SECRET: VALID, R2_ACCESS_KEY_ID: '' });
+  expect(result.ok).toBe(false);
+  expect(result.message).toContain('R2_ACCESS_KEY_ID');
+}, 30_000);
+
+test('a public URL with a path is refused everywhere, not only in production', async () => {
+  const result = await run({
+    BETTER_AUTH_SECRET: VALID,
+    R2_PUBLIC_BUCKET: 'r2-public',
+    R2_PUBLIC_URL: 'https://media.example.invalid/assets/',
+  });
+  expect(result.ok).toBe(false);
+  expect(result.message).toContain('R2_PUBLIC_URL');
+}, 30_000);
+
+test('half of the cache-purge pair fails the boot', async () => {
+  const result = await run({
+    BETTER_AUTH_SECRET: VALID,
+    CLOUDFLARE_ZONE_ID: 'zone',
+  });
+  expect(result.ok).toBe(false);
+  expect(result.message).toContain('CLOUDFLARE_CACHE_PURGE_TOKEN');
+}, 30_000);
+
+test('one bucket under both names is refused: a publish would delete its only object', async () => {
+  const result = await run({
+    BETTER_AUTH_SECRET: VALID,
+    R2_PUBLIC_BUCKET: 'r2-private',
+    R2_PUBLIC_URL: 'https://media.example.invalid',
+  });
+  expect(result.ok).toBe(false);
+  expect(result.message).toContain('different buckets');
+}, 30_000);
 
 async function run(
   secretEnv: Record<string, string>

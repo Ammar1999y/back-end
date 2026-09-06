@@ -17,7 +17,7 @@
  *   function: `shouldOptimizeImage` excludes SVG, and `validateMagicBytes`
  *   rejects animated WebP at the door.
  */
-import { uploadMsg } from '@/app/api/upload/image/messages';
+import { uploadMsg } from '@/app/api/upload/file/messages';
 
 import { HTTP_STATUS } from '@/utils/api-messages';
 import { CustomError } from '@/utils/error-class';
@@ -144,6 +144,11 @@ export type OptimizeImageOptions = {
  * because it is what stopped the two sites from drifting apart.
  */
 async function encodeAttempt(input: Buffer, width: number, quality: number) {
+  // This re-encode is also what STRIPS image metadata: the output is built from
+  // decoded pixels and the encoder emits no `EXIF`/`XMP ` chunk (measured on
+  // the RIFF chunks). An optimisation that skipped it for an input already
+  // under the byte ceiling would begin storing and serving camera EXIF —
+  // location included — and every test here would still pass.
   const image = new Bun.Image(input, { maxPixels: MAX_IMAGE_PIXELS })
     // Height omitted keeps the aspect ratio; `withoutEnlargement` is what stops
     // a 64px avatar being blown up to `initialWidth` and re-encoded.

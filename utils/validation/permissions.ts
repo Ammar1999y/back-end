@@ -102,10 +102,12 @@ export const pagePermissionSchema = rawPagePermissionSchema
   .transform(normalizeActionsForPage)
   .superRefine(({ permissions }, ctx) => {
     // `create` alone needs no read access (per product spec).
-    // `edit`/`delete` (all-scope) require `view`.
+    // `edit`/`delete`/`publish` (all-scope) require `view`.
     // `editOwn`/`deleteOwn` require `view` OR `viewOwn`.
     const hasAllWrite =
-      permissions.edit === true || permissions.delete === true;
+      permissions.edit === true ||
+      permissions.delete === true ||
+      permissions.publish === true;
 
     if (hasAllWrite && permissions.view !== true) {
       ctx.addIssue({

@@ -135,10 +135,11 @@ function finish(request: Request, response: Response): Response {
  *    single origin below is what answers it.
  *
  * The gap layer 3 does not cover is `multipart/form-data`, which IS CORS-simple:
- * a cross-site form can POST to the upload route with no preflight. That route is
- * session-gated (`app/api/upload/image/handler.ts`) and layer 2 keeps the cookie
- * off such a request; `bun run smoke` asserts the 401. **Any future multipart or
- * form-encoded route inherits this gap and needs the same treatment.**
+ * a cross-site form can POST to an upload route with no preflight. Both such
+ * routes (`app/api/upload/file/handler.ts`, `app/api/dash/media/files/handler.ts`)
+ * are session-gated and layer 2 keeps the cookie off such a request; `bun run
+ * smoke` asserts the 401. **Any future multipart or form-encoded route inherits
+ * this gap and needs the same treatment.**
  */
 const CORS_POLICY = {
   // A single trusted origin, not `*`: these endpoints are credentialed
@@ -166,8 +167,12 @@ const CORS_POLICY = {
   maxAge: 600,
 } as const;
 
-/** Bounds framework buffering before route-specific payload validation. */
-export const MAX_REQUEST_BODY_BYTES = 8 * 1024 * 1024;
+/**
+ * Bounds framework buffering before route-specific payload validation. Sized
+ * for the largest admitted file — a 10 MB document (`MAX_DOCUMENT_SIZE_MB`) plus
+ * multipart framing; every per-file cap is enforced again inside the handler.
+ */
+export const MAX_REQUEST_BODY_BYTES = 12 * 1024 * 1024;
 
 /** Lets shutdown honor the longest route-specific timeout. */
 export const MAX_ROUTE_TIMEOUT_SECONDS = REGISTERED_ROUTES.reduce(

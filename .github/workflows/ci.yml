@@ -118,8 +118,13 @@ jobs:
           R2_ACCOUNT_ID: ci-placeholder
           R2_ACCESS_KEY_ID: ci-placeholder
           R2_SECRET_ACCESS_KEY: ci-placeholder
-          R2_PUBLIC_BUCKET: ci-placeholder
-          R2_PRIVATE_BUCKET: ci-placeholder
+          # Two distinct names, and the public URL beside them: production
+          # refuses one bucket serving both visibilities, and refuses a public
+          # bucket it cannot address. Collapsing these back to one placeholder
+          # fails the boot, which is the point of running it in this posture.
+          R2_PUBLIC_BUCKET: ci-placeholder-public
+          R2_PRIVATE_BUCKET: ci-placeholder-private
+          R2_PUBLIC_URL: https://ci-placeholder.example.invalid
         run: bun run smoke
 
   # The database-backed tiers. Their own job because they need a PostgreSQL

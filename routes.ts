@@ -33,6 +33,13 @@ import * as authOtpSend from '@/app/api/auth/otp/send/handler';
 import * as authOtpVerify from '@/app/api/auth/otp/verify/handler';
 import * as authPasswordlessSend from '@/app/api/auth/passwordless/send/handler';
 import * as dashAuthReauth from '@/app/api/dash/auth/reauth/handler';
+import * as dashMediaFilesId from '@/app/api/dash/media/files/[id]/handler';
+import * as dashMediaFilesIdPublish from '@/app/api/dash/media/files/[id]/publish/handler';
+import * as dashMediaFilesIdUnpublish from '@/app/api/dash/media/files/[id]/unpublish/handler';
+import * as dashMediaFiles from '@/app/api/dash/media/files/handler';
+import * as dashMediaFoldersId from '@/app/api/dash/media/folders/[id]/handler';
+import * as dashMediaFolders from '@/app/api/dash/media/folders/handler';
+import * as dashMedia from '@/app/api/dash/media/handler';
 import * as dashPermissionsId from '@/app/api/dash/permissions/[id]/handler';
 import * as dashPermissions from '@/app/api/dash/permissions/handler';
 import * as dashRoles from '@/app/api/dash/roles/handler';
@@ -52,7 +59,8 @@ import * as meChangePhone from '@/app/api/dash/users/me/change-phone/handler';
 import * as meChangePhoneVerify from '@/app/api/dash/users/me/change-phone/verify/handler';
 import * as devSignUp from '@/app/api/dev/sign-up/handler';
 import * as healthStorage from '@/app/api/health/storage/handler';
-import * as uploadImage from '@/app/api/upload/image/handler';
+import * as uploadFile from '@/app/api/upload/file/handler';
+import { UUID_V7_PATTERN } from '@/utils';
 import { BETTER_AUTH_ENDPOINTS } from '@/lib/auth/allowed-paths';
 import {
   MAX_FILTERS_RAW_LENGTH,
@@ -67,6 +75,8 @@ import {
   toPublishedManifest,
   toRegisteredRoutes,
 } from '@/lib/http/route-manifest';
+// Types and constants only, so the framework-free property above holds.
+import { PURPOSE_NAME_MAX, PURPOSE_NAME_PATTERN } from '@/lib/media/policy';
 // A plain frozen object of page keys — no server library, so the framework-free
 // property above holds.
 import { DASHBOARD_PAGE_NAMES } from '@/lib/permissions/constants';
@@ -466,19 +476,184 @@ export const ROUTES: readonly RouteDefinition[] = [
     response: 'envelope',
   },
 
+  // ---- dashboard: media library -------------------------------------------
+  // Folders and files are addressed by id, never by path: a folder path would
+  // need a `/` inside a path parameter, which `:param` cannot carry.
+  {
+    method: 'GET',
+    path: '/api/dash/media',
+    handler: dashMedia.GET,
+    preAuth: 'ip-limit',
+    auth: 'permission',
+    captcha: false,
+    handlerRateLimit: true,
+    body: 'none',
+    response: 'envelope',
+    query: [
+      {
+        name: 'folder',
+        required: false,
+        description:
+          'The folder to list. Omitted means the root, which holds folders only.',
+        pattern: UUID_V7_PATTERN,
+      },
+      {
+        name: 'scope',
+        required: false,
+        description:
+          '`folder` (default) lists one folder with its breadcrumbs and subfolders; `all` searches every library file and, when `search` is given, folder names; `unfiled` lists active files in no folder that no record references, which are deleted `retentionDays` after they were first found unfiled unless moved into a folder.',
+        enum: dashMedia.MEDIA_SCOPES,
+      },
+      ...dataTableQuery(
+        'displayName, sizeBytes, mimeType, kind, bucketType, createdAt, updatedAt'
+      ),
+    ],
+  },
+  {
+    method: 'POST',
+    path: '/api/dash/media/files',
+    handler: dashMediaFiles.POST,
+    preAuth: 'ip-limit',
+    auth: 'permission',
+    captcha: false,
+    handlerRateLimit: true,
+    body: 'multipart',
+    response: 'envelope',
+    // Read from the query, not the form: it is checked before the multipart
+    // body is parsed.
+    query: [
+      {
+        name: 'folder',
+        required: true,
+        description: 'The folder the file is uploaded into.',
+        pattern: UUID_V7_PATTERN,
+      },
+    ],
+    // Image processing may outlast the global ceiling; timing out here drops
+    // the connection without an error body.
+    timeoutSeconds: 120,
+  },
+  {
+    method: 'PUT',
+    path: '/api/dash/media/files',
+    handler: dashMediaFiles.PUT,
+    preAuth: 'ip-limit',
+    auth: 'permission',
+    captcha: false,
+    handlerRateLimit: true,
+    body: 'json',
+    response: 'envelope',
+  },
+  {
+    method: 'DELETE',
+    path: '/api/dash/media/files',
+    handler: dashMediaFiles.DELETE,
+    preAuth: 'ip-limit',
+    auth: 'permission',
+    captcha: false,
+    handlerRateLimit: true,
+    body: 'json',
+    response: 'envelope',
+  },
+  {
+    method: 'GET',
+    path: '/api/dash/media/files/:id',
+    handler: dashMediaFilesId.GET,
+    preAuth: 'ip-limit',
+    auth: 'permission',
+    captcha: false,
+    handlerRateLimit: true,
+    body: 'none',
+    response: 'envelope',
+  },
+  {
+    method: 'PUT',
+    path: '/api/dash/media/files/:id',
+    handler: dashMediaFilesId.PUT,
+    preAuth: 'ip-limit',
+    auth: 'permission',
+    captcha: false,
+    handlerRateLimit: true,
+    body: 'json',
+    response: 'envelope',
+  },
+  {
+    method: 'POST',
+    path: '/api/dash/media/files/:id/publish',
+    handler: dashMediaFilesIdPublish.POST,
+    preAuth: 'ip-limit',
+    auth: 'permission',
+    captcha: false,
+    handlerRateLimit: true,
+    body: 'none',
+    response: 'envelope',
+  },
+  {
+    method: 'POST',
+    path: '/api/dash/media/files/:id/unpublish',
+    handler: dashMediaFilesIdUnpublish.POST,
+    preAuth: 'ip-limit',
+    auth: 'permission',
+    captcha: false,
+    handlerRateLimit: true,
+    body: 'none',
+    response: 'envelope',
+  },
+  {
+    method: 'POST',
+    path: '/api/dash/media/folders',
+    handler: dashMediaFolders.POST,
+    preAuth: 'ip-limit',
+    auth: 'permission',
+    captcha: false,
+    handlerRateLimit: true,
+    body: 'json',
+    response: 'envelope',
+  },
+  {
+    method: 'PUT',
+    path: '/api/dash/media/folders/:id',
+    handler: dashMediaFoldersId.PUT,
+    preAuth: 'ip-limit',
+    auth: 'permission',
+    captcha: false,
+    handlerRateLimit: true,
+    body: 'json',
+    response: 'envelope',
+  },
+  {
+    method: 'DELETE',
+    path: '/api/dash/media/folders/:id',
+    handler: dashMediaFoldersId.DELETE,
+    preAuth: 'ip-limit',
+    auth: 'permission',
+    captcha: false,
+    handlerRateLimit: true,
+    body: 'none',
+    response: 'envelope',
+    query: [
+      {
+        name: 'recursive',
+        required: false,
+        description:
+          'Delete the folder with everything under it, up to `FOLDER_RECURSIVE_DELETE_MAX` descendants. Omitted, only an empty folder is deleted.',
+        enum: ['true', 'false'],
+      },
+    ],
+  },
+
   // ---- upload -------------------------------------------------------------
-  // The only `multipart` route, and the only one whose body is read lazily —
-  // the handler authorises the caller and runs its own per-user limiter before
-  // calling `readFormData()`.
+  // A `multipart` route whose body is read lazily — the handler authorises the
+  // caller and runs its own per-user limiter before calling `readFormData()`.
   //
-  // `ip-limit`, like every other authenticated surface: the handler now performs
-  // a session lookup and a permissions read, so unauthenticated traffic must be
+  // `ip-limit`, like every other authenticated surface: the handler performs a
+  // session lookup and a permissions read, so unauthenticated traffic must be
   // bounded before it can force either. Its own limiter is keyed per user, which
   // by definition cannot bound a caller that has no session yet.
   {
     method: 'POST',
-    path: '/api/upload/image',
-    handler: uploadImage.POST,
+    path: '/api/upload/file',
+    handler: uploadFile.POST,
     preAuth: 'ip-limit',
     auth: 'permission',
     captcha: false,
@@ -492,8 +667,16 @@ export const ROUTES: readonly RouteDefinition[] = [
         name: 'resource',
         required: true,
         description:
-          'Dashboard resource the image is for. The caller must hold create or edit on it.',
+          'Dashboard resource the file is for. The caller must hold create or edit on it.',
         enum: DASHBOARD_PAGE_NAMES,
+      },
+      {
+        name: 'purpose',
+        required: false,
+        description:
+          'A purpose declared in code for this resource (`UPLOAD_PURPOSES`), which decides the bucket and the admitted kinds. Omitted: private, any admitted kind.',
+        maxLength: PURPOSE_NAME_MAX,
+        pattern: PURPOSE_NAME_PATTERN,
       },
     ],
     // Image processing may outlast the global ceiling; timing out here drops

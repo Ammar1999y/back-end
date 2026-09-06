@@ -24,6 +24,7 @@ export const DASHBOARD_PAGES = {
   home: 'الرئيسية',
   users: 'المستخدمين',
   permissions: 'الصلاحيات',
+  media: 'الملفات',
 } as const;
 
 /**
@@ -63,6 +64,14 @@ export const PERMISSION_ACTIONS = {
    * correct a name should not thereby be able to disarm someone's 2FA.
    */
   resetTwoFactor: 'إعادة تعيين التحقق بخطوتين',
+  /**
+   * Page-scoped to `media`. Moving a file between the private and the public
+   * bucket changes who on the internet can read it, which `edit` (a rename, a
+   * move between folders) never does — so it is its own grant, like
+   * `resetTwoFactor`, and `validatePermissionScope` refuses to confer it to a
+   * role whose creator does not hold it.
+   */
+  publish: 'نشر',
 } as const;
 
 export type DashboardPage = keyof typeof DASHBOARD_PAGES;
@@ -138,6 +147,22 @@ export const DEFAULT_PAGE_PERMISSIONS: Array<{
       'delete',
       'deleteOwn',
       'create',
+    ],
+  },
+  // No `viewOwn`: a library that shows each user only their own uploads is not
+  // a shared library, and a folder view that hides other people's files reads
+  // as an empty folder. `editOwn`/`deleteOwn` resolve against `files.uploaded_by`
+  // and `folders.created_by`.
+  {
+    name: 'media',
+    availablePermissions: [
+      'view',
+      'edit',
+      'editOwn',
+      'delete',
+      'deleteOwn',
+      'create',
+      'publish',
     ],
   },
 ];

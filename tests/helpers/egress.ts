@@ -71,6 +71,9 @@ const DEFAULT_ROUTES: Record<string, EgressRoute> = {
   'apis.deewan.sa': () => json({ status: 'sent' }),
   // `sendOtpWhatsApp` requires a truthy `status` in the body, not just a 2xx.
   'services.rmz.one': () => json({ status: 'success' }),
+  // The cache purge in `lib/cloudflare/purge.ts` reads `success`, and its
+  // request body carries the purged URLs, which is what the media tests assert.
+  'api.cloudflare.com': () => json({ success: true, errors: [], result: {} }),
 };
 
 /** Cloudflare R2, whose hostname carries the account id. */

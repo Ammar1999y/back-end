@@ -1,5 +1,5 @@
 /**
- * The authorization gate on `POST /api/upload/image`.
+ * The authorization gate on `POST /api/upload/file`.
  *
  * Ported from `scripts/probe/dev-live/database/upload-auth-gate.dev-probe.ts`.
  * Three things the port changes, all of them because the harness can reach what
@@ -31,9 +31,10 @@ import type { SignedInSession } from '../helpers/session';
 import { eq } from 'drizzle-orm';
 
 import { app } from '@/app';
-import { uploadMsg } from '@/app/api/upload/image/messages';
+import { uploadMsg } from '@/app/api/upload/file/messages';
 import { db } from '@/db';
 import { files, sessions } from '@/db/schema';
+import { mediaMsg } from '@/lib/media/messages';
 
 import {
   HTTP_STATUS,
@@ -149,7 +150,7 @@ async function attempt(options: {
   body?: BodyInit;
   contentType?: string;
 }): Promise<UploadAttempt> {
-  const url = `/api/upload/image${options.query ?? '?resource=users'}`;
+  const url = `/api/upload/file${options.query ?? '?resource=users'}`;
   const init: RequestInit = {
     method: 'POST',
     ...(options.body !== undefined && { body: options.body }),
@@ -202,6 +203,18 @@ function imageForm(): FormData {
   form.append(
     'files',
     new File([svg], 'gate-fixture.svg', { type: 'image/svg+xml' })
+  );
+  return form;
+}
+
+/** A document, for the second kind the route admits. */
+function pdfForm(): FormData {
+  const form = new FormData();
+  form.append(
+    'files',
+    new File(['%PDF-1.4\n%harness\n'], 'gate-fixture.pdf', {
+      type: 'application/pdf',
+    })
   );
   return form;
 }
@@ -277,9 +290,9 @@ describe('the gate admits the callers it should', () => {
     // NOT an assertion that this is right. `resolveActionScope` answers
     // `allowed: true, scope: 'own'` for a request for `edit` backed only by
     // `editOwn`, and `requireAnyPermission` reads the boolean and discards the
-    // scope — which is defensible here (a temporary upload is attached to no
+    // scope — which is defensible here (a pending upload is attached to no
     // record yet, so there is nothing to scope against) but is written down
-    // nowhere. Pinned so that changing it is deliberate; reported with the port.
+    // nowhere. Pinned so that changing it is deliberate.
     const result = await attempt({
       session: actor('editOwn'),
       body: new FormData(),
@@ -289,11 +302,11 @@ describe('the gate admits the callers it should', () => {
     expect(result.body).toEqual(failure(uploadMsg.noFiles));
   });
 
-  test('a granted upload reaches the object store, attributed to the session user', async () => {
+  test('a granted upload lands PRIVATE and PENDING, attributed to the session user, and answers with the row not the key', async () => {
     const session = actor('create');
     const result = await attempt({ session, body: imageForm() });
 
-    expect(result.status).toBe(HTTP_STATUS.OK);
+    expect(result.status).toBe(HTTP_STATUS.CREATED);
     expect(result.reads).toEqual(['formData']);
 
     // The object store is the far end of the pipeline; a gate failure never gets
@@ -302,29 +315,102 @@ describe('the gate admits the callers it should', () => {
     const puts = storeOpsOf('PutObject');
     expect(puts.length).toBe(1);
     expect(puts[0]?.contentType).toBe('image/svg+xml');
-    expect(puts[0]?.key?.startsWith('temp/')).toBe(true);
-    expect(result.body).toEqual({
-      success: true,
-      message: uploadMsg.uploaded,
-      data: [puts[0]?.key],
-    });
+    // Opaque key under the application's prefix, in the PRIVATE bucket — no
+    // purpose was named, so the default policy applies. Nothing a caller sends
+    // chooses a bucket.
+    expect(puts[0]?.key).toMatch(/^m\/\d{4}\/\d{2}\/[0-9a-f-]{36}\.svg$/);
+    expect(puts[0]?.bucket).toBe(process.env.R2_PRIVATE_BUCKET);
+    expect(puts[0]?.ifNoneMatch).toBe('*');
 
-    // `uploadedBy` comes from the SESSION, not from anything the client sent —
-    // the identity the gate resolved is the identity the row is attributed to.
     const rows = await db
       .select({
+        id: files.id,
         r2Key: files.r2Key,
+        bucketType: files.bucketType,
+        status: files.status,
+        kind: files.kind,
+        folderId: files.folderId,
         uploadedBy: files.uploadedBy,
-        isTemporary: files.isTemporary,
+        displayName: files.displayName,
       })
       .from(files);
     expect(rows).toEqual([
       {
+        id: expect.any(String),
         r2Key: puts[0]?.key ?? '',
+        bucketType: 'private',
+        status: 'pending',
+        kind: 'image',
+        folderId: null,
+        // `uploadedBy` comes from the SESSION, not from anything the client sent.
         uploadedBy: session.user.userId,
-        isTemporary: true,
+        displayName: 'gate-fixture.svg',
       },
     ]);
+
+    // The response carries the row's id and a URL — never the object key, which
+    // is an implementation detail no client is given.
+    expect(result.body).toMatchObject({
+      success: true,
+      message: mediaMsg.uploaded,
+      data: [
+        {
+          id: rows[0]?.id,
+          kind: 'image',
+          mimeType: 'image/svg+xml',
+          bucketType: 'private',
+          transition: null,
+          folderId: null,
+          displayName: 'gate-fixture.svg',
+        },
+      ],
+    });
+    // The signed URL necessarily carries the key; the row's own key column is
+    // not published as a field.
+    expect((result.body as { data: object[] }).data[0]).not.toHaveProperty(
+      'r2Key'
+    );
+  });
+
+  test('a document is admitted through the same gate and stored as an attachment', async () => {
+    const result = await attempt({ session: actor('create'), body: pdfForm() });
+
+    expect(result.status).toBe(HTTP_STATUS.CREATED);
+    const puts = storeOpsOf('PutObject');
+    expect(puts.length).toBe(1);
+    expect(puts[0]?.contentType).toBe('application/pdf');
+    expect(puts[0]?.key).toMatch(/\.pdf$/);
+    expect(result.body).toMatchObject({
+      data: [{ kind: 'document', mimeType: 'application/pdf' }],
+    });
+  });
+
+  test('a type outside the allowlist is refused after the gate, by name', async () => {
+    const form = new FormData();
+    form.append(
+      'files',
+      new File(['MZ\u{90}\u{0}'], 'setup.exe', {
+        type: 'application/x-msdownload',
+      })
+    );
+    const result = await attempt({ session: actor('create'), body: form });
+
+    expect(result.status).toBe(HTTP_STATUS.BAD_REQUEST);
+    expect(result.body).toEqual(failure(mediaMsg.typeNotAllowed('setup')));
+    expect(storeOps()).toEqual([]);
+  });
+
+  test('bytes that do not match the declared type are refused', async () => {
+    const form = new FormData();
+    form.append(
+      'files',
+      new File(['not a pdf at all'], 'fake.pdf', { type: 'application/pdf' })
+    );
+    const result = await attempt({ session: actor('create'), body: form });
+
+    expect(result.status).toBe(HTTP_STATUS.BAD_REQUEST);
+    expect(result.body).toEqual(failure(mediaMsg.refused('fake', 'signature')));
+    expect(storeOps()).toEqual([]);
   });
 });
 
@@ -405,6 +491,27 @@ describe('the gate refuses everyone else', () => {
     });
     expect(admitted.status).toBe(HTTP_STATUS.BAD_REQUEST);
     expect(admitted.body).toEqual(failure(uploadMsg.noFiles));
+  });
+
+  test('an unknown purpose is refused after the permission check, body untouched', async () => {
+    // The purpose registry is code; a name it does not hold is a client error,
+    // and it is only learnable by a caller already authorised on the resource.
+    const result = await attempt({
+      session: actor('create'),
+      query: '?resource=users&purpose=nope',
+      body: imageForm(),
+    });
+
+    expect(result.status).toBe(HTTP_STATUS.BAD_REQUEST);
+    expect(result.body).toEqual(failure(mediaMsg.invalidPurpose));
+    expect(result.reads).toEqual([]);
+
+    const anonymous = await attempt({
+      query: '?resource=users&purpose=nope',
+      body: imageForm(),
+    });
+    expect(anonymous.status).toBe(HTTP_STATUS.UNAUTHORIZED);
+    expect(anonymous.reads).toEqual([]);
   });
 });
 
@@ -532,11 +639,8 @@ describe('the resource parameter is checked before the body is parsed', () => {
     // `resource` used to be parsed BEFORE the session check, so an
     // unauthenticated caller got 400 for a name that is not a page and 401 for
     // one that is — an exact, unauthenticated membership test for
-    // `DASHBOARD_PAGE_NAMES`. It was accepted only while `/openapi.json`
-    // published those names to anyone; the document is authenticated now, so the
-    // divergence had to go with it.
-    //
-    // Both answers must be byte-identical, and neither may read the body.
+    // `DASHBOARD_PAGE_NAMES`. Both answers must be byte-identical, and neither
+    // may read the body.
     const unknown = await attempt({
       query: '?resource=nope',
       body: imageForm(),

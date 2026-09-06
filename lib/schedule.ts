@@ -1,5 +1,7 @@
 import { runDatabaseSweep } from '@/db/maintenance';
 import { errorClassOf } from '@/utils';
+import { reconcileObjectStore } from '@/lib/media/reconcile';
+import { hasUsageSources } from '@/lib/media/usages';
 import { runMaintenanceSweep } from '@/lib/sqlite/maintenance';
 
 // Infrastructure schedules must not move with host or business time zones.
@@ -27,6 +29,28 @@ const JOBS: readonly ScheduledJob[] = [
     name: 'database-retention-sweep',
     expression: '30 3 * * *',
     run: runDatabaseSweep,
+  },
+  // Read-only: lists both buckets and reports drift against `files`. Weekly,
+  // because it pages the whole bucket. Nothing here deletes; the report is what
+  // a human acts on.
+  {
+    name: 'object-store-reconcile',
+    expression: '0 4 * * 0',
+    run: async () => {
+      const report = await reconcileObjectStore();
+      console.log(
+        JSON.stringify({ msg: 'object store reconciled', ...report })
+      );
+      // A cut-short listing or an exhausted HEAD budget left rows uncompared;
+      // the report says how many, and the run says there is more to look at.
+      return {
+        status: 'ok',
+        hasMore: report.buckets.some(
+          (bucket) => bucket.truncated || bucket.unchecked > 0
+        ),
+        durationMs: report.durationMs,
+      };
+    },
   },
 ];
 
@@ -113,6 +137,19 @@ export function startSchedule(
       { tz: SCHEDULE_TIMEZONE }
     )
   );
+
+  // The unfiled half of the retention sweep is driven entirely by
+  // `USAGE_SOURCES`; with none declared it can neither list nor reap anything,
+  // and a degraded guard that says nothing is how a default comes to be
+  // inherited unnoticed by every project built on this kit.
+  if (!hasUsageSources())
+    console.log(
+      JSON.stringify({
+        msg: 'media.usage-registry is empty',
+        detail:
+          'No owner table is declared in lib/media/usages.ts, so the media API governs library files only and the unfiled scope and its reaper are inert.',
+      })
+    );
 
   console.log(
     JSON.stringify({

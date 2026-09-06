@@ -17,3 +17,7 @@
 *.woff binary
 *.woff2 binary
 *.db binary
+
+# Office fixtures under tests/fixtures/office: byte-exact, never line-ending normalised.
+*.doc binary
+*.xls binary
