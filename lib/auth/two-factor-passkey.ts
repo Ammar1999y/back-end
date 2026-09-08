@@ -13,18 +13,13 @@
  * so a mismatch cannot resolve at all.
  */
 import type { AuthContext } from './two-factor-challenge';
-import type { EntityID } from '@/types';
 
-import { and, eq, lt } from 'drizzle-orm';
+import { eq } from 'drizzle-orm';
 
 import { twoFactorMsg } from '@/app/api/auth/otp/messages';
-import { db, withTransaction } from '@/db';
-import { passkeys, verifications } from '@/db/schema';
+import { withTransaction } from '@/db';
+import { verifications } from '@/db/schema';
 import { sanitizeForLog } from '@/utils';
-import {
-  generateAuthenticationOptions,
-  verifyAuthenticationResponse,
-} from '@simplewebauthn/server';
 import { APIError, createAuthEndpoint } from 'better-auth/api';
 import * as z from 'zod';
 
@@ -35,27 +30,17 @@ import {
   twoFactorPasskeyVerifySchema,
 } from '@/utils/validation/two-factor';
 
-import { PUBLIC_ORIGIN } from '../env';
+import {
+  advancePasskeyCounter,
+  passkeyOptions,
+  verifyUserPasskey,
+} from './passkey-assertion';
 import { envelopeResponse } from './plugin-openapi';
 import {
   completeTwoFactorChallenge,
   resolveTwoFactorChallenge,
   spendChallengeAttempt,
 } from './two-factor-challenge';
-
-/**
- * Must equal what the plugin's `getRpID` computes at registration — a credential
- * registered under one RP ID cannot be asserted under another — so it is derived
- * from the same source rather than configured twice.
- */
-const RP_ID = new URL(PUBLIC_ORIGIN).hostname;
-
-/** Taken from the library's option type: a local copy would silently narrow it. */
-type AuthenticatorTransportFuture = NonNullable<
-  NonNullable<
-    Parameters<typeof generateAuthenticationOptions>[0]['allowCredentials']
-  >[number]['transports']
->[number];
 
 const CHALLENGE_MAX_AGE_S = 300;
 
@@ -83,51 +68,6 @@ async function requireChallenge(ctx: AuthContext) {
   return challenge;
 }
 
-/**
- * Raises a credential's signature counter to `to`, and never lowers it.
- *
- * ⚠️ A monotonic maximum, NOT a compare-and-swap on the value the assertion was
- * verified against. Under a swap, two concurrent assertions that both read 3
- * resolve as "3→4 lands, 3→9 loses" and the row keeps 4 — so a cloned
- * authenticator replaying 5 through 8 passes the monotonicity check the counter
- * exists to provide. `WHERE counter < to` keeps the higher of the two, and "no
- * row updated" then means the stored value is already at least `to`, which is
- * the outcome we want rather than a failure.
- *
- * Exported for its own test: the ceremony cannot be driven without a real
- * authenticator, so this write is the only part of the counter path a test can
- * reach, and it is the part that matters.
- */
-export async function advancePasskeyCounter(
-  passkeyId: string,
-  to: number
-): Promise<boolean> {
-  // An authenticator that implements no counter reports 0 for every assertion,
-  // which SimpleWebAuthn accepts. There is nothing to advance and nothing to
-  // reconcile, and without this every such sign-in would log.
-  if (to === 0) return true;
-
-  const [advanced] = await db
-    .update(passkeys)
-    .set({ counter: to })
-    .where(and(eq(passkeys.id, passkeyId), lt(passkeys.counter, to)))
-    .returning({ id: passkeys.id });
-  return Boolean(advanced);
-}
-
-async function userPasskeys(userId: EntityID) {
-  return db
-    .select({
-      credentialID: passkeys.credentialID,
-      publicKey: passkeys.publicKey,
-      counter: passkeys.counter,
-      transports: passkeys.transports,
-      userId: passkeys.userId,
-    })
-    .from(passkeys)
-    .where(eq(passkeys.userId, userId));
-}
-
 const twoFactorPasskey = () =>
   ({
     id: 'two-factor-passkey',
@@ -145,26 +85,11 @@ const twoFactorPasskey = () =>
         },
         async (ctx) => {
           const challenge = await requireChallenge(ctx);
-          const credentials = await userPasskeys(challenge.user.id);
-          if (credentials.length === 0)
+          const options = await passkeyOptions(challenge.user.id, () => {
             throw new APIError(HTTP_STATUS.BAD_REQUEST, {
               message: twoFactorMsg.methodUnavailable,
               code: CUSTOM_AUTH_CODE,
             });
-
-          const options = await generateAuthenticationOptions({
-            rpID: RP_ID,
-            // A second factor must prove a person, not just a device: without
-            // user verification a stolen unlocked laptop asserts silently.
-            userVerification: 'required',
-            allowCredentials: credentials.map((credential) => ({
-              id: credential.credentialID,
-              transports: credential.transports
-                ? (credential.transports.split(
-                    ','
-                  ) as AuthenticatorTransportFuture[])
-                : undefined,
-            })),
           });
 
           // Replacing any previous ceremony for this challenge is deliberate:
@@ -246,80 +171,18 @@ const twoFactorPasskey = () =>
                 code: CUSTOM_AUTH_CODE,
               });
 
-            const credentialId = (response as { id?: unknown }).id;
-            if (typeof credentialId !== 'string')
-              throw new APIError(HTTP_STATUS.UNPROCESSABLE, {
-                message: twoFactorMsg.invalidCode,
-                code: CUSTOM_AUTH_CODE,
-              });
-
-            // The server-side binding: `allowCredentials` is a hint the browser
-            // may ignore, so the credential is looked up UNDER the challenge
-            // user rather than globally.
-            const [credential] = await db
-              .select({
-                credentialID: passkeys.credentialID,
-                publicKey: passkeys.publicKey,
-                counter: passkeys.counter,
-                transports: passkeys.transports,
-                id: passkeys.id,
-              })
-              .from(passkeys)
-              .where(
-                and(
-                  eq(passkeys.credentialID, credentialId),
-                  eq(passkeys.userId, challenge.user.id)
-                )
-              )
-              .limit(1);
-
-            if (!credential) {
-              await chargeFailure();
-              throw new APIError(HTTP_STATUS.UNAUTHORIZED, {
-                message: twoFactorMsg.invalidCode,
-                code: CUSTOM_AUTH_CODE,
-              });
-            }
-
             let verification;
             try {
-              verification = await verifyAuthenticationResponse({
-                // The library checks the shape itself and throws into the catch
-                // below; a Zod mirror of `AuthenticationResponseJSON` would only
-                // drift from it.
-                response: response as unknown as Parameters<
-                  typeof verifyAuthenticationResponse
-                >[0]['response'],
-                expectedChallenge: stored.value,
-                expectedOrigin: PUBLIC_ORIGIN,
-                expectedRPID: RP_ID,
-                credential: {
-                  id: credential.credentialID,
-                  publicKey: new Uint8Array(
-                    Buffer.from(credential.publicKey, 'base64')
-                  ),
-                  counter: credential.counter,
-                  transports: credential.transports
-                    ? (credential.transports.split(
-                        ','
-                      ) as AuthenticatorTransportFuture[])
-                    : undefined,
-                },
-                requireUserVerification: true,
-              });
+              verification = await verifyUserPasskey(
+                challenge.user.id,
+                response,
+                stored.value
+              );
             } catch (error) {
               await chargeFailure();
               console.error(
                 sanitizeForLog({ msg: 'twoFactor.passkey.verifyFailed', error })
               );
-              throw new APIError(HTTP_STATUS.UNAUTHORIZED, {
-                message: twoFactorMsg.invalidCode,
-                code: CUSTOM_AUTH_CODE,
-              });
-            }
-
-            if (!verification.verified) {
-              await chargeFailure();
               throw new APIError(HTTP_STATUS.UNAUTHORIZED, {
                 message: twoFactorMsg.invalidCode,
                 code: CUSTOM_AUTH_CODE,
@@ -333,14 +196,14 @@ const twoFactorPasskey = () =>
             // attempt was not a guess and the challenge is still live.
             if (
               !(await advancePasskeyCounter(
-                credential.id,
-                verification.authenticationInfo.newCounter
+                verification.credential.id,
+                verification.newCounter
               ))
             )
               console.error(
                 sanitizeForLog({
                   msg: 'twoFactor.passkey.counterReconciled',
-                  passkeyId: credential.id,
+                  passkeyId: verification.credential.id,
                 })
               );
 

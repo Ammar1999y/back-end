@@ -166,7 +166,7 @@ export const twoFactorMethod = pgEnum('two_factor_method', TWO_FACTOR_METHODS);
 // Whitelist of supported auth providers — extend here when adding OAuth.
 // Constraining the column to a known set prevents direct writes from
 // introducing provider IDs that downstream code cannot handle.
-export const providerIdEnumValues = ['credential'] as const;
+export const providerIdEnumValues = ['credential', 'google'] as const;
 export const providerId = pgEnum('provider_id', providerIdEnumValues);
 /**
  * The upload saga's durable step marker (see `lib/media/lifecycle.ts`):
@@ -205,6 +205,10 @@ export const users = pgTable(
       ? varchar('phone_number', { length: PHONE_NUMBER_MAX }).notNull()
       : varchar('phone_number', { length: PHONE_NUMBER_MAX }),
     emailVerified: boolean('email_verified').default(false).notNull(),
+    authRevokedAt: timestamp('auth_revoked_at', {
+      withTimezone: true,
+      precision: 3,
+    }),
     phoneNumberVerified: boolean('phone_number_verified')
       .default(false)
       .notNull(),
@@ -386,6 +390,11 @@ export const accounts = pgTable(
     check(
       'chk_credential_issuer',
       sql`provider_id <> 'credential' OR issuer = 'local:credential'`
+    ),
+    // Text comparison allows this check in the same migration transaction that adds the enum value.
+    check(
+      'chk_google_account',
+      sql`provider_id::text <> 'google' OR (issuer = 'https://accounts.google.com' AND password IS NULL)`
     ),
   ]
 );

@@ -45,13 +45,10 @@ import {
 } from '@/utils/validation/two-factor';
 
 import { API_PATH_MAX, auditLog, USER_AGENT_MAX } from '../audit';
+import { withAuthTransaction } from './transaction';
 import { consumeDeviceTrust } from './trusted-device';
+import { lockEligibleAuthUser } from './user-eligibility';
 
-/**
- * Either kind of Better Auth context. `better-auth` does not re-export it, so
- * `@better-auth/core` is declared here — in `devDependencies`, because the
- * import is type-only, and pinned EXACTLY to the version `better-auth` pins.
- */
 export type AuthContext = GenericEndpointContext;
 
 const TWO_FACTOR_COOKIE_NAME = 'two_factor';
@@ -104,7 +101,11 @@ function parseChallengeState(raw: string): ChallengeState | null {
     defaultMethod:
       typeof record.defaultMethod === 'string' ? record.defaultMethod : null,
     firstFactor:
-      record.firstFactor === 'passwordless' ? 'passwordless' : 'password',
+      record.firstFactor === 'google'
+        ? 'google'
+        : record.firstFactor === 'passwordless'
+          ? 'passwordless'
+          : 'password',
     excludeContactKind:
       record.excludeContactKind === 'email' ||
       record.excludeContactKind === 'phone'
@@ -469,7 +470,7 @@ export async function resolveRequestSession(
   return { userId, sessionId, userEmail };
 }
 
-type FirstFactor = 'password' | 'passwordless';
+type FirstFactor = 'password' | 'passwordless' | 'google';
 
 export interface IssueChallengeParams {
   userId: EntityID;
@@ -477,6 +478,8 @@ export interface IssueChallengeParams {
   /** The session the first factor created, which must not survive this call. */
   session: { id: string; token: string };
   firstFactor: FirstFactor;
+  // The Better Auth adapter must already be scoped to this same transaction.
+  transaction?: Tx;
   excludeContactKind?: ContactKind;
   /** The user's submitted choice, already filtered by `HONOUR_REMEMBER_ME`. */
   rememberMe: boolean;
@@ -544,7 +547,7 @@ export async function issueTwoFactorChallenge(
   // The reset is therefore NOT gated on the method list: under an empty list it
   // is the only way back for an account still holding stored 2FA state.
   if (!TWO_FACTOR_ENABLED) {
-    const [row] = await db
+    const [row] = await (params.transaction ?? db)
       .select({ enabled: users.twoFactorEnabled })
       .from(users)
       .where(eq(users.id, params.userId))
@@ -562,7 +565,7 @@ export async function issueTwoFactorChallenge(
     return { kind: 'proceed' };
   }
 
-  const state = await readEnrollment(params.userId);
+  const state = await readEnrollment(params.userId, params.transaction);
   // From the database, not the caller's session object: a stale copy would
   // decide a login in the direction that skips the factor.
   if (!state.enabled) return { kind: 'proceed' };
@@ -601,7 +604,10 @@ export async function issueTwoFactorChallenge(
   // operator's method-list change strands keep signing in with the password
   // alone while every other holder of that enrolment was refused. The skip has
   // to be a skip of a factor that still exists.
-  if (await consumeDeviceTrust(ctx, params.userId)) {
+  if (
+    params.firstFactor !== 'google' &&
+    (await consumeDeviceTrust(ctx, params.userId))
+  ) {
     // The one path that completes a login without a second factor, and the one
     // an incident review looks for. Nothing else records it.
     await recordChallengeEvent(
@@ -619,8 +625,6 @@ export async function issueTwoFactorChallenge(
   await withdrawFirstFactorSession(ctx, params.session.token);
   await carryRememberChoice(ctx, params.rememberMe);
 
-  // `session.create.after` in lib/auth.ts already committed `loginSuccess: true`
-  // for the row just deleted, and the audit log is append-only.
   await recordChallengeEvent(
     params,
     { loginSuccess: true },
@@ -736,7 +740,7 @@ async function recordChallengeEvent(
   newData: Record<string, unknown>
 ): Promise<void> {
   try {
-    await withTransaction((tx) =>
+    const write = (tx: Tx) =>
       auditLog(tx, {
         userId: params.userId,
         userEmail: params.userEmail,
@@ -751,8 +755,9 @@ async function recordChallengeEvent(
             params.auditMeta.userAgent?.slice(0, USER_AGENT_MAX) ?? null,
           apiPath: params.auditMeta.apiPath.slice(0, API_PATH_MAX),
         },
-      })
-    );
+      });
+    if (params.transaction) await write(params.transaction);
+    else await withTransaction(write);
   } catch (error) {
     console.error(
       sanitizeForLog({
@@ -1012,49 +1017,74 @@ async function invalidateChallenge(
   expireCookie(ctx, ctx.context.authCookies.dontRememberToken);
 }
 
-/**
- * Consumes the challenge and issues the session it stood in for.
- *
- * `consumeVerificationValue` returns the row to exactly one concurrent caller,
- * so two verifications racing on one challenge produce one session; a value that
- * no longer matches the resolved user means the challenge was rotated underneath
- * this request and is refused.
- */
+// Completion and rotation share the user lock: rotation either removes the
+// completed session or invalidates the challenge before completion can proceed.
+// Rechecking eligibility and the pending challenge under that lock makes the
+// pre-lock challenge resolution safe to use.
+export async function withTwoFactorChallengeTransaction<T>(
+  ctx: AuthContext,
+  challenge: ResolvedChallenge,
+  complete: () => Promise<T>
+): Promise<T | null> {
+  return withAuthTransaction(ctx, async (tx) => {
+    const user = await lockEligibleAuthUser(
+      tx,
+      eq(users.id, challenge.user.id)
+    );
+    if (!user) return null;
+    const pending = await ctx.context.internalAdapter.findVerificationValue(
+      challenge.challengeId
+    );
+    if (
+      !pending ||
+      pending.value !== user.id ||
+      pending.expiresAt <= new Date()
+    )
+      return null;
+    return complete();
+  });
+}
+
 export async function completeTwoFactorChallenge(
   ctx: AuthContext,
   challenge: ResolvedChallenge,
   /** The option that actually completed it, for the audit chain. */
   completedWith: string
 ): Promise<{ token: string } | null> {
-  const consumed = await ctx.context.internalAdapter.consumeVerificationValue(
-    challenge.challengeId
+  const created = await withTwoFactorChallengeTransaction(
+    ctx,
+    challenge,
+    async () => {
+      // Atomic consumption elects one verifier; rotation or another user-bound value must never complete this challenge.
+      const consumed =
+        await ctx.context.internalAdapter.consumeVerificationValue(
+          challenge.challengeId
+        );
+      if (!consumed || consumed.value !== challenge.user.id) return null;
+
+      await ctx.context.internalAdapter.deleteVerificationByIdentifier(
+        attemptsIdentifier(challenge.challengeId)
+      );
+      await ctx.context.internalAdapter.deleteVerificationByIdentifier(
+        stateIdentifier(challenge.challengeId)
+      );
+      const user = await ctx.context.internalAdapter.findUserById(
+        challenge.user.id
+      );
+      if (!user) return null;
+      const session = await ctx.context.internalAdapter.createSession(
+        challenge.user.id,
+        !challenge.rememberMe
+      );
+      return session ? { user, session } : null;
+    }
   );
-  if (!consumed || consumed.value !== challenge.user.id) {
+  if (!created) {
     await invalidateChallenge(ctx, challenge.challengeId);
     return null;
   }
-
-  await ctx.context.internalAdapter
-    .deleteVerificationByIdentifier(attemptsIdentifier(challenge.challengeId))
-    .catch(() => {});
-  await ctx.context.internalAdapter
-    .deleteVerificationByIdentifier(stateIdentifier(challenge.challengeId))
-    .catch(() => {});
-
-  const user = await ctx.context.internalAdapter.findUserById(
-    challenge.user.id
-  );
-  if (!user) return null;
-
-  // The submitted choice, carried from issuance. The library passes
-  // `!!dontRememberMe` here and this path passed nothing, so a user who asked
-  // not to be remembered got a 28-day row behind a session-scoped cookie.
+  const { user, session } = created;
   const dontRememberMe = !challenge.rememberMe;
-  const session = await ctx.context.internalAdapter.createSession(
-    challenge.user.id,
-    dontRememberMe
-  );
-  if (!session) return null;
 
   await setSessionCookie(ctx, { session, user }, dontRememberMe);
   // `setSessionCookie` SETS the marker when the answer is "do not remember" and

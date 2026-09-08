@@ -30,12 +30,12 @@ import { commitEmailChange, refreshSessionCookies } from '../../contact-change';
 /**
  * Step 2 of the email change: verify the OTP that was sent to the NEW address
  * and, in the SAME transaction, commit `email = newEmail` + `emailVerified =
- * true` and revoke the user's other sessions. Verification and the sensitive
+ * true` and revoke all the user's sessions. Verification and the sensitive
  * action are atomic, so there is no verify→commit replay window.
  */
 export const POST: Handler = async (ctx) => {
   try {
-    const { session, userId, sessionId } = await requireSession(ctx);
+    const { session, userId } = await requireSession(ctx);
 
     await enforceRateLimit({
       scope: 'users.me.change-email.verify.post',
@@ -74,7 +74,6 @@ export const POST: Handler = async (ctx) => {
             tx,
             userId,
             newEmail,
-            keepSessionId: sessionId,
             auditMeta,
           })
         )
@@ -92,7 +91,6 @@ export const POST: Handler = async (ctx) => {
               tx,
               userId,
               newEmail: matched.targetIdentifier ?? newEmail,
-              keepSessionId: sessionId,
               keepVerificationSessionId: matched.verificationSessionId,
               auditMeta,
             }),

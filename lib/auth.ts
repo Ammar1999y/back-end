@@ -6,7 +6,6 @@ import { eq } from 'drizzle-orm';
 
 import { twoFactorMsg } from '@/app/api/auth/otp/messages';
 import { db, withTransaction } from '@/db';
-import * as schema from '@/db/schema';
 import { users } from '@/db/schema';
 import { sanitizeForLog, validID } from '@/utils';
 import { betterAuth } from 'better-auth';
@@ -21,6 +20,7 @@ import { captcha, openAPI } from 'better-auth/plugins';
 import { PUBLIC_ORIGIN } from '@/lib/env';
 
 import {
+  CREDENTIAL_PROVIDER_ID,
   CUSTOM_AUTH_CODE,
   EMAIL_NOT_VERIFIED_CODE,
   HTTP_STATUS,
@@ -47,34 +47,36 @@ import { normalizePasswordInput } from '@/utils/validation/rules';
 import {
   API_PATH_MAX,
   auditLog,
-  getClientIp,
   TRUSTED_IP_HEADERS,
   USER_AGENT_MAX,
 } from './audit';
+import { authAdapterOptions } from './auth/adapter-options';
+import { hasAdminReauth } from './auth/admin-reauth';
 import { BETTER_AUTH_ALLOWED_PATH_SET } from './auth/allowed-paths';
+import { reauthenticationRequired } from './auth/api-error';
+import { authAuditMeta } from './auth/audit-meta';
 import { BASE_ERROR_CODES } from './auth/code-errors';
 import { assertLiveSession } from './auth/live-session';
 import { LoginRejected, verifyLoginAttempt } from './auth/login-guard';
+import { oauth } from './auth/oauth';
 import { hashPassword } from './auth/password';
 import { consumePasswordProof, mintPasswordProof } from './auth/password-proof';
 import { passwordless } from './auth/passwordless';
+import { reauthentication } from './auth/reauth';
 import { consumeReauthGrant } from './auth/reauth-grant';
 import { submittedRememberMe } from './auth/remember-me';
+import { authDatabase } from './auth/transaction';
 import { twoFactorPlugins } from './auth/two-factor';
 import {
   PLUGIN_VERIFIER_METHOD,
   resolveRequestSession,
   resolveTwoFactorChallenge,
 } from './auth/two-factor-challenge';
-import { REQUIRE_ROLE_FOR_LOGIN } from './permissions/constants';
+import { roleAllowsLogin } from './auth/user-eligibility';
 import { sanitizePermissions } from './permissions/utils';
 
-// ⚠️ WARNING: password.verify below accepts ONLY a proof minted by the before
-// hook after a real verifyLoginAttempt(). If you add a path that relies on
-// Better Auth's built-in password verification, you MUST mint a proof for it in
-// the before hook — see PASSWORD_PROOF_PATHS. Without that the path rejects
-// every password, which is the deliberate failure direction: it is visible
-// immediately, where the previous `async () => true` accepted every password.
+// Better Auth password checks require a proof minted here after password verification
+// or a valid reauthentication window. New library password paths need the same boundary.
 /**
  * The complete Better Auth surface this deployment exposes. Every other Better
  * Auth path is answered 404 by the `before` hook below, so this set — not Better
@@ -89,7 +91,7 @@ const CUSTOM_CODE = CUSTOM_AUTH_CODE;
 
 /**
  * Everything the 2FA and passkey paths need before Better Auth's own middleware
- * runs: a live session, a really-verified password, and no client-chosen device
+ * runs: a live session, reauthentication proof, and no client-chosen device
  * trust. One function because all three answers share the session lookup.
  *
  * Returns the modified context when the body had to change, `undefined`
@@ -183,13 +185,36 @@ async function enforceTwoFactorPathPolicy(
   if (!needsProof) return { context: { ...ctx, body: { ...body, ...patch } } };
 
   const supplied = body.password;
+  if (
+    supplied === undefined &&
+    (await hasAdminReauth(session.sessionId, session.userId))
+  ) {
+    const credential = await db.query.accounts.findFirst({
+      where: (accounts, { and, eq }) =>
+        and(
+          eq(accounts.userId, session.userId),
+          eq(accounts.providerId, CREDENTIAL_PROVIDER_ID)
+        ),
+    });
+    if (credential?.password)
+      return {
+        context: {
+          ...ctx,
+          body: {
+            ...body,
+            ...patch,
+            password: mintPasswordProof([credential.password]),
+          },
+        },
+      };
+  }
+  if (supplied === undefined) throw reauthenticationRequired();
   if (typeof supplied !== 'string')
     throw new APIError(HTTP_STATUS.UNAUTHORIZED, {
       message: MSG_INVALID_CREDENTIALS,
       code: CUSTOM_CODE,
     });
 
-  const reqHeaders = requestHeaders(ctx);
   let acceptedHashes: AcceptedPasswordHashes;
   try {
     acceptedHashes = await verifyLoginAttempt({
@@ -198,12 +223,7 @@ async function enforceTwoFactorPathPolicy(
       // The timing floor guards anonymous enumeration; the caller here is
       // already authenticated.
       skipTimingGuard: true,
-      auditMeta: {
-        ip: getClientIp(reqHeaders),
-        userAgent:
-          reqHeaders.get('user-agent')?.slice(0, USER_AGENT_MAX) ?? null,
-        apiPath: (ctx.path ?? '').slice(0, API_PATH_MAX),
-      },
+      auditMeta: authAuditMeta(ctx),
       purpose: 'reauth_two_factor',
     });
   } catch (e) {
@@ -273,10 +293,6 @@ async function readRequestSession(
   return { userId, sessionId: found.session.id };
 }
 
-function requestHeaders(ctx: HookContext): Headers {
-  return ctx.headers ?? ctx.request?.headers ?? new Headers();
-}
-
 /**
  * The bounds this schema stores under, applied to the plugin's own bodies.
  *
@@ -340,12 +356,14 @@ function rejectOverlongPassword(body: unknown): void {
 const FIRST_LOGIN_PATHS: ReadonlySet<string> = new Set([
   '/sign-in/email',
   '/passwordless/verify',
+  '/oauth/google/start',
 ]);
 
 /** How a session came to exist, from the endpoint that created it. */
 const SESSION_METHOD_BY_PATH: Readonly<Record<string, string>> = {
   '/sign-in/email': 'password',
   '/passwordless/verify': 'passwordless',
+  '/oauth/google/callback': 'google',
   // ⚠️ The FIRST factor is not knowable from the path — a challenge completed
   // here may have followed either route — so these say only that a second
   // factor finished the login. The chain is on the completion event
@@ -381,6 +399,9 @@ const PASSWORD_PROOF_PATHS: ReadonlySet<string> = new Set([
  * access here — the class `lib/auth/live-session.ts` exists to close.
  */
 const LIVE_SESSION_PATHS: ReadonlySet<string> = new Set([
+  '/reauth/methods',
+  '/reauth/passkey/options',
+  '/reauth/passkey/verify',
   '/two-factor/disable',
   '/two-factor/get-totp-uri',
   '/two-factor/generate-backup-codes',
@@ -480,16 +501,16 @@ export const auth = betterAuth({
   // this consumer; reading `process.env` directly here left `baseURL` undefined
   // whenever only the new name was set.
   baseURL: PUBLIC_ORIGIN,
-  database: drizzleAdapter(db, { provider: 'pg', schema: schema }),
+  database: drizzleAdapter(db, authAdapterOptions),
   emailAndPassword: {
     enabled: true,
     autoSignIn: false,
     password: {
       hash: hashPassword,
       // NOT a password check — the before hook already ran the real one. This
-      // only confirms that it did, for THIS request and THIS account row. See
-      // lib/auth/password-proof.ts for why it is a one-shot token rather than
-      // the `async () => true` it replaces.
+      // only confirms that it did, for THIS request and THIS account row.
+      // PASSWORD_PROOF_PATHS must cover every exposed library password check;
+      // an omitted path fails closed because no accepted proof is minted.
       verify: async ({ hash, password }) =>
         consumePasswordProof(hash, password),
     },
@@ -554,13 +575,7 @@ export const auth = betterAuth({
           });
         }
 
-        const reqHeaders = requestHeaders(ctx);
-        const auditMeta = {
-          ip: getClientIp(reqHeaders),
-          userAgent:
-            reqHeaders.get('user-agent')?.slice(0, USER_AGENT_MAX) ?? null,
-          apiPath: ctx.path.slice(0, API_PATH_MAX),
-        };
+        const auditMeta = authAuditMeta(ctx);
 
         let acceptedHashes: AcceptedPasswordHashes;
         try {
@@ -690,7 +705,7 @@ export const auth = betterAuth({
               code: CUSTOM_CODE,
             });
 
-          const userData = await db.query.users.findFirst({
+          const userData = await authDatabase().query.users.findFirst({
             where: (users, { eq, and, isNull }) =>
               and(eq(users.id, userId), isNull(users.deletedAt)),
             columns: {
@@ -720,7 +735,7 @@ export const auth = betterAuth({
           if (
             !userData ||
             !userData.isActive ||
-            (userData.role && !userData.role.isActive)
+            !roleAllowsLogin(userData.role)
           ) {
             throw new APIError(HTTP_STATUS.UNAUTHORIZED, {
               message: MSG_INVALID_CREDENTIALS,
@@ -765,12 +780,6 @@ export const auth = betterAuth({
           }
 
           if (!userData.roleId || !userData.role) {
-            if (REQUIRE_ROLE_FOR_LOGIN) {
-              throw new APIError(HTTP_STATUS.UNAUTHORIZED, {
-                message: MSG_INVALID_CREDENTIALS,
-                code: CUSTOM_CODE,
-              });
-            }
             return {
               data: {
                 ...session,
@@ -890,6 +899,7 @@ export const auth = betterAuth({
   },
   account: {
     modelName: 'accounts',
+    accountLinking: { enabled: false },
   },
   // The adapter resolves a model as `schema[modelName]`, so this string and the
   // export in `db/schema.ts` must stay identical.
@@ -916,6 +926,8 @@ export const auth = betterAuth({
     }),
     // Passwordless sign-in (OTP → session). Verifies its own captcha/OTP.
     passwordless(),
+    oauth(),
+    reauthentication(),
     // Empty unless a method is configured.
     ...twoFactorPlugins,
     openAPI({ disableDefaultReference: true }),

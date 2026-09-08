@@ -21,6 +21,8 @@ import {
   BETTER_AUTH_KNOWN_PATHS,
   betterAuthServes,
 } from '@/lib/auth/allowed-paths';
+import { googleStartSchema } from '@/lib/auth/oauth';
+import { reauthPasskeySchema } from '@/lib/auth/reauth';
 import { CAPTCHA_TOKEN_MAX_LENGTH } from '@/lib/captcha';
 import {
   ALLOWED_MIME_TYPES,
@@ -446,6 +448,13 @@ const OPERATION_DOCS: Record<
 };
 
 const BETTER_AUTH_SUMMARIES: Record<string, string> = {
+  'GET /capabilities': 'Read enabled OAuth sign-in providers',
+  'GET /reauth/methods': 'Read usable reauthentication methods',
+  'POST /reauth/passkey/options': 'Start passkey reauthentication',
+  'POST /reauth/passkey/verify': 'Complete passkey reauthentication',
+  'POST /oauth/google/start': 'Start Google sign-in',
+  'GET /oauth/google/callback': 'Complete the verified Google exchange',
+  'GET /oauth/result': 'Consume the Google redirect result',
   'GET /get-session': 'Get the current Better Auth session',
   'POST /sign-out': 'Sign out the current session',
   'POST /sign-in/email': 'Sign in with email and password',
@@ -486,12 +495,15 @@ const BETTER_AUTH_SUMMARIES: Record<string, string> = {
  * `/sign-out` and `/get-session` take no body, so they have no entry.
  */
 const BETTER_AUTH_BODIES: Record<string, z.ZodType> = {
+  '/oauth/google/start': googleStartSchema,
+  '/reauth/passkey/verify': reauthPasskeySchema,
   '/sign-in/email': loginSchema.omit({ captcha: true }),
   '/passwordless/verify': passwordlessVerifySchema,
   // This deployment's own two-factor endpoints declare `z.record` to Better
   // Call and parse these; publishing the same schemas is what keeps the
   // document and the handler from drifting apart.
   '/two-factor/disable': twoFactorPasswordSchema,
+  '/two-factor/get-totp-uri': twoFactorPasswordSchema,
   '/two-factor/totp/start': twoFactorPasswordSchema,
   '/two-factor/totp/confirm': twoFactorTotpConfirmSchema,
   '/two-factor/generate-backup-codes': twoFactorPasswordSchema,
@@ -881,6 +893,11 @@ const ERROR_ENVELOPE_SCHEMA: JsonSchema = {
   properties: {
     success: { const: false },
     message: { type: 'string' },
+    code: {
+      type: 'string',
+      description:
+        'Machine-readable error code when supplied. REAUTH_REQUIRED requests a password/passkey reauthentication proof. otp_proof_throttle identifies a proof-level OTP throttle at an authenticated boundary.',
+    },
     data: NULL_SCHEMA,
   },
   required: ['success', 'message', 'data'],
@@ -1539,8 +1556,7 @@ const PAGINATED_SUCCESS_ROUTES = new Set([
 ]);
 
 /**
- * Routes whose success calls `refreshSessionCookies`. A client that ignores the
- * new `Set-Cookie` keeps presenting a token the change just invalidated.
+ * Email commits revoke the current session; refreshSessionCookies clears its cookie cache.
  */
 const SESSION_COOKIE_ROUTES = new Set([
   'POST /api/dash/users/me/change-email',
@@ -1550,7 +1566,7 @@ const SESSION_COOKIE_ROUTES = new Set([
 const SET_COOKIE_HEADER: JsonSchema = {
   'Set-Cookie': {
     description:
-      'Re-issued session cookie. The token presented on this request is no longer valid.',
+      'Session cookies are cleared after committing an email change. Every session is revoked; sign in again.',
     schema: { type: 'string' },
   },
 };
@@ -1559,7 +1575,9 @@ function successResponseFor(key: string): JsonSchema {
   const data = SUCCESS_DATA_SCHEMAS[key];
   if (!data) throw new Error(`No success data schema for ${key}`);
   return {
-    description: 'Success.',
+    description: SESSION_COOKIE_ROUTES.has(key)
+      ? 'An email change commits when data.verified is true. On commit, Google is unlinked and every session is revoked, including the current session. The client must show an alert that the email changed and sign-in is required, clear its authenticated state, and return to sign-in. If data.verified is false, continue the email OTP flow; the change has not committed and sessions remain active.'
+      : 'Success.',
     ...(SESSION_COOKIE_ROUTES.has(key) && { headers: SET_COOKIE_HEADER }),
     content: {
       'application/json': {
@@ -1762,6 +1780,13 @@ const BETTER_AUTH_PATH_STATUSES: Record<
   string,
   readonly (keyof typeof BETTER_AUTH_STATUS_DESCRIPTIONS)[]
 > = {
+  '/capabilities': [],
+  '/reauth/methods': ['401'],
+  '/reauth/passkey/options': ['400', '401', '403'],
+  '/reauth/passkey/verify': ['400', '401', '403'],
+  '/oauth/google/start': ['400', '401', '403'],
+  '/oauth/google/callback': ['400', '401'],
+  '/oauth/result': ['401'],
   '/sign-in/email': ['400', '401', '403', '422'],
   '/sign-out': ['400', '403'],
   '/passwordless/verify': ['400', '401', '403', '422'],
@@ -1809,10 +1834,11 @@ const BETTER_AUTH_ERROR_SCHEMA: JsonSchema = {
  * Paths that throttle from INSIDE the endpoint as well as from the wildcard's
  * admission limiter, and so answer 429/503 in two body shapes: the wildcard's
  * goes to `handleApiError` (envelope), an inner `CustomError` goes to
- * `toAuthApiError`. Only `/passwordless/verify` has an inner limiter, and
- * Better Auth's own `rateLimit` is disabled.
+ * `toAuthApiError`. Better Auth's own `rateLimit` is disabled.
  */
 const BETTER_AUTH_LOCAL_THROTTLE_PATHS = new Set([
+  '/reauth/passkey/options',
+  '/reauth/passkey/verify',
   '/passwordless/verify',
   // Both reach `enforceOtpSurfaceSendQuota` / `enforceOtpVerifyQuota`, whose
   // `CustomError` becomes a 429 with `Retry-After` — or a 503 when the limiter
@@ -1987,8 +2013,19 @@ function betterAuthResponses(path: string, method: HttpMethod): JsonSchema {
     };
   }
 
-  if (method === 'POST' && TWO_FACTOR_CHALLENGE_PATHS.has(path))
+  if (
+    path === '/oauth/google/callback' ||
+    path === '/oauth/result' ||
+    (method === 'POST' && TWO_FACTOR_CHALLENGE_PATHS.has(path))
+  )
     responses['200'] = withTwoFactorChallengeBranch(responses['200']);
+
+  if (path === '/oauth/google/callback')
+    responses['302'] = {
+      description:
+        'Return to the validated same-origin callbackURL, without codes or tokens. Fetch /api/auth/oauth/result with cookies to consume the result.',
+      headers: { Location: { schema: { type: 'string', format: 'uri' } } },
+    };
 
   return responses;
 }
@@ -2481,12 +2518,18 @@ export function openApiDocument(
           'response shapes under this prefix. Every Better Auth path outside ' +
           'this list is answered 404 by the before-hook in lib/auth.ts.',
         responses: betterAuthResponses(endpoint.path, method),
-        security:
-          endpoint.path === '/get-session' || endpoint.path === '/sign-out'
+        security: endpoint.path.startsWith('/reauth/')
+          ? [{ sessionCookie: [] }]
+          : endpoint.path === '/get-session' || endpoint.path === '/sign-out'
             ? [{}, { sessionCookie: [] }]
             : [],
       };
       const parameters: JsonSchema[] = [];
+      if (
+        endpoint.path === '/oauth/google/callback' &&
+        Array.isArray(generated?.parameters)
+      )
+        parameters.push(...generated.parameters.filter(isJsonSchema));
       if (method === 'GET' && endpoint.path === '/get-session')
         parameters.push(
           {

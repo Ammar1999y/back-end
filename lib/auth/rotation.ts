@@ -1,14 +1,18 @@
 import type { Tx } from '@/db';
+import type { getAuditMeta } from '@/lib/audit';
 import type { EntityID } from '@/types';
 
-import { and, eq, inArray, like, ne } from 'drizzle-orm';
+import { and, eq, inArray, like, ne, sql } from 'drizzle-orm';
 
 import {
+  accounts,
   sessions,
   trustedDevices,
+  users,
   verifications,
   verificationSessions,
 } from '@/db/schema';
+import { auditLog } from '@/lib/audit';
 
 /**
  * Single policy for what a credential / identity rotation invalidates.
@@ -80,7 +84,11 @@ async function revokeVerificationArtifacts(
     await tx.delete(verifications).where(
       inArray(
         verifications.identifier,
-        owned.map((session) => `2fa-proven-${session.id}`)
+        owned.flatMap((session) => [
+          `2fa-proven-${session.id}`,
+          `reauth-method-${session.id}`,
+          `reauth-passkey-${session.id}`,
+        ])
       )
     );
 }
@@ -138,6 +146,10 @@ export async function revokePendingProofs(
   trustedDeviceRotation: 'revoke' | 'keep' = 'revoke'
 ): Promise<void> {
   await tx
+    .update(users)
+    .set({ authRevokedAt: sql`clock_timestamp()`, updatedAt: users.updatedAt })
+    .where(eq(users.id, userId));
+  await tx
     .delete(verificationSessions)
     .where(
       keepVerificationSessionId
@@ -151,4 +163,36 @@ export async function revokePendingProofs(
   if (trustedDeviceRotation === 'revoke')
     await revokeTwoFactorState(tx, userId);
   else await revokeVerificationArtifacts(tx, userId);
+}
+
+export async function unlinkGoogle(
+  tx: Tx,
+  userId: EntityID,
+  auditMeta: ReturnType<typeof getAuditMeta>
+): Promise<void> {
+  const removed = await tx
+    .delete(accounts)
+    .where(and(eq(accounts.userId, userId), eq(accounts.providerId, 'google')))
+    .returning({ id: accounts.id });
+  if (removed.length === 0) return;
+  const [user] = await tx
+    .select({ email: users.email })
+    .from(users)
+    .where(eq(users.id, userId));
+  if (!user) throw new Error('Unlinked identity has no local user.');
+  for (const account of removed)
+    await auditLog(tx, {
+      userId,
+      userEmail: user.email,
+      action: 'DELETE',
+      tableName: 'accounts',
+      recordId: account.id,
+      oldData: { provider: 'google', identityLinked: true },
+      newData: {
+        provider: 'google',
+        identityLinked: false,
+        reason: 'google_identity_unlinked',
+      },
+      meta: auditMeta,
+    });
 }

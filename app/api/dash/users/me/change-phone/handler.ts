@@ -6,6 +6,7 @@ import { otpMsg } from '@/app/api/auth/otp/messages';
 import { db, withTransaction } from '@/db';
 import { users } from '@/db/schema';
 import { getAuditMeta } from '@/lib/audit';
+import { requireReauthWindow } from '@/lib/auth/admin-reauth';
 import { LoginRejected, verifyLoginAttempt } from '@/lib/auth/login-guard';
 import { verifyTurnstileRequest } from '@/lib/captcha';
 import { requireSession } from '@/lib/http/session';
@@ -80,13 +81,16 @@ export const POST: Handler = async (ctx) => {
 
     const auditMeta = getAuditMeta(ctx);
     try {
-      await verifyLoginAttempt({
-        userId,
-        password: parsed.data.currentPassword,
-        skipTimingGuard: true,
-        auditMeta,
-        purpose: 'reauth_change_phone',
-      });
+      if (parsed.data.currentPassword === undefined)
+        await requireReauthWindow(userId, sessionId);
+      else
+        await verifyLoginAttempt({
+          userId,
+          password: parsed.data.currentPassword,
+          skipTimingGuard: true,
+          auditMeta,
+          purpose: 'reauth_change_phone',
+        });
     } catch (e) {
       if (e instanceof LoginRejected)
         throw new CustomError(

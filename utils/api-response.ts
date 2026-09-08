@@ -35,6 +35,7 @@ interface ApiSuccessOptions<T = unknown> {
 
 interface ApiErrorOptions {
   message: string;
+  code?: string;
   status?: number;
   headers?: Record<string, string>;
 }
@@ -96,12 +97,13 @@ export function apiRaw({
 
 export function apiError({
   message,
+  code,
   status = HTTP_STATUS.BAD_REQUEST,
   headers,
 }: ApiErrorOptions): HandlerOutput<null> {
   return {
     status,
-    body: { success: false, message, data: null },
+    body: { success: false, message, data: null, ...(code && { code }) },
     ...(headers && { headers }),
   };
 }
@@ -143,6 +145,7 @@ export function handleApiError(
         : undefined;
     return apiError({
       message: error.message,
+      code: error.code,
       status: error.status,
       ...(headers && { headers }),
     });

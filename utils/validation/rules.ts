@@ -188,6 +188,12 @@ export const passwordSchema = z.preprocess(
     })
 );
 
+export const reauthPasswordSchema = passwordSchema
+  .optional()
+  .describe(
+    'May be omitted while this session has an open password/passkey reauthentication window. Otherwise omission returns 401 REAUTH_REQUIRED.'
+  );
+
 // Saudi phone: strips non-digits, accepts 966XXXXXXXXX / 05XXXXXXXX / 5XXXXXXXX
 const phoneCleanupRegex = /[^\d]/g;
 const saudiPhoneEmptyError = 'رقم الهاتف مطلوب';

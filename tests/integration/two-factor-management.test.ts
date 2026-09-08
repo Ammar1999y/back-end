@@ -97,12 +97,16 @@ function call(
  * merely a session. The window is bound to the session, so nothing has to be
  * threaded through the request afterwards.
  */
-async function signInCookie(user: SeededUser): Promise<string> {
+async function signInCookie(
+  user: SeededUser,
+  reauthenticate = true
+): Promise<string> {
   const response = await call('POST', '/api/auth/sign-in/email', {
     email: user.email,
     password: user.password,
   });
   const cookie = cookieHeader(response.headers.getSetCookie());
+  if (!reauthenticate) return cookie;
   const reauth = await call(
     'POST',
     '/api/dash/auth/reauth',
@@ -159,7 +163,7 @@ describe('removing one method', () => {
     // a challenge rather than a session, and these endpoints need a session.
     // A real user reaches them by completing their second factor; the fixture
     // reaches the same state by holding a session from before enrolment.
-    const cookie = await signInCookie(user);
+    const cookie = await signInCookie(user, false);
     // A VERIFIED TOTP, not an intent row alone: the removal below is allowed
     // only because a factor a challenge would offer survives it.
     await enrolTotpBySql(user.userId);
@@ -237,7 +241,7 @@ describe('removing one method', () => {
 describe('backup codes', () => {
   test('are not a usable method until the user acknowledges them', async () => {
     const user = await seedUser();
-    const cookie = await signInCookie(user);
+    const cookie = await signInCookie(user, false);
 
     const enabled = await call(
       'POST',

@@ -6,6 +6,8 @@ import {
   TWO_FACTOR_OTP_AVAILABLE,
 } from '@/utils/validation/two-factor';
 
+import { GOOGLE_ENABLED } from './oauth-config';
+
 /**
  * The two-factor surface, gated per METHOD by the environment: a method that is
  * off contributes no entry, so `app.ts` never forwards its path to Better Auth
@@ -229,6 +231,51 @@ function twoFactorEndpoints(): RoutePrefixPath[] {
  * that hook's `PASSWORD_PROOF_PATHS`, or it rejects every password.
  */
 export const BETTER_AUTH_ENDPOINTS: readonly RoutePrefixPath[] = [
+  { path: '/capabilities', methods: ['GET'], preAuthLimit: 60, captcha: false },
+  {
+    path: '/reauth/methods',
+    methods: ['GET'],
+    preAuthLimit: 60,
+    captcha: false,
+  },
+  ...(isTwoFactorMethodEnabled('passkey')
+    ? ([
+        {
+          path: '/reauth/passkey/options',
+          methods: ['POST'],
+          preAuthLimit: 20,
+          captcha: false,
+        },
+        {
+          path: '/reauth/passkey/verify',
+          methods: ['POST'],
+          preAuthLimit: 20,
+          captcha: false,
+        },
+      ] satisfies RoutePrefixPath[])
+    : []),
+  ...(GOOGLE_ENABLED
+    ? ([
+        {
+          path: '/oauth/google/start',
+          methods: ['POST'],
+          preAuthLimit: 20,
+          captcha: true,
+        },
+        {
+          path: '/oauth/google/callback',
+          methods: ['GET'],
+          preAuthLimit: 30,
+          captcha: false,
+        },
+        {
+          path: '/oauth/result',
+          methods: ['GET'],
+          preAuthLimit: 60,
+          captcha: false,
+        },
+      ] satisfies RoutePrefixPath[])
+    : []),
   // GET only, and this is the case that proves the values have to be MEASURED
   // rather than read off the dependency's declaration. `getSession` declares
   // `method: ["GET", "POST"]`, but its own handler throws
@@ -276,6 +323,13 @@ export const BETTER_AUTH_ENDPOINTS: readonly RoutePrefixPath[] = [
  * it is derived from the enabled set alone.
  */
 export const BETTER_AUTH_KNOWN_PATHS: ReadonlySet<string> = new Set([
+  '/capabilities',
+  '/reauth/methods',
+  '/reauth/passkey/options',
+  '/reauth/passkey/verify',
+  '/oauth/google/start',
+  '/oauth/google/callback',
+  '/oauth/result',
   '/get-session',
   '/sign-out',
   '/sign-in/email',

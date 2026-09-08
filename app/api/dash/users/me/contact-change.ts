@@ -8,7 +8,11 @@ import { users } from '@/db/schema';
 import { sanitizeForLog } from '@/utils';
 import { auditLog, getAuditMeta } from '@/lib/audit';
 import { auth } from '@/lib/auth';
-import { revokeOtherSessions, revokePendingProofs } from '@/lib/auth/rotation';
+import {
+  revokeOtherSessions,
+  revokePendingProofs,
+  unlinkGoogle,
+} from '@/lib/auth/rotation';
 import {
   contactChangeStrandsTwoFactor,
   removeMethodIntent,
@@ -60,9 +64,8 @@ async function detachTwoFactorFromContact(
 }
 
 /**
- * Refresh the cookie-cached session after an identity field (email) changed so
- * the stale cached identity is replaced. Failure is non-fatal — the DB change
- * already committed.
+ * Read uncached session state so a revoked email-change session clears its
+ * cookies. Failure is non-fatal because revocation already committed.
  */
 export async function refreshSessionCookies(
   headers: Headers
@@ -113,7 +116,10 @@ interface CommitContactChangeOpts {
   auditMeta: AuditMeta;
 }
 
-interface CommitEmailChangeOpts extends CommitContactChangeOpts {
+interface CommitEmailChangeOpts extends Omit<
+  CommitContactChangeOpts,
+  'keepSessionId'
+> {
   newEmail: string;
 }
 
@@ -121,7 +127,6 @@ export async function commitEmailChange({
   tx,
   userId,
   newEmail,
-  keepSessionId,
   keepVerificationSessionId,
   auditMeta,
 }: CommitEmailChangeOpts): Promise<void> {
@@ -169,10 +174,8 @@ export async function commitEmailChange({
     .set({ email: newEmail, emailVerified: true })
     .where(eq(users.id, userId));
 
-  // Email is an identity/credential change — same revocation policy as every
-  // other rotation: other sessions die, and sibling proofs issued against the
-  // old identity die with them.
-  await revokeOtherSessions(tx, userId, keepSessionId);
+  await unlinkGoogle(tx, userId, auditMeta);
+  await revokeOtherSessions(tx, userId);
   await revokePendingProofs(tx, userId, keepVerificationSessionId);
 
   await auditLog(tx, {

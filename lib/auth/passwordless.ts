@@ -3,7 +3,7 @@ import type { BetterAuthPlugin } from 'better-auth';
 import { and, eq, isNull } from 'drizzle-orm';
 
 import { ensureMinDelay, otpMsg } from '@/app/api/auth/otp/messages';
-import { db, withTransaction } from '@/db';
+import { db } from '@/db';
 import { userContactColumn } from '@/db/queries';
 import { users } from '@/db/schema';
 import { sanitizeForLog } from '@/utils';
@@ -25,53 +25,17 @@ import {
 } from '@/utils/otp';
 import { OTP_ENABLED, passwordlessVerifySchema } from '@/utils/validation/otp';
 
-import { API_PATH_MAX, auditLog, getClientIp, USER_AGENT_MAX } from '../audit';
+import { auditLog } from '../audit';
 import { verifyTurnstileRequest } from '../captcha';
 import { enforceOtpVerifyQuota, otpContactKind } from '../rate-limit';
 import { toAuthApiError } from './api-error';
+import { authAuditMeta } from './audit-meta';
 import { submittedRememberMe } from './remember-me';
+import { recordAbandonedSession } from './session-audit';
 import {
   issueTwoFactorChallenge,
   twoFactorUnavailableError,
 } from './two-factor-challenge';
-
-/**
- * Records that a just-issued session was withdrawn before its cookie shipped.
- *
- * Best-effort and swallowed: the caller is already rethrowing the failure that
- * caused it, and a second fault here must not replace that one. A missing
- * compensating row leaves the same gap this closes, which is why it is logged.
- */
-async function recordAbandonedSession(params: {
-  userId: string;
-  userEmail: string;
-  sessionId: string;
-  auditMeta: { ip: string | null; userAgent: string | null; apiPath: string };
-}): Promise<void> {
-  try {
-    await withTransaction((tx) =>
-      auditLog(tx, {
-        userId: params.userId,
-        userEmail: params.userEmail,
-        action: 'DELETE',
-        tableName: 'sessions',
-        recordId: params.sessionId,
-        oldData: { loginSuccess: true },
-        newData: { sessionAbandoned: true, reason: 'cookie_delivery_failed' },
-        meta: params.auditMeta,
-      })
-    );
-  } catch (error) {
-    console.error(
-      sanitizeForLog({
-        msg: 'passwordless.abandonedSessionAudit.failed',
-        userId: params.userId,
-        sessionId: params.sessionId,
-        error,
-      })
-    );
-  }
-}
 
 /**
  * Passwordless login (step 2 / verify). Reuses the project's hardened OTP
@@ -191,12 +155,7 @@ export const passwordless = () =>
                 HTTP_STATUS.BAD_REQUEST
               );
 
-            const auditMeta = {
-              ip: getClientIp(headers),
-              userAgent:
-                headers.get('user-agent')?.slice(0, USER_AGENT_MAX) ?? null,
-              apiPath: '/passwordless/verify'.slice(0, API_PATH_MAX),
-            };
+            const auditMeta = authAuditMeta(ctx, '/passwordless/verify');
 
             // The OTP to email/phone proves control of that contact, so flip the
             // matching verified flag too (also satisfies the login gate below).

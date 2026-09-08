@@ -98,3 +98,17 @@ export async function currentDatabase(): Promise<string> {
   if (!row) throw new Error('current_database() returned no row');
   return row.db;
 }
+
+export async function waitForUserLock(): Promise<void> {
+  await assertHarnessDatabase();
+  const deadline = performance.now() + 5000;
+  while (performance.now() < deadline) {
+    const rows = await db.execute(sql`select pid from pg_stat_activity
+      where datname = current_database() and pid <> pg_backend_pid()
+        and wait_event_type = 'Lock' and cardinality(pg_blocking_pids(pid)) > 0
+        and query like '%"users"%'`);
+    if (rows.length > 0) return;
+    await Bun.sleep(10);
+  }
+  throw new Error('No request reached a blocked users query.');
+}

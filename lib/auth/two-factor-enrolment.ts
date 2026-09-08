@@ -63,7 +63,8 @@ import {
   twoFactorTotpConfirmSchema,
 } from '@/utils/validation/two-factor';
 
-import { API_PATH_MAX, auditLog, getClientIp, USER_AGENT_MAX } from '../audit';
+import { auditLog } from '../audit';
+import { authAuditMeta } from './audit-meta';
 import { envelopeResponse } from './plugin-openapi';
 import { mintReauthGrant, requireReauthPassword } from './reauth-grant';
 import { revokeOtherSessions, revokeTwoFactorState } from './rotation';
@@ -121,7 +122,6 @@ export async function auditLifecycle(
   session: RequestSession,
   newData: Record<string, unknown>
 ): Promise<void> {
-  const headers = ctx.headers ?? ctx.request?.headers ?? new Headers();
   await auditLog(tx, {
     userId: session.userId,
     userEmail: session.userEmail,
@@ -130,11 +130,7 @@ export async function auditLifecycle(
     recordId: session.userId,
     oldData: {},
     newData: { ...newData, actor: session.userId },
-    meta: {
-      ip: getClientIp(headers),
-      userAgent: headers.get('user-agent')?.slice(0, USER_AGENT_MAX) ?? null,
-      apiPath: (ctx.path ?? '').slice(0, API_PATH_MAX),
-    },
+    meta: authAuditMeta(ctx),
   });
 }
 

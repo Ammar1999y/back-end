@@ -6,6 +6,7 @@ import { otpMsg } from '@/app/api/auth/otp/messages';
 import { db, withTransaction } from '@/db';
 import { users } from '@/db/schema';
 import { getAuditMeta } from '@/lib/audit';
+import { requireReauthWindow } from '@/lib/auth/admin-reauth';
 import { LoginRejected, verifyLoginAttempt } from '@/lib/auth/login-guard';
 import { verifyTurnstileRequest } from '@/lib/captcha';
 import { requireSession } from '@/lib/http/session';
@@ -45,7 +46,6 @@ import { commitEmailChange, refreshSessionCookies } from '../contact-change';
  *    POST /change-email/verify only after the code matches.
  *  - OTP_AUTO_VERIFY: the change is committed immediately (no code), since the
  *    deployment has opted out of real verification.
- * Either way the current password re-auth is required to initiate.
  */
 export const POST: Handler = async (ctx) => {
   try {
@@ -82,13 +82,16 @@ export const POST: Handler = async (ctx) => {
     // Re-auth in its own short tx so the later mutation doesn't hold a row lock
     // across argon2.
     try {
-      await verifyLoginAttempt({
-        userId,
-        password: parsed.data.currentPassword,
-        skipTimingGuard: true,
-        auditMeta,
-        purpose: 'reauth_change_email',
-      });
+      if (parsed.data.currentPassword === undefined)
+        await requireReauthWindow(userId, sessionId);
+      else
+        await verifyLoginAttempt({
+          userId,
+          password: parsed.data.currentPassword,
+          skipTimingGuard: true,
+          auditMeta,
+          purpose: 'reauth_change_email',
+        });
     } catch (e) {
       if (e instanceof LoginRejected)
         throw new CustomError(
@@ -135,7 +138,6 @@ export const POST: Handler = async (ctx) => {
           tx,
           userId,
           newEmail,
-          keepSessionId: sessionId,
           auditMeta,
         })
       );

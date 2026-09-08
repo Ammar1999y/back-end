@@ -24,7 +24,7 @@ import {
   users,
 } from '@/db/schema';
 import { symmetricEncrypt } from 'better-auth/crypto';
-import { advancePasskeyCounter } from '@/lib/auth/two-factor-passkey';
+import { advancePasskeyCounter } from '@/lib/auth/passkey-assertion';
 import { PUBLIC_ORIGIN } from '@/lib/env';
 
 import { HTTP_STATUS } from '@/utils/api-messages';

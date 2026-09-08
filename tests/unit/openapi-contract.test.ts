@@ -146,6 +146,44 @@ function documentOperations(document: unknown): Array<{
 }
 
 describe('the OpenAPI document', () => {
+  test('email commits document revoking every session and the required client alert on both routes', () => {
+    const document = openApiDocument(toPublishedManifest(ROUTES));
+    for (const path of [
+      '/api/dash/users/me/change-email',
+      '/api/dash/users/me/change-email/verify',
+    ]) {
+      const response = objectProperty(
+        objectProperty(operationOf(document, path, 'post'), 'responses'),
+        '200'
+      );
+      expect(response.description).toContain(
+        'every session is revoked, including the current session'
+      );
+      expect(response.description).toContain('must show an alert');
+      expect(response.description).toContain('data.verified is false');
+    }
+  });
+
+  test('credential proof fields describe the optional reauthentication window and errors preserve their code', () => {
+    const document = openApiDocument(toPublishedManifest(ROUTES));
+    for (const path of [
+      '/api/dash/users/me/change-password',
+      '/api/dash/users/me/change-email',
+      '/api/dash/users/me/change-phone',
+    ]) {
+      const schema = requestSchemaOf(document, path, 'post');
+      expect(
+        objectProperty(objectProperty(schema, 'properties'), 'currentPassword')
+          .description
+      ).toContain('401 REAUTH_REQUIRED');
+      expect(schema.required).not.toContain('currentPassword');
+      const error = responseSchemaOf(document, path, 'post', '401');
+      expect(
+        objectProperty(objectProperty(error, 'properties'), 'code').type
+      ).toBe('string');
+    }
+  });
+
   test('builds from the full route table without throwing', () => {
     const paths = pathsOf(openApiDocument(toManifest(ROUTES)));
     expect(paths.length).toBeGreaterThan(0);
@@ -1560,6 +1598,49 @@ describe('the statuses each Better Auth operation declares', () => {
   };
 
   const MEASURED: Record<string, readonly string[]> = {
+    '/capabilities': ['200', '404', '429', '500', '503'],
+    '/reauth/methods': ['200', '401', '404', '429', '500', '503'],
+    '/reauth/passkey/options': [
+      '200',
+      '400',
+      '401',
+      '403',
+      '404',
+      '429',
+      '500',
+      '503',
+    ],
+    '/reauth/passkey/verify': [
+      '200',
+      '400',
+      '401',
+      '403',
+      '404',
+      '429',
+      '500',
+      '503',
+    ],
+    '/oauth/google/start': [
+      '200',
+      '400',
+      '401',
+      '403',
+      '404',
+      '429',
+      '500',
+      '503',
+    ],
+    '/oauth/google/callback': [
+      '200',
+      '302',
+      '400',
+      '401',
+      '404',
+      '429',
+      '500',
+      '503',
+    ],
+    '/oauth/result': ['200', '401', '404', '429', '500', '503'],
     '/get-session': ['200', '404', '429', '500', '503'],
     '/sign-out': ['200', '400', '403', '404', '429', '500', '503'],
     '/sign-in/email': [

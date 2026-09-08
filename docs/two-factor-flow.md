@@ -1,5 +1,11 @@
 # التحقق بخطوتين — ما يراه المستخدم فعليًا
 
+The [OAuth and shared reauthentication contract](oauth-sign-in.md) extends this
+flow: Google uses local 2FA unless the current verified token proves `mfa`;
+password and enrolled passkey can open the shared reauthentication window.
+Google is sign-in only. Local email changes revoke every session; the client
+must alert the user before returning to sign-in.
+
 ## كيف تقرأ هذه الوثيقة
 
 هذه وثيقة **سلوك**، لا وثيقة كود. كل سطر فيها يجيب سؤالًا واحدًا: **ماذا فعل المستخدم، وماذا رأى؟**

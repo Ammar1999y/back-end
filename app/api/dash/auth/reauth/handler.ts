@@ -2,6 +2,7 @@ import type { Handler } from '@/lib/http/contract';
 
 import { getAuditMeta } from '@/lib/audit';
 import { mintAdminReauth } from '@/lib/auth/admin-reauth';
+import { authenticationStartedAt } from '@/lib/auth/authentication-time';
 import { LoginRejected, verifyLoginAttempt } from '@/lib/auth/login-guard';
 import { requireSession } from '@/lib/http/session';
 import { enforceRateLimit, userIdentifier } from '@/lib/rate-limit';
@@ -20,20 +21,9 @@ import {
 import { CustomError } from '@/utils/error-class';
 import { passwordSchema } from '@/utils/validation/rules';
 
-/**
- * Opens the administrator's re-authentication window.
- *
- * ⚠️ Not a login and not a session: the caller already holds both. This says the
- * person at the keyboard is still the account's owner, for the class of actions
- * that lower ANOTHER account's security posture — `D12` lists them, and
- * `requirePermission({ reauth: true })` is where they read it.
- *
- * The answer is a proof the client sends back in `x-reauth-proof`. A WINDOW
- * rather than a single use, because a per-request prompt on every row of a batch
- * is what gets the control disabled.
- */
 export const POST: Handler = async (ctx) => {
   try {
+    const startedAt = await authenticationStartedAt();
     const { userId, sessionId } = await requireSession(ctx);
 
     // Per user, not per IP: this is an authenticated password check, and the
@@ -71,7 +61,13 @@ export const POST: Handler = async (ctx) => {
       throw error;
     }
 
-    const { expiresIn } = await mintAdminReauth(userId, sessionId);
+    const { expiresIn } = await mintAdminReauth(
+      userId,
+      sessionId,
+      'password',
+      undefined,
+      startedAt
+    );
     // No token in the body: the window is bound to THIS session, so the caller
     // simply continues on the same cookie. A bearer token would add a secret to
     // leak and no security — anyone who can send the cookie can send it too.

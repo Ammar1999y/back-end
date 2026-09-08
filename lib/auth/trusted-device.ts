@@ -40,7 +40,7 @@ import {
   MSG_NOT_FOUND,
 } from '@/utils/api-messages';
 
-import { getClientIp, USER_AGENT_MAX } from '../audit';
+import { authAuditMeta } from './audit-meta';
 import { envelopeResponse } from './plugin-openapi';
 import { consumeTwoFactorProof } from './two-factor-challenge';
 
@@ -131,7 +131,7 @@ async function grantDeviceTrust(
   userId: EntityID
 ): Promise<void> {
   const identifier = `trust-device-${crypto.randomBytes(IDENTIFIER_BYTES).toString('base64url')}`;
-  const headers = ctx.headers ?? ctx.request?.headers ?? new Headers();
+  const meta = authAuditMeta(ctx);
   const expiresAt = new Date(Date.now() + TRUST_DEVICE_MAX_AGE_S * 1000);
 
   try {
@@ -139,8 +139,8 @@ async function grantDeviceTrust(
       tx.insert(trustedDevices).values({
         userId,
         trustIdentifier: identifier,
-        userAgent: headers.get('user-agent')?.slice(0, USER_AGENT_MAX) ?? null,
-        ipAddress: getClientIp(headers),
+        userAgent: meta.userAgent,
+        ipAddress: meta.ip,
         expiresAt,
       })
     );

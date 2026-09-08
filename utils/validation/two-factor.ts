@@ -19,7 +19,7 @@ import {
   otpCodeSchema,
   PHONE_OTP_AVAILABLE,
 } from './otp';
-import { idSchema, passwordSchema } from './rules';
+import { idSchema, reauthPasswordSchema } from './rules';
 
 export const TWO_FACTOR_METHODS = [
   'totp',
@@ -185,7 +185,7 @@ const optionIdSchema = z.string().min(1).max(40);
 export const twoFactorOtpSendSchema = z.object({
   channel: enabledTwoFactorChannel.optional(),
   option: optionIdSchema.optional(),
-  password: passwordSchema.optional(),
+  password: reauthPasswordSchema,
 });
 
 export const twoFactorOtpVerifySchema = z.object({
@@ -195,7 +195,9 @@ export const twoFactorOtpVerifySchema = z.object({
 });
 
 /** Re-authentication alone: TOTP setup, backup-code generation, disable, the passkey grant. */
-export const twoFactorPasswordSchema = z.object({ password: passwordSchema });
+export const twoFactorPasswordSchema = z.object({
+  password: reauthPasswordSchema,
+});
 
 export const twoFactorTotpConfirmSchema = z.object({ code: otpCodeSchema });
 
@@ -206,7 +208,7 @@ export const twoFactorMethodOptionSchema = z.object({
 });
 
 export const twoFactorMethodDisableSchema = twoFactorMethodOptionSchema.extend({
-  password: passwordSchema,
+  password: reauthPasswordSchema,
 });
 
 export const twoFactorPasskeyVerifySchema = z.object({

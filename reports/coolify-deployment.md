@@ -210,16 +210,16 @@ broken configuration.
 
 **Configuration > General:**
 
-| Field           | Value                           |
-| --------------- | ------------------------------- |
-| Build Pack      | `Nixpacks`                      |
-| Base Directory  | `/`                             |
-| Static Site     | Off                             |
-| Ports Exposes   | `3000`                          |
-| Port Mappings   | Empty                           |
-| Install Command | `bun install --frozen-lockfile` |
-| Build Command   | `bun run build`                 |
-| Start Command   | `bun run start`                 |
+| Field           | Value                                           |
+| --------------- | ----------------------------------------------- |
+| Build Pack      | `Nixpacks`                                      |
+| Base Directory  | `/`                                             |
+| Static Site     | Off                                             |
+| Ports Exposes   | `3000`                                          |
+| Port Mappings   | Empty                                           |
+| Install Command | `bun install --frozen-lockfile`                 |
+| Build Command   | `bun run build`                                 |
+| Start Command   | `bun scripts/build-openapi.ts && bun run start` |
 
 `bun run build` is `bun scripts/build-openapi.ts && tsc --noEmit`. There is no
 bundle. The script generates `build/openapi.json` from the **production-filtered**
@@ -234,6 +234,19 @@ nothing — the runtime route reads it and still requires a live dashboard sessi
 command is overridden in Coolify, `NODE_ENV=production` must be carried over** —
 HSTS, the production env validation in `lib/env.server.ts`, the
 absolute-`SQLITE_DIR` rule and the dev-only endpoint gates all key off it.
+
+The start command above regenerates OpenAPI using runtime configuration before
+starting the server. Apply this rule to every deployment: all environment-gated
+routes, including 2FA methods and OAuth providers, must agree with the served
+document. Keep `NODE_ENV=production` set as a runtime variable for both commands.
+Build with secrets and optional providers absent; runtime secrets do not belong
+in the image. Never expose the generated `build/` directory as static content.
+
+If OpenAPI generation fails, `&&` prevents the server from starting; the new
+container cannot serve requests. Inspect its startup log, correct the runtime
+configuration (or the reported schema/build error), and redeploy. Keep the
+generation step in the start command so the served document matches the runtime
+routes.
 
 **Consider adding `--no-env-file`.** Bun auto-loads `.env` from the working
 directory. Measured precedence is the safe direction — a real process variable
@@ -1750,8 +1763,12 @@ bucket CORS rule in the Cloudflare console — the API token cannot (measured
 
 - [ ] Release committed, pushed, CI green.
 - [ ] Bun 1.4.0 in the build log; SQLite version recorded (§8).
-- [ ] Build `bun run build`, start `bun run start`, `NODE_ENV=production` set as
+- [ ] Build `bun run build`, start `bun scripts/build-openapi.ts && bun run start`, `NODE_ENV=production` set as
       a runtime variable; `--no-env-file` decided (§2).
+- [ ] Google project, only when `ENABLED_OAUTH_PROVIDERS` includes `google`:
+      publishing status **In production**, redirect URI registered for the
+      canonical origin, and, if the local-2FA bypass is wanted, **Authentication
+      strength claims** enabled with verification status **Verified** (§14).
 - [ ] Every secret scoped **runtime-only**; nothing in the "Must be absent"
       table present, especially `TEST_DATABASE_URL`.
 - [ ] `SQLITE_MAINTENANCE_TOKEN` generated with `openssl rand -hex 32`, or left
@@ -1801,3 +1818,107 @@ bucket CORS rule in the Cloudflare console — the API token cannot (measured
       public file and re-fetching its URL (§13.3).
 - [ ] Traefik buffering limit raised before documents above the old cap are
       allowed (§13.5).
+
+## 14. Google OAuth sign-in
+
+Added 2026-09-07. Local behavioral and migration tests are recorded in
+[oauth-sign-in-implementation.md](oauth-sign-in-implementation.md). These
+instructions have not been executed against a live Google project or Coolify VPS.
+
+### Configuration and migration
+
+OAuth is disabled by default. Leave `ENABLED_OAUTH_PROVIDERS` unset or empty to
+omit Google from public capabilities and make its start, callback and result
+routes unavailable. Password, OTP and existing local 2FA remain available according
+to their existing settings.
+
+To enable Google, set these runtime environment variables:
+
+| Variable                  | Value                                                                                  |
+| ------------------------- | -------------------------------------------------------------------------------------- |
+| `ENABLED_OAUTH_PROVIDERS` | `google`                                                                               |
+| `GOOGLE_CLIENT_ID`        | The web application's Google OAuth client ID, ending in `.apps.googleusercontent.com`. |
+| `GOOGLE_CLIENT_SECRET`    | That client's secret; server-only, never a public client variable.                     |
+
+An unknown provider or missing/malformed enabled-provider credentials refuses
+startup without printing the values. Keep Google credentials out of the image,
+repository, browser configuration and logs. Keep `BETTER_AUTH_SECRET` stable
+across a release so in-flight signed browser state remains verifiable.
+
+Apply `bun run db:migrate` before starting this code, even while OAuth is disabled.
+Migration `0011_greedy_paibok` extends the provider enum, adds
+`users.auth_revoked_at`, and enforces Google's issuer/password storage constraint.
+It creates no users and backfills no identities. The existing account uniqueness
+constraints enforce one provider link per user and unique provider/subject pairs.
+Do not deploy old application code after enabling Google without first accounting
+for its narrower provider enum contract. Disabling the environment switch is the
+operational rollback; it leaves stored links and password accounts intact.
+
+### Google project
+
+1. Configure a Google OAuth **web application** client and consent/audience setup
+   for this deployment. Register the exact redirect URI
+   `https://<PUBLIC_ORIGIN host>/api/auth/oauth/google/callback`. The origin must
+   be the application's canonical HTTPS origin, not an internal container name
+   or an alternate proxy host. Register development redirects separately.
+   Use **In production** for the live deployment. Google documents a
+   [Testing exception](https://support.google.com/cloud/answer/15549945?hl=en)
+   for basic identity scopes, so the application's `openid`/`email` request does
+   not require users to appear in the test-user list. Receiving `amr` has the
+   separate publication and verification prerequisites in step 3.
+2. Grant only `openid` and `email`. The server requests online access and no
+   incremental scopes. It does not call Google APIs or retain provider tokens.
+3. To make Google's MFA evidence available, enable **Authentication strength
+   claims** (`amr`) through Google Auth Platform → Settings → Advanced Settings.
+   Google's [security bundle setup](https://developers.google.com/identity/siwg/security-bundle)
+   requires the app's publishing status to be **In production** and verification
+   status **Verified**.
+   The server requests `amr` for sign-in. Missing `amr` uses local 2FA; the
+   optional claim is not required to enable Google sign-in. Google does not
+   support requests to reauthenticate a Google Account, so the owner approved
+   password/passkey reauthentication. Session age claims are not required.
+4. Allow outbound HTTPS to `oauth2.googleapis.com` and `www.googleapis.com` for
+   code exchange and Google signing keys. Browsers navigate to
+   `accounts.google.com`. Keep the VPS clock synchronized for Google token
+   validity. Proof start and credential-revocation comparisons both use the
+   database clock and do not depend on application/database clock alignment.
+
+### Build, proxy and client wiring
+
+Follow the build/start rule in §2 for all environment-gated routes, including
+OAuth and 2FA. The runtime start command regenerates the authenticated OpenAPI
+artifact using the same provider and factor configuration as capabilities and
+routes; Google secrets remain runtime-only.
+
+Preserve cookies on the full-page Google redirect and the callback. The callback
+is a top-level GET and does not carry a CAPTCHA header; do not add a proxy rule
+requiring one there. Keep the existing CAPTCHA and Origin protections on the
+start POST. Do not cache `/api/auth/*`. Exclude callback query strings,
+authorization headers, cookies and provider request/response bodies from proxy,
+APM and error logs. Callback queries contain short-lived authorization codes and
+state even though the application's request logger records only the path.
+
+The consuming client must implement the capability-driven Google button, its
+same-origin completion page, single-use result retrieval, the existing local 2FA
+challenge UI, and the list of usable reauthentication choices described in
+[docs/oauth-sign-in.md](../docs/oauth-sign-in.md). This repository has no frontend
+application to deploy. After a local email change the client must alert the user
+that the email changed and sign-in is required, clear authenticated state, and
+return to sign-in because every session, including the current one, is revoked.
+
+### Live rollout checks
+
+- With Google disabled, check that capabilities omit it and both start and
+  callback return 404.
+- With Google enabled, sign in an administrator-created, initially unverified
+  Gmail account. Check that the existing account is linked and verified without
+  email OTP, and that its password still works.
+- Check a local-2FA account with and without current Google MFA evidence. Confirm
+  that only the verified `mfa` case receives a direct session and that its bypass
+  is audited; ordinary Google sign-in must enter local 2FA even on a trusted device.
+- Verify password and enrolled passkey reauthentication with the real client.
+  Confirm that Google is offered only for sign-in and never opens a
+  sensitive-operation reauthentication window.
+- Complete a local email change and check that the link, all sessions and pending
+  proof state are invalidated. Check generic failures for unknown identities and
+  changed Google emails without logging the provider payload.

@@ -22,8 +22,8 @@
  * 1. A refused change leaves the stored hash BYTE-IDENTICAL. Every negative
  *    case re-reads `accounts.password`; a status code alone cannot tell a
  *    rejection from a rejection that already wrote.
- * 2. A successful rotation revokes every OTHER session and keeps the current
- *    one, and drops the user's pending OTP proofs. Known Issues #1 is about a
+ * 2. A successful email change revokes all sessions; password and phone changes
+ *    keep the current one. All drop pending OTP proofs. Known Issues #1 is about a
  *    proof that survives a rotation, so the purge is asserted by row state — a
  *    `forgot_password` proof seeded before the change, gone after it — and not
  *    inferred from a 200.
@@ -922,7 +922,7 @@ describe('POST /api/dash/users/me/change-email — the two-step change', () => {
     expect(rows[0]?.consumedAt).toBeNull();
   });
 
-  test('the delivered code commits the change, revokes the other session and audits it', async () => {
+  test('the delivered code commits the change, revokes every session and audits it', async () => {
     if (!pendingEmail.code) throw new Error('the initiate test did not run');
     const userId = subject('email').userId;
     const before = await userRow(userId);
@@ -947,11 +947,8 @@ describe('POST /api/dash/users/me/change-email — the two-step change', () => {
     expect(after.email).toBe(pendingEmail.address);
     expect(after.emailVerified).toBe(true);
 
-    // Email is a credential here, so it carries the same revocation policy as
-    // the password.
     const sessionsAfter = await liveSessionIds(userId);
-    expect(sessionsAfter).toHaveLength(1);
-    expect(sessionsBefore).toContain(sessionsAfter[0] ?? '');
+    expect(sessionsAfter).toHaveLength(0);
 
     // The consumed proof survives as a single-use record; nothing else does.
     const rows = await proofRows(userId);
@@ -992,17 +989,18 @@ describe('POST /api/dash/users/me/change-email — the two-step change', () => {
   test('replaying the consumed code is refused', async () => {
     if (!pendingEmail.code) throw new Error('the initiate test did not run');
     const userId = subject('email').userId;
+    const fresh = await signIn({
+      ...actor('emailPrimary').user,
+      email: pendingEmail.address,
+    });
 
     const response = await app.handle(
-      authedPost(actor('emailPrimary'), CHANGE_EMAIL_VERIFY, {
+      authedPost(fresh, CHANGE_EMAIL_VERIFY, {
         newEmail: pendingEmail.address,
         code: pendingEmail.code,
       })
     );
 
-    // The code row is deleted on success, so the proof cannot be spent twice.
-    // A 200 here would look harmlessly idempotent while meaning that a captured
-    // code stays live after it has been used.
     expect(response.status).toBe(HTTP_STATUS.BAD_REQUEST);
     expect(await emailOf(userId)).toBe(pendingEmail.address);
   });

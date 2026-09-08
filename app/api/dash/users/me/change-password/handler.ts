@@ -4,9 +4,10 @@ import type { Handler } from '@/lib/http/contract';
 import { and, eq, isNull } from 'drizzle-orm';
 
 import { otpMsg } from '@/app/api/auth/otp/messages';
-import { withTransaction } from '@/db';
+import { db, withTransaction } from '@/db';
 import { accounts, users } from '@/db/schema';
 import { auditLog, getAuditMeta } from '@/lib/audit';
+import { requireReauthWindow } from '@/lib/auth/admin-reauth';
 import { checkPasswordCompromise } from '@/lib/auth/check-password';
 import { LoginRejected, verifyLoginAttempt } from '@/lib/auth/login-guard';
 import { hashPassword } from '@/lib/auth/password';
@@ -69,14 +70,35 @@ export const POST: Handler = async (ctx) => {
     // consumed with a compare-and-swap condition under the account row lock.
     let passwordProof: VerifiedPasswordProof;
     try {
-      passwordProof = await verifyLoginAttempt({
-        userId,
-        password: parsed.data.currentPassword,
-        skipTimingGuard: true,
-        returnPasswordProof: true,
-        auditMeta,
-        purpose: 'reauth_change_password',
-      });
+      if (parsed.data.currentPassword === undefined) {
+        await requireReauthWindow(userId, sessionId);
+        const [credential] = await db
+          .select({ accountId: accounts.id, expectedHash: accounts.password })
+          .from(accounts)
+          .where(
+            and(
+              eq(accounts.userId, userId),
+              eq(accounts.providerId, CREDENTIAL_PROVIDER_ID)
+            )
+          );
+        if (!credential?.expectedHash)
+          throw new CustomError(
+            userMsg.passwordUpdateFailed,
+            HTTP_STATUS.BAD_REQUEST
+          );
+        passwordProof = {
+          accountId: credential.accountId,
+          expectedHash: credential.expectedHash,
+        };
+      } else
+        passwordProof = await verifyLoginAttempt({
+          userId,
+          password: parsed.data.currentPassword,
+          skipTimingGuard: true,
+          returnPasswordProof: true,
+          auditMeta,
+          purpose: 'reauth_change_password',
+        });
     } catch (e) {
       if (e instanceof LoginRejected)
         throw new CustomError(
@@ -89,15 +111,13 @@ export const POST: Handler = async (ctx) => {
     const hashedPassword = await hashPassword(parsed.data.newPassword);
 
     await withTransaction(async (tx) => {
-      // Fresh DB read under FOR SHARE, inside the same tx as the mutation,
-      // so a concurrent admin deactivation/demotion is visible and blocks
-      // the password rotation. The cookie-cached session can be up to 5
-      // minutes stale — checking outside the tx leaves a TOCTOU window.
+      // Recheck liveness after hashing; a concurrent suspension must not commit a credential change.
+      // Rotation writes the user after the credential, so acquire the user lock first to avoid lock inversion.
       const [freshUser] = await tx
         .select({ roleId: users.roleId, isActive: users.isActive })
         .from(users)
         .where(and(eq(users.id, userId), isNull(users.deletedAt)))
-        .for('share');
+        .for('update');
 
       if (!freshUser || !freshUser.isActive || !freshUser.roleId)
         throw new CustomError(

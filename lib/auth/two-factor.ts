@@ -11,12 +11,18 @@
  * `/two-factor/send-otp` and `/two-factor/verify-otp` inert, so the second
  * factor's codes run on this project's own OTP system instead.
  */
+import type { AuthContext } from './two-factor-challenge';
 import type { BetterAuthPlugin } from 'better-auth';
 
 import { twoFactorMsg } from '@/app/api/auth/otp/messages';
 import { sanitizeForLog, validID } from '@/utils';
 import { passkey } from '@better-auth/passkey';
-import { APIError, createAuthMiddleware, isAPIError } from 'better-auth/api';
+import {
+  APIError,
+  createAuthEndpoint,
+  createAuthMiddleware,
+  isAPIError,
+} from 'better-auth/api';
 import { twoFactor } from 'better-auth/plugins/two-factor';
 
 import { CUSTOM_AUTH_CODE, HTTP_STATUS } from '@/utils/api-messages';
@@ -26,7 +32,7 @@ import {
   TWO_FACTOR_OTP_AVAILABLE,
 } from '@/utils/validation/two-factor';
 
-import { API_PATH_MAX, getClientIp, USER_AGENT_MAX } from '../audit';
+import { authAuditMeta } from './audit-meta';
 import { submittedRememberMe } from './remember-me';
 import { trustedDevicePlugin } from './trusted-device';
 import {
@@ -35,8 +41,10 @@ import {
   PLUGIN_VERIFIER_METHOD,
   recordPluginCompletion,
   resolveRequestSession,
+  resolveTwoFactorChallenge,
   TWO_FACTOR_CHALLENGE_MAX_AGE_S,
   twoFactorUnavailableError,
+  withTwoFactorChallengeTransaction,
 } from './two-factor-challenge';
 import {
   recordPasskeyEnrolment,
@@ -51,6 +59,40 @@ import { twoFactorPasskeyPlugins } from './two-factor-passkey';
  * export in `db/schema.ts` must match exactly or every 2FA read throws.
  */
 const TWO_FACTOR_TABLE = 'twoFactorCredentials';
+
+async function runPluginVerifier<T>(
+  ctx: AuthContext,
+  verify: () => Promise<T>
+) {
+  if (await resolveRequestSession(ctx)) return verify();
+  const challenge = await resolveTwoFactorChallenge(ctx);
+  const result = challenge
+    ? await withTwoFactorChallengeTransaction(ctx, challenge, async () => {
+        try {
+          return { response: await verify() };
+        } catch (error) {
+          // Invalid-code attempts must commit their counters before returning the error.
+          if (isAPIError(error)) return { error };
+          throw error;
+        }
+      })
+    : null;
+  if (!result)
+    throw new APIError(HTTP_STATUS.UNAUTHORIZED, {
+      message: twoFactorMsg.challengeMissing,
+      code: CUSTOM_AUTH_CODE,
+    });
+  if ('error' in result) throw result.error;
+  return result.response;
+}
+
+function forwardVerifierHeaders(ctx: AuthContext, headers: Headers) {
+  for (const cookie of headers.getSetCookie())
+    ctx.responseHeaders?.append('set-cookie', cookie);
+  headers.forEach((value, name) => {
+    if (name !== 'set-cookie') ctx.responseHeaders?.set(name, value);
+  });
+}
 
 /**
  * Baked into every enrolled authenticator, so changing it later means
@@ -91,9 +133,6 @@ const twoFactorSignInGuard = () =>
             const newSession = ctx.context.newSession;
             if (!newSession) return;
 
-            const headers =
-              ctx.headers ?? ctx.request?.headers ?? new Headers();
-
             const outcome = await issueTwoFactorChallenge(ctx, {
               userId: newSession.user.id,
               userEmail: newSession.user.email,
@@ -103,12 +142,7 @@ const twoFactorSignInGuard = () =>
               },
               firstFactor: 'password',
               rememberMe: submittedRememberMe(ctx.body),
-              auditMeta: {
-                ip: getClientIp(headers),
-                userAgent:
-                  headers.get('user-agent')?.slice(0, USER_AGENT_MAX) ?? null,
-                apiPath: (ctx.path ?? '/sign-in/email').slice(0, API_PATH_MAX),
-              },
+              auditMeta: authAuditMeta(ctx, ctx.path ?? '/sign-in/email'),
             });
 
             if (outcome.kind === 'refused') throw twoFactorUnavailableError();
@@ -149,7 +183,31 @@ const twoFactorAuth = () => {
 
   return {
     ...core,
-    endpoints,
+    endpoints: {
+      ...endpoints,
+      verifyTOTP: createAuthEndpoint(
+        endpoints.verifyTOTP.path,
+        { ...endpoints.verifyTOTP.options, use: [] },
+        async (ctx) => {
+          const result = await runPluginVerifier(ctx, () =>
+            endpoints.verifyTOTP({ ...ctx, returnHeaders: true })
+          );
+          forwardVerifierHeaders(ctx, result.headers);
+          return ctx.json(result.response);
+        }
+      ),
+      verifyBackupCode: createAuthEndpoint(
+        endpoints.verifyBackupCode.path,
+        { ...endpoints.verifyBackupCode.options, use: [] },
+        async (ctx) => {
+          const result = await runPluginVerifier(ctx, () =>
+            endpoints.verifyBackupCode({ ...ctx, returnHeaders: true })
+          );
+          forwardVerifierHeaders(ctx, result.headers);
+          return ctx.json(result.response);
+        }
+      ),
+    },
     hooks: {
       after: [
         {

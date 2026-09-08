@@ -10,7 +10,11 @@ import { validID } from '@/utils';
 import { auditLog, getAuditMeta } from '@/lib/audit';
 import { checkPasswordCompromise } from '@/lib/auth/check-password';
 import { hashPassword } from '@/lib/auth/password';
-import { revokeOtherSessions, revokePendingProofs } from '@/lib/auth/rotation';
+import {
+  revokeOtherSessions,
+  revokePendingProofs,
+  unlinkGoogle,
+} from '@/lib/auth/rotation';
 import {
   contactChangeStrandsTwoFactor,
   removeMethodIntent,
@@ -611,6 +615,7 @@ async function handleAdminEdit(
     }
 
     const emailChanged = lockedUser.email !== validatedData.email;
+    if (emailChanged) await unlinkGoogle(tx, userId, auditMeta);
     // Phone is only persisted when enabled. An omitted key means "keep current"
     // — only an explicit null/'' clears it — so a partial update can't silently
     // wipe the number. Presence comes from the PARSED value (`undefined` only
@@ -975,6 +980,7 @@ export const DELETE: Handler = async (ctx) => {
       // Soft-delete is the most total rotation there is; same policy.
       await revokeOtherSessions(tx, userId);
       await revokePendingProofs(tx, userId);
+      await unlinkGoogle(tx, userId, auditMeta);
       await tx.delete(accounts).where(eq(accounts.userId, userId));
       if (lockedUser.role_scope === CUSTOM_ROLE_VALUE) {
         // Capture the matrix before the role disappears. Deleting a user also

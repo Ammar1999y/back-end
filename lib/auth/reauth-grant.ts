@@ -1,24 +1,4 @@
-/**
- * A short-lived, single-use proof that the holder re-entered their password.
- *
- * It exists for the operations that cannot carry a password themselves: the
- * WebAuthn ceremonies are the library's endpoints with the library's bodies, and
- * a per-request password prompt on a multi-step ceremony is what gets a control
- * disabled rather than used. So the password is proven ONCE, in a POST of ours,
- * and the completing request presents the grant.
- *
- * Constraints, and none of them is optional:
- *   - bound to one user, and to one purpose;
- *   - single-use — `consumeVerificationValue` hands the row to exactly one
- *     concurrent caller;
- *   - short-lived;
- *   - never sufficient alone. Every consumer still requires a live session for
- *     the same user, so a leaked grant is not a credential.
- *
- * Stored in `verifications` with the user id as the VALUE, which is what makes
- * `revokeTwoFactorState`'s `WHERE value = userId` sweep it on a credential
- * rotation.
- */
+// Grants are consumed once and require the same live user session; their user-valued rows participate in credential rotation.
 import crypto from 'node:crypto';
 import type { AuthContext } from './two-factor-challenge';
 import type { EntityID } from '@/types';
@@ -32,8 +12,11 @@ import {
   MSG_INVALID_CREDENTIALS,
 } from '@/utils/api-messages';
 
-import { API_PATH_MAX, getClientIp, USER_AGENT_MAX } from '../audit';
+import { hasAdminReauth } from './admin-reauth';
+import { reauthenticationRequired } from './api-error';
+import { authAuditMeta } from './audit-meta';
 import { LoginRejected, verifyLoginAttempt } from './login-guard';
+import { resolveRequestSession } from './two-factor-challenge';
 
 const GRANT_BYTES = 24;
 
@@ -76,27 +59,27 @@ export async function consumeReauthGrant(
   return validID(consumed.value) === params.userId;
 }
 
-/**
- * The password re-check every security-lowering 2FA transition takes.
- *
- * Not `PASSWORD_PROOF_PATHS`: that list exists to mint a proof for Better Auth's
- * own stubbed `password.verify`, and these are this deployment's endpoints,
- * which never reach it. The check is the same one, called directly — so a
- * hijacked session cannot add a factor it controls, remove one it does not, or
- * turn the feature off.
- */
+// App-owned 2FA endpoints do not reach the library password hook; they use this boundary.
 export async function requireReauthPassword(
   ctx: AuthContext,
   userId: EntityID
 ): Promise<void> {
   const supplied = (ctx.body as { password?: unknown } | undefined)?.password;
+  if (supplied === undefined) {
+    const session = await resolveRequestSession(ctx);
+    if (
+      session?.userId === userId &&
+      (await hasAdminReauth(session.sessionId, userId))
+    )
+      return;
+    throw reauthenticationRequired();
+  }
   if (typeof supplied !== 'string')
     throw new APIError(HTTP_STATUS.UNAUTHORIZED, {
       message: MSG_INVALID_CREDENTIALS,
       code: CUSTOM_AUTH_CODE,
     });
 
-  const headers = ctx.headers ?? ctx.request?.headers ?? new Headers();
   try {
     await verifyLoginAttempt({
       userId,
@@ -104,11 +87,7 @@ export async function requireReauthPassword(
       // The caller already holds a session; the timing floor guards anonymous
       // enumeration, which this is not.
       skipTimingGuard: true,
-      auditMeta: {
-        ip: getClientIp(headers),
-        userAgent: headers.get('user-agent')?.slice(0, USER_AGENT_MAX) ?? null,
-        apiPath: (ctx.path ?? '').slice(0, API_PATH_MAX),
-      },
+      auditMeta: authAuditMeta(ctx),
       purpose: 'reauth_two_factor',
     });
   } catch (error) {

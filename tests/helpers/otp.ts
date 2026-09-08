@@ -28,6 +28,7 @@ export async function seedOtpProof(options: {
   purpose: OtpPurpose;
   code: string;
   channel?: OtpChannel;
+  targetIdentifier?: string;
 }): Promise<SeededOtpProof> {
   await assertHarnessDatabase();
 
@@ -37,6 +38,7 @@ export async function seedOtpProof(options: {
       userId: options.userId,
       channel: options.channel ?? 'email',
       identifier: options.identifier,
+      targetIdentifier: options.targetIdentifier,
       purpose: options.purpose,
       attemptNumber: 1,
     })

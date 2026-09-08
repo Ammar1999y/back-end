@@ -113,7 +113,7 @@ const TIERS: Record<string, Tier> = {
     // Same reason as the integration tier: read at module load, so it cannot be
     // set per test. The offered-method intersection has the enabled set as one
     // of its three terms, and with none configured every case is vacuously empty.
-    env: TWO_FACTOR_TEST_ENV,
+    env: { ...TWO_FACTOR_TEST_ENV, ENABLED_OAUTH_PROVIDERS: '' },
   },
   /**
    * `--parallel` for wall-clock, `--no-isolate` so the preload — and therefore
@@ -140,7 +140,12 @@ const TIERS: Record<string, Tier> = {
      * Existing tests are unaffected because a seeded user has
      * `two_factor_enabled = false`, so no challenge is issued for them.
      */
-    env: TWO_FACTOR_TEST_ENV,
+    env: {
+      ...TWO_FACTOR_TEST_ENV,
+      ENABLED_OAUTH_PROVIDERS: 'google',
+      GOOGLE_CLIENT_ID: 'harness.apps.googleusercontent.com',
+      GOOGLE_CLIENT_SECRET: 'harness-google-client-secret',
+    },
   },
   /**
    * Serial. Every test here owns a real socket, a real child process or a real

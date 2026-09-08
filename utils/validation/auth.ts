@@ -16,6 +16,7 @@ import {
   optionalPhoneSchema,
   passwordSchema,
   phoneSchema,
+  reauthPasswordSchema,
   sanitizeStrictSingleLine,
 } from './rules';
 
@@ -235,14 +236,14 @@ export const selfUpdateUserSchema = selfUpdateUserBodySchema
 
 // Self-service: change own password
 export const changePasswordSchema = z.object({
-  currentPassword: passwordSchema,
+  currentPassword: reauthPasswordSchema,
   newPassword: passwordSchema,
 });
 
 // Self-service: change own email — step 1 (initiate). Requires current-password
 // re-auth; the new address is NOT written until ownership is proven via OTP.
 export const changeEmailSchema = z.object({
-  currentPassword: passwordSchema,
+  currentPassword: reauthPasswordSchema,
   newEmail: emailSchema,
 });
 
@@ -258,7 +259,7 @@ const phoneOtpChannelSchema = z.enum(PHONE_OTP_CHANNELS);
 
 // Self-service: change own phone — step 1 (initiate).
 export const changePhoneSchema = z.object({
-  currentPassword: passwordSchema,
+  currentPassword: reauthPasswordSchema,
   newPhoneNumber: phoneSchema,
   channel: phoneOtpChannelSchema,
 });

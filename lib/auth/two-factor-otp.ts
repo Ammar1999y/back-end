@@ -38,12 +38,12 @@ import {
   twoFactorOtpVerifySchema,
 } from '@/utils/validation/two-factor';
 
-import { API_PATH_MAX, getClientIp, USER_AGENT_MAX } from '../audit';
 import {
   enforceOtpSurfaceSendQuota,
   enforceOtpVerifyQuota,
 } from '../rate-limit';
 import { toAuthApiError } from './api-error';
+import { authAuditMeta } from './audit-meta';
 import { envelopeResponse } from './plugin-openapi';
 import { requireReauthPassword } from './reauth-grant';
 import { revokeOtherSessions } from './rotation';
@@ -117,15 +117,6 @@ async function enrolmentTarget(
     });
 
   return { userId, userEmail: user.email, channel, destination };
-}
-
-function auditMetaOf(ctx: AuthContext, path: string) {
-  const headers = ctx.headers ?? ctx.request?.headers ?? new Headers();
-  return {
-    ip: getClientIp(headers),
-    userAgent: headers.get('user-agent')?.slice(0, USER_AGENT_MAX) ?? null,
-    apiPath: path.slice(0, API_PATH_MAX),
-  };
 }
 
 /** 404, not 400: an unserved path answers like every other unserved path. */
@@ -328,7 +319,7 @@ async function verifyForSignIn(
   // Charged BEFORE the challenge budget: a quota rejection produced no verdict,
   // and `spendChallengeAttempt` no longer writes the counter back, so spending
   // first and then throwing here would destroy the challenge.
-  const auditMeta = auditMetaOf(ctx, '/two-factor/otp/verify');
+  const auditMeta = authAuditMeta(ctx, '/two-factor/otp/verify');
   await enforceOtpVerifyQuota({
     channel: target.channel,
     identifier: target.destination,
@@ -391,7 +382,7 @@ async function verifyForEnrolment(
   code: string
 ) {
   const target = await enrolmentTargetFromSession(ctx, requestSession);
-  const auditMeta = auditMetaOf(ctx, '/two-factor/otp/verify');
+  const auditMeta = authAuditMeta(ctx, '/two-factor/otp/verify');
 
   await enforceOtpVerifyQuota({
     channel: target.channel,

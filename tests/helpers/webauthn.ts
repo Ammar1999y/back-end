@@ -26,11 +26,14 @@ function base64url(bytes: Uint8Array): string {
   return Buffer.from(bytes).toString('base64url');
 }
 
-function coseP256PublicKey(): Uint8Array {
-  const { publicKey } = crypto.generateKeyPairSync('ec', {
+function coseP256PublicKey(
+  publicKey = crypto.generateKeyPairSync('ec', {
     namedCurve: 'prime256v1',
-  });
-  const jwk = publicKey.export({ format: 'jwk' }) as { x: string; y: string };
+  }).publicKey
+): Uint8Array {
+  const jwk = publicKey.export({ format: 'jwk' });
+  if (typeof jwk.x !== 'string' || typeof jwk.y !== 'string')
+    throw new Error('Missing EC coordinates.');
   // COSE_Key: kty EC2, alg ES256, crv P-256, then the two coordinates.
   return isoCBOR.encode(
     new Map<number, number | Uint8Array>([
@@ -41,6 +44,59 @@ function coseP256PublicKey(): Uint8Array {
       [-3, new Uint8Array(Buffer.from(jwk.y, 'base64url'))],
     ])
   );
+}
+
+export function syntheticAuthenticator() {
+  const keys = crypto.generateKeyPairSync('ec', { namedCurve: 'prime256v1' });
+  const credentialID = crypto.randomBytes(16).toString('base64url');
+  return {
+    credentialID,
+    publicKey: Buffer.from(coseP256PublicKey(keys.publicKey)).toString(
+      'base64'
+    ),
+    assertion(input: {
+      challenge: string;
+      origin: string;
+      rpId: string;
+      counter?: number;
+      userVerified?: boolean;
+    }) {
+      const clientData = Buffer.from(
+        JSON.stringify({
+          type: 'webauthn.get',
+          challenge: input.challenge,
+          origin: input.origin,
+          crossOrigin: false,
+        })
+      );
+      const counter = Buffer.alloc(4);
+      counter.writeUInt32BE(input.counter ?? 1);
+      const authenticatorData = Buffer.concat([
+        crypto.createHash('sha256').update(input.rpId).digest(),
+        Buffer.from([FLAG_UP | (input.userVerified === false ? 0 : FLAG_UV)]),
+        counter,
+      ]);
+      const signature = crypto.sign(
+        'SHA256',
+        Buffer.concat([
+          authenticatorData,
+          crypto.createHash('sha256').update(clientData).digest(),
+        ]),
+        keys.privateKey
+      );
+      return {
+        id: credentialID,
+        rawId: credentialID,
+        type: 'public-key',
+        clientExtensionResults: {},
+        response: {
+          clientDataJSON: base64url(clientData),
+          authenticatorData: base64url(authenticatorData),
+          signature: base64url(signature),
+        },
+      };
+    },
+  };
 }
 
 export interface RegistrationResponseInput {

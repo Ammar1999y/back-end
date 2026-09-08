@@ -122,6 +122,7 @@ export interface HandlerCookie {
 interface HandlerEnvelope<T = unknown> {
   success: boolean;
   message: string;
+  code?: string;
   data: T;
   meta?: PaginationMeta;
 }
