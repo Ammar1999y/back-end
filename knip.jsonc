@@ -1,46 +1,54 @@
 {
   "$schema": "https://unpkg.com/knip@latest/schema.json",
   "tags": ["-knipignore"],
-  // The runtime graph has exactly one root: `server.ts` validates the runtime
-  // and then dynamically imports `app.ts` -> `routes.ts` -> every handler, and
-  // knip follows dynamic imports.
-  //
-  // Declaring `entry` at all REPLACES knip's defaults, which is why every other
-  // root below has to be spelled out — including the test patterns, whose
-  // built-in `**/*.test.ts` root disappears with them.
-  "entry": [
-    "server.ts",
-    "scripts/**/*.ts",
-    // `.mjs` as well as `.ts`: `scripts/require-bun.mjs` is the `preinstall`
-    // hook, run by `node` from a package.json script string, so no import edge
-    // reaches it. It is plain `.mjs` because npm must be able to execute it
-    // before `node_modules` exists.
-    "scripts/**/*.mjs",
-    // The benchmark harness is tracked but standalone — run by hand, never
-    // imported by the application. Declared the same way in
-    // scripts/find-unused-files.ts. Extension-agnostic on purpose: `bench/s3` is
-    // TypeScript and a `bun test` suite, the rest is `.mjs`.
-    "bench/**",
+  "workspaces": {
+    ".": {
+      // The runtime graph has exactly one root: `server.ts` validates the runtime
+      // and then dynamically imports `app.ts` -> `routes.ts` -> every handler, and
+      // knip follows dynamic imports.
+      //
+      // Declaring `entry` at all REPLACES knip's defaults, which is why every other
+      // root below has to be spelled out — including the test patterns, whose
+      // built-in `**/*.test.ts` root disappears with them.
+      "entry": [
+        "server.ts",
+        "scripts/**/*.ts",
+        // `.mjs` as well as `.ts`: `scripts/require-bun.mjs` is the `preinstall`
+        // hook, run by `node` from a package.json script string, so no import edge
+        // reaches it. It is plain `.mjs` because npm must be able to execute it
+        // before `node_modules` exists.
+        "scripts/**/*.mjs",
+        // The benchmark harness is tracked but standalone — run by hand, never
+        // imported by the application. Declared the same way in
+        // scripts/find-unused-files.ts. Extension-agnostic on purpose: `bench/s3` is
+        // TypeScript and a `bun test` suite, the rest is `.mjs`.
+        "bench/**",
 
-    // ---- the test suite -----------------------------------------------------
-    // One pattern per tier rather than `tests/**`, so a file that lands outside
-    // a tier is still reported. `tests/unit/harness-layout.test.ts` asserts the
-    // same partition from the other side.
-    "tests/unit/**/*.test.ts",
-    "tests/integration/**/*.test.ts",
-    "tests/process/**/*.test.ts",
-    "tests/matrix/**/*.test.ts",
-    // Spawned as programs by path string from a sibling test, so no import edge
-    // exists for knip to follow. They are entry points, not ignored files —
-    // declaring them here keeps THEIR imports checked, which `ignore` would not.
-    "tests/fixtures/_*.ts",
-    "tests/fixtures/_*.cjs",
-    // Loaded by `--preload`, which `tests/helpers/run.ts` passes as a string on
-    // the `bun test` command line. Same situation: a real root with no import
-    // edge. `preload-base.ts` needs no entry of its own — knip resolves it from
-    // `bunfig.toml`'s `[test] preload`.
-    "tests/helpers/preload-database.ts",
-  ],
+        // ---- the test suite -----------------------------------------------------
+        // One pattern per tier rather than `tests/**`, so a file that lands outside
+        // a tier is still reported. `tests/unit/harness-layout.test.ts` asserts the
+        // same partition from the other side.
+        "tests/unit/**/*.test.ts",
+        "tests/integration/**/*.test.ts",
+        "tests/process/**/*.test.ts",
+        "tests/matrix/**/*.test.ts",
+        // Spawned as programs by path string from a sibling test, so no import edge
+        // exists for knip to follow. They are entry points, not ignored files —
+        // declaring them here keeps THEIR imports checked, which `ignore` would not.
+        "tests/fixtures/_*.ts",
+        "tests/fixtures/_*.cjs",
+        // Loaded by `--preload`, which `tests/helpers/run.ts` passes as a string on
+        // the `bun test` command line. Same situation: a real root with no import
+        // edge. `preload-base.ts` needs no entry of its own — knip resolves it from
+        // `bunfig.toml`'s `[test] preload`.
+        "tests/helpers/preload-database.ts",
+      ],
+    },
+    "bench/sqlite/*": {
+      // The worker path is passed to a subprocess as a string, so no import edge reaches it.
+      "entry": ["worker.mjs"],
+    },
+  },
   // Tool configs (`drizzle.config.ts`, `eslint.config.mjs`, `prettier.config.js`)
   // are deliberately absent: knip recognises those itself and reports a
   // redundant entry pattern for each. Nothing is ignored either — knip flags a
@@ -55,12 +63,6 @@
     // Optional dependencies used only by manually run benchmarks.
     "sharp",
     "uuid",
-    // `bench/sqlite/better-sqlite3` carries its own package.json and lockfile
-    // and is installed by hand with npm, never by the root `bun install`. On a
-    // machine that has run that benchmark the import resolves through the
-    // nested `node_modules` and knip stays quiet; on a clean checkout — CI —
-    // it does not, and knip attributes it to the ROOT package.json. Listing it
-    // here is what makes the two agree.
     "@simplewebauthn/server",
     "@peculiar/x509",
   ],
