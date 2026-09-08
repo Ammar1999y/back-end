@@ -61,10 +61,11 @@
     // nested `node_modules` and knip stays quiet; on a clean checkout — CI —
     // it does not, and knip attributes it to the ROOT package.json. Listing it
     // here is what makes the two agree.
-    "better-sqlite3",
+    "@simplewebauthn/server",
+    "@peculiar/x509",
   ],
   // `mise` is invoked by the `scan:*` scripts and installed by `mise.toml`
   // rather than by `bun install`, so it is deliberately not a dependency.
   // `dedupe` is a Bun subcommand rather than a PATH binary.
-  "ignoreBinaries": ["mise", "dedupe"],
+  "ignoreBinaries": ["mise"],
 }

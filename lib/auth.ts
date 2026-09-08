@@ -652,6 +652,8 @@ export const auth = betterAuth({
   advanced: {
     database: {
       generateId: false,
+      // Custom OAuth stores identities only; unused generic token and image columns are absent.
+      validateSchema: false,
     },
     // Better Auth otherwise resolves the client IP from `x-forwarded-for`,
     // which is client-controllable whenever the origin is directly reachable.
@@ -886,14 +888,6 @@ export const auth = betterAuth({
         required: false,
         defaultValue: null,
         input: false,
-      },
-      // Virtual field - populated from session metadata
-      roleName: {
-        type: 'string',
-        required: false,
-        defaultValue: null,
-        input: false,
-        returned: false,
       },
     },
   },

@@ -2326,14 +2326,10 @@ function referencedBetterAuthSchemas(paths: JsonSchema): JsonSchema {
 
   const user = selected.User;
   if (isJsonSchema(user) && isJsonSchema(user.properties)) {
-    const properties = Object.fromEntries(
-      // Configured `returned: false`; the upstream generator does not honour it.
-      Object.entries(user.properties).filter(([name]) => name !== 'roleName')
-    );
     selected.User = {
       ...user,
       properties: {
-        ...properties,
+        ...user.properties,
         id: UUID_SCHEMA,
         email: { type: 'string', format: 'email' },
         image: { type: ['string', 'null'] },

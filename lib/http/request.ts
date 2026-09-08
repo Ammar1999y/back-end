@@ -112,7 +112,7 @@ function methodCanHaveBody(method: string): boolean {
  *
  * Matcher and runtime parser agree end to end on the pinned Bun. They did not
  * up to 1.3.14, where `Request.formData()` matched `form-data` case-SENSITIVELY
- * and threw on `Multipart/Form-Data`; 1.4.0 — the floor `server.ts` asserts —
+ * and threw on `Multipart/Form-Data`; 1.4.X — the floor `server.ts` asserts —
  * made it case-insensitive, and all three spellings now parse (measured). The
  * regression cases in `tests/unit/request-body-policy.test.ts` are what catch a
  * floor regression rather than leaving it to be inferred — this pointer is the

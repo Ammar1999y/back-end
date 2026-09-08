@@ -220,7 +220,7 @@ jobs:
         # fail-closed admission gates — over a percentage.
         #
         # Bun's own `coverageThreshold` cannot express this floor: it is applied
-        # per FILE on 1.4.0, and this repository has files a given tier
+        # per FILE on 1.4.X, and this repository has files a given tier
         # legitimately never loads. See the script's header.
         run: bun scripts/check-coverage.ts
 

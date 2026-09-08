@@ -2,7 +2,11 @@ import net from 'node:net';
 import tls from 'node:tls';
 import type { Socket } from 'node:net';
 import type Mail from 'nodemailer/lib/mailer';
-import type SMTPTransport from 'nodemailer/lib/smtp-transport';
+import type {
+  SMTPSentMessageInfo,
+  SMTPTransportGetSocketCallback,
+  SMTPTransportOptions,
+} from 'nodemailer/lib/smtp-transport';
 
 import { createTransport } from 'nodemailer';
 
@@ -23,7 +27,7 @@ class SmtpDeadlineExceeded extends Error {
 }
 
 function openSocket(
-  options: SMTPTransport.Options,
+  options: SMTPTransportOptions,
   callback: (error: Error | null, socket: Socket) => void
 ): Socket {
   const host = options.host ?? 'localhost';
@@ -54,22 +58,19 @@ function openSocket(
 }
 
 export async function sendMailWithDeadline(
-  options: SMTPTransport.Options,
+  options: SMTPTransportOptions,
   message: Mail.Options,
   deadlineMs: number
-): Promise<SMTPTransport.SentMessageInfo> {
+): Promise<SMTPSentMessageInfo> {
   const owned: { socket: Socket | null } = { socket: null };
   const transport = createTransport({
     ...options,
     getSocket: (
-      resolved: SMTPTransport.Options,
-      callback: (
-        error: Error | null,
-        socketOptions: { connection: Socket; secured?: boolean } | null
-      ) => void
+      resolved: SMTPTransportOptions,
+      callback: SMTPTransportGetSocketCallback
     ) => {
       owned.socket = openSocket(resolved, (error, socket) => {
-        if (error) callback(error, null);
+        if (error) callback(error);
         else callback(null, { connection: socket, secured: resolved.secure });
       });
     },

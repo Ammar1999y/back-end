@@ -109,7 +109,7 @@ export function createShutdown(
     // below holds the stores open with nothing in flight and the forced exit
     // reports a crash a whole budget later. Continuing to the stores is safe on
     // this path because `Bun.Server.stop()` closes the listening socket when it
-    // is CALLED — measured on Bun 1.4.0: a connection attempted while the
+    // is CALLED — measured on Bun: a connection attempted while the
     // returned promise was still pending was refused — so a later rejection
     // never means the listener is still admitting requests. It does mean the
     // stop did not complete cleanly, so the exit code says so.

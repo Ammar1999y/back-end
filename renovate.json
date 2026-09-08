@@ -28,7 +28,7 @@
   "packageRules": [
     {
       "description": "Require manual approval for TypeScript toolchain majors.",
-      "matchPackageNames": ["typescript", "@types/node"],
+      "matchPackageNames": ["typescript"],
       "matchUpdateTypes": ["major"],
       "dependencyDashboardApproval": true,
       "groupName": "typescript toolchain (major)",

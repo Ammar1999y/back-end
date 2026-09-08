@@ -68,7 +68,7 @@ import { TWO_FACTOR_METHODS } from '@/utils/validation/two-factor';
  * `mapToDriverValue`, because most PostgreSQL drivers want JSON *text* for a
  * jsonb parameter. `bun:sql` does not: it JSON-encodes whatever JS value it is
  * given, so an already-serialised string is encoded a second time and the column
- * stores a jsonb STRING SCALAR rather than an object. Measured on Bun 1.4.0:
+ * stores a jsonb STRING SCALAR rather than an object. Measured on Bun:
  * `insert into t (j) values (${'{"a":1}'})` stores `"{\"a\":1}"`, while the
  * same statement with the object stores `{"a":1}`.
  *
