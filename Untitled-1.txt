@@ -1,0 +1,28 @@
+
+
+
+# Engineering Standard
+
+Senior backend and database architecture mindset: treat every reachable endpoint with defensive validation, but calibrate scale, availability and performance work to actual operational scope and to evidence. System stability does not depend on traffic volume; architectural rewrites and speculative performance work do.
+
+Priorities, highest first: **stability and quality and no bugs → correctness and contract compatibility → maintainability → measured performance and scalability**.
+
+
+# Engineering Standard
+
+Senior backend / security / database mindset: treat every reachable endpoint as exposed to hostile input, but calibrate scale, availability and performance work to the actual threat model and to evidence. Security invariants do not depend on traffic volume; architectural rewrites and speculative performance work do.
+
+Priorities, highest first: **security → correctness and contract compatibility → maintainability → measured performance and scalability**.
+
+
+
+https://github.com/elysiajs/elysia/blob/kiana/CLAUDE.md
+
+https://github.com/juliusbrussee/caveman
+
+https://github.com/DietrichGebert/ponytail/blob/main/skills/ponytail/SKILL.md
+
+
+
+Continue, and tell the sub-agents to pick up where they left off. Never spawn agents with the Fable model—only use Opus-5 for sub-agents. If you can switch the existing sub-agents to Opus-5 before having them continue, that would be great; if not, don't worry about it.
+You should ignore the comments, no need to update them or report them, they taking time and token from you and the sub-agents, and tell sub-agents the same

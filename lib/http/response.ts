@@ -13,16 +13,7 @@ import { responsePayload, serializeSetCookie } from './contract';
  */
 export const DEFAULT_CACHE_CONTROL = 'no-store';
 
-/**
- * Serialises a `HandlerOutput` into a web `Response`.
- *
- * Shared by every adapter. A native `Response` is used rather than each
- * framework's cookie/header API because `Set-Cookie` is the one header that
- * legitimately repeats, and `Headers.append` is the only mechanism all three
- * frameworks agree on — Next's `NextResponse.cookies` and Elysia's reactive
- * cookie map both model a subset of the attributes (neither has a slot for
- * `Partitioned`), which is exactly how an attribute gets dropped silently.
- */
+/** Keep Better Auth's raw cookie values and extension attributes intact across adapters. */
 export function toWebResponse(output: HandlerOutput): Response {
   const headers = new Headers();
   const extraHeaders = Object.entries(output.headers ?? {});

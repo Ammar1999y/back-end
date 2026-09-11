@@ -237,8 +237,6 @@ const checks = await main().catch((error: unknown) => [
   },
 ]);
 
-// After the results are collected, never in a `finally` callback: the kill must
-// be awaited, and an async `finally` swallows a rejection from the await.
 server.kill();
 await server.exited;
 

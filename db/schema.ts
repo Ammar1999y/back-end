@@ -326,9 +326,6 @@ export const sessions = pgTable(
     ...timestamps,
   },
   (t) => [
-    // The third column lets the per-user "active sessions ordered by
-    // createdAt DESC" query satisfy its sort from the index instead of an
-    // in-memory pass after the (userId, expiresAt) filter.
     index('idx_sessions_user_expires_created').on(
       t.userId,
       t.expiresAt,

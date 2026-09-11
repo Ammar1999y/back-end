@@ -6,9 +6,6 @@
 // here, so this benchmark has one shared/ directory and one entry point
 // instead of a folder per implementation.
 //
-// `lib/id.ts` (`generateUuidV7`) is not benchmarked directly: it is a
-// zero-overhead pass-through to `uuid`'s `v7()` (see that file), so measuring
-// `v7()` itself already measures the seam's current cost.
 
 import { createRequire } from 'node:module';
 
