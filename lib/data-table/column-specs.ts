@@ -22,9 +22,12 @@ import { dataTableConfig } from './config';
 export type FilterColumnType =
   'text' | 'number' | 'boolean' | 'date' | 'select' | 'multiSelect';
 
-export interface FilterColumnSpec {
-  /** Actual database type of the column. Drives coercion and operators. */
-  type: FilterColumnType;
+/** The types whose members are NOT enumerable up front. */
+type OpenColumnType = 'text' | 'number' | 'boolean' | 'date';
+/** The types that name a value set rather than a storage type. */
+type ClosedColumnType = 'select' | 'multiSelect';
+
+interface FilterColumnSpecBase {
   /**
    * Minimum input length for substring-search operators. Below the trigram
    * length pg_trgm's GIN index can't be used and the predicate degrades to a
@@ -36,14 +39,36 @@ export interface FilterColumnSpec {
    * up to MAX_FILTER_ITEMS of them multiply into a very expensive query.
    */
   allowScanOnly?: boolean;
-  /**
-   * The closed set a `select`/`multiSelect` column can hold. REQUIRED for a
-   * column backed by a PostgreSQL enum: an unknown member reaches PostgreSQL as
-   * a cast error (a 500), and `''` can never be a value, so emptiness is NULL.
-   * With it, membership is checked before any SQL is built.
-   */
-  values?: readonly string[];
 }
+
+/**
+ * A union, not one optional field, because `values` is not optional where it
+ * matters and the type has to say so.
+ *
+ * `select` / `multiSelect` name a VALUE SET; in this codebase that set is
+ * always a PostgreSQL enum or a closed lookup. Without `values` the validator
+ * has nothing to check membership against, so it admitted any string and the
+ * column was treated as string-like — which made `isEmpty` emit
+ * `enum_column = ''`, a `22P02` cast error surfacing as a 500 that any
+ * authorized caller could trigger. Every registered spec already supplies the
+ * set; this is what stops the next one from forgetting.
+ */
+export type FilterColumnSpec =
+  | (FilterColumnSpecBase & {
+      /** Actual database type of the column. Drives coercion and operators. */
+      type: OpenColumnType;
+      /** Not applicable: these types have no enumerable member set. */
+      values?: undefined;
+    })
+  | (FilterColumnSpecBase & {
+      type: ClosedColumnType;
+      /**
+       * The closed set this column can hold. Membership is checked before any
+       * SQL is built, so an unknown member is a 422 rather than a PostgreSQL
+       * cast error, and `''` is never one of them — emptiness is NULL.
+       */
+      values: readonly string[];
+    });
 
 export type FilterColumnSpecs = Record<string, FilterColumnSpec>;
 
@@ -114,4 +139,55 @@ export function operatorAllowedForType(
   operator: FilterOperator
 ): boolean {
   return OPERATORS_BY_TYPE[type].has(operator);
+}
+
+/**
+ * Operators one DESCRIPTOR accepts, in the order the UI offers them.
+ *
+ * Keyed on the spec rather than the type alone because `allowScanOnly` removes
+ * operators from a column of an otherwise identical type: `notILike` is offered
+ * on `users.name` and refused with a 422 on `media.displayName`. A list built
+ * from the type alone would publish the second as available.
+ */
+export function operatorsForSpec(
+  spec: FilterColumnSpec
+): readonly FilterOperator[] {
+  return [...OPERATORS_BY_TYPE[spec.type]].filter(
+    (operator) => spec.allowScanOnly || !isScanOnlyOperator(operator)
+  );
+}
+
+/**
+ * The filter contract of one descriptor map, as published prose.
+ *
+ * Derived, never transcribed. The route table used to carry a hand-written list
+ * of allowed ids per route, maintained separately from the map the handler
+ * actually passes to `parseDataTableParams` — two sources of truth for one
+ * allowlist, with nothing to notice when a column was added to one and not the
+ * other. Operators and closed-set members were not published at all, so a
+ * generated client could offer `iLike` on a timestamp and read the 422 as a
+ * server fault.
+ */
+export function describeFilterColumns(
+  specs: FilterColumnSpecs,
+  defaultMinSearchLength: number
+): string {
+  return Object.entries(specs)
+    .map(([id, spec]) => {
+      const parts: string[] = [spec.type];
+      if (spec.values) parts.push(`one of ${spec.values.join('|')}`);
+      const floor = spec.minSearchLength ?? defaultMinSearchLength;
+      if (operatorsForSpec(spec).some(isSearchOperator))
+        parts.push(`substring searches need ${floor}+ characters`);
+      parts.push(`operators: ${operatorsForSpec(spec).join(', ')}`);
+      return `\`${id}\` (${parts.join('; ')})`;
+    })
+    .join('. ');
+}
+
+/** Just the ids, for the parameters that take no operator. */
+export function filterColumnIds(specs: FilterColumnSpecs): string {
+  return Object.keys(specs)
+    .map((id) => `\`${id}\``)
+    .join(', ');
 }

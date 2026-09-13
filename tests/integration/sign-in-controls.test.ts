@@ -347,6 +347,57 @@ describe('the per-account login lockout', () => {
   });
 });
 
+describe('lockout state on an account that cannot sign in', () => {
+  const fixture: { user: SeededUser | null } = { user: null };
+
+  function actor(): SeededUser {
+    if (!fixture.user) throw new Error('fixture not seeded');
+    return fixture.user;
+  }
+
+  beforeAll(async () => {
+    acceptCaptcha();
+    // Active user, DEACTIVATED role: `roleAllowsLogin` refuses the session in
+    // `session.create.before`, and the refusal is the same generic 401 a wrong
+    // password gets. The password check runs first, so the lockout counter is
+    // the only thing that can tell the two apart.
+    fixture.user = await seedUser({ roleActive: false });
+  });
+
+  test('the refusal is the generic one, so nothing is revealed by the answer', async () => {
+    const refused = await attempt(actor().email, actor().password);
+    const wrong = await attempt(UNKNOWN_EMAIL, WRONG_PASSWORD);
+
+    expect(refused.status).toBe(HTTP_STATUS.UNAUTHORIZED);
+    expect(await refused.text()).toBe(await wrong.text());
+    expect(await sessionCount(actor().userId)).toBe(0);
+  });
+
+  test('a correct password does not clear the counter for an ineligible account', async () => {
+    await attempt(actor().email, WRONG_PASSWORD);
+    const charged = await lockRow(actor().userId);
+    expect(charged.failedLoginAttempts).toBeGreaterThan(0);
+
+    const response = await attempt(actor().email, actor().password);
+    expect(response.status).toBe(HTTP_STATUS.UNAUTHORIZED);
+
+    // The oracle: a correct candidate reset the counter and a wrong one did
+    // not, so an attacker could tell them apart by whether the account went on
+    // to lock — on an account that cannot sign in at all.
+    expect(await lockRow(actor().userId)).toEqual(charged);
+  });
+
+  test('the counter still locks the account at the threshold', async () => {
+    const before = await lockRow(actor().userId);
+    for (let n = before.failedLoginAttempts; n < MAX_FAILED_ATTEMPTS; n++)
+      await attempt(actor().email, WRONG_PASSWORD);
+
+    const row = await lockRow(actor().userId);
+    expect(row.failedLoginAttempts).toBe(MAX_FAILED_ATTEMPTS);
+    expect(row.lockedUntil).not.toBeNull();
+  });
+});
+
 describe('a refused or unavailable Turnstile verification', () => {
   const fixture: { user: SeededUser | null } = { user: null };
 

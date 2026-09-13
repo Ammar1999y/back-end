@@ -51,8 +51,14 @@ async function verifyTurnstileToken(
       signal: controller.signal,
     });
     if (!response.ok) return false;
-    const data = (await response.json()) as { success?: boolean };
-    return data.success === true;
+    // `unknown`, then a runtime check. Asserting `{ success?: boolean }` on a
+    // third-party body happened to fail closed — `null.success` throws into the
+    // catch, a string's is `undefined` — but only by accident of what the
+    // property access does, and a refactor that reads the field defensively
+    // would turn "the provider answered something else" into a pass.
+    const data: unknown = await response.json();
+    if (typeof data !== 'object' || data === null) return false;
+    return (data as Record<string, unknown>)['success'] === true;
   } catch (error) {
     console.error(sanitizeForLog(error));
     return false;

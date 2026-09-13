@@ -44,11 +44,9 @@ function hasSessionCookieCache(headers: Headers): boolean {
  *   unrestricted grant first, then the own grant itself.
  * - Anything else: exact match only.
  *
- * Exported, which its own comment below already assumed ("exported to every
- * future call site") while the keyword was missing. It is the highest-value pure
- * function in the repository — a bug here is an authorization bypass — and while
- * it was private every case in its matrix cost a session and a database round
- * trip, which is a materially weaker test of it. See
+ * Exported so it can be tested directly: a bug here is an authorization bypass,
+ * and reached only through `checkUserPermission` every case in its matrix costs
+ * a session and a database round trip. See
  * `tests/unit/permission-scope.test.ts`.
  */
 export function resolveActionScope(

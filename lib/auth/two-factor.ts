@@ -24,8 +24,13 @@ import {
   isAPIError,
 } from 'better-auth/api';
 import { twoFactor } from 'better-auth/plugins/two-factor';
+import { PUBLIC_ORIGIN } from '@/lib/env';
 
-import { CUSTOM_AUTH_CODE, HTTP_STATUS } from '@/utils/api-messages';
+import {
+  CUSTOM_AUTH_CODE,
+  HTTP_STATUS,
+  MSG_INVALID_INPUT,
+} from '@/utils/api-messages';
 import {
   isTwoFactorMethodEnabled,
   TWO_FACTOR_ENABLED,
@@ -33,6 +38,7 @@ import {
 } from '@/utils/validation/two-factor';
 
 import { authAuditMeta } from './audit-meta';
+import { RP_ID } from './passkey-assertion';
 import { submittedRememberMe } from './remember-me';
 import { trustedDevicePlugin } from './trusted-device';
 import {
@@ -60,11 +66,27 @@ import { twoFactorPasskeyPlugins } from './two-factor-passkey';
  */
 const TWO_FACTOR_TABLE = 'twoFactorCredentials';
 
+/**
+ * Sign-in mode only, and that is a security invariant rather than a routing
+ * detail: with a request session the plugin's own verifier used to run DIRECTLY,
+ * outside `withTwoFactorChallengeTransaction`, so neither the challenge's
+ * attempt budget nor the sign-in lockout bounded the guesses. Nothing needs that
+ * branch — enrolment is owned by `lib/auth/two-factor-enrolment.ts`.
+ *
+ * `assertPluginVerifierOffered` in `lib/auth.ts` refuses the same shape one
+ * layer out, with the same answer. Kept in both places because that fence lives
+ * in another module and is keyed by path, and this is the function that owns
+ * verification.
+ */
 async function runPluginVerifier<T>(
   ctx: AuthContext,
   verify: () => Promise<T>
 ) {
-  if (await resolveRequestSession(ctx)) return verify();
+  if (await resolveRequestSession(ctx))
+    throw new APIError(HTTP_STATUS.BAD_REQUEST, {
+      message: MSG_INVALID_INPUT,
+      code: CUSTOM_AUTH_CODE,
+    });
   const challenge = await resolveTwoFactorChallenge(ctx);
   const result = challenge
     ? await withTwoFactorChallengeTransaction(ctx, challenge, async () => {
@@ -284,6 +306,13 @@ const twoFactorAuth = () => {
 const passkeyManagement = () => {
   const plugin = passkey({
     rpName: TOTP_ISSUER,
+    // Both pinned to the deployment, not derived from the request: the plugin
+    // reads `expectedOrigin` from the caller's own `Origin` header when
+    // `origin` is unset, so half the ceremony would be fenced by browser RP-ID
+    // rules and Better Auth's origin middleware while the assertion half
+    // (`lib/auth/passkey-assertion.ts`) already pins `PUBLIC_ORIGIN`.
+    origin: PUBLIC_ORIGIN,
+    rpID: RP_ID,
     schema: { passkey: { modelName: 'passkeys' } },
     // A client hint, and not the control: the plugin's own
     // `/passkey/verify-registration` passes `requireUserVerification: false`,

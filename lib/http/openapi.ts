@@ -12,6 +12,7 @@ import { deleteSessionsSchema } from '@/app/api/dash/users/[id]/sessions/handler
 import { SESSION_CURSOR_PATTERN } from '@/app/api/dash/users/[id]/sessions/pagination';
 import { devSignUpSchema } from '@/app/api/dev/sign-up/handler';
 import { bucketTypeEnum, fileKindEnum, fileTransitionEnum } from '@/db/schema';
+import packageManifest from '@/package.json';
 import { UUID_V7_PATTERN } from '@/utils';
 import * as z from 'zod';
 import { auth } from '@/lib/auth';
@@ -87,6 +88,7 @@ import {
   twoFactorTotpConfirmSchema,
 } from '@/utils/validation/two-factor';
 
+import { bodyPolicyCeiling } from './request';
 import { isDevelopmentOnlyPath } from './route-manifest';
 import { requireDashboardAccess } from './session';
 
@@ -189,6 +191,9 @@ const CONFLICT_ROUTES = new Set([
   // A referenced file, a file mid-transition, a duplicate folder name, a
   // non-empty folder, an unpublish with a public owner.
   'DELETE /api/dash/media/files',
+  // Rename and move refuse a file mid-transition, for the reason publish does.
+  'PUT /api/dash/media/files',
+  'PUT /api/dash/media/files/:id',
   'POST /api/dash/media/files/:id/publish',
   'POST /api/dash/media/files/:id/unpublish',
   'POST /api/dash/media/folders',
@@ -205,6 +210,11 @@ const BODYLESS_BAD_REQUEST_ROUTES = new Set([
 
 /** Correct-method operations whose own handler can deliberately answer 404. */
 const NOT_FOUND_ROUTES = new Set([
+  // The target user is gone, out of the caller's scope, or holds no such
+  // method. Reachable from three throws in the handler, and absent here because
+  // the consistency checks below compare DECLARED tables against each other and
+  // nothing compares either against what a handler can actually throw.
+  'POST /api/dash/users/:id/two-factor/reset',
   'POST /api/auth/forgot-password/reset',
   'POST /api/auth/forgot-password/second-factor/send',
   'POST /api/auth/forgot-password/complete',
@@ -358,6 +368,12 @@ const OPERATION_DOCS: Record<
   'PUT /api/dash/users/:id': {
     summary: 'Update a dashboard user',
     tag: 'Users',
+    // The `oneOf` below has no discriminator IN the body, because the thing that
+    // selects the branch is not in the body: it is whether the path id is the
+    // caller's own. A generated client validates `{ name }` happily for another
+    // user and then gets a 422 for the admin fields it did not send.
+    description:
+      'Two bodies, selected by WHO the path id names. Updating your own account takes the self shape (`name` alone). Updating anyone else takes the administrative shape, whose required fields are listed in its branch — sending the self shape for another user is refused 422. The branches are not distinguishable from the payload, so a client must pick by comparing the path id with the signed-in user.',
   },
   'DELETE /api/dash/users/:id': {
     summary: 'Delete a dashboard user',
@@ -801,6 +817,42 @@ function restrictToEnabledChannels(schema: JsonSchema): JsonSchema {
   return { ...schema, [key]: kept };
 }
 
+/**
+ * The routes that name ONE second-factor enrolment.
+ *
+ * Keyed like `BETTER_AUTH_SUMMARIES`, because these are Better Auth paths and
+ * not entries in the route manifest.
+ */
+const OTP_CONTACT_KIND_ROUTES = new Set([
+  'POST /two-factor/methods/disable',
+  'POST /two-factor/methods/default',
+]);
+
+/**
+ * The conditional requirement `z.toJSONSchema` cannot see.
+ *
+ * A user may hold an `otp:email` and an `otp:phone` enrolment at once, so
+ * `contactKind` is what says which one the request means; the handler refuses
+ * `{ method: 'otp' }` alone rather than resolving it by row order. Published as
+ * `if`/`then` so a generated client refuses the ambiguous body too.
+ */
+function requireContactKindForOtp(schema: JsonSchema): JsonSchema {
+  if (!isJsonSchema(schema.properties) || !schema.properties['contactKind'])
+    return schema;
+  const existing = Array.isArray(schema.allOf) ? schema.allOf : [];
+  return {
+    ...schema,
+    allOf: [
+      ...existing,
+      {
+        if: { properties: { method: { const: 'otp' } }, required: ['method'] },
+        // eslint-disable-next-line unicorn/no-thenable -- JSON Schema 2020-12 keyword paired with `if`, not a promise
+        then: { required: ['contactKind'] },
+      },
+    ],
+  };
+}
+
 function applyRequestContractRules(
   key: string | undefined,
   schema: JsonSchema,
@@ -812,6 +864,8 @@ function applyRequestContractRules(
     result = addUserRoleRules(result, true);
   if (key !== undefined && OTP_SEND_ROUTES.has(key))
     result = restrictToEnabledChannels(result);
+  if (key !== undefined && OTP_CONTACT_KIND_ROUTES.has(key))
+    result = requireContactKindForOtp(result);
   return result;
 }
 
@@ -923,7 +977,9 @@ function successEnvelopeSchema(
 
 const ERROR_RESPONSE: JsonSchema = {
   description: 'The standard API error envelope.',
-  content: { 'application/json': { schema: ERROR_ENVELOPE_SCHEMA } },
+  content: {
+    'application/json': { schema: componentRef('ErrorEnvelope') },
+  },
 };
 
 const PERMISSION_ACTION_PROPERTIES = Object.fromEntries(
@@ -1093,78 +1149,87 @@ const BUCKET_TYPE_SCHEMA: JsonSchema = {
  * URL for a public object and a signed URL, valid for one hour, for anything
  * else; `transition` is non-null while a publish or unpublish is still copying.
  */
+const MEDIA_FILE_PROPERTIES = {
+  id: UUID_SCHEMA,
+  kind: { type: 'string', enum: [...fileKindEnum] },
+  displayName: { type: 'string', maxLength: MEDIA_DISPLAY_NAME_MAX },
+  mimeType: { type: 'string', enum: [...KNOWN_MIME_TYPES] },
+  sizeBytes: { type: 'integer', minimum: 0 },
+  bucketType: BUCKET_TYPE_SCHEMA,
+  transition: {
+    anyOf: [{ type: 'string', enum: [...fileTransitionEnum] }, NULL_SCHEMA],
+    description:
+      'Non-null while a visibility change is in flight, and each value tells a client something different: `to_public`/`to_private` mean the copy is being made and verified and `url` still answers from the OLD bucket, so the change is in progress; `cleanup` means the flip is done and `url` is final, and only the stale copy in the other bucket (and, for a public one, its edge cache) is still being removed by the nightly sweep — nothing is pending for the client. `url` always points at the current bucket. Removing the object from the origin is unconditional; evicting an edge copy needs the configured cache purge; a copy already in a browser stays readable until its `Cache-Control` lifetime ends and cannot be recalled.',
+  },
+  width: { type: ['integer', 'null'], minimum: 1 },
+  height: { type: ['integer', 'null'], minimum: 1 },
+  blurhash: NULLABLE_STRING_SCHEMA,
+  folderId: {
+    ...NULLABLE_UUID_SCHEMA,
+    description:
+      'Null for a file uploaded for a record rather than into the library.',
+  },
+  uploadedBy: NULLABLE_UUID_SCHEMA,
+  unfiledAt: {
+    anyOf: [DATE_TIME_SCHEMA, NULL_SCHEMA],
+    description:
+      'When the nightly sweep first found the file unfiled — active, in no folder, referenced by no record. It is deleted `retentionDays` (see `scope=unfiled`) after this unless moved into a folder; null otherwise.',
+  },
+  url: {
+    type: 'string',
+    format: 'uri',
+    description:
+      'Permanent public URL for a public object; otherwise a signed URL valid for one hour. Never store it.',
+  },
+  createdAt: DATE_TIME_SCHEMA,
+  updatedAt: DATE_TIME_SCHEMA,
+} as const;
+
+const MEDIA_FILE_REQUIRED: readonly (keyof typeof MEDIA_FILE_PROPERTIES)[] = [
+  'id',
+  'kind',
+  'displayName',
+  'mimeType',
+  'sizeBytes',
+  'bucketType',
+  'transition',
+  'width',
+  'height',
+  'blurhash',
+  'folderId',
+  'uploadedBy',
+  'unfiledAt',
+  'url',
+  'createdAt',
+  'updatedAt',
+];
+
 const MEDIA_FILE_SCHEMA: JsonSchema = {
   type: 'object',
-  properties: {
-    id: UUID_SCHEMA,
-    kind: { type: 'string', enum: [...fileKindEnum] },
-    displayName: { type: 'string', maxLength: MEDIA_DISPLAY_NAME_MAX },
-    mimeType: { type: 'string', enum: [...KNOWN_MIME_TYPES] },
-    sizeBytes: { type: 'integer', minimum: 0 },
-    bucketType: BUCKET_TYPE_SCHEMA,
-    transition: {
-      anyOf: [{ type: 'string', enum: [...fileTransitionEnum] }, NULL_SCHEMA],
-      description:
-        'Non-null while a visibility change is in flight, and each value tells a client something different: `to_public`/`to_private` mean the copy is being made and verified and `url` still answers from the OLD bucket, so the change is in progress; `cleanup` means the flip is done and `url` is final, and only the stale copy in the other bucket (and, for a public one, its edge cache) is still being removed by the nightly sweep — nothing is pending for the client. `url` always points at the current bucket. Removing the object from the origin is unconditional; evicting an edge copy needs the configured cache purge; a copy already in a browser stays readable until its `Cache-Control` lifetime ends and cannot be recalled.',
-    },
-    width: { type: ['integer', 'null'], minimum: 1 },
-    height: { type: ['integer', 'null'], minimum: 1 },
-    blurhash: NULLABLE_STRING_SCHEMA,
-    folderId: {
-      ...NULLABLE_UUID_SCHEMA,
-      description:
-        'Null for a file uploaded for a record rather than into the library.',
-    },
-    uploadedBy: NULLABLE_UUID_SCHEMA,
-    unfiledAt: {
-      anyOf: [DATE_TIME_SCHEMA, NULL_SCHEMA],
-      description:
-        'When the nightly sweep first found the file unfiled — active, in no folder, referenced by no record. It is deleted `retentionDays` (see `scope=unfiled`) after this unless moved into a folder; null otherwise.',
-    },
-    url: {
-      type: 'string',
-      format: 'uri',
-      description:
-        'Permanent public URL for a public object; otherwise a signed URL valid for one hour. Never store it.',
-    },
-    createdAt: DATE_TIME_SCHEMA,
-    updatedAt: DATE_TIME_SCHEMA,
-  },
-  required: [
-    'id',
-    'kind',
-    'displayName',
-    'mimeType',
-    'sizeBytes',
-    'bucketType',
-    'transition',
-    'width',
-    'height',
-    'blurhash',
-    'folderId',
-    'uploadedBy',
-    'unfiledAt',
-    'url',
-    'createdAt',
-    'updatedAt',
-  ],
+  properties: MEDIA_FILE_PROPERTIES,
+  required: [...MEDIA_FILE_REQUIRED],
   additionalProperties: false,
 };
 
+const MEDIA_FOLDER_PROPERTIES = {
+  id: UUID_SCHEMA,
+  name: { type: 'string', minLength: 1, maxLength: FOLDER_NAME_MAX },
+  parentId: {
+    ...NULLABLE_UUID_SCHEMA,
+    description: 'Null for a root folder.',
+  },
+  createdBy: NULLABLE_UUID_SCHEMA,
+  createdAt: DATE_TIME_SCHEMA,
+  updatedAt: DATE_TIME_SCHEMA,
+} as const;
+
+const MEDIA_FOLDER_REQUIRED: readonly (keyof typeof MEDIA_FOLDER_PROPERTIES)[] =
+  ['id', 'name', 'parentId', 'createdBy', 'createdAt', 'updatedAt'];
+
 const MEDIA_FOLDER_SCHEMA: JsonSchema = {
   type: 'object',
-  properties: {
-    id: UUID_SCHEMA,
-    name: { type: 'string', minLength: 1, maxLength: FOLDER_NAME_MAX },
-    parentId: {
-      ...NULLABLE_UUID_SCHEMA,
-      description: 'Null for a root folder.',
-    },
-    createdBy: NULLABLE_UUID_SCHEMA,
-    createdAt: DATE_TIME_SCHEMA,
-    updatedAt: DATE_TIME_SCHEMA,
-  },
-  required: ['id', 'name', 'parentId', 'createdBy', 'createdAt', 'updatedAt'],
+  properties: MEDIA_FOLDER_PROPERTIES,
+  required: [...MEDIA_FOLDER_REQUIRED],
   additionalProperties: false,
 };
 
@@ -1181,14 +1246,14 @@ const MEDIA_BREADCRUMB_SCHEMA: JsonSchema = {
 const MEDIA_FOLDER_HIT_SCHEMA: JsonSchema = {
   type: 'object',
   properties: {
-    ...(MEDIA_FOLDER_SCHEMA.properties as Record<string, JsonSchema>),
+    ...MEDIA_FOLDER_PROPERTIES,
     breadcrumbs: {
       type: 'array',
       items: MEDIA_BREADCRUMB_SCHEMA,
       description: 'Root → the folder itself.',
     },
   },
-  required: [...(MEDIA_FOLDER_SCHEMA.required as string[]), 'breadcrumbs'],
+  required: [...MEDIA_FOLDER_REQUIRED, 'breadcrumbs'],
   additionalProperties: false,
 };
 
@@ -1226,8 +1291,8 @@ const MEDIA_LIST_SCHEMA: JsonSchema = {
       properties: {
         ...MEDIA_CAPABILITY_PROPERTIES,
         breadcrumbs: { type: 'array', items: MEDIA_BREADCRUMB_SCHEMA },
-        folders: { type: 'array', items: MEDIA_FOLDER_SCHEMA },
-        files: { type: 'array', items: MEDIA_FILE_SCHEMA },
+        folders: { type: 'array', items: componentRef('MediaFolder') },
+        files: { type: 'array', items: componentRef('MediaFile') },
       },
       required: [
         'visibilities',
@@ -1244,8 +1309,11 @@ const MEDIA_LIST_SCHEMA: JsonSchema = {
         'The library search (`scope=all`): one page of files across every folder and, when `search` is given, up to twenty folders whose name matches, each with its path from the root.',
       properties: {
         ...MEDIA_CAPABILITY_PROPERTIES,
-        files: { type: 'array', items: MEDIA_FILE_SCHEMA },
-        folders: { type: 'array', items: MEDIA_FOLDER_HIT_SCHEMA },
+        files: { type: 'array', items: componentRef('MediaFile') },
+        folders: {
+          type: 'array',
+          items: componentRef('MediaFolderHit'),
+        },
         foldersTruncated: {
           type: 'boolean',
           description:
@@ -1267,7 +1335,7 @@ const MEDIA_LIST_SCHEMA: JsonSchema = {
         'The unfiled view (`scope=unfiled`): one page of active files in no folder that no record references — uploads whose record is gone. Each is deleted `retentionDays` after its `unfiledAt` stamp unless moved into a folder with `PUT /api/dash/media/files/{id}`.',
       properties: {
         ...MEDIA_CAPABILITY_PROPERTIES,
-        files: { type: 'array', items: MEDIA_FILE_SCHEMA },
+        files: { type: 'array', items: componentRef('MediaFile') },
         retentionDays: {
           type: 'integer',
           minimum: 1,
@@ -1315,7 +1383,7 @@ const FOLDER_DELETE_SCHEMA: JsonSchema = {
 const MEDIA_FILE_DETAILS_SCHEMA: JsonSchema = {
   type: 'object',
   properties: {
-    ...(MEDIA_FILE_SCHEMA.properties as Record<string, JsonSchema>),
+    ...MEDIA_FILE_PROPERTIES,
     downloadUrl: {
       type: 'string',
       format: 'uri',
@@ -1333,14 +1401,34 @@ const MEDIA_FILE_DETAILS_SCHEMA: JsonSchema = {
       description: 'Owners on pages the caller may not view.',
     },
   },
-  required: [
-    ...(MEDIA_FILE_SCHEMA.required as string[]),
-    'downloadUrl',
-    'usedBy',
-    'hiddenUsages',
-  ],
+  required: [...MEDIA_FILE_REQUIRED, 'downloadUrl', 'usedBy', 'hiddenUsages'],
   additionalProperties: false,
 };
+
+/**
+ * The project schemas that appear in more than one operation, published once
+ * under `components.schemas` and referenced from every use.
+ *
+ * Inlined, the six largest of these occupied about 79 KB of a 320 KB document
+ * and the media file schema alone appeared nine times: code generators emit a
+ * duplicate anonymous type per copy, and one logical change rewrites every one
+ * of those document locations. The literals above stay the source — two of
+ * these schemas are BUILT from another's properties, and a `$ref` cannot be
+ * spread — so what is shared is the published form, not the definition.
+ */
+const COMPONENT_SCHEMAS: Record<string, JsonSchema> = {
+  MediaFile: MEDIA_FILE_SCHEMA,
+  MediaFileDetails: MEDIA_FILE_DETAILS_SCHEMA,
+  MediaFolder: MEDIA_FOLDER_SCHEMA,
+  MediaFolderHit: MEDIA_FOLDER_HIT_SCHEMA,
+  MediaUsage: MEDIA_USAGE_SCHEMA,
+  ErrorEnvelope: ERROR_ENVELOPE_SCHEMA,
+};
+
+/** A reference to one of the above. The name is checked at build time. */
+function componentRef(name: keyof typeof COMPONENT_SCHEMAS): JsonSchema {
+  return { $ref: `#/components/schemas/${name}` };
+}
 
 const SUCCESS_DATA_SCHEMAS: Record<string, JsonSchema> = {
   'POST /api/auth/forgot-password/reset': RESET_OUTCOME_SCHEMA,
@@ -1505,7 +1593,7 @@ const SUCCESS_DATA_SCHEMAS: Record<string, JsonSchema> = {
     additionalProperties: false,
   },
   'GET /api/dash/media': MEDIA_LIST_SCHEMA,
-  'POST /api/dash/media/files': MEDIA_FILE_SCHEMA,
+  'POST /api/dash/media/files': componentRef('MediaFile'),
   'DELETE /api/dash/media/files': {
     type: 'object',
     properties: {
@@ -1526,21 +1614,21 @@ const SUCCESS_DATA_SCHEMAS: Record<string, JsonSchema> = {
     required: ['deleted', 'pending'],
     additionalProperties: false,
   },
-  'GET /api/dash/media/files/:id': MEDIA_FILE_DETAILS_SCHEMA,
+  'GET /api/dash/media/files/:id': componentRef('MediaFileDetails'),
   'PUT /api/dash/media/files': {
     type: 'array',
-    items: MEDIA_FILE_SCHEMA,
+    items: componentRef('MediaFile'),
     description: 'The moved files, in their new folder.',
   },
-  'PUT /api/dash/media/files/:id': MEDIA_FILE_SCHEMA,
-  'POST /api/dash/media/files/:id/publish': MEDIA_FILE_SCHEMA,
-  'POST /api/dash/media/files/:id/unpublish': MEDIA_FILE_SCHEMA,
-  'POST /api/dash/media/folders': MEDIA_FOLDER_SCHEMA,
-  'PUT /api/dash/media/folders/:id': MEDIA_FOLDER_SCHEMA,
+  'PUT /api/dash/media/files/:id': componentRef('MediaFile'),
+  'POST /api/dash/media/files/:id/publish': componentRef('MediaFile'),
+  'POST /api/dash/media/files/:id/unpublish': componentRef('MediaFile'),
+  'POST /api/dash/media/folders': componentRef('MediaFolder'),
+  'PUT /api/dash/media/folders/:id': componentRef('MediaFolder'),
   'DELETE /api/dash/media/folders/:id': FOLDER_DELETE_SCHEMA,
   'POST /api/upload/file': {
     type: 'array',
-    items: MEDIA_FILE_SCHEMA,
+    items: componentRef('MediaFile'),
     minItems: 1,
     maxItems: 1,
     description:
@@ -1571,13 +1659,28 @@ const SET_COOKIE_HEADER: JsonSchema = {
   },
 };
 
+/**
+ * What the client does with each SHAPE this pair actually returns.
+ *
+ * One description for both operations told clients to branch on
+ * `data.verified`, which the START operation never returns: it answers
+ * `otpSent` or `autoVerified`, and only completion answers `verified`. A client
+ * following it never advanced to code entry and could not recognise an
+ * auto-verified change — the one outcome that revokes its session.
+ */
+const COMMIT_CONSEQUENCE =
+  'On commit, Google is unlinked and every session is revoked, including the current one: show an alert that the email changed and sign-in is required, clear the authenticated state, and return to sign-in.';
+
+const CONTACT_CHANGE_DESCRIPTIONS: Record<string, string> = {
+  'POST /api/dash/users/me/change-email': `Two shapes. \`data.otpSent\` means a code is on its way to the NEW address: collect it and post it to the verify operation; nothing has changed yet and sessions remain active. \`data.autoVerified\` means the deployment verifies contacts without a code and the change has ALREADY committed. ${COMMIT_CONSEQUENCE}`,
+  'POST /api/dash/users/me/change-email/verify': `\`data.verified\` is the commit. ${COMMIT_CONSEQUENCE}`,
+};
+
 function successResponseFor(key: string): JsonSchema {
   const data = SUCCESS_DATA_SCHEMAS[key];
   if (!data) throw new Error(`No success data schema for ${key}`);
   return {
-    description: SESSION_COOKIE_ROUTES.has(key)
-      ? 'An email change commits when data.verified is true. On commit, Google is unlinked and every session is revoked, including the current session. The client must show an alert that the email changed and sign-in is required, clear its authenticated state, and return to sign-in. If data.verified is false, continue the email OTP flow; the change has not committed and sessions remain active.'
-      : 'Success.',
+    description: CONTACT_CHANGE_DESCRIPTIONS[key] ?? 'Success.',
     ...(SESSION_COOKIE_ROUTES.has(key) && { headers: SET_COOKIE_HEADER }),
     content: {
       'application/json': {
@@ -1627,7 +1730,7 @@ const STORAGE_RESPONSES: JsonSchema = {
   },
   '401': {
     description:
-      'The deep probe was requested without the configured maintenance token.',
+      'The request carried no valid maintenance token. The whole route requires it, not only `deep=1`.',
     content: {
       'application/json': {
         schema: {
@@ -1713,7 +1816,9 @@ const PRE_AUTH_RESPONSES: JsonSchema = {
         schema: { type: 'integer', minimum: 0 },
       },
     },
-    content: { 'application/json': { schema: ERROR_ENVELOPE_SCHEMA } },
+    content: {
+      'application/json': { schema: componentRef('ErrorEnvelope') },
+    },
   },
   '503': {
     description: 'The admission limiter store is unavailable and fails closed.',
@@ -1723,7 +1828,9 @@ const PRE_AUTH_RESPONSES: JsonSchema = {
         schema: { type: 'integer', minimum: 1 },
       },
     },
-    content: { 'application/json': { schema: ERROR_ENVELOPE_SCHEMA } },
+    content: {
+      'application/json': { schema: componentRef('ErrorEnvelope') },
+    },
   },
 };
 
@@ -2013,6 +2120,21 @@ function betterAuthResponses(path: string, method: HttpMethod): JsonSchema {
     };
   }
 
+  // Through the same function every table route publishes with, applied to the
+  // policy `ROUTE_PREFIXES` declares for `/api/auth` — these operations read
+  // their bodies inside the library, so the refusal comes from the boundary in
+  // `app.ts`, in this project's envelope like the pre-auth refusals above rather
+  // than in Better Auth's error shape. ⚠️ The prefix's policy is restated here
+  // because this file addresses `/api/auth` by literal throughout and never
+  // receives `ROUTE_PREFIXES`; changing it there must change it here.
+  if (method === 'POST')
+    responses['413'] = {
+      description: `The request body exceeds ${bodyPolicyCeiling('json')} bytes, which the server refuses before the route runs.`,
+      content: {
+        'application/json': { schema: componentRef('ErrorEnvelope') },
+      },
+    };
+
   if (
     path === '/oauth/google/callback' ||
     path === '/oauth/result' ||
@@ -2067,13 +2189,30 @@ function commonResponses(entry: RouteManifestEntry): JsonSchema {
         entry.body === 'none'
           ? 'The operation violates a handler-level business rule.'
           : 'The request body is absent, empty, not parseable, or violates a handler-level business rule.',
-      content: { 'application/json': { schema: ERROR_ENVELOPE_SCHEMA } },
+      content: {
+        'application/json': { schema: componentRef('ErrorEnvelope') },
+      },
+    };
+
+  // 413 is derivable from the body policy alone — `bodyPolicyCeiling` is the
+  // same function the boundary in `app.ts` refuses with, so the published bound
+  // cannot describe a limit the server does not apply. Published because a
+  // client that cannot see the bound has no way to split or reject a payload
+  // before sending it.
+  if (entry.body !== 'none')
+    responses['413'] = {
+      description: `The request body exceeds ${bodyPolicyCeiling(entry.body, entry.maxJsonBodyBytes)} bytes, which the server refuses before the route runs.`,
+      content: {
+        'application/json': { schema: componentRef('ErrorEnvelope') },
+      },
     };
 
   if (CONFLICT_ROUTES.has(key))
     responses['409'] = {
       description: 'A unique value or permission assignment already exists.',
-      content: { 'application/json': { schema: ERROR_ENVELOPE_SCHEMA } },
+      content: {
+        'application/json': { schema: componentRef('ErrorEnvelope') },
+      },
     };
 
   // 422 is the standard validation failure, and it is NOT limited to body
@@ -2089,7 +2228,9 @@ function commonResponses(entry: RouteManifestEntry): JsonSchema {
     responses['422'] = {
       description:
         'Validation failed — a schema field, or a path parameter, was rejected.',
-      content: { 'application/json': { schema: ERROR_ENVELOPE_SCHEMA } },
+      content: {
+        'application/json': { schema: componentRef('ErrorEnvelope') },
+      },
     };
 
   // The refusals the route's own authorisation produces, from the one field that
@@ -2099,7 +2240,9 @@ function commonResponses(entry: RouteManifestEntry): JsonSchema {
   if (entry.auth !== 'public') {
     responses['401'] = {
       description: 'No session, or the session row is no longer live.',
-      content: { 'application/json': { schema: ERROR_ENVELOPE_SCHEMA } },
+      content: {
+        'application/json': { schema: componentRef('ErrorEnvelope') },
+      },
     };
   }
 
@@ -2116,7 +2259,9 @@ function commonResponses(entry: RouteManifestEntry): JsonSchema {
             ? 'The caller lacks the required authority or failed the required captcha.'
             : 'The caller lacks the grant, scope or role authority this route requires.'
           : 'The captcha this route requires was absent or rejected.',
-      content: { 'application/json': { schema: ERROR_ENVELOPE_SCHEMA } },
+      content: {
+        'application/json': { schema: componentRef('ErrorEnvelope') },
+      },
     };
 
   if (entry.preAuth === 'ip-limit' || entry.handlerRateLimit)
@@ -2133,6 +2278,10 @@ function commonResponses(entry: RouteManifestEntry): JsonSchema {
 
   return responses;
 }
+
+/** Methods in a stable order, so one collision reads the same on every run. */
+const methodList = (methods: Iterable<string>): string =>
+  [...methods].toSorted((a, b) => (a === b ? 0 : a < b ? -1 : 1)).join(', ');
 
 /**
  * The limits both upload routes share, stated once in the document. A client
@@ -2292,7 +2441,62 @@ function openApiConsistencyProblems(
       );
   }
 
+  // Two producers write into one `paths` map. Table routes merge per method; the
+  // Better Auth loop that runs after them ASSIGNS a complete path item, so the
+  // whole path is at stake, not the methods the two happen to share — a
+  // documented table-owned `POST` beside Better Auth's `GET` on one path
+  // vanishes from the document just as silently as a duplicated method would.
+  // Rejecting the shared PATH is therefore the rule that matches the merge; it
+  // stops being necessary only if that assignment becomes a per-method merge.
+  // No collision exists today, which is exactly when to make one impossible to
+  // introduce quietly.
+  const tablePaths = new Map<string, Set<string>>();
+  for (const entry of manifest) {
+    const { path } = toOpenApiPath(entry.path);
+    const methods = tablePaths.get(path) ?? new Set<string>();
+    methods.add(entry.method);
+    tablePaths.set(path, methods);
+  }
+  for (const endpoint of BETTER_AUTH_ENDPOINTS) {
+    const full = `/api/auth${endpoint.path}`;
+    const claimed = tablePaths.get(full);
+    if (claimed)
+      problems.push(
+        `${full} is declared by the route table (${methodList(claimed)}) AND by the Better Auth prefix (${methodList(endpoint.methods)}); the Better Auth loop replaces the whole path item, so the table's operations would be absent from the document`
+      );
+  }
+
   return problems;
+}
+
+/**
+ * Two producers write into one `components.schemas` map as well, and the merge
+ * has the same shape as the `paths` one above: `referencedBetterAuthSchemas`
+ * spreads LAST, so a Better Auth schema sharing a name with a project schema
+ * would silently replace it while every `$ref` this file emits keeps pointing at
+ * the name. The `$ref`-resolution test would still pass — the name resolves, to
+ * the wrong schema.
+ *
+ * Checked against the REFERENCED subset rather than Better Auth's whole
+ * catalogue: a name it defines and this document never references is merged into
+ * nothing, and failing the build for it would turn an unrelated library upgrade
+ * into an outage.
+ */
+function schemaCollisionProblems(betterAuthSchemas: JsonSchema): string[] {
+  return Object.keys(betterAuthSchemas)
+    .filter((name) => name in COMPONENT_SCHEMAS)
+    .map(
+      (name) =>
+        `components.schemas '${name}' is defined by COMPONENT_SCHEMAS AND by Better Auth; the merge would keep only the second, under every $ref this document emits`
+    );
+}
+
+/** Never returns when there is anything to report. */
+function assertConsistent(problems: readonly string[]): void {
+  if (problems.length > 0)
+    throw new Error(
+      `OpenAPI document is inconsistent with the route table:\n  ${problems.join('\n  ')}`
+    );
 }
 
 function referencedBetterAuthSchemas(paths: JsonSchema): JsonSchema {
@@ -2374,6 +2578,30 @@ function referencedBetterAuthSchemas(paths: JsonSchema): JsonSchema {
 }
 
 /**
+ * The document's own version, as SemVer build metadata on the application's.
+ *
+ * ⚠️ `APPLICATION_VERSION` is read from `package.json` and is `0.1.0` for the
+ * whole of the build phase. **Bump it with every published contract change once
+ * this launches**, and keep bumping it: the build-metadata suffix below
+ * distinguishes two documents, but only the version proper tells a client which
+ * of them is NEWER, and nothing derives that automatically.
+ *
+ * The suffix is a short digest of the document's own content, so two
+ * deployments of the same code with different routes or a different configured
+ * 2FA surface no longer both report the same version — which is what made
+ * generated clients and caches treat incompatible revisions as identical. It is
+ * computed over the document WITHOUT `info.version`, because that field is what
+ * it is being computed for.
+ */
+const APPLICATION_VERSION = packageManifest.version;
+
+function documentVersion(document: JsonSchema): string {
+  const hasher = new Bun.CryptoHasher('sha256');
+  hasher.update(JSON.stringify(document));
+  return `${APPLICATION_VERSION}+${hasher.digest('hex').slice(0, 12)}`;
+}
+
+/**
  * Builds the document. Called per request rather than at module load so a
  * conversion failure cannot prevent the server from booting.
  *
@@ -2390,11 +2618,10 @@ function referencedBetterAuthSchemas(paths: JsonSchema): JsonSchema {
 export function openApiDocument(
   manifest: readonly RouteManifestEntry[] = []
 ): JsonSchema {
-  const problems = openApiConsistencyProblems(manifest);
-  if (problems.length > 0)
-    throw new Error(
-      `OpenAPI document is inconsistent with the route table:\n  ${problems.join('\n  ')}`
-    );
+  // Before anything is generated: an inconsistent table produces a confidently
+  // wrong document, and reporting every problem at once beats failing on the
+  // first one the generator happens to trip over.
+  assertConsistent(openApiConsistencyProblems(manifest));
 
   const paths: Record<string, JsonSchema> = {};
 
@@ -2440,8 +2667,9 @@ export function openApiDocument(
       parameters.push({
         name: 'x-maintenance-token',
         in: 'header',
-        required: false,
-        description: 'Required when `deep=1`; ignored by the cheap probe.',
+        required: true,
+        description:
+          'The shared maintenance secret. Required on every request to this route; without it the answer is 401.',
         schema: { type: 'string', minLength: 1 },
       });
 
@@ -2510,9 +2738,9 @@ export function openApiDocument(
         summary,
         tags: ['Authentication'],
         description:
-          'Served by Better Auth, which owns its own routing, validation and ' +
-          'response shapes under this prefix. Every Better Auth path outside ' +
-          'this list is answered 404 by the before-hook in lib/auth.ts.',
+          'Served by the authentication library, which owns its own routing, ' +
+          'validation and response shapes under this prefix. Every path under ' +
+          'it that is not documented here is answered 404.',
         responses: betterAuthResponses(endpoint.path, method),
         security: endpoint.path.startsWith('/reauth/')
           ? [{ sessionCookie: [] }]
@@ -2560,7 +2788,7 @@ export function openApiDocument(
       // Only the method that carries it. A documented request body on `GET`
       // describes a request no client can make.
       if (schema && method === 'POST') {
-        const body = requestBody(schema);
+        const body = requestBody(schema, `${method} ${endpoint.path}`);
         if (body) operation.requestBody = body;
       } else if (method === 'POST' && isJsonSchema(generated?.requestBody)) {
         const normalized = normalizeOpenApi31(generated.requestBody);
@@ -2587,17 +2815,21 @@ export function openApiDocument(
     );
   }
 
-  return {
+  // After `paths`, because which Better Auth schemas are merged at all depends
+  // on what the document ended up referencing.
+  const betterAuthSchemas = referencedBetterAuthSchemas(paths);
+  assertConsistent(schemaCollisionProblems(betterAuthSchemas));
+
+  const document: JsonSchema = {
     openapi: '3.1.1',
     info: {
       title: 'Dashboard API',
-      version: '0.1.0',
       license: {
         name: 'Private; redistribution is not licensed',
         identifier: 'LicenseRef-Proprietary',
       },
       description:
-        'Generated from the route manifest in `routes.ts` and the Zod schemas the handlers validate with. Not hand-maintained.',
+        'Generated from the server’s own route table and the schemas its handlers validate with, so it describes what the deployment actually serves. Not hand-maintained.',
     },
     servers: [
       {
@@ -2641,7 +2873,7 @@ export function openApiDocument(
       { name: 'Contract', description: 'The generated OpenAPI document.' },
     ],
     components: {
-      schemas: referencedBetterAuthSchemas(paths),
+      schemas: { ...COMPONENT_SCHEMAS, ...betterAuthSchemas },
       securitySchemes: {
         sessionCookie: {
           type: 'apiKey',
@@ -2652,6 +2884,10 @@ export function openApiDocument(
     },
     paths,
   };
+
+  const info = document.info;
+  if (isJsonSchema(info)) info.version = documentVersion(document);
+  return document;
 }
 
 /**

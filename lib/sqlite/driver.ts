@@ -12,18 +12,17 @@
  * under Node regardless of `bun --bun`, so `bun:sqlite` was unreachable there
  * (`ERR_UNSUPPORTED_ESM_URL_SCHEME`).
  *
- * Elysia runs the server under Bun, so the swap happened with the framework
- * migration, exactly as the previous version of this file specified. Everything
- * driver-specific stayed inside this file; no caller changed.
+ * The server runs under Bun, so `bun:sqlite` is the driver. Everything
+ * driver-specific lives inside this file; no caller sees it.
  *
  * ============================================================================
- * WHAT CHANGED, AND WHAT TO RE-CHECK IF THE DRIVER EVER MOVES AGAIN
+ * WHAT TO RE-CHECK IF THE DRIVER EVER MOVES
  * ============================================================================
  * 1. `new Database(path, { create: true })` — bun:sqlite does not create the
  *    file unless asked.
  * 2. PRAGMA is a statement, not a method: `db.run('PRAGMA journal_mode = WAL')`,
  *    and reading one back goes through `db.query`.
- * 3. A missing row is `null` here and was `undefined` under better-sqlite3.
+ * 3. A missing row is `null` here and `undefined` under better-sqlite3.
  *    `SqliteStatement.get` is typed `Row | null` for that reason; every caller
  *    tests falsiness, which covers both.
  * 4. BLOB columns come back as `Uint8Array`, not `Buffer`. Everything here reads
@@ -33,7 +32,7 @@
  *    this codebase is prepared once at module scope and held for the process —
  *    a cache eviction finalising one of them would be a latent failure. `prepare`
  *    hands back a statement this code owns outright.
- * 6. Integers past 2^53 lose precision, as they did before. `safeIntegers` would
+ * 6. Integers past 2^53 lose precision. `safeIntegers` would
  *    fix it but returns EVERY integer as a bigint, which breaks `JSON.stringify`.
  *    Do not enable it: the largest value stored here is a millisecond timestamp
  *    (~1.7e12) against a ~9e15 ceiling.
@@ -67,6 +66,11 @@ export interface SqliteStatement {
    * connection prepared. Call it only for a statement with a lifetime shorter
    * than the connection's — the deep health check's `quick_check` is the one
    * such case, and without it every readiness poll leaked a statement.
+   *
+   * A driver without an explicit per-statement release would have to implement
+   * this by dropping the reference and letting GC collect it — which is exactly
+   * the unbounded growth the `quick_check` caller exists to avoid, so check for
+   * one before swapping.
    */
   finalize(): void;
 }
@@ -102,54 +106,33 @@ export interface SqliteConnection {
 }
 
 /**
- * ============================================================================
- * STATEMENT LIFETIME — why this connection tracks what it prepares
- * ============================================================================
- * SQLite's `close_v2` DEFERS the real close while any prepared statement is
- * still alive, and reports success while doing it. Measured on this Bun build:
- * a statement prepared from a connection, then `db.close(false)`, still
- * returned rows afterwards — the handle, its file lock and its memory were all
- * still held, and nothing said so.
+ * `close(true)` is the only close here, and the argument is the whole point.
  *
- * The consequence was not theoretical. `lib/rate-limit/store.ts` closes the
- * connection when one prepare in its batch fails, in order to release the
- * handle; every statement prepared BEFORE the failure kept it open until
- * garbage collection, so the guard did not do what it was written to do. The
- * deep health check leaked one statement per poll for the same reason.
+ * `close(false)` — SQLite's `close_v2` — DEFERS the real close while any
+ * prepared statement is still alive and reports success while doing it, so the
+ * handle, its file lock and its memory stay held with nothing saying so.
+ * `lib/rate-limit/store.ts` and `lib/cache/index.ts` close the connection when
+ * one prepare in their batch fails, specifically to release the handle; under
+ * that form the guard did not do what it was written to do. `close(true)`
+ * finalizes the outstanding statements instead, and `Statement#finalize` is
+ * idempotent natively, so tracking live statements here adds nothing over it.
  *
- * So: every native statement is tracked here, `close()` finalizes all of them
- * first, and only then closes with `throwOnError = true`.
- *
- * The tracking `Set` earns its place from `close(false)`, which is the half that
- * still holds: re-measured on Bun 1.4.0, a `prepare()`d statement kept returning
- * rows after it (`{"afterRead":{"a":1}}`). `close(true)` no longer throws for an
- * outstanding statement — 1.4.0 made it finalize every statement including the
- * cached `query()` ones, where before it threw `database is locked` — so it is
- * strictly stronger than it was, and the throw this design once used as a
- * leak SIGNAL is gone. Nothing here depended on that throw for correctness; if
- * leak detection is wanted, assert it directly rather than expecting the driver
- * to raise it.
+ * ⚠️ This rests on bun:sqlite. A driver swap must re-measure
+ * close-with-outstanding-statements before trusting it: one that neither
+ * finalizes nor tolerates them needs a registry of live statements here.
  */
 export function openConnection(path: string): SqliteConnection {
   // The path comes from SQLITE_DIR (deployment configuration), never a request.
   const db = new Database(path, { create: true, readwrite: true });
-  const live = new Set<{ finalize(): void }>();
 
   return {
     prepare(sql) {
       const statement = db.prepare<unknown, SQLQueryBindings[]>(sql);
-      live.add(statement);
-      let finalized = false;
       return {
         get: (...params) => statement.get(...params) as never,
         all: (...params) => statement.all(...params) as never,
         run: (...params) => ({ changes: statement.run(...params).changes }),
-        finalize: () => {
-          if (finalized) return;
-          finalized = true;
-          live.delete(statement);
-          statement.finalize();
-        },
+        finalize: () => statement.finalize(),
       };
     },
     exec: (sql) => {
@@ -177,13 +160,9 @@ export function openConnection(path: string): SqliteConnection {
     },
     transaction: (fn) => db.transaction(fn),
     transactionImmediate: (fn) => db.transaction(fn).immediate,
-    close: () => {
-      for (const statement of live) statement.finalize();
-      live.clear();
-      // `true`, not `false`: `close(false)` is the form that leaves a prepared
-      // statement live and the handle open (measured above), and this is the path
-      // that has to actually release the file.
-      db.close(true);
-    },
+    // `true`, not `false`: `close(false)` is the form that leaves a prepared
+    // statement live and the handle open (measured above), and this is the path
+    // that has to actually release the file.
+    close: () => db.close(true),
   };
 }

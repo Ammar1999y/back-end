@@ -45,8 +45,9 @@ the Elysia-versus-Hono question is open"; `Bun.cron` is a **runtime** API that
 survives a framework change untouched, and its single-process precondition was
 already satisfied by `reusePort: false`. That deleted both `/api/internal/*`
 routes and the whole maintenance attack surface behind them.
-`SQLITE_MAINTENANCE_TOKEN` survives, guarding `?deep=1` alone, and now has a
-32-character floor. The trade — losing the scheduled task's own failure alerting
+`SQLITE_MAINTENANCE_TOKEN` survives, guarding the whole of
+`GET /api/health/storage`, and now has a 32-character floor and is required in
+production. The trade — losing the scheduled task's own failure alerting
 — is paid by the structured per-run log described in §9.
 
 ## Open gates
@@ -126,7 +127,9 @@ Do not expose production traffic until these are resolved.
 4. ~~**Schedule both sweeps, and generate `SQLITE_MAINTENANCE_TOKEN`
    properly.**~~ **MOSTLY CLOSED IN CODE.** Both sweeps run in-process now, so
    there is nothing to schedule and no unset-token failure mode that silently
-   stops them (§9). The token guards `GET /api/health/storage?deep=1` alone.
+   stops them (§9). The token guards `GET /api/health/storage` alone — the whole
+   route, not only `?deep=1` — and is required in production, because the health
+   check carries it (§7).
 
    What remains yours: **use `openssl rand -hex 32` and nothing else.** The
    generated value is the entire control. A short token is now refused at boot —
@@ -345,23 +348,23 @@ or image history shows Coolify fell back to `--build-arg`.
 
 ### Required
 
-| Variable                               | Secret | Notes                                                                                                                                                                                                                                                        |
-| -------------------------------------- | ------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `NODE_ENV=production`                  | No     | Enforced at boot — see §2.                                                                                                                                                                                                                                   |
-| `TZ=UTC`                               | No     | Optional hygiene, not a control. It was load-bearing until the `timestamptz` columns dropped `mode: 'string'` (gate 1); no security decision reads the host zone now. Unrelated to `NEXT_PUBLIC_BUSINESS_TIMEZONE`, which is display only.                   |
-| `PUBLIC_URL=https://<domain>`          | No     | Absolute origin: scheme required, no path/query/fragment/credentials, HTTPS in production. Used for both CORS and Better Auth's `baseURL`. `NEXT_PUBLIC_URL` is a legacy alias; setting both to different values is a boot failure.                          |
-| `DATABASE_URL`                         | Yes    | PostgreSQL connection string for `bun:sql`. Put `sslmode` in the URL — see §3.1.                                                                                                                                                                             |
-| `BETTER_AUTH_SECRET`                   | Yes    | ≥32 chars, no surrounding whitespace.                                                                                                                                                                                                                        |
-| `PASSWORD_PEPPER_ACTIVE_ID`            | Yes    | Must name a key in the keyring.                                                                                                                                                                                                                              |
-| `PASSWORD_PEPPER_KEYRING`              | Yes    | One-line JSON; retain old keys still referenced by stored hashes.                                                                                                                                                                                            |
-| `OTP_HMAC_ACTIVE_ID`                   | Yes    | Must name a key in `OTP_HMAC_KEYRING`.                                                                                                                                                                                                                       |
-| `OTP_HMAC_KEYRING`                     | Yes    | Same shape as the pepper keyring: `{"<id>":{"generation":1,"secret":"<32 bytes, unpadded base64url>"}}`. Generate with `openssl rand -base64 32 \| tr '+/' '-_' \| tr -d '='`. Malformed is a **boot** failure.                                              |
-| `TURNSTILE_SECRET_KEY`                 | Yes    | Production Cloudflare secret.                                                                                                                                                                                                                                |
-| `SQLITE_DIR=/app/data`                 | No     | Absolute; no production default — the app refuses to boot without it.                                                                                                                                                                                        |
-| `SQLITE_MAINTENANCE_TOKEN`             | No     | Gates `GET /api/health/storage?deep=1` and nothing else. `openssl rand -hex 32`. **At least 32 characters when set** — a shorter value refuses to boot. Leave unset to disable the deep probe; every path fails closed. Failed attempts are logged by class. |
-| `NEXT_PUBLIC_ENABLED_OTP_CHANNELS`     | No     | Comma list: `email`, `sms`, `whatsapp`.                                                                                                                                                                                                                      |
-| `NEXT_PUBLIC_ENABLED_2FA_METHODS`      | No     | Comma list: `totp`, `otp`, `backup_code`, `passkey`. Unset disables two-factor entirely and every `/two-factor/*` and `/passkey/*` path answers 404. Parsed strictly — an unknown name, a duplicate or a trailing comma is a **boot** failure.               |
-| `NEXT_PUBLIC_ENABLED_2FA_OTP_CHANNELS` | No     | Comma list from the same set as the OTP channels, and deliberately a SEPARATE variable. Where the second-factor codes go. Required when `otp` is in the methods list; a missing provider credential for an enabled channel is a boot failure in production.  |
+| Variable                               | Secret | Notes                                                                                                                                                                                                                                                                                |
+| -------------------------------------- | ------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `NODE_ENV=production`                  | No     | Enforced at boot — see §2.                                                                                                                                                                                                                                                           |
+| `TZ=UTC`                               | No     | Optional hygiene, not a control. It was load-bearing until the `timestamptz` columns dropped `mode: 'string'` (gate 1); no security decision reads the host zone now. Unrelated to `NEXT_PUBLIC_BUSINESS_TIMEZONE`, which is display only.                                           |
+| `PUBLIC_URL=https://<domain>`          | No     | Absolute origin: scheme required, no path/query/fragment/credentials, HTTPS in production. Used for both CORS and Better Auth's `baseURL`. `NEXT_PUBLIC_URL` is a legacy alias; setting both to different values is a boot failure.                                                  |
+| `DATABASE_URL`                         | Yes    | PostgreSQL connection string for `bun:sql`. Put `sslmode` in the URL — see §3.1.                                                                                                                                                                                                     |
+| `BETTER_AUTH_SECRET`                   | Yes    | ≥32 chars, no surrounding whitespace.                                                                                                                                                                                                                                                |
+| `PASSWORD_PEPPER_ACTIVE_ID`            | Yes    | Must name a key in the keyring.                                                                                                                                                                                                                                                      |
+| `PASSWORD_PEPPER_KEYRING`              | Yes    | One-line JSON; retain old keys still referenced by stored hashes.                                                                                                                                                                                                                    |
+| `OTP_HMAC_ACTIVE_ID`                   | Yes    | Must name a key in `OTP_HMAC_KEYRING`.                                                                                                                                                                                                                                               |
+| `OTP_HMAC_KEYRING`                     | Yes    | Same shape as the pepper keyring: `{"<id>":{"generation":1,"secret":"<32 bytes, unpadded base64url>"}}`. Generate with `openssl rand -base64 32 \| tr '+/' '-_' \| tr -d '='`. Malformed is a **boot** failure.                                                                      |
+| `TURNSTILE_SECRET_KEY`                 | Yes    | Production Cloudflare secret.                                                                                                                                                                                                                                                        |
+| `SQLITE_DIR=/app/data`                 | No     | Absolute; no production default — the app refuses to boot without it.                                                                                                                                                                                                                |
+| `SQLITE_MAINTENANCE_TOKEN`             | Yes    | Gates the WHOLE of `GET /api/health/storage`, and nothing else. `openssl rand -hex 32`. **At least 32 characters** — a shorter value refuses to boot, and so does an absent one in production, because the health check cannot pass without it. Failed attempts are logged by class. |
+| `NEXT_PUBLIC_ENABLED_OTP_CHANNELS`     | No     | Comma list: `email`, `sms`, `whatsapp`.                                                                                                                                                                                                                                              |
+| `NEXT_PUBLIC_ENABLED_2FA_METHODS`      | No     | Comma list: `totp`, `otp`, `backup_code`, `passkey`. Unset disables two-factor entirely and every `/two-factor/*` and `/passkey/*` path answers 404. Parsed strictly — an unknown name, a duplicate or a trailing comma is a **boot** failure.                                       |
+| `NEXT_PUBLIC_ENABLED_2FA_OTP_CHANNELS` | No     | Comma list from the same set as the OTP channels, and deliberately a SEPARATE variable. Where the second-factor codes go. Required when `otp` is in the methods list; a missing provider credential for an enabled channel is a boot failure in production.                          |
 
 ### Two-factor configuration
 
@@ -450,12 +453,14 @@ one-way property the password pepper keyring exists to avoid, and there is no
 keyring for this value. Treat it as unrotatable once users have enrolled, or
 plan a forced re-enrolment.
 
-A missing `SQLITE_MAINTENANCE_TOKEN` does **not** stop boot and does **not**
-fail readiness. It gates the optional `?deep=1` probe alone, which answers 401
-without it. Readiness stopped reporting `maintenanceTokenSet` when the token
-became optional: leaving it unset is a supported configuration, so a check that
-turned that into a 503 would have removed a healthy container from service for
-following this table.
+A missing `SQLITE_MAINTENANCE_TOKEN` **stops a production boot**. It gates the
+whole readiness route, so an unset value leaves the orchestrator polling an
+endpoint that answers 401 forever — a container that never turns healthy, for a
+reason visible only in the application log. Readiness itself still reports
+nothing about the token: a request that gets a body has already presented one.
+Outside production it stays optional, and an unset value simply makes the route
+unreachable — `maintenanceTokenMatches` refuses an empty configured value rather
+than treating it as "no auth required".
 
 `SQLITE_DIR` is fatal at boot instead, because a defaulted value would let an
 unmounted volume boot happily and write to the container layer, where every
@@ -728,17 +733,19 @@ wget -qO- --server-response --post-data='' \
   "http://127.0.0.1:3000/api/internal/sqlite-sweep" 2>&1 | head -3
 ```
 
-Apply the same to `/api/health/storage?deep=1` if you can express the query
-condition — but **the cheap variant must stay reachable** for the health check.
-The deep variant is token-gated, so this is hardening, not a gap. It is now the
-only surface `SQLITE_MAINTENANCE_TOKEN` guards.
+Apply the same to `/api/health/storage`. The whole route is token-gated and the
+container's own health check reaches it over loopback (§7 — a CMD check, not an
+HTTP one), so nothing legitimate crosses the edge to it. This is hardening on top
+of the token, not the control: it is the only surface `SQLITE_MAINTENANCE_TOKEN`
+guards, and the gate is in the application.
 
-Also block `/api/dev/` the same way. Both dev endpoints refuse outside
-`NODE_ENV=development`, but they refuse _differently_: `/api/dev/email-test/fixed`
-answers 404 (deliberately indistinguishable from an unrouted path), while
-`/api/dev/sign-up` answers **403 with a distinctive body**, which is a positive
-existence oracle for the route in production. Blocking the prefix costs nothing
-and removes the divergence from the internet's view of it.
+Also block `/api/dev/` the same way. The prefix holds one endpoint today,
+`/api/dev/sign-up`, and outside `NODE_ENV=development` it is not registered at
+all (`toRegisteredRoutes`), so it answers the ordinary 404 — deliberately
+indistinguishable from an unrouted path, rather than the 403 that used to
+confirm the route exists. Blocking the prefix costs nothing and keeps that true
+for any dev endpoint added later, which will not get the filtering for free if
+it is registered outside the table.
 
 > **This whole section is prefix matching, and prefix matching is currently
 > bypassable — see gate 2.** A crafted request with a ≤3-character `Host`
@@ -748,12 +755,13 @@ and removes the divergence from the internet's view of it.
 
 ### Proxy limits that must match the application
 
-| Setting                                                        | Must be              | Because                                                                                                                                                                                                                                            |
-| -------------------------------------------------------------- | -------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Cloudflare proxy read timeout, Traefik `responseHeaderTimeout` | **> 120 s**          | The upload routes' ceiling. Cloudflare's free-plan 100 s limit is _below_ it — raise it on a paid plan or lower the application ceiling deliberately.                                                                                              |
-| Cloudflare native upload ceiling                               | **Plan ceiling**     | This is not the application limit. The `max_upload` zone setting starts at 100 MB; an exact body-size WAF rule requires Enterprise.                                                                                                                |
-| Traefik upload-route body limit                                | **12,582,912 bytes** | 12 MiB: one 10 MB document plus multipart framing, the same bound as `MAX_REQUEST_BODY_BYTES`. The buffering middleware rejects an oversized request with 413 before forwarding it to Bun. Images are capped far lower (1 MiB) by the application. |
-| Bun/Elysia server-wide body limit                              | **12 MiB**           | `MAX_REQUEST_BODY_BYTES` (`app.ts`) is the final origin-wide ceiling. It is broader than any single route's contract and does not replace the upload-specific Traefik rule.                                                                        |
+| Setting                                                        | Must be              | Because                                                                                                                                                                                                                                                                                                                                                                             |
+| -------------------------------------------------------------- | -------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Cloudflare proxy read timeout, Traefik `responseHeaderTimeout` | **> 120 s**          | The upload routes' ceiling. Cloudflare's free-plan 100 s limit is _below_ it — raise it on a paid plan or lower the application ceiling deliberately.                                                                                                                                                                                                                               |
+| Cloudflare native upload ceiling                               | **Plan ceiling**     | This is not the application limit. The `max_upload` zone setting starts at 100 MB; an exact body-size WAF rule requires Enterprise.                                                                                                                                                                                                                                                 |
+| Traefik upload-route body limit                                | **12,582,912 bytes** | 12 MiB: one 10 MB document plus multipart framing, the same bound as `MAX_REQUEST_BODY_BYTES`. The buffering middleware rejects an oversized request with 413 before forwarding it to Bun. Images are capped far lower (1 MiB) by the application.                                                                                                                                  |
+| Bun/Elysia server-wide body limit                              | **12 MiB**           | `MAX_REQUEST_BODY_BYTES` (`lib/http/request.ts`) is the final origin-wide ceiling. It is broader than any single route's contract and does not replace the upload-specific Traefik rule.                                                                                                                                                                                            |
+| JSON routes                                                    | **1 MiB, in code**   | `MAX_JSON_BODY_BYTES` (`lib/http/request.ts`), enforced while the body streams and answered with a 413 in the API envelope. NOTHING is needed at the proxy for it — it is listed so a 413 on a non-upload path is not mistaken for a Traefik refusal. A route may raise its own with `maxJsonBodyBytes` in `routes.ts`; the published document states each route's effective bound. |
 
 Configure an upload-only Traefik router and attach this middleware through
 Coolify's custom labels:
@@ -786,10 +794,19 @@ direct origin access either way.
 
 Request ceilings, for reference:
 
-| Scope                                                 | Value | Where                                 |
-| ----------------------------------------------------- | ----- | ------------------------------------- |
-| Server-wide idle timeout                              | 60 s  | `IDLE_TIMEOUT_SECONDS` in `server.ts` |
-| `POST /api/upload/file`, `POST /api/dash/media/files` | 120 s | `timeoutSeconds` in `routes.ts`       |
+| Scope                             | Value | Where                                        |
+| --------------------------------- | ----- | -------------------------------------------- |
+| Server-wide idle timeout          | 60 s  | `IDLE_TIMEOUT_SECONDS` in `server.ts`        |
+| The six media routes listed below | 120 s | `MEDIA_ROUTE_TIMEOUT_SECONDS` in `routes.ts` |
+
+The six, every one of which calls R2 inside the request:
+
+- `POST /api/upload/file`
+- `POST /api/dash/media/files`
+- `DELETE /api/dash/media/files`
+- `POST /api/dash/media/files/:id/publish`
+- `POST /api/dash/media/files/:id/unpublish`
+- `DELETE /api/dash/media/folders/:id`
 
 **Neither number is measured on the target VPS** (`TODO.md` EM-1 — note that
 `TODO.md` is gitignored and therefore absent from a fresh clone, so every
@@ -817,15 +834,18 @@ Both are code defects being fixed, not settings; they are here because they set
 the floor on how much VPS this deployment needs and what a CPU alert will look
 like before then.
 
-The Traefik 1,114,112-byte limit is per **request**; the handler's 1 MiB per-file
-limit still applies separately. The 64 KiB allowance is for the multipart
-boundary and headers, not a second file. Test an exactly 1 MiB accepted file and
-the first rejected request through the deployed domain before enabling the rule.
+The Traefik 12,582,912-byte limit is per **request**; the per-file limits still
+apply separately inside the handler, and they are much lower — 1 MiB for an
+image, `MAX_DOCUMENT_SIZE_MB` (10 MB) for a document. The 2 MiB between 10 MB and
+12 MiB is the multipart boundary and header allowance, not a second file. Test an
+exactly-at-limit accepted file and the first rejected request through the
+deployed domain before enabling the rule.
 
 Traefik documents a 413 response when its buffering limit is exceeded. That
 response is outside the API envelope because the request is not forwarded to
 Elysia. Do not assume a direct Bun rejection has identical status/body behavior;
-the real-listener Windows probe reset the client connection above 8 MiB. Production
+the real-listener Windows probe reset the client connection above the configured
+`maxRequestBodySize` rather than answering 413. Production
 verification must go through Cloudflare and Traefik, and must confirm that no R2
 or database work occurs on rejection.
 
@@ -897,14 +917,14 @@ What it is now:
 - **Built once per process and frozen.** A repeat request serves cached bytes.
 - **`/api/dev/*` is filtered out of the document in production**
   (`toPublishedManifest`), so the document no longer undoes the decision
-  `app/api/dev/email-test/fixed/handler.ts` makes deliberately — 404 rather than
-  403, "indistinguishable from an unrouted path in every other mode".
+  `toRegisteredRoutes` makes deliberately — 404 rather than 403,
+  "indistinguishable from an unrouted path in every other mode".
 
 A Cloudflare rate-limiting rule is still worth having, but it is hardening now
 rather than the only control.
 
 **The coupling that made this unsafe to do alone is also closed.**
-`POST /api/upload/image` validated `?resource=` _before_ the session check, so an
+`POST /api/upload/file` validated `?resource=` _before_ the session check, so an
 unauthenticated caller got **400 for an unknown resource and 401 for a real page
 name** — harmless only while the document published those names to anyone.
 Closing the document without that would have turned the divergence into a working
@@ -992,7 +1012,8 @@ The bound is **derived** by `shutdownTimeoutMs()` in `lib/shutdown.ts`:
 Both terms matter — a route without its own `timeoutSeconds` may still run for the 60 s
 global ceiling. **If a 135 s deploy window is unacceptable, the lever is the
 route ceilings, not the bound.** Lowering the bound directly reintroduces the
-abort. Note that ONE route sits at 120 s (`/api/upload/image`), and below 75 s
+abort. Note that SIX routes sit at 120 s — the media routes listed in §5, all
+sharing `MEDIA_ROUTE_TIMEOUT_SECONDS` — and below 75 s
 the 60 s global ceiling becomes binding — meaning `IDLE_TIMEOUT_SECONDS` too. Both
 depend on the VPS measurement in `TODO.md` EM-1. `lib/shutdown.ts` owns the
 formula and `tests/unit/shutdown-coordinator.test.ts` asserts it, so changing a
@@ -1084,23 +1105,63 @@ a property of the Bun build — check it with the command in §8.
 
 ## 7. Configure health check
 
-| Field        | Value                 |
-| ------------ | --------------------- |
-| Enabled      | Yes                   |
-| Scheme       | `http`                |
-| Host         | `127.0.0.1`           |
-| Port         | `3000`                |
-| Method       | `GET`                 |
-| Path         | `/api/health/storage` |
-| Return code  | `200`                 |
-| Interval     | `30s`                 |
-| Timeout      | `5s`                  |
-| Retries      | `5`                   |
-| Start period | `30s`                 |
+**Type: CMD, not HTTP.** The route requires `x-maintenance-token` on every
+request and an HTTP-type check has no header field. A CMD check runs inside the
+container with the container's environment, so it can send the token the
+deployment already holds.
+
+| Field        | Value |
+| ------------ | ----- |
+| Enabled      | Yes   |
+| Type         | `CMD` |
+| Interval     | `30s` |
+| Timeout      | `5s`  |
+| Retries      | `5`   |
+| Start period | `30s` |
+
+Command:
+
+```sh
+curl -fsS -H "x-maintenance-token: $SQLITE_MAINTENANCE_TOKEN" "http://127.0.0.1:3000/api/health/storage" || exit 1
+```
+
+`curl` must exist in the image — the HTTP variant required it too.
+[Coolify health checks](https://coolify.io/docs/knowledge-base/health-checks).
+
+> ⚠️ **An HTTP-type check here marks the container unhealthy forever.** It sends
+> no token, so every poll answers 401 and `curl -f` reports that as a failure.
+> A deploy that never turns healthy while the log shows
+> `maintenance token rejected` with `reason: "absent"` is this mistake.
 
 The route opens (and on first call migrates) `rate-limit.db`, then reads back
-its PRAGMAs. It returns 200 `{"status":"ok"}` only when every check holds;
-otherwise 503 with the failing field visible in `checks`:
+its PRAGMAs. It returns 200 `{"status":"ok","checks":{...}}` only when every
+check holds, 503 `{"status":"degraded","checks":{...}}` when one fails, and 401
+`{"status":"unauthorized"}` to a caller without the token.
+
+**The WHOLE route requires `SQLITE_MAINTENANCE_TOKEN`**, not only `?deep=1`, and
+the variable is therefore REQUIRED in production (§3): an unset one makes the
+container permanently unhealthy, so the boot refuses instead of the probe.
+Two reasons for gating the cheap probe as well, and the second is the larger:
+
+- Naming the failing subsystem to the internet is a readiness probe telling an
+  attacker which dependency is down.
+- An anonymous probe needs a bound, and the only bound available here is
+  deployment-wide: `ipIdentifier` answers 503 without a trusted proxy header and
+  the container's own probe carries none, so a per-IP limiter would refuse
+  exactly the caller this route exists for. A shared budget is a restart switch
+  — spend it at 4 req/s and the orchestrator's own `curl -f` starts reading 429
+  — and it charged a SQLite write per poll, which is what the paragraph below
+  forbids. Authentication removes the need for either.
+
+To diagnose by hand, from inside the container:
+
+```bash
+curl -sS -H "x-maintenance-token: $SQLITE_MAINTENANCE_TOKEN" \
+  "http://127.0.0.1:3000/api/health/storage"
+# {"status":"degraded","checks":{...}}
+```
+
+The checks:
 
 | Check               | Requires                                                       |
 | ------------------- | -------------------------------------------------------------- |
@@ -1117,9 +1178,11 @@ usable yet not configured the way the limiter's latency and durability
 assumptions require.
 
 Deliberately cheap enough to poll every 30 s: **PRAGMA reads plus one
-`SELECT 1`.** It does not run `quick_check` and does not write to SQLite — either
-would put the health check in write-lock contention with the limiter. It reports status only: no paths, schema
-contents or row counts.
+`SELECT 1`.** It does not run `quick_check` and **does not write to SQLite** —
+either would put the health check in write-lock contention with the limiter,
+which has been measured blocking for over two seconds (§4). The route carries no
+limiter of its own for the same reason: a limiter charge IS a SQLite write. It
+reports status only: no paths, schema contents or row counts.
 
 **PostgreSQL is checked now.** `checks.postgres` is a bounded `SELECT 1` on the
 CHEAP path — not behind `?deep=1`, because a readiness probe that cannot see the
@@ -1161,11 +1224,12 @@ curl -fsS -H "x-maintenance-token: $SQLITE_MAINTENANCE_TOKEN" \
 # {"status":"ok","checks":{...,"quickCheck":true,"writable":true}}
 ```
 
-Set the UI **Return code** to `200` but do not rely on it for exact matching:
-Coolify's generated Nixpacks health command uses `curl -f` with a `wget`
-fallback and decides health from the command exit — it does not interpolate
-`health_check_return_code`. The external smoke test in §8 is what asserts the
-exact status. Confirm `curl` or `wget` exists in the image.
+**Return code** is not a field of a CMD check and never was load-bearing: even
+for the HTTP type, Coolify's generated Nixpacks command uses `curl -f` with a
+`wget` fallback and decides health from the command's exit status — it does not
+interpolate `health_check_return_code`. The command above is explicit about it
+(`-f` plus `|| exit 1`). The external smoke test in §8 is what asserts the exact
+status.
 [Health checks](https://coolify.io/docs/knowledge-base/health-checks) ·
 [generator source](https://github.com/coollabsio/coolify/blob/v4.x/app/Jobs/ApplicationDeploymentJob.php#L3239-L3283)
 
@@ -1307,12 +1371,13 @@ exist; a task still pointing at either will 404 on every run.
    nothing but a failing task every hour, and a failing task is exactly the
    alert you want to still mean something.
 2. `SQLITE_MAINTENANCE_TOKEN` stays. It now guards one surface only,
-   `GET /api/health/storage?deep=1`, and **must be at least 32 characters when
-   set** — `lib/env.server.ts` refuses to boot otherwise. The floor exists
+   `GET /api/health/storage` — the whole route — and **must be at least 32
+   characters** — `lib/env.server.ts` refuses to boot otherwise. The floor exists
    because the comparison short-circuits on length before its constant-time
    compare (it must; `timingSafeEqual` throws on a length mismatch), so a short
-   token leaks its own length before any content guessing. Leave the variable
-   unset to disable the deep probe entirely; the routes fail closed either way.
+   token leaks its own length before any content guessing. It is also REQUIRED in
+   production now: change the Coolify health check to the CMD form in §7 in the
+   same deploy, or the container will never report healthy.
 3. The `/api/internal/*` edge rules in §5 now match nothing. Keep them — they
    cost nothing and re-adding such a route without them would be silent.
 
@@ -1744,12 +1809,28 @@ The grant file also patches the permission copy that live sessions carry in
 administrator signed in before the migration sees the `media` page once their
 five-minute session cookie cache refreshes, rather than after a re-login.
 
+`002_media_trgm_indexes.sql` REPLACES an index rather than only adding one: it
+drops `idx_files_display_name_trgm` and creates
+`idx_files_display_name_active_trgm` in its place, because the old predicate
+excluded the rows the `unfiled` scope searches. On a database that already has
+the old index this is a `DROP INDEX` plus a GIN build, neither of them
+`CONCURRENTLY` (phase-2 files run as one implicit transaction), so `files` is
+write-locked for the build. It is a non-event on a `files` table of any size
+this deployment has now; if it ever runs against a large one, take the brief
+write pause into account or run the two statements by hand with
+`DROP INDEX CONCURRENTLY` / `CREATE INDEX CONCURRENTLY` before deploying.
+
 ### 13.5 Proxy limits
 
 `MAX_REQUEST_BODY_BYTES` is 12 MiB in code (10 MB documents plus multipart
 framing), and the upload-route Traefik buffering limit in §5 is set to the same
 12,582,912 bytes on both upload paths. Record the value actually applied on the
 proxy here when it is set.
+
+The 12 MiB reaches the two multipart routes only. Every JSON route stops at
+`MAX_JSON_BODY_BYTES` (1 MiB) inside the application, so a 413 on a non-upload
+path is the app's own envelope, not a proxy refusal — the two are told apart by
+whether the body carries the API envelope.
 
 ### 13.6 No CORS, no direct uploads
 
@@ -1771,8 +1852,11 @@ bucket CORS rule in the Cloudflare console — the API token cannot (measured
       strength claims** enabled with verification status **Verified** (§14).
 - [ ] Every secret scoped **runtime-only**; nothing in the "Must be absent"
       table present, especially `TEST_DATABASE_URL`.
-- [ ] `SQLITE_MAINTENANCE_TOKEN` generated with `openssl rand -hex 32`, or left
-      unset. A configured value below 32 characters refuses to boot (gate 4).
+- [ ] `SQLITE_MAINTENANCE_TOKEN` generated with `openssl rand -hex 32`.
+      Required in production; a value below 32 characters refuses to boot
+      (gate 4).
+- [ ] The health check is the **CMD** form in §7, carrying the token. An
+      HTTP-type check answers 401 on every poll and never turns healthy.
 - [ ] The `sqlite-expiry-sweep` and `postgres-retention-sweep` Coolify tasks
       **deleted** — both sweeps run in-process now and their routes are gone (§9).
 - [ ] Log alerting configured on `scheduled sweep failed`, on
@@ -1793,8 +1877,9 @@ bucket CORS rule in the Cloudflare console — the API token cannot (measured
 - [ ] `/openapi.json` optionally rate-limited at the edge — hardening now: the
       route is authenticated, `ip-limit`ed and built once (§5).
 - [ ] Proxy read timeout > 120 s; upload-only Traefik buffering limit set to
-      1,114,112 bytes and verified at both sides of the boundary; Cloudflare
-      plan ceiling/body-size capability recorded separately (§5).
+      12,582,912 bytes — the same value as `MAX_REQUEST_BODY_BYTES` (§5) — and
+      verified at both sides of the boundary; Cloudflare plan ceiling/body-size
+      capability recorded separately (§5).
 - [ ] Stop-first/rolling decision recorded; stop grace period **longer than the
       `shutdownTimeoutMs` in the startup log** (135 s today).
 - [ ] Health check passing on the canonical path (no trailing slash);

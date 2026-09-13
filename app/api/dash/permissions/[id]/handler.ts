@@ -1,8 +1,5 @@
 import type { Handler } from '@/lib/http/contract';
-import type {
-  DashboardPage,
-  PermissionAction,
-} from '@/lib/permissions/constants';
+import type { DashboardPage } from '@/lib/permissions/constants';
 
 import {
   and,
@@ -18,6 +15,7 @@ import { db, withTransaction } from '@/db';
 import { rolePermissions, roles, sessions, users } from '@/db/schema';
 import { validID } from '@/utils';
 import { auditLog, getAuditMeta } from '@/lib/audit';
+import { revokeSessionArtifacts } from '@/lib/auth/rotation';
 import { requirePermission } from '@/lib/http/session';
 import {
   CUSTOM_ROLE_VALUE,
@@ -253,7 +251,7 @@ export const PUT: Handler = async (ctx) => {
         const permissionsData = validatedData.permissions.map((p) => ({
           roleId: roleId,
           pageName: p.name,
-          permissions: p.permissions as Record<PermissionAction, boolean>,
+          permissions: p.permissions,
         }));
 
         const existingPermissions = await tx
@@ -346,14 +344,24 @@ export const PUT: Handler = async (ctx) => {
       });
 
       if (existingRole.isActive && validatedData.isActive === false) {
-        await tx.delete(sessions).where(
-          inArray(
-            sessions.userId,
-            tx
-              .select({ id: users.id })
-              .from(users)
-              .where(and(eq(users.roleId, roleId), isNull(users.deletedAt)))
+        const revoked = await tx
+          .delete(sessions)
+          .where(
+            inArray(
+              sessions.userId,
+              tx
+                .select({ id: users.id })
+                .from(users)
+                .where(and(eq(users.roleId, roleId), isNull(users.deletedAt)))
+            )
           )
+          .returning({ id: sessions.id });
+        // Deactivating the role revokes its holders' sessions; their
+        // re-authentication windows and two-factor proofs are keyed by session
+        // id and are unreachable once the session rows are gone.
+        await revokeSessionArtifacts(
+          tx,
+          revoked.map((session) => session.id)
         );
       } else if (
         permissionsChanged ||
@@ -509,8 +517,7 @@ export const DELETE: Handler = async (ctx) => {
         tableName: 'roles',
         recordId: roleId,
         // Same field set the UPDATE and custom-role events record, so a
-        // deleted role can be reconstructed from its own event: the snapshot
-        // used to omit isActive/scope/createdBy that every sibling kept.
+        // deleted role can be reconstructed from its own event alone.
         oldData: {
           auditVersion: PERMISSION_AUDIT_VERSION,
           scope: ROLE_SCOPE.STANDARD,

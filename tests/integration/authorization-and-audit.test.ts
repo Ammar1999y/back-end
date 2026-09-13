@@ -669,10 +669,11 @@ describe('an audit row written by an actual route mutation', () => {
 
 describe('the maintenance token — the accept path, and the compare that guards it', () => {
   /**
-   * Driven through `GET /api/health/storage?deep=1`, which is now the ONLY
-   * surface the token guards. The two `/api/internal/*` sweep routes it used to
-   * gate are gone — the sweeps run in-process (`lib/schedule.ts`), which is what
-   * removed them from the unauthenticated route table entirely.
+   * Driven through `GET /api/health/storage`, which is now the ONLY surface the
+   * token guards — and it guards the whole route, not just `?deep=1`. The two
+   * `/api/internal/*` sweep routes it used to gate are gone — the sweeps run
+   * in-process (`lib/schedule.ts`), which is what removed them from the
+   * unauthenticated route table entirely.
    *
    * The compare itself is unchanged and shared, so this still covers it: the
    * route calls the same `maintenanceTokenMatches`.
@@ -757,10 +758,26 @@ describe('the maintenance token — the accept path, and the compare that guards
     expect(body.checks?.writable).toBe(true);
   });
 
-  test('the cheap probe needs no token and does not run the deep checks', async () => {
+  test('the CHEAP probe refuses an anonymous caller too, in the same shape', async () => {
     const response = await app.handle(
       new Request('http://localhost/api/health/storage', {
         headers: baseHeaders(),
+      })
+    );
+    const body = (await response.json()) as Record<string, unknown>;
+
+    // The gate is the whole route. An anonymous caller used to get
+    // `{status:'ok'}` plus a deployment-wide poll budget whose exhaustion made
+    // the orchestrator's own probe read 429 — a restart switch with no
+    // credentials. Nothing here is reachable without the token now.
+    expect(response.status).toBe(HTTP_STATUS.UNAUTHORIZED);
+    expect(body).toEqual({ status: 'unauthorized' });
+  });
+
+  test('the token answers the CHEAP probe with the breakdown, without the deep checks', async () => {
+    const response = await app.handle(
+      new Request('http://localhost/api/health/storage', {
+        headers: baseHeaders({ 'x-maintenance-token': configured }),
       })
     );
     const body = (await response.json()) as {
@@ -768,6 +785,8 @@ describe('the maintenance token — the accept path, and the compare that guards
     };
 
     expect(response.status).toBe(HTTP_STATUS.OK);
+    expect(body.checks?.journalModeWal).toBe(true);
+    expect(body.checks?.postgres).toBe(true);
     expect(body.checks).not.toHaveProperty('quickCheck');
     expect(body.checks).not.toHaveProperty('writable');
   });

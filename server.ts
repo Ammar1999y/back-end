@@ -112,8 +112,8 @@ assertBunVersion();
 assertSqliteVersion();
 
 // Only now. Everything below this line reads a validated NODE_ENV.
-const { app, MAX_REQUEST_BODY_BYTES, MAX_ROUTE_TIMEOUT_SECONDS } =
-  await import('./app');
+const { app, MAX_ROUTE_TIMEOUT_SECONDS } = await import('./app');
+const { MAX_REQUEST_BODY_BYTES } = await import('./lib/http/request');
 const { drainAfterResponse, pendingAfterResponse } =
   await import('./lib/http/after-response');
 const { closeRateLimitStore } = await import('./lib/rate-limit/store');

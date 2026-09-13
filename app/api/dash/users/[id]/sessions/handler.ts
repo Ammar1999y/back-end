@@ -10,6 +10,7 @@ import { roles, sessions, users } from '@/db/schema';
 import { validID } from '@/utils';
 import * as z from 'zod';
 import { auditLog, getAuditMeta } from '@/lib/audit';
+import { revokeSessionArtifacts } from '@/lib/auth/rotation';
 import { requirePermission } from '@/lib/http/session';
 import { validateRolePermissionScope } from '@/lib/permissions/utils';
 import { enforceRateLimit, userIdentifier } from '@/lib/rate-limit';
@@ -89,6 +90,7 @@ async function authorizeSessionAccess(
     session,
     userId: currentUserId,
     sessionId: currentSessionId,
+    roleId: actorRoleId,
     scope: editScope,
     permissions: actorPermissions,
   } = await requirePermission(ctx, {
@@ -112,7 +114,9 @@ async function authorizeSessionAccess(
   if (!isSelf && !editScope)
     throw new CustomError(MSG_INSUFFICIENT_PERMISSIONS, HTTP_STATUS.FORBIDDEN);
 
-  if (isSelf && !session.user.roleId)
+  // `edit` forces the database read, so this is the live role id rather than
+  // the cookie-cached `session.user.roleId`.
+  if (isSelf && !actorRoleId)
     throw new CustomError(MSG_INSUFFICIENT_PERMISSIONS, HTTP_STATUS.FORBIDDEN);
 
   return {
@@ -314,6 +318,13 @@ export const DELETE: Handler = async (ctx) => {
           )
         )
         .returning({ id: sessions.id });
+
+      // The revoked sessions' re-authentication windows and two-factor proofs
+      // go with them; nothing can reach those rows once the session is gone.
+      await revokeSessionArtifacts(
+        tx,
+        deleted.map((s) => s.id)
+      );
 
       if (deleted.length > 0) {
         await auditLog(tx, {

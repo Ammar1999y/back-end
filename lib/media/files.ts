@@ -113,6 +113,15 @@ async function lockFilesForEdit(
   );
   if (editable.length !== wanted.length)
     throw new CustomError(mediaMsg.fileNotFound, HTTP_STATUS.NOT_FOUND);
+  // AFTER the disclosure gate above, and 409 rather than 404: the caller can
+  // already see this file, so the honest answer is that it is busy. A visibility
+  // transition copies the object to the other bucket with the row's CURRENT name
+  // in its `Content-Disposition` (`targetHeaders`), so a rename that lands
+  // mid-transition leaves the copy serving the old name while the row and every
+  // newly signed download use the new one. `changeVisibility` refuses the same
+  // state from the other side.
+  if (editable.some((row) => row.transition))
+    throw new CustomError(mediaMsg.fileBusy, HTTP_STATUS.CONFLICT);
   return editable;
 }
 

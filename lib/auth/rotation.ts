@@ -4,6 +4,7 @@ import type { EntityID } from '@/types';
 
 import { and, eq, inArray, like, ne, sql } from 'drizzle-orm';
 
+import { db } from '@/db';
 import {
   accounts,
   sessions,
@@ -44,6 +45,38 @@ import { auditLog } from '@/lib/audit';
  * a user. They are single-use, short-lived, and useless without the challenge
  * cookie the browser holds, so they are left to the retention sweep.
  */
+/**
+ * The `verifications` rows keyed by SESSION id: the two-factor proof and both
+ * re-authentication windows.
+ *
+ * Reachable only THROUGH the session id — none of the three stores the user id —
+ * so a session deleted without them leaves rows nothing can find again until
+ * they expire. Every path that deletes a session owes this call.
+ *
+ * Two kinds of path do, and both are bound to it rather than trusted to remember:
+ * this codebase's own deletes call it inside their transaction, and Better Auth's
+ * — `/sign-out`, a revoked session, an expired row the library reaps — reach it
+ * through the `session.delete.after` database hook in `lib/auth.ts`. That hook is
+ * why the executor is widened: it runs after the library's transaction has
+ * committed, so what it has is the pool.
+ */
+export async function revokeSessionArtifacts(
+  tx: Tx | typeof db,
+  sessionIds: readonly string[]
+): Promise<void> {
+  if (sessionIds.length === 0) return;
+  await tx.delete(verifications).where(
+    inArray(
+      verifications.identifier,
+      sessionIds.flatMap((id) => [
+        `2fa-proven-${id}`,
+        `reauth-method-${id}`,
+        `reauth-passkey-${id}`,
+      ])
+    )
+  );
+}
+
 async function revokeVerificationArtifacts(
   tx: Tx,
   userId: EntityID
@@ -76,21 +109,18 @@ async function revokeVerificationArtifacts(
   // matters here. Method removal deliberately KEEPS the caller's session, so a
   // surviving marker lets that same session mint a new trusted device
   // immediately after the revocation below removed the old ones.
+  //
+  // This reaches the SURVIVING sessions only. A session already deleted by this
+  // rotation is no longer here to be found, which is why every delete carries
+  // `revokeSessionArtifacts` itself rather than relying on call order.
   const owned = await tx
     .select({ id: sessions.id })
     .from(sessions)
     .where(eq(sessions.userId, userId));
-  if (owned.length > 0)
-    await tx.delete(verifications).where(
-      inArray(
-        verifications.identifier,
-        owned.flatMap((session) => [
-          `2fa-proven-${session.id}`,
-          `reauth-method-${session.id}`,
-          `reauth-passkey-${session.id}`,
-        ])
-      )
-    );
+  await revokeSessionArtifacts(
+    tx,
+    owned.map((session) => session.id)
+  );
 }
 
 /**
@@ -115,13 +145,18 @@ export async function revokeOtherSessions(
   userId: EntityID,
   keepSessionId?: string | null
 ): Promise<void> {
-  await tx
+  const removed = await tx
     .delete(sessions)
     .where(
       keepSessionId
         ? and(eq(sessions.userId, userId), ne(sessions.id, keepSessionId))
         : eq(sessions.userId, userId)
-    );
+    )
+    .returning({ id: sessions.id });
+  await revokeSessionArtifacts(
+    tx,
+    removed.map((session) => session.id)
+  );
 }
 
 /**

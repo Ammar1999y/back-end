@@ -229,6 +229,11 @@ async function drive(mode: Mode, port: number, tls: boolean): Promise<void> {
         host: '127.0.0.1',
         port,
         secure: tls,
+        // `lib/smtp.ts` refuses a transport with no TLS guarantee, so the
+        // plaintext peers have to say so: these speak the protocol phases,
+        // which is what the deadline is measured against, and nothing
+        // production sends ever reaches them.
+        ...(!tls && { ignoreTLS: true }),
         // The peer's own certificate as the trust root, rather than disabling
         // verification: the deadline is what this fixture measures, and a
         // handshake that skips validation is not the handshake production runs.

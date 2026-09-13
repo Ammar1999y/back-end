@@ -23,6 +23,7 @@
  * before wildcards regardless of registration order, which is why
  * `/api/dash/users/me/...` still wins over `/api/dash/users/:id`.
  */
+import type { FilterColumnSpecs } from '@/lib/data-table/column-specs';
 import type { RouteDefinition, RoutePrefix } from '@/lib/http/route-manifest';
 
 import * as authForgotComplete from '@/app/api/auth/forgot-password/complete/handler';
@@ -63,11 +64,22 @@ import * as uploadFile from '@/app/api/upload/file/handler';
 import { UUID_V7_PATTERN } from '@/utils';
 import { BETTER_AUTH_ENDPOINTS } from '@/lib/auth/allowed-paths';
 import {
+  describeFilterColumns,
+  filterColumnIds,
+} from '@/lib/data-table/column-specs';
+import { dataTableConfig } from '@/lib/data-table/config';
+import {
+  DEFAULT_PER_PAGE,
+  MAX_FILTER_ITEMS,
+  MAX_FILTER_VALUES,
   MAX_FILTERS_RAW_LENGTH,
+  MAX_ID_LENGTH,
   MAX_PAGE,
   MAX_PER_PAGE,
   MAX_SEARCH_LENGTH,
+  MAX_SORT_ITEMS,
   MAX_SORT_RAW_LENGTH,
+  MAX_VALUE_LENGTH,
   MIN_SEARCH_LENGTH,
 } from '@/lib/data-table/parsers';
 import { openApiRouteHandler } from '@/lib/http/openapi';
@@ -81,13 +93,50 @@ import { PURPOSE_NAME_MAX, PURPOSE_NAME_PATTERN } from '@/lib/media/policy';
 // property above holds.
 import { DASHBOARD_PAGE_NAMES } from '@/lib/permissions/constants';
 
+import { FOLDER_RECURSIVE_DELETE_MAX } from '@/utils/validation/constants';
+
+/**
+ * The idle-timeout ceiling for the media routes that call R2 in the request.
+ *
+ * A CHOSEN bound, not a derived worst case, and the distinction matters because
+ * this comment used to claim the second. The arithmetic runs past 120 s: the
+ * visibility saga makes three R2 calls before the flip and a fourth plus a purge
+ * after it (`lib/media/visibility.ts`), which at the client's 45 s per call —
+ * `maxAttempts` 3 × a 15 s request timeout — plus the purge module's own 25 s
+ * budget is 205 s; a two-bucket bulk delete (`lib/media/lifecycle.ts`) is
+ * 2 × (45 + 25) = 140 s.
+ *
+ * 120 s covers the healthy path with a wide margin and is deliberately short of
+ * those numbers. Past it the connection is dropped with the destructive half
+ * already logged, and the remainder is left to the retention sweep — which is
+ * the accepted residual risk, not an oversight. The global ceiling
+ * (`IDLE_TIMEOUT_SECONDS`, 60 s) is what this replaces: it dropped the
+ * connection mid-operation on the healthy path.
+ *
+ * SIX routes carry it, and the count is load-bearing: it is the largest term in
+ * `MAX_ROUTE_TIMEOUT_SECONDS`, which sets the shutdown drain window
+ * (`lib/shutdown.ts`). Raising it lengthens every deploy.
+ */
+const MEDIA_ROUTE_TIMEOUT_SECONDS = 120;
+
+/**
+ * The list-query parameters for one route, DERIVED from the descriptor map the
+ * handler actually enforces.
+ *
+ * It used to take a hand-written comma-separated string of column ids, kept
+ * beside the real map rather than taken from it, and published none of the item
+ * or value caps — so the document accepted a 21-filter request the runtime
+ * answers 422 to, and a column added to one list and not the other was
+ * invisible. `specs` is the same object passed to `parseDataTableParams`, so
+ * the two cannot disagree.
+ */
 const dataTableQuery = (
-  columns: string
+  specs: FilterColumnSpecs
 ): NonNullable<RouteDefinition['query']> => [
   {
     name: 'maxPerPage',
     required: false,
-    description: 'Upper bound applied to perPage for this request.',
+    description: `Upper bound applied to perPage for this request. Lowering it below the default (${DEFAULT_PER_PAGE}) also lowers the page size used when perPage is omitted.`,
     type: 'integer',
     minimum: 1,
     maximum: MAX_PER_PAGE,
@@ -104,8 +153,7 @@ const dataTableQuery = (
     name: 'perPage',
     required: false,
     // A dependency between two parameters, which no OpenAPI keyword expresses.
-    description:
-      'Rows per page. A `maxPerPage` on the same request lowers this ceiling; a value above the effective ceiling is rejected, not clamped.',
+    description: `Rows per page, defaulting to ${DEFAULT_PER_PAGE}. A \`maxPerPage\` on the same request lowers this ceiling; a value above the effective ceiling is rejected, not clamped.`,
     type: 'integer',
     minimum: 1,
     maximum: MAX_PER_PAGE,
@@ -113,21 +161,21 @@ const dataTableQuery = (
   {
     name: 'sort',
     required: false,
-    description: `JSON array of { id, desc } objects. Allowed ids: ${columns}.`,
+    description: `JSON array of { id, desc } objects, at most ${MAX_SORT_ITEMS}, each id at most ${MAX_ID_LENGTH} characters. An id outside the list below is ignored and the route's default sort applies. Allowed ids: ${filterColumnIds(specs)}.`,
     maxLength: MAX_SORT_RAW_LENGTH,
     example: '[{"id":"createdAt","desc":true}]',
   },
   {
     name: 'filters',
     required: false,
-    description: `JSON array of { id, value, variant, operator, filterId } objects. Allowed ids: ${columns}.`,
+    description: `JSON array of { id, value, variant, operator, filterId } objects, at most ${MAX_FILTER_ITEMS}; \`id\` and \`filterId\` at most ${MAX_ID_LENGTH} characters, each value at most ${MAX_VALUE_LENGTH}, and at most ${MAX_FILTER_VALUES} values in one filter. An unknown id, or an operator the column's type does not accept, is a 422. Columns: ${describeFilterColumns(specs, MIN_SEARCH_LENGTH)}.`,
     maxLength: MAX_FILTERS_RAW_LENGTH,
   },
   {
     name: 'joinOperator',
     required: false,
     description: 'How multiple structured filters are combined.',
-    enum: ['and', 'or'],
+    enum: [...dataTableConfig.joinOperators],
   },
   // No `maxLength`, unlike the parameters above: this is the one the parser
   // ignores rather than rejects, and a bound the server does not enforce makes
@@ -235,9 +283,7 @@ export const ROUTES: readonly RouteDefinition[] = [
     handlerRateLimit: true,
     body: 'none',
     response: 'envelope',
-    query: dataTableQuery(
-      'roleName, description, isActive, createdAt, updatedAt'
-    ),
+    query: dataTableQuery(dashPermissions.PERMISSIONS_FILTER_COLUMNS),
   },
   {
     method: 'POST',
@@ -363,7 +409,7 @@ export const ROUTES: readonly RouteDefinition[] = [
     handlerRateLimit: true,
     body: 'none',
     response: 'envelope',
-    query: dataTableQuery('name, email, isActive, createdAt, updatedAt'),
+    query: dataTableQuery(dashUsers.USERS_FILTER_COLUMNS),
   },
   {
     method: 'POST',
@@ -504,9 +550,7 @@ export const ROUTES: readonly RouteDefinition[] = [
           '`folder` (default) lists one folder with its breadcrumbs and subfolders; `all` searches every library file and, when `search` is given, folder names; `unfiled` lists active files in no folder that no record references, which are deleted `retentionDays` after they were first found unfiled unless moved into a folder.',
         enum: dashMedia.MEDIA_SCOPES,
       },
-      ...dataTableQuery(
-        'displayName, sizeBytes, mimeType, kind, bucketType, createdAt, updatedAt'
-      ),
+      ...dataTableQuery(dashMedia.MEDIA_FILTER_COLUMNS),
     ],
   },
   {
@@ -529,9 +573,8 @@ export const ROUTES: readonly RouteDefinition[] = [
         pattern: UUID_V7_PATTERN,
       },
     ],
-    // Image processing may outlast the global ceiling; timing out here drops
-    // the connection without an error body.
-    timeoutSeconds: 120,
+    // Image processing, then the upload itself; same ceiling, same reasoning.
+    timeoutSeconds: MEDIA_ROUTE_TIMEOUT_SECONDS,
   },
   {
     method: 'PUT',
@@ -554,6 +597,7 @@ export const ROUTES: readonly RouteDefinition[] = [
     handlerRateLimit: true,
     body: 'json',
     response: 'envelope',
+    timeoutSeconds: MEDIA_ROUTE_TIMEOUT_SECONDS,
   },
   {
     method: 'GET',
@@ -587,6 +631,7 @@ export const ROUTES: readonly RouteDefinition[] = [
     handlerRateLimit: true,
     body: 'none',
     response: 'envelope',
+    timeoutSeconds: MEDIA_ROUTE_TIMEOUT_SECONDS,
   },
   {
     method: 'POST',
@@ -598,6 +643,7 @@ export const ROUTES: readonly RouteDefinition[] = [
     handlerRateLimit: true,
     body: 'none',
     response: 'envelope',
+    timeoutSeconds: MEDIA_ROUTE_TIMEOUT_SECONDS,
   },
   {
     method: 'POST',
@@ -631,12 +677,12 @@ export const ROUTES: readonly RouteDefinition[] = [
     handlerRateLimit: true,
     body: 'none',
     response: 'envelope',
+    timeoutSeconds: MEDIA_ROUTE_TIMEOUT_SECONDS,
     query: [
       {
         name: 'recursive',
         required: false,
-        description:
-          'Delete the folder with everything under it, up to `FOLDER_RECURSIVE_DELETE_MAX` descendants. Omitted, only an empty folder is deleted.',
+        description: `Delete the folder with everything under it, up to ${FOLDER_RECURSIVE_DELETE_MAX} descendants — subfolders plus their files, not counting the folder itself. Omitted, only an empty folder is deleted.`,
         enum: ['true', 'false'],
       },
     ],
@@ -674,17 +720,21 @@ export const ROUTES: readonly RouteDefinition[] = [
         name: 'purpose',
         required: false,
         description:
-          'A purpose declared in code for this resource (`UPLOAD_PURPOSES`), which decides the bucket and the admitted kinds. Omitted: private, any admitted kind.',
+          'One of the purposes this deployment declares for the resource above; it decides which bucket the file goes to and which kinds are admitted. Omitted: private, any admitted kind.',
         maxLength: PURPOSE_NAME_MAX,
         pattern: PURPOSE_NAME_PATTERN,
       },
     ],
-    // Image processing may outlast the global ceiling; timing out here drops
-    // the connection without an error body.
-    timeoutSeconds: 120,
+    // Image processing, then the upload itself; same ceiling, same reasoning.
+    timeoutSeconds: MEDIA_ROUTE_TIMEOUT_SECONDS,
   },
 
   // ---- operations ---------------------------------------------------------
+  // `preAuth: 'none'` and no handler limiter, and neither is an omission: the
+  // handler refuses every request without `x-maintenance-token` before it
+  // touches a store, and a per-IP limiter would answer 503 to the container's
+  // own probe, which carries no trusted proxy header. `auth: 'public'` says
+  // "no session", which is what this table can express — the gate is the token.
   {
     method: 'GET',
     path: '/api/health/storage',
@@ -765,6 +815,11 @@ export const REGISTERED_ROUTES = toRegisteredRoutes(ROUTES);
 export const ROUTE_PREFIXES: readonly RoutePrefix[] = [
   {
     prefix: '/api/auth',
+    // Better Auth reads every path it serves as TEXT — JSON, or the
+    // URL-encoded form its sign-in also accepts. Nothing under here takes a
+    // file, so the prefix takes the parsed-into-memory ceiling and a caller
+    // cannot claim the upload allowance on `/sign-in/email`.
+    body: 'json',
     paths: BETTER_AUTH_ENDPOINTS,
   },
 ];

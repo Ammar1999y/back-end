@@ -1,5 +1,5 @@
 /**
- * The S3 changes in the Bun 1.4 release notes that `docs/bun-s3.md` does not
+ * The S3 changes in the Bun 1.4 release notes that the Bun S3 docs (https://bun.com/docs/runtime/s3) does not
  * cover.
  *
  * The guide in `docs/` documents the API as it stands; the release post

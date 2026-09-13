@@ -8,6 +8,7 @@
  * whichever route ran first.
  */
 import { beforeAll, describe, expect, test } from 'bun:test';
+import { createHash } from 'node:crypto';
 
 import { sql } from 'drizzle-orm';
 
@@ -261,6 +262,10 @@ describe('boundary overrides and their reset', () => {
   });
 });
 
+/** `uploadToR2` requires the digest of what it is sending. */
+const digestOf = (body: string): string =>
+  createHash('sha256').update(body).digest('hex');
+
 describe('object-store boundary', () => {
   // Its own boundary, because the `fetch` router cannot see this one: the AWS SDK
   // resolves `NodeHttpHandler` — `node:http`, not `fetch` — so a guard installed
@@ -274,6 +279,7 @@ describe('object-store boundary', () => {
       key: 'harness/one.png',
       bucketType: 'public',
       contentType: 'image/png',
+      sha256: digestOf('harness-bytes'),
     });
 
     expect(result).toEqual({ success: true, key: 'harness/one.png' });
@@ -302,6 +308,7 @@ describe('object-store boundary', () => {
         key: 'harness/two.png',
         bucketType: 'public',
         contentType: 'image/png',
+        sha256: digestOf('x'),
       })
     ).rejects.toThrow(/injected PutObject failure/);
 
@@ -320,6 +327,7 @@ describe('object-store boundary', () => {
       key: 'harness/three.png',
       bucketType: 'public',
       contentType: 'image/png',
+      sha256: digestOf('bytes'),
     });
     await deleteFromR2({ key: 'harness/three.png', bucketType: 'public' });
 

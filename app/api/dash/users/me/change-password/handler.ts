@@ -10,7 +10,7 @@ import { auditLog, getAuditMeta } from '@/lib/audit';
 import { requireReauthWindow } from '@/lib/auth/admin-reauth';
 import { checkPasswordCompromise } from '@/lib/auth/check-password';
 import { LoginRejected, verifyLoginAttempt } from '@/lib/auth/login-guard';
-import { hashPassword } from '@/lib/auth/password';
+import { hashPassword, verifyPassword } from '@/lib/auth/password';
 import { revokeOtherSessions, revokePendingProofs } from '@/lib/auth/rotation';
 import { verifyTurnstileRequest } from '@/lib/captcha';
 import { requireSession } from '@/lib/http/session';
@@ -56,6 +56,11 @@ export const POST: Handler = async (ctx) => {
         HTTP_STATUS.UNPROCESSABLE
       );
 
+    // Covers the `currentPassword` branch only — that value is verified against
+    // the stored hash below, so plaintext equality with it IS equality with the
+    // stored password, at no Argon2 cost. The re-authentication branch supplies
+    // no plaintext to compare against and is checked against the hash instead;
+    // see below.
     if (parsed.data.currentPassword === parsed.data.newPassword)
       throw new CustomError(
         userMsg.newPasswordSameAsCurrent,
@@ -86,6 +91,29 @@ export const POST: Handler = async (ctx) => {
             userMsg.passwordUpdateFailed,
             HTTP_STATUS.BAD_REQUEST
           );
+
+        // The same rule the branch above enforces on plaintext, against the
+        // only thing this branch has: the stored hash. Without it an open
+        // re-authentication window let a caller submit their EXISTING password
+        // as `newPassword`, and the route rehashed it, revoked every other
+        // session and every pending proof, and audited `passwordChanged: true`
+        // for a change that did not happen. `change-email` and `change-phone`
+        // both compare the new value against the STORED one for this reason;
+        // this route compared against the supplied one, which is absent here.
+        //
+        // One Argon2 verify, which is what the other branch already spends
+        // inside `verifyLoginAttempt` — so both branches cost the same.
+        if (
+          await verifyPassword({
+            hash: credential.expectedHash,
+            password: parsed.data.newPassword,
+          })
+        )
+          throw new CustomError(
+            userMsg.newPasswordSameAsCurrent,
+            HTTP_STATUS.BAD_REQUEST
+          );
+
         passwordProof = {
           accountId: credential.accountId,
           expectedHash: credential.expectedHash,

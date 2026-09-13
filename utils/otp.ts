@@ -384,11 +384,19 @@ async function sendOtpEmail(email: string, code: string, purpose: OtpPurpose) {
     throw new CustomError(MSG_EMAIL_SEND_FAILED, HTTP_STATUS.INTERNAL_ERROR);
   }
 
-  if (!info.messageId) {
+  // The outcome that can actually occur. `messageId` is assigned on every
+  // success by the SMTP transport and typed `string`, so testing it proved
+  // nothing; a per-recipient refusal is the real "sent, but nowhere" case — the
+  // transport resolves with the message accepted for some recipients and
+  // rejected for others, and this send has exactly one.
+  if (info.rejected && info.rejected.length > 0) {
     console.error(
       sanitizeForLog({
         msg: 'otp.provider.rejected',
         channel: 'email',
+        // A count, never the address: this function's whole contract is that
+        // nothing provider- or payload-derived leaves it.
+        rejected: info.rejected.length,
       })
     );
     throw new CustomError(MSG_EMAIL_SEND_FAILED, HTTP_STATUS.INTERNAL_ERROR);
@@ -409,22 +417,17 @@ async function sendOtpEmail(email: string, code: string, purpose: OtpPurpose) {
  *  - the outward message must be a member of `SAFE_DELIVERY_MESSAGES`;
  *    anything else is replaced, including a `CustomError` carrying text a
  *    future sender chose;
- *  - `smsMessage` is invoked INSIDE the boundary. Evaluating it in the caller
- *    handed the OTP to a caller-supplied callback outside this `try`, so a
- *    throw from it bypassed the boundary entirely.
+ *  - the outbound text is built INSIDE the boundary, so nothing that composes
+ *    it can throw past this `try`.
  */
 async function sendOtp(
   channel: OtpChannel,
   identifier: string,
   code: string,
-  purpose: OtpPurpose,
-  smsMessage?: (code: string) => string
+  purpose: OtpPurpose
 ) {
   try {
-    const text =
-      channel === 'sms'
-        ? (smsMessage?.(code) ?? otpTextFor(purpose, code))
-        : otpTextFor(purpose, code);
+    const text = otpTextFor(purpose, code);
     if (OTP_DELIVERY_OUTBOX) {
       recordOutboxDelivery({
         channel,
@@ -490,8 +493,6 @@ interface ProcessOtpSendOptions {
   sendTo: string;
   /** Localized entity label used in error messages */
   entityName: string;
-  /** Optional custom SMS message. Receives the OTP code as argument */
-  smsMessage?: (code: string) => string;
   /**
    * Hands the provider call to the caller to run AFTER its response is on the
    * wire. Every HTTP caller passes one; without it the delivery is awaited
@@ -559,7 +560,6 @@ export async function processOtpSend({
   targetIdentifier = null,
   sendTo,
   entityName,
-  smsMessage,
   deferDelivery,
 }: ProcessOtpSendOptions): Promise<ProcessOtpSendResult> {
   // The session row is keyed on what is being proven, not on the transport.
@@ -781,7 +781,7 @@ export async function processOtpSend({
     throw new CustomError(MSG_OTP_SEND_FAILED, HTTP_STATUS.INTERNAL_ERROR);
   const deliver = async () => {
     try {
-      await sendOtp(channel, sendTo, otpCode, purpose, smsMessage);
+      await sendOtp(channel, sendTo, otpCode, purpose);
     } catch (error) {
       try {
         await refundFailedDelivery(result.sessionId, hashedCode);

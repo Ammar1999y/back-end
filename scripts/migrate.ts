@@ -1,5 +1,5 @@
 /**
- * Apply every pending migration to the database in `DATABASE_URL`, in two
+ * Apply every pending migration to the database in `DATABASE_URL`, in three
  * phases, with one command: `bun run db:migrate`.
  *
  * **Phase 1 — `db/drizzle/`, the generated migrations.** This replaces
@@ -31,9 +31,25 @@
  * inside a transaction block, so it needs a file of its own containing that
  * single statement.
  *
+ * **Phase 3 — the referrer contract.** Every table that references `files` must
+ * use the composite `(file_id, file_status)` key. A plain `file_id -> files(id)`
+ * key is invisible to `unreferenced()` and blocks only the FINAL row delete,
+ * which `finishDeleting` reaches after the object is already destroyed. A new
+ * referrer can only arrive through a migration, so this is where it is caught:
+ * the integration tier asserts the same rule, but a deployment that never ran
+ * the suite would otherwise install the schema that loses bytes.
+ *
+ * **One advisory lock around all three.** Both migration phases read what is
+ * pending before either transaction begins, so two processes starting together
+ * both see the same set: the second waits on the DDL, replays it, fails, and
+ * rolls back. Harmless with one maintenance shell, a crash loop from a
+ * multi-replica entrypoint.
+ *
  * Reads `process.env.DATABASE_URL` directly rather than importing
  * `@/lib/env.server`: migrating a database must not require a password pepper
- * keyring, a Turnstile secret or a session signing key to be configured.
+ * keyring, a Turnstile secret or a session signing key to be configured. The
+ * two modules phase 3 imports are leaves for the same reason — a registry
+ * literal and a pure catalog check, neither of which opens a connection.
  */
 import { SQL } from 'bun';
 import { readdir, readFile } from 'node:fs/promises';
@@ -42,6 +58,9 @@ import { fileURLToPath } from 'node:url';
 
 import { drizzle } from 'drizzle-orm/bun-sql';
 import { migrate } from 'drizzle-orm/bun-sql/migrator';
+
+import { referrerContractViolations } from '../lib/media/referrer-contract';
+import { registeredFileColumns } from '../lib/media/usage-sources';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const DRIZZLE_DIR = path.join(HERE, '..', 'db', 'drizzle');
@@ -71,9 +90,23 @@ async function sqlFilesInOrder(): Promise<string[]> {
 // the pool, so a second one would only be another thing to close.
 const client = new SQL(connectionString, { max: 1 });
 
+/**
+ * An arbitrary constant, and the only thing that makes two migrators serialize.
+ * Any other holder of this exact number would deadlock with them, so it is
+ * declared next to its only use rather than in a shared constants file where a
+ * second caller could quietly adopt it.
+ */
+const MIGRATION_LOCK_KEY = 8_421_337_104_552_113n;
+
 try {
   const [target] = await client`select current_database() as db`;
   console.log(`database: ${(target as { db: string }).db}\n`);
+
+  // Blocking, not `try_advisory_lock`: a concurrent migrator is something to
+  // WAIT for, and refusing would turn a rolling deploy into a failed release.
+  process.stdout.write('migration lock ... ');
+  await client`select pg_advisory_lock(${MIGRATION_LOCK_KEY})`;
+  console.log('acquired');
 
   process.stdout.write('drizzle migrations ... ');
   await migrate(drizzle({ client }), { migrationsFolder: DRIZZLE_DIR });
@@ -90,10 +123,29 @@ try {
     console.log('ok');
   }
 
+  process.stdout.write('referrer contract ... ');
+  const violations = await referrerContractViolations(
+    (statement) => client.unsafe(statement),
+    registeredFileColumns()
+  );
+  if (violations.length > 0)
+    throw new Error(
+      'foreign keys into files break the referrer contract, so deleting one ' +
+        'would destroy the object before PostgreSQL refuses the row: ' +
+        violations.join('; ')
+    );
+  console.log('ok');
+
   console.log(`\nup to date (${files.length} hand-written file(s) applied).`);
 } catch (error) {
   console.error('\nFAILED:', error instanceof Error ? error.message : error);
   process.exitCode = 1;
 } finally {
+  // Before the close, and tolerant of never having been taken: the connection
+  // dying releases it anyway, but an explicit release keeps a pooled backend
+  // from carrying the lock into whatever reuses it.
+  await client`select pg_advisory_unlock(${MIGRATION_LOCK_KEY})`.catch(
+    () => []
+  );
   await client.close();
 }

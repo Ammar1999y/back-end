@@ -237,9 +237,13 @@ export async function deleteFiles(params: {
       );
       if (visible.length !== ids.length)
         throw new CustomError(mediaMsg.fileNotFound, HTTP_STATUS.NOT_FOUND);
-      // A row mid-transition or already deleting: the two sagas must not
-      // interleave, and a repeat of a delete in flight has nothing to add.
-      if (visible.some((row) => row.status === 'deleting' || row.transition))
+      // Anything but `active`: the two sagas must not interleave, a repeat of a
+      // delete in flight has nothing to add, and a `pending` row is an upload
+      // still in progress — deleting its row lets the PUT that follows write an
+      // object nothing owns, discoverable only by reconciliation. The folder
+      // path and `lockFilesForEdit` both already demand `active`; this one
+      // named the two states it had seen instead.
+      if (visible.some((row) => row.status !== 'active' || row.transition))
         throw new CustomError(mediaMsg.fileBusy, HTTP_STATUS.CONFLICT);
 
       await tx

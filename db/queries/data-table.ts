@@ -1,6 +1,6 @@
 import type { FilterColumnSpecs } from '@/lib/data-table/column-specs';
 import type { ExtendedColumnSort } from '@/types/data-table';
-import type { AnyColumn, SQL, Table } from 'drizzle-orm';
+import type { SQL, Table } from 'drizzle-orm';
 
 import { and, asc, desc, ilike, or } from 'drizzle-orm';
 
@@ -79,8 +79,16 @@ export function parseDataTableParams<T extends Table>(
   // A filter the parser could not read is a client error, not a filter to
   // ignore: dropping it silently broadens an `and` query and narrows an `or`
   // one, so the caller gets rows they never asked for with a 200.
-  const parsed = parseSearchParams<T>(params, defaultSort, () => {
-    throw new CustomError(MSG_INVALID_FILTER, HTTP_STATUS.UNPROCESSABLE);
+  const parsed = parseSearchParams<T>(params, {
+    defaultSort,
+    // The allowlist, handed to the parser rather than applied to its output:
+    // its `defaultSort` fallback has to run AFTER unknown ids are dropped, or a
+    // sort naming a column outside this map takes the handler's declared
+    // ordering with it and leaves only the primary-key tiebreaker.
+    sortableColumnIds: Object.keys(filterableColumns),
+    onFilterDropped: () => {
+      throw new CustomError(MSG_INVALID_FILTER, HTTP_STATUS.UNPROCESSABLE);
+    },
   });
 
   // Clamp perPage to MAX_PER_PAGE ceiling
@@ -122,8 +130,8 @@ export function parseDataTableParams<T extends Table>(
     const escaped = escapeLike(search);
     const conditions: SQL[] = [];
     for (const colName of searchableColumns) {
-      const col = getColumn(table, colName as keyof T);
-      if (col) conditions.push(ilike(col as AnyColumn, `%${escaped}%`));
+      const col = getColumn(table, colName);
+      if (col) conditions.push(ilike(col, `%${escaped}%`));
     }
     if (conditions.length > 0) searchWhere = or(...conditions);
   }
@@ -138,6 +146,12 @@ export function parseDataTableParams<T extends Table>(
   // --- Sorting ---
   // Sorting stays lenient: an unknown sort key only changes row ORDER, never
   // which rows are returned, so dropping it can't mislead the caller.
+  //
+  // Client ids are already filtered inside the parser, which is what makes its
+  // `defaultSort` fallback authoritative. What is left for this line is a
+  // SERVER-declared `defaultSort` naming a column absent from the map — a
+  // configuration mistake, and one that would otherwise reach `getColumn` and
+  // order by a column the caller may not filter on.
   // `Object.hasOwn`, not `in` — `in` walks the prototype chain, so a sort id of
   // `constructor` would be treated as allowlisted.
   const safeSorts = parsed.sort.filter((s) =>
@@ -147,7 +161,7 @@ export function parseDataTableParams<T extends Table>(
   function applySorting(t: T) {
     const orderBy: ReturnType<typeof asc>[] = [];
     for (const s of safeSorts) {
-      const col = getColumn(t, s.id as keyof T);
+      const col = getColumn(t, s.id);
       if (col) orderBy.push(s.desc ? desc(col) : asc(col));
     }
     // Deterministic tiebreaker: append the unique primary key so rows sharing
@@ -157,7 +171,7 @@ export function parseDataTableParams<T extends Table>(
     // pages. UUID v7 is time-sortable, so desc(id) aligns with the createdAt
     // desc default. Skipped if the caller already sorts by id.
     if (!safeSorts.some((s) => s.id === 'id')) {
-      const idCol = getColumn(t, 'id' as keyof T);
+      const idCol = getColumn(t, 'id');
       if (idCol) orderBy.push(desc(idCol));
     }
     return orderBy;

@@ -73,9 +73,9 @@ type AuditMeta = ReturnType<typeof getAuditMeta>;
 export const GET: Handler = async (ctx) => {
   try {
     const {
-      session,
       userId,
       sessionId,
+      roleId: actorRoleId,
       scope: viewScope,
       permissions: actorViewPermissions,
     } = await requirePermission(ctx, {
@@ -101,7 +101,11 @@ export const GET: Handler = async (ctx) => {
         HTTP_STATUS.FORBIDDEN
       );
 
-    if (isSelf && !session.user.roleId)
+    // Owner decision: `view` is a read action, so `requirePermission` answers
+    // from the cookie cache and this role id is the cached copy — the same
+    // revocation window every read route accepts (reports/should-ignore.md,
+    // known issue 5). Forcing the database here would make the cache pointless.
+    if (isSelf && !actorRoleId)
       throw new CustomError(
         MSG_INSUFFICIENT_PERMISSIONS,
         HTTP_STATUS.FORBIDDEN
@@ -813,6 +817,7 @@ export const PUT: Handler = async (ctx) => {
     const {
       session,
       userId,
+      roleId: actorRoleId,
       scope: editScope,
       permissions: actorPermissions,
     } = await requirePermission(ctx, {
@@ -840,7 +845,9 @@ export const PUT: Handler = async (ctx) => {
     const actor = {
       userId,
       userEmail: session.user.email,
-      hasRole: !!session.user.roleId,
+      // `edit` forces the database read, so this is the live role id rather
+      // than the cookie-cached `session.user.roleId`.
+      hasRole: !!actorRoleId,
     };
 
     if (userId === targetId) {

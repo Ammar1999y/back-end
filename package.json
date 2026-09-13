@@ -16,7 +16,6 @@
     "format:check": "prettier --check .",
     "audit": "bun scripts/audit.ts",
     "find:unused-files": "bun scripts/find-unused-files.ts && bunx knip",
-    "find:non-null": "bun scripts/find-non-null-assertions.ts",
     "check:coverage": "bun scripts/check-coverage.ts",
     "precommit": "lefthook run fix && lefthook run verify",
     "verify": "lefthook run verify",

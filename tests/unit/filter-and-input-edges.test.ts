@@ -70,17 +70,24 @@ describe('L1 - an over-cap page size is reported, not silently defaulted', () =>
     ['page', { page: '10001' }],
   ])('%s over the ceiling is reported', (_label, params) => {
     let dropped = 0;
-    parseSearchParams(params, undefined, () => {
-      dropped++;
+    parseSearchParams(params, {
+      onFilterDropped: () => {
+        dropped++;
+      },
     });
     expect(dropped).toBe(1);
   });
 
   test('an absent parameter is not a dropped one', () => {
     let dropped = 0;
-    const parsed = parseSearchParams({}, undefined, () => {
-      dropped++;
-    });
+    const parsed = parseSearchParams(
+      {},
+      {
+        onFilterDropped: () => {
+          dropped++;
+        },
+      }
+    );
     expect(dropped).toBe(0);
     expect(parsed.page).toBe(1);
     expect(parsed.perPage).toBe(10);
@@ -100,9 +107,14 @@ describe('L1/L4 - a SUPPLIED but unreadable parameter is not an absent one', () 
     [''],
   ])('perPage=%p is reported rather than defaulted', (value) => {
     let dropped = 0;
-    const parsed = parseSearchParams({ perPage: value }, undefined, () => {
-      dropped++;
-    });
+    const parsed = parseSearchParams(
+      { perPage: value },
+      {
+        onFilterDropped: () => {
+          dropped++;
+        },
+      }
+    );
 
     // Both halves matter: the caller is told, AND the fallback is still a legal
     // page size so a non-throwing handler cannot be steered by the bad value.
@@ -237,7 +249,13 @@ describe('negated set membership includes rows with no value', () => {
       ],
       joinOperator: 'and',
       specs: {
-        phoneNumber: { type: isArrayOperator ? 'multiSelect' : 'select' },
+        // `values` is required on a closed-set descriptor, so the set has to
+        // contain the value under test or `membersAllowed` rejects it before
+        // any SQL is built.
+        phoneNumber: {
+          type: isArrayOperator ? 'multiSelect' : 'select',
+          values: ['0500000000'],
+        },
       },
     });
     if (!condition) throw new Error('filterColumns produced no condition');

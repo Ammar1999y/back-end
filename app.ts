@@ -26,11 +26,17 @@ import {
   enforcePreAuthIpLimit,
   UNKNOWN_PREFIX_SCOPE,
 } from '@/lib/http/pre-auth';
-import { buildRequestMeta } from '@/lib/http/request';
+import {
+  boundedBodyRequest,
+  buildRequestMeta,
+  declaresBodyOver,
+  MAX_REQUEST_BODY_BYTES,
+} from '@/lib/http/request';
 import { toWebResponse } from '@/lib/http/response';
 import { applyResponsePolicy } from '@/lib/http/response-policy';
 import {
   allowHeader,
+  createBodyCeilingLookup,
   createRouteLookup,
   toManifest,
 } from '@/lib/http/route-manifest';
@@ -39,11 +45,13 @@ import { applySecurityHeaders } from '@/lib/http/security-headers';
 import {
   CUSTOM_AUTH_CODE,
   HTTP_STATUS,
+  MSG_BODY_TOO_LARGE,
   MSG_INTERNAL_ERROR,
   MSG_METHOD_NOT_ALLOWED,
   MSG_PAGE_NOT_FOUND,
 } from '@/utils/api-messages';
 import { apiError, handleApiError } from '@/utils/api-response';
+import { CustomError } from '@/utils/error-class';
 
 /**
  * The generated route inventory. Exported because three consumers need it and
@@ -56,6 +64,10 @@ import { apiError, handleApiError } from '@/utils/api-response';
 export const ROUTE_MANIFEST = toManifest(REGISTERED_ROUTES);
 
 const lookupMethods = createRouteLookup(REGISTERED_ROUTES, ROUTE_PREFIXES);
+const lookupBodyCeiling = createBodyCeilingLookup(
+  REGISTERED_ROUTES,
+  ROUTE_PREFIXES
+);
 
 async function localiseAuthError(response: Response): Promise<Response> {
   if (response.ok) return response;
@@ -167,13 +179,6 @@ const CORS_POLICY = {
   maxAge: 600,
 } as const;
 
-/**
- * Bounds framework buffering before route-specific payload validation. Sized
- * for the largest admitted file — a 10 MB document (`MAX_DOCUMENT_SIZE_MB`) plus
- * multipart framing; every per-file cap is enforced again inside the handler.
- */
-export const MAX_REQUEST_BODY_BYTES = 12 * 1024 * 1024;
-
 /** Lets shutdown honor the longest route-specific timeout. */
 export const MAX_ROUTE_TIMEOUT_SECONDS = REGISTERED_ROUTES.reduce(
   (longest, route) => Math.max(longest, route.timeoutSeconds ?? 0),
@@ -256,8 +261,35 @@ const base = new Elysia({
     startedAt.set(request, performance.now());
     applySecurityHeaders(set.headers);
 
-    if (new URL(request.url).hostname.length < MIN_ROUTABLE_HOSTNAME_LENGTH)
+    const url = new URL(request.url);
+    if (url.hostname.length < MIN_ROUTABLE_HOSTNAME_LENGTH)
       return finish(request, notFound());
+
+    // The ONE ceiling every request crosses, whatever serves it.
+    //
+    // The reader in `withBodyPolicy` bounds the routes it reads for, and that is
+    // every route in the table — but not `/api/auth/*`, which hands the raw
+    // request to `auth.handler`, nor the next mount of that shape. Those
+    // inherited `maxRequestBodySize` in front of captcha-holding and
+    // pre-auth-limited endpoints, and nothing said so. Deciding here, from the
+    // path alone, means a mount cannot opt out of the ceiling by not using the
+    // reader — and cannot have it widened by the `Content-Type` its caller
+    // chose.
+    //
+    // `Content-Length` only, because this hook must not touch the stream: the
+    // body still has to reach whichever consumer is allowed to read it. A
+    // chunked request declares no length, so the counting half is applied where
+    // the body is actually read — `readBoundedText` for table routes,
+    // `boundedBodyRequest` at the Better Auth prefix below.
+    if (declaresBodyOver(request, lookupBodyCeiling(url.pathname)))
+      return finish(
+        request,
+        toWebResponse(
+          handleApiError(
+            new CustomError(MSG_BODY_TOO_LARGE, HTTP_STATUS.CONTENT_TOO_LARGE)
+          )
+        )
+      );
 
     // Route-aware OPTIONS. The CORS plugin answers OPTIONS on ANY path with
     // 204 (it registers its own `OPTIONS /` and `OPTIONS /*` catch-alls —
@@ -270,12 +302,12 @@ const base = new Elysia({
     // on the slash form never reached the canonicalisation below and answered 404
     // while every other method on the same URL answered 308 (measured). One URL
     // shape, one answer.
-    if (request.method === 'OPTIONS') {
-      const url = new URL(request.url);
-      if (lookupMethods(url.pathname).size === 0) {
-        const canonical = canonicalRedirect(url);
-        return finish(request, canonical ?? notFound());
-      }
+    if (
+      request.method === 'OPTIONS' &&
+      lookupMethods(url.pathname).size === 0
+    ) {
+      const canonical = canonicalRedirect(url);
+      return finish(request, canonical ?? notFound());
     }
   })
   // Spread into mutable arrays: the plugin's option type is `string[]`, and the
@@ -297,9 +329,9 @@ const base = new Elysia({
    * own `Content-Security-Policy` silently replaced the global one. This runs
    * last and overwrites.
    */
-  .mapResponse(({ response, request }) => {
-    if (!(response instanceof Response)) return;
-    return finish(request, response) as never;
+  .mapResponse(({ responseValue, request }) => {
+    if (!(responseValue instanceof Response)) return;
+    return finish(request, responseValue) as never;
   })
   /**
    * Post-response work. One wiring line, by design — everything else lives in
@@ -392,27 +424,13 @@ function register(instance: typeof base): typeof base {
    *
    * **The allowlist is enforced HERE, before `auth.handler` is called at all.**
    * `lib/auth.ts` also enforces it, in a `before` hook, and that is not the same
-   * position: Better Auth runs plugin `onRequest` handlers ahead of its own hooks,
-   * so a path outside the list reaches every plugin before the hook can reject
-   * it. Through better-auth 1.6.26 the captcha plugin matched its endpoint list
-   * with `pathname.includes(...)`, so ANY path containing `sign-in/email`
-   * matched: `/api/auth/zz/sign-in/email/zz` answered `400 Missing CAPTCHA
-   * response` instead of 404, and supplying a token made it perform an outbound
-   * Turnstile siteverify for a path this server does not serve —
-   * unauthenticated, attacker-triggerable spend against the Turnstile quota.
-   *
-   * 1.7 fixed that plugin: it strips the base path and compares exactly
-   * (`endpoint === pathname`, wildcards only when the configured entry contains
-   * `*` — read in `node_modules/better-auth/dist/plugins/captcha/index.mjs`),
-   * and the same request now answers 404 here with no captcha involvement
-   * (re-measured on 1.7.1). So this check is no longer what stops that specific
-   * leak.
-   *
-   * It stays anyway, and so does the `before` hook. The reason for checking
-   * first was never that one plugin — it is that ANY plugin's `onRequest` runs
-   * ahead of the hook, so the class stays open as long as the decision is made
-   * downstream of the plugin chain. Making it here removes the class; the
-   * upstream fix removed one instance of it.
+   * position: Better Auth runs every plugin's `onRequest` ahead of its own
+   * hooks, so a path outside the list reaches the whole plugin chain before the
+   * hook can reject it. A plugin that matches its endpoint list loosely then
+   * acts on a path this server does not serve — the captcha plugin did exactly
+   * that, spending an outbound Turnstile siteverify on an unauthenticated
+   * request to an unrouted path. Deciding here removes the class; both checks
+   * stay, because only this one is upstream of the plugins.
    */
   for (const prefix of ROUTE_PREFIXES) {
     // The union of every sub-path's methods. Registered from the table rather
@@ -439,45 +457,59 @@ function register(instance: typeof base): typeof base {
               limit: known?.preAuthLimit,
               scope: known ? undefined : UNKNOWN_PREFIX_SCOPE,
             });
+            // Unreachable auth paths answer with this API's envelope like every
+            // other unknown path, instead of Better Auth's own bodyless 404 — and
+            // the trailing-slash form redirects, which the wildcard match had been
+            // hiding from `onError`.
+            //
+            // `routeMiss`, not `notFound`: five real `ROUTES` entries sit under
+            // this prefix (`/api/auth/otp/*`, `/api/auth/forgot-password/*`,
+            // `/api/auth/passwordless/send`) and are not Better Auth paths, so a
+            // `GET` on one falls through the `GET /api/auth/*` wildcard to here.
+            // Answering 404 made the same wrong-method condition on the same path
+            // give two answers depending on the method: measured, `GET
+            // /api/auth/otp/send` → 404 with no `Allow` while `PUT` on it → 405
+            // with `Allow: POST, OPTIONS`, because PUT is not a method this
+            // wildcard is mounted for and reached `onError` instead. `routeMiss`
+            // falls back to `notFound()` on an empty lookup, so a genuinely
+            // unknown sub-path keeps its 404.
+            if (!known)
+              return canonicalRedirect(url) ?? routeMiss(url.pathname);
+            // A known path under a method it does not serve is a 405 with an
+            // accurate `Allow`, decided from the same table. Handing it to
+            // `auth.handler` instead answered Better Auth's own 404 for
+            // `GET /sign-out`, and let `GET /sign-in/email` reach the captcha
+            // plugin's processing before the method was rejected.
+            if (!betterAuthServes(subPath, request.method))
+              return routeMiss(url.pathname);
+            // Better Auth answers 404 for a HEAD on a path it serves for GET
+            // (measured on 1.7.1), and Elysia dispatches HEAD to the GET
+            // registration — so the substitution has to happen here or HEAD is
+            // unserved on every auth path. The runtime discards the body.
+            // `new Request(url, …)` is a GET; naming the method explicitly is what
+            // the linter objects to, not the substitution.
+            const forwarded =
+              request.method === 'HEAD'
+                ? new Request(request.url, { headers: request.headers })
+                : // The half the `onRequest` hook cannot do. That hook refuses a
+                  // body which DECLARES itself over the ceiling; a chunked request
+                  // declares nothing, and Better Auth reads the body itself — so
+                  // without this the captcha-holding and pre-auth-limited
+                  // endpoints under this prefix would still be bounded by nothing
+                  // but `maxRequestBodySize`. Same lookup as the hook, so the two
+                  // halves of one ceiling cannot drift. Reading it here also makes
+                  // the refusal a 413 from this file rather than whatever the
+                  // library makes of a stream that errored mid-parse.
+                  await boundedBodyRequest(
+                    request,
+                    lookupBodyCeiling(url.pathname)
+                  );
+            return localiseAuthError(await auth.handler(forwarded));
           } catch (error) {
-            // This wildcard bypasses the adapter that normally preserves API errors.
+            // This wildcard bypasses the adapter that normally preserves API
+            // errors — the 413 `boundedBodyRequest` throws included.
             return toWebResponse(handleApiError(error));
           }
-          // Unreachable auth paths answer with this API's envelope like every
-          // other unknown path, instead of Better Auth's own bodyless 404 — and
-          // the trailing-slash form redirects, which the wildcard match had been
-          // hiding from `onError`.
-          //
-          // `routeMiss`, not `notFound`: five real `ROUTES` entries sit under
-          // this prefix (`/api/auth/otp/*`, `/api/auth/forgot-password/*`,
-          // `/api/auth/passwordless/send`) and are not Better Auth paths, so a
-          // `GET` on one falls through the `GET /api/auth/*` wildcard to here.
-          // Answering 404 made the same wrong-method condition on the same path
-          // give two answers depending on the method: measured, `GET
-          // /api/auth/otp/send` → 404 with no `Allow` while `PUT` on it → 405
-          // with `Allow: POST, OPTIONS`, because PUT is not a method this
-          // wildcard is mounted for and reached `onError` instead. `routeMiss`
-          // falls back to `notFound()` on an empty lookup, so a genuinely
-          // unknown sub-path keeps its 404.
-          if (!known) return canonicalRedirect(url) ?? routeMiss(url.pathname);
-          // A known path under a method it does not serve is a 405 with an
-          // accurate `Allow`, decided from the same table. Handing it to
-          // `auth.handler` instead answered Better Auth's own 404 for
-          // `GET /sign-out`, and let `GET /sign-in/email` reach the captcha
-          // plugin's processing before the method was rejected.
-          if (!betterAuthServes(subPath, request.method))
-            return routeMiss(url.pathname);
-          // Better Auth answers 404 for a HEAD on a path it serves for GET
-          // (measured on 1.7.1), and Elysia dispatches HEAD to the GET
-          // registration — so the substitution has to happen here or HEAD is
-          // unserved on every auth path. The runtime discards the body.
-          // `new Request(url, …)` is a GET; naming the method explicitly is what
-          // the linter objects to, not the substitution.
-          const forwarded =
-            request.method === 'HEAD'
-              ? new Request(request.url, { headers: request.headers })
-              : request;
-          return localiseAuthError(await auth.handler(forwarded));
         },
         elysiaRouteConfig
       );

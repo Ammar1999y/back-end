@@ -93,13 +93,6 @@
 - **Impact:** Public, captcha-gated CPU and outbound-request amplification against authentication availability.
 - **Remediation:** Price this route's pre-proof work with the existing weighted per-IP limiter or materially lower its limit. Preserve account-independent ordering to avoid an existence oracle.
 
-### C-014 · Medium · Password recovery can commit after the account is suspended or deleted
-
-- **Locations:** `app/api/auth/forgot-password/reset/handler.ts:102-211`; `app/api/auth/forgot-password/complete/handler.ts:100-219`; correct pattern at `utils/otp.ts:833-849`.
-- **Evidence and failure scenario:** Both routes check eligibility before entering the verification transaction. `processOtpVerify` later locks the user row but does not re-check `deletedAt` or `isActive`; the completion callbacks re-read only factor/account records. If an administrator suspends a compromised account while a valid reset is in flight, the reset serializes after suspension and still rewrites the password.
-- **Impact:** A containment action does not freeze credential rotation; the new password becomes usable immediately if the account is reactivated.
-- **Remediation:** Re-read the user under the held lock with the full active/non-deleted eligibility predicate and collapse failure to the generic invalid-or-expired response on both reset paths.
-
 ### C-015 · Medium · The advertised OTP resend countdown contradicts the exponential server ladder
 
 - **Locations:** anonymous send handlers in `app/api/auth/otp/send/handler.ts`, `passwordless/send/handler.ts`, and `forgot-password/send/handler.ts`; ladder in `utils/otp.ts:55-58,640-648`.
@@ -315,13 +308,6 @@
 - **Impact:** Rate-bounded event-loop and memory amplification.
 - **Remediation:** Add a bounded JSON reader/body policy sized to the largest JSON schema while retaining 12 MiB only for multipart. Elysia's native schema parsing occurs before `beforeHandle`, so switching these handlers to automatic parsing would lose the current body-after-admission ordering; keep the explicit framework-independent reader.
 
-### C-049 · Low · User detail exposes session metadata on a cookie-cached write-tier grant
-
-- **Locations:** `app/api/dash/users/[id]/handler.ts:81-199`; child session route at `app/api/dash/users/[id]/sessions/handler.ts:94-98`.
-- **Evidence and failure scenario:** The parent GET checks cached `users.view`, then reads cached `users.edit` to decide whether to return another user's IP address, user agent, and session cursor. The child route checks edit permission live from the database. After edit revocation, the parent can continue returning metadata for five minutes while the child refuses access.
-- **Impact:** Bounded extension of stale read access and inconsistent authorization across one resource.
-- **Remediation:** Force a database-backed check for the write-tier decision, or make the whole detail GET use `forceDB:true`.
-
 ### C-050 · Low · "New password must differ" is skipped when re-authentication uses an existing window
 
 - **Locations:** `app/api/dash/users/me/change-password/handler.ts:59-92`.
@@ -352,12 +338,6 @@
 - **Locations:** `app/api/dash/permissions/handler.ts:188`; `app/api/dash/permissions/[id]/handler.ts:256`; `lib/permissions/utils.ts:113`; `db/schema.ts:867`; `utils/validation/rules.ts:145-154`.
 - **Evidence and impact:** Normalization creates partial action records, yet the column/readers assert `Record<PermissionAction,boolean>`. Current consumers sanitize before use, masking the type error. The UUID preprocess also falls back to numeric `0` and asserts a narrower Zod pipe.
 - **Remediation:** Type stored matrices as `Partial<Record<...>>`, keep normalization at the boundary, return a string invalid sentinel, and remove unearned Zod assertions.
-
-### C-055 · Low · Administrative side effects are not audited at the shared mutation boundaries
-
-- **Locations:** `app/api/dash/users/handler.ts:228-234`; `app/api/dash/users/[id]/handler.ts:683-684,800-805,981-984`; `app/api/dash/permissions/[id]/handler.ts:348-357,484-487`.
-- **Evidence and impact:** Admin flows create/delete credential accounts, strip OTP factor intent, revoke sessions, and detach roles without the events emitted by dedicated session, 2FA, or credential routes. Investigators see the initiating user/role event but not consistently the security-relevant side effects.
-- **Remediation:** Audit at shared boundaries such as method removal and session revocation, or include explicit effect counts/details in the causing event.
 
 ### C-056 · Low · Upload byte gates disagree on normalized versus raw content type
 
@@ -449,12 +429,6 @@
 - **Evidence and impact:** The current Gmail service always resolves a TLS host before this code, making the branch dormant. A future transport configured without `service`/`host` connects to `localhost:587` with opportunistic STARTTLS rather than failing configuration, silently weakening transport expectations.
 - **Remediation:** Throw during configuration when neither an explicit nor service-resolved host exists; require TLS for non-implicit-TLS transports.
 
-### C-070 · Low · OTP generation uses only 900,000 of the accepted six-digit values
-
-- **Locations:** `utils/otp.ts:50-52`; `utils/validation/otp.ts:219-225`.
-- **Evidence and impact:** Generation starts at 100,000 and never emits leading-zero codes, while validation accepts all six digits. This reduces entropy by 10%; attempt limits keep the practical impact low.
-- **Remediation:** Generate `0..999999` and left-pad to six digits.
-
 ### C-071 · Low · OTP delivery contains dead boundary checks and an unused SMS option
 
 - **Locations:** `utils/otp.ts:387-395`; `processOtpSend` options.
@@ -534,23 +508,11 @@
 - **Evidence and impact:** Generic `JsonSchema` objects are asserted to contain typed `properties` and `required`. Refactoring the base media schema could publish a composite whose required keys are absent while `additionalProperties:false` rejects every real response, with no type error.
 - **Remediation:** Define shared media properties and required keys once in typed literals and build each schema from that source without casts.
 
-### C-084 · Low · Development bootstrap can generate a role name longer than its column
-
-- **Locations:** `app/api/dev/sign-up/handler.ts:74`; bounds in `utils/validation/constants.ts:37,76`.
-- **Evidence and impact:** `system-${email}` can exceed `varchar(100)` because valid emails extend to 150 characters. The development-only bootstrap then fails on the first setup of a project using such an address.
-- **Remediation:** Name the role from the new user ID, as normal custom roles do, or apply the role-name bound explicitly.
-
 ### C-085 · Low · A redundant role-permission index duplicates the prefix of a unique index
 
 - **Locations:** `db/schema.ts:876-877`.
 - **Evidence and impact:** `(role_id)` is a strict prefix of unique `(role_id,page_name)`, and all observed role-keyed reads/conflicts can use the composite index. The extra index adds write and storage cost without a distinct query.
 - **Remediation:** Drop `idx_role_permissions_role_id` in a generated migration.
-
-### C-086 · Low · Migration 0007 changed the verification default without repairing existing rows
-
-- **Locations:** `db/drizzle/0005_two_factor_tables.sql:35`; `db/drizzle/0007_real_the_watchers.sql:2`; `db/schema.ts:464`.
-- **Evidence and impact:** Rows inserted between the two migrations retain `verified=true` even though 0007 changed the default to prevent unconfirmed credentials being active. Fresh installs are safe because both run in one empty migration sequence; affected developer/staging databases can retain incorrect state.
-- **Remediation:** Add an explicit repair migration for unconfirmed legacy rows if such databases remain supported, and require future semantic-default changes to include a data decision.
 
 ### C-087 · Low · Migration phases have no advisory lock
 
@@ -569,12 +531,6 @@
 - **Locations:** `tsconfig.json:6`; `eslint.config.mjs:46-51`; server imports involving jsdom.
 - **Evidence and impact:** TypeScript includes DOM types, and importing jsdom reintroduces `lib.dom` even when `--lib esnext` is passed. ESLint's `no-undef` is disabled for TypeScript. No browser-global misuse exists today, so both static gates would miss the first one.
 - **Remediation:** Add `no-restricted-globals` for browser-only globals across server source; changing `tsconfig.lib` alone is ineffective.
-
-### C-090 · Low · ESLint core rules are never enabled and JavaScript files are outside TypeScript checking
-
-- **Locations:** `eslint.config.mjs:36-44`; `tsconfig.json:8-9,35`; `scripts/require-bun.mjs`.
-- **Evidence and impact:** The configuration does not spread `@eslint/js` recommended rules, and `allowJs/checkJs` has no effect because include patterns omit `.js/.mjs`. Root scripts, including the preinstall runtime gate, therefore miss both rule families.
-- **Remediation:** Enable `js.configs.recommended` and include checked JavaScript/module files in the TypeScript project.
 
 ### C-091 · Low · The non-null assertion gate cannot fail and is not part of any gate group
 
@@ -595,35 +551,11 @@
 - **Evidence and impact:** `bun dedupe --check` reports no duplicates while the lock contains multiple incompatible versions; Bun checks only duplicates that can be collapsed. The command is correct for that narrower purpose, but its message claims any package resolving to multiple versions fails.
 - **Remediation:** Rename the gate/message to collapsible duplicates, and add a separate allowlisted single-version policy only if that stronger invariant is intended.
 
-### C-094 · Low · Dependency audit is unscheduled and has no severity/exception policy
-
-- **Locations:** `.github/workflows/ci.yml:3-6,237-249`; `.github/workflows/security.yml:3-8`; `scripts/audit.ts:31`.
-- **Evidence and impact:** `bun audit` runs only on push/PR, so advisories against an unchanged lockfile wait for the next code event. No severity floor or documented ignore path exists, allowing one low advisory to block all pushes without a review mechanism.
-- **Remediation:** Schedule the audit, set an explicit `--audit-level`, and record reviewed exceptions with repeatable `--ignore` entries and rationale.
-
 ### C-095 · Low · Coverage gating accepts stale or wrong-tier reports
 
 - **Locations:** `scripts/check-coverage.ts:48,65-69,123-138`.
 - **Evidence and impact:** The gate accepted a five-day-old report from a tier containing files outside the tier its thresholds describe. CI ordering currently produces the right file, but local/reordered runs can pass on unrelated evidence; thresholds are also materially below current measurements.
 - **Remediation:** Require report provenance and creation after the current run began, and recalibrate floors to the maintained baseline with an explicit margin.
-
-### C-096 · Low · Pinned Bun runtime and Bun types are on different patch versions
-
-- **Locations:** `package.json:35,63`; `bun.lock`.
-- **Evidence and impact:** Runtime is pinned to Bun 1.4.2 while `@types/bun` resolves to 1.4.1, leaving new/fixed 1.4.2 API declarations unavailable and allowing compile-time/runtime drift.
-- **Remediation:** Pin Bun types to the runtime patch and update them as one dependency group without manual approval drift.
-
-### C-097 · Low · Workflow cancellation and artifact settings weaken the main-branch signal
-
-- **Locations:** `.github/workflows/ci.yml:11-13,209`; `.github/workflows/security.yml:13-15`.
-- **Evidence and impact:** `cancel-in-progress:true` keyed by ref cancels verification of an earlier main-branch commit when another push arrives, and missing JUnit output is only a warning. A reporter failure can therefore leave tests green without their expected evidence.
-- **Remediation:** Cancel only pull-request supersessions and make missing test artifacts an error.
-
-### C-098 · Low · ESLint file globs apply inconsistent rule sets
-
-- **Locations:** `eslint.config.mjs:108-141`.
-- **Evidence and impact:** Type-aware rules name only three root `.ts` files, leaving `drizzle.config.ts` and future root files without floating-promise checks; Bun builtin exemptions omit `.mjs`; Drizzle rules omit `.mts/.cts`.
-- **Remediation:** Define one shared extension/root source set and reuse it across type-aware, import, and Drizzle blocks.
 
 ### C-099 · Low · The smoke harness does not faithfully execute or terminate the production command
 
@@ -643,35 +575,11 @@
 - **Evidence and impact:** Renovate delays newly released packages, but `bun add`/`bun update` have no matching `minimumReleaseAge`. Developers can resolve a release during the very window the repository policy intends to avoid.
 - **Remediation:** Configure Bun's install-level `minimumReleaseAge` and explicit excludes so local and automated resolution enforce the same policy.
 
-### C-102 · Low · Better Auth `session.freshAge` is inert configuration
-
-- **Locations:** `lib/auth.ts:682`; installed Better Auth middleware/endpoints.
-- **Evidence and impact:** The option is consumed only by freshness middleware on endpoints this deployment does not serve or has rewrapped without that middleware. Actual freshness is enforced by the admin re-authentication window and `authRevokedAt`, so the value suggests a ten-hour control that does nothing.
-- **Remediation:** Remove the option or set it to zero with the real freshness policy documented at its authoritative boundary.
-
-### C-103 · Low · Password compromise checking imports an undeclared transitive dependency
-
-- **Locations:** `lib/auth/check-password.ts:4`; `package.json`; dependency gates.
-- **Evidence and impact:** The app imports `@better-fetch/fetch` directly but receives it only through Better Auth. Knip's unlisted check does not report it. If Better Auth bundles, renames, or removes that dependency, the module fails to load and every password-setting path breaks.
-- **Remediation:** Use the global `fetch` already sufficient for this code, or declare and pin the direct dependency explicitly.
-
-### C-104 · Low · `requireReauthSession` implements only part of the shared live-session eligibility contract
-
-- **Locations:** `lib/auth/request-context.ts:9-17`; complete predicates in `lib/auth/user-eligibility.ts:18` and `lib/auth/live-session.ts:56-57`.
-- **Evidence and impact:** The helper checks role presence but not active/deleted state and can use the cookie cache. All three current callers are separately protected by `LIVE_SESSION_PATHS`, but a new caller outside that set would silently admit a suspended user.
-- **Remediation:** Delegate to `assertLiveSession` instead of duplicating a partial eligibility check.
-
 ### C-105 · Low · An unused transaction option silently disables password-hash upgrades
 
 - **Locations:** `lib/auth/login-guard.ts:76,391`; all `verifyLoginAttempt` callers.
 - **Evidence and impact:** No caller supplies `tx`, but the option moves expensive verification into the caller's transaction and suppresses the pepper/hash upgrade with no signal. The first future use would inherit both defects.
 - **Remediation:** Remove the unused option and retain one supported transaction boundary.
-
-### C-106 · Low · Passwordless users cannot retrieve their TOTP URI after valid passkey re-authentication
-
-- **Locations:** `lib/auth.ts:187-208`; `lib/auth/reauth-grant.ts:63-76`.
-- **Evidence and impact:** The Better Auth body patch creates the synthetic password proof only when a password credential exists, while the app's re-auth grant accepts a valid passkey window. Google/passkey-only users therefore receive `401 REAUTH_REQUIRED` for `get-totp-uri` and are prompted for a password they do not have.
-- **Remediation:** Serve URI retrieval from the app-owned enrollment boundary using the shared re-auth grant, or remove the unreachable library route. Do not enable a library option that would waive proof.
 
 ### C-107 · Low · Lockout state can confirm a correct password for an otherwise ineligible account
 
@@ -710,33 +618,8 @@
 - **Evidence and impact:** Comments discuss missing historical exports, superseded MVCC explanations, framework/driver migrations, and dependency-version history rather than current non-local constraints. This conflicts with `AGENTS.md` and can preserve obsolete justification, as the redundant SQLite lifecycle does.
 - **Remediation:** Sweep the class: remove history, code narration, and version stories while retaining only external constraints, non-local invariants, and deliberate choices not recoverable from code.
 
-### C-113 · Low · Storage benchmarks no longer reproduce current storage boundaries
-
-- **Locations:** `bench/s3/shared/clients.ts:33`; `bench/s3/live-r2.ts:117`; `bench/s3/production-ops.test.ts:73`; `bench/s3/candidate.test.ts:139`; SQLite benchmark schema/report; current `lib/r2/client.ts` and `lib/rate-limit/store.ts`.
-- **Evidence and impact:** S3 benchmark guards expect region `weur` while production uses `auto`, expect three send sites while six exist, and claim a visibility copy has no caller. Two focused source-guard tests fail on those mismatches. The SQLite benchmark still creates a retired `auth_rate_limit` table, labels Node/Next as current production, and uses pre-weighted limiter SQL although the app runs Bun with a different schema.
-- **Remediation:** Align benchmark clients, schemas, operation inventories, and runtime claims with current shared boundaries, or label and retire the harnesses as historical before using their results for decisions.
-
-### C-114 · Low · Disabled upload types lose filename extensions on existing downloads
-
-- **Locations:** `lib/media/files.ts:285`; `lib/media/allowlist.ts:166`; `lib/media/visibility.ts:61`.
-- **Evidence and failure scenario:** `downloadFilename` uses the enabled-upload allowlist rather than the complete known-type table. A stored DOC/XLS renamed to `report` downloads as `report` after that type is disabled, while an enabled PDF becomes `report.pdf`; signed downloads and visibility-copy headers share the helper.
-- **Impact:** Existing content loses file association when admission policy changes.
-- **Remediation:** Resolve stored metadata from the complete type registry and reserve the enabled subset for new-upload admission.
-
-### C-115 · Low · Password and OTP benchmarks report concurrency they never achieve
-
-- **Locations:** `bench/password/run.mjs:171,302`; `bench/otp/run.mjs:91`; `bench/password/README.md:187`.
-- **Evidence and impact:** Pools stop after `count` operations but label output with requested concurrency even when `concurrency > count`. Recorded rows claim 32-way concurrency from 16 operations; focused probes measured an actual peak of 16. Short soak runs similarly report four despite fewer operations.
-- **Remediation:** Require enough work to sustain every requested concurrency, measure/report achieved concurrency, and rerun or relabel affected capacity conclusions.
-
 ### C-116 · Low · Email-change OpenAPI instructions branch on fields the start operation never returns
 
 - **Locations:** `lib/http/openapi.ts:1578`; `app/api/dash/users/me/change-email/handler.ts:147,178`.
 - **Evidence and impact:** Prose tells clients to branch on `data.verified`, but start returns `{otpSent:true}` or `{autoVerified:true}`; only completion returns `{verified:true}`. A client following the prose never advances to code entry and cannot recognize an auto-verified change/session revocation.
 - **Remediation:** Document start using `otpSent`/`autoVerified` and completion using `verified`, preserving existing response contracts.
-
-### C-117 · Low · The SQLite denial benchmark mistakes zero row changes for freedom from writer contention
-
-- **Locations:** `bench/sqlite/FINAL-REPORT.md:162,171`; `bench/sqlite/shared/schema.mjs:83`.
-- **Evidence and impact:** The report says a refused UPSERT acts like a non-contending primary-key read. With another connection holding `BEGIN IMMEDIATE`, a plain SELECT succeeded while both benchmark and production denial UPSERTs returned `SQLITE_BUSY`; an INSERT starts a write transaction even when the conflict condition performs no update. The existing test proves zero changed rows, not absence of writer serialization.
-- **Remediation:** Correct the benchmark conclusion and add a held-writer refusal case; continue describing the benefit as avoided mutation/WAL growth only.

@@ -99,12 +99,17 @@ export const REQUIRE_PHONE_VERIFICATION = false as boolean;
 export const OTP_AUTO_VERIFY = false;
 
 /**
- * Whether a submitted `rememberMe` is honoured.
+ * Whether a submitted `rememberMe` is honoured — i.e. whether the UI offers the
+ * choice at all.
  *
- * `false` pins every session to the short lifetime regardless of what the client
- * asked for, which is what a deployment that wants uniform session expiry needs.
- * `true` — the default — means the choice reaches session creation and the
- * cookie, instead of being read and dropped.
+ * `false` ignores the client's value and gives every session the REMEMBERED
+ * lifetime, which is also what an absent field means on every sign-in path
+ * (`submittedRememberMe`). It does not pin sessions to the short lifetime:
+ * shortening every session for clients that never asked would be a different
+ * policy, and one no sign-in path implements.
+ *
+ * `true` — the default — means an explicit `false` reaches session creation and
+ * the cookie instead of being read and dropped.
  */
 export const HONOUR_REMEMBER_ME = true as boolean;
 

@@ -65,6 +65,7 @@ import { passwordless } from './auth/passwordless';
 import { reauthentication } from './auth/reauth';
 import { consumeReauthGrant } from './auth/reauth-grant';
 import { submittedRememberMe } from './auth/remember-me';
+import { revokeSessionArtifacts } from './auth/rotation';
 import { authDatabase } from './auth/transaction';
 import { twoFactorPlugins } from './auth/two-factor';
 import {
@@ -105,6 +106,7 @@ async function enforceTwoFactorPathPolicy(
   const needsProof = PASSWORD_PROOF_PATHS.has(path);
   const needsLiveSession = LIVE_SESSION_PATHS.has(path);
   const stripsTrustDevice = TRUST_DEVICE_STRIPPED_PATHS.has(path);
+  const stripsSessionCreation = SESSION_CREATION_STRIPPED_PATHS.has(path);
   const dualMode = DUAL_MODE_LIVE_SESSION_PATHS.has(path);
   const needsGrant = REAUTH_GRANT_PATHS.has(path);
 
@@ -143,7 +145,13 @@ async function enforceTwoFactorPathPolicy(
       });
   }
 
-  if (!needsProof && !needsLiveSession && !stripsTrustDevice) return undefined;
+  if (
+    !needsProof &&
+    !needsLiveSession &&
+    !stripsTrustDevice &&
+    !stripsSessionCreation
+  )
+    return undefined;
 
   const body =
     ctx.body && typeof ctx.body === 'object'
@@ -157,9 +165,10 @@ async function enforceTwoFactorPathPolicy(
   // backup code and rewrites the set, then returns WITHOUT completing the
   // challenge or re-arming the attempt counter, which spends a code and bricks
   // the challenge in one call.
-  const patch: Record<string, unknown> = stripsTrustDevice
-    ? { trustDevice: false, disableSession: false }
-    : {};
+  const patch: Record<string, unknown> = {
+    ...(stripsTrustDevice && { trustDevice: false, disableSession: false }),
+    ...(stripsSessionCreation && { createSession: false }),
+  };
 
   if (!needsProof && !needsLiveSession)
     return { context: { ...ctx, body: { ...body, ...patch } } };
@@ -468,6 +477,24 @@ const TRUST_DEVICE_STRIPPED_PATHS: ReadonlySet<string> = new Set(
 );
 
 /**
+ * Library paths whose body can ask for a SESSION, which this deployment does not
+ * grant from an enrolment.
+ *
+ * `/passkey/verify-registration` takes `createSession`, and on the way out
+ * `recordPasskeyEnrolment` rotates the user's sessions and keeps only the one
+ * the REQUEST arrived on — so the session the plugin had just minted is deleted
+ * after its cookie was already set on the response. Measured: the browser is
+ * left holding a token for a row that no longer exists, `/get-session` keeps
+ * answering 200 from the cookie cache, and every path that checks liveness
+ * answers 401. Forcing the flag off is also the only correct direction: a
+ * session minted here has completed no second factor, and the account has one
+ * from this request onwards.
+ */
+const SESSION_CREATION_STRIPPED_PATHS: ReadonlySet<string> = new Set([
+  '/passkey/verify-registration',
+]);
+
+/**
  * What Better Call reports as the path of an endpoint declared without one.
  * Mirrored, and it fails closed: if the placeholder changes upstream, our own
  * `auth.api.*` calls to server-only endpoints answer 404.
@@ -679,7 +706,6 @@ export const auth = betterAuth({
   session: {
     expiresIn: 28 * 24 * 60 * 60,
     updateAge: 24 * 60 * 60,
-    freshAge: 10 * 60 * 60,
     cookieCache: {
       enabled: true,
       // TODO: set from the deployment's security policy.
@@ -867,6 +893,38 @@ export const auth = betterAuth({
           } catch (error) {
             console.error(
               sanitizeForLog({ msg: 'session.loginAudit.failed', error })
+            );
+          }
+        },
+      },
+      delete: {
+        /**
+         * The library side of `revokeSessionArtifacts`'s invariant: the three
+         * `verifications` rows keyed by a SESSION id — the two-factor proof and
+         * both re-authentication windows — are reachable only through that id,
+         * so a session deleted without them leaves rows nothing can find again
+         * until they expire.
+         *
+         * This codebase's own deletes call the function inside their own
+         * transaction. Better Auth's do not go through them at all: `/sign-out`,
+         * a revoked session, a user deletion and the rows the library reaps all
+         * route through `deleteWithHooks` / `deleteManyWithHooks`, which load the
+         * row and fire this hook once PER row (verified in
+         * `node_modules/better-auth/dist/db/with-hooks.mjs`). That makes this the
+         * shared boundary for every library-side delete, and the only one — the
+         * endpoints above it are a list that grows.
+         *
+         * Best-effort: the hook is queued after the library's transaction has
+         * committed, so the session is already gone and failing here would report
+         * a sign-out that did happen as an error. The rows expire on their own
+         * within the re-authentication window, and a session id is never reused.
+         */
+        after: async (session) => {
+          try {
+            await revokeSessionArtifacts(authDatabase(), [session.id]);
+          } catch (error) {
+            console.error(
+              sanitizeForLog({ msg: 'session.artifactRevoke.failed', error })
             );
           }
         },

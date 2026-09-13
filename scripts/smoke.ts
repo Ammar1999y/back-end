@@ -12,7 +12,7 @@
  * readiness check passes (so the volume opened, migrated, and reported the
  * PRAGMAs this build expects), the security headers are attached, an unrouted
  * path produces the API envelope rather than a framework default, Better Auth is
- * mounted, and both authenticated surfaces refuse an anonymous caller.
+ * mounted, and every authenticated surface refuses an anonymous caller.
  *
  * What it does NOT prove: that PostgreSQL is reachable. Readiness now includes a
  * bounded `SELECT 1`, and CI runs this against a deliberately unreachable host —
@@ -26,7 +26,24 @@
 import { TRUSTED_IP_HEADERS } from '@/lib/audit/constants';
 import { SECURITY_HEADERS } from '@/lib/http/security-headers';
 
-const PORT = Number(process.env.SMOKE_PORT ?? 3999);
+/**
+ * `Number('')` is 0 and `Number('http')` is NaN, and both used to reach
+ * `Bun.serve`: a NaN port makes the server pick a random free one and every
+ * probe below then goes to 3999, where nothing is listening, so the run reports
+ * "server did not boot" for a configuration mistake.
+ */
+function smokePort(): number {
+  const configured = process.env.SMOKE_PORT;
+  if (configured === undefined || configured === '') return 3999;
+  const port = Number(configured);
+  if (!Number.isSafeInteger(port) || port < 1 || port > 65_535)
+    throw new Error(
+      `SMOKE_PORT must be an integer between 1 and 65535. Received: "${configured}".`
+    );
+  return port;
+}
+
+const PORT = smokePort();
 const BASE = `http://127.0.0.1:${PORT}`;
 const BOOT_TIMEOUT_MS = 30_000;
 const POLL_INTERVAL_MS = 250;
@@ -46,6 +63,22 @@ const EDGE_HEADERS: Record<string, string> = {
   [TRUSTED_IP_HEADERS[0]]: '203.0.113.7',
 };
 
+/**
+ * The maintenance token this run uses, and gives the child.
+ *
+ * `/api/health/storage` answers 401 without it — the WHOLE route, not only
+ * `?deep=1` — so the readiness probe below cannot run anonymously at all. The
+ * checks ARE what a boot test can prove, so this supplies one: an ambient value
+ * is reused when the environment sets one (the production-posture CI run does),
+ * otherwise a throwaway that lives for this process.
+ *
+ * 32 characters at minimum, and required in production — `lib/env.server.ts`
+ * refuses a shorter one, and an absent one, at boot.
+ */
+const MAINTENANCE_TOKEN =
+  process.env.SQLITE_MAINTENANCE_TOKEN ||
+  `smoke-${crypto.randomUUID()}${crypto.randomUUID()}`;
+
 const probe = (path: string, init: RequestInit = {}): Promise<Response> =>
   fetch(`${BASE}${path}`, {
     ...init,
@@ -58,11 +91,34 @@ interface Check {
   detail: string;
 }
 
-const server = Bun.spawn(['bun', 'server.ts'], {
-  env: { ...process.env, PORT: String(PORT) },
+/**
+ * The DEPLOYED command, flag for flag: `package.json`'s `start` is
+ * `bun --bun server.ts`, and `--bun` is what makes a `#!/usr/bin/env node`
+ * shebang in a dependency's binary resolve to Bun. A smoke test that boots
+ * `bun server.ts` certifies a runtime posture the deployment does not use.
+ */
+const SERVER_COMMAND = ['bun', '--bun', 'server.ts'] as const;
+
+const server = Bun.spawn([...SERVER_COMMAND], {
+  env: {
+    ...process.env,
+    PORT: String(PORT),
+    SQLITE_MAINTENANCE_TOKEN: MAINTENANCE_TOKEN,
+  },
   stdout: 'inherit',
   stderr: 'inherit',
 });
+
+/**
+ * A signal to this process has to reach the CHILD, or an interrupted smoke run
+ * leaves a server holding the port — the next run then probes someone else's
+ * process and reports whatever it finds.
+ */
+for (const signal of ['SIGINT', 'SIGTERM'] as const)
+  process.on(signal, () => {
+    server.kill(signal);
+    process.exitCode = 1;
+  });
 
 /** Polls readiness until the server answers, dies, or the deadline passes. */
 async function waitForBoot(): Promise<Response | null> {
@@ -70,7 +126,9 @@ async function waitForBoot(): Promise<Response | null> {
   while (Date.now() < deadline) {
     if (server.exitCode !== null) return null;
     try {
-      return await probe('/api/health/storage');
+      return await probe('/api/health/storage', {
+        headers: { 'x-maintenance-token': MAINTENANCE_TOKEN },
+      });
     } catch {
       await Bun.sleep(POLL_INTERVAL_MS);
     }
@@ -103,6 +161,12 @@ async function runChecks(health: Response): Promise<Check[]> {
   const internal = await probe('/api/internal/sqlite-sweep', {
     method: 'POST',
   });
+  // Readiness itself, WITHOUT the token. The deployed health check is a CMD
+  // check that carries it; this is the other half — that a caller from outside
+  // the container gets nothing, including the poll that used to be free and
+  // spendable (the deployment-wide budget behind it made the orchestrator's own
+  // probe fail at 4 req/s).
+  const anonymousHealth = await probe('/api/health/storage');
   // The upload route's authentication gate, checked here because it is the only
   // gate in the app that a request can reach WITHOUT a preflight: multipart is a
   // CORS-simple content type, so CORS does not stand in front of it. It must
@@ -199,6 +263,11 @@ async function runChecks(health: Response): Promise<Check[]> {
       name: 'file upload rejects an unauthenticated request',
       ok: upload.status === 401,
       detail: `HTTP ${upload.status}`,
+    },
+    {
+      name: 'storage readiness is not served to an anonymous caller',
+      ok: anonymousHealth.status === 401,
+      detail: `HTTP ${anonymousHealth.status}`,
     },
     {
       name: 'the OpenAPI contract is not served to an anonymous caller',

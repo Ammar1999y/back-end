@@ -33,7 +33,11 @@ import { describe, expect, spyOn, test } from 'bun:test';
 import zlib from 'node:zlib';
 
 import { uploadMsg } from '@/app/api/upload/file/messages';
+import { JSDOM } from 'jsdom';
 import {
+  admitUpload,
+  DOCUMENT_BYTE_BUDGET_MIB,
+  DOCUMENT_REQUEST_UNIT,
   UPLOAD_MEGAPIXEL_BUDGET,
   UPLOAD_REQUEST_UNIT,
 } from '@/lib/media/upload';
@@ -56,9 +60,11 @@ import {
   SVG_MAX_RENDERED_NODES,
 } from '@/utils/images/config';
 import { rasterDimensions } from '@/utils/images/raster-bytes';
+import { imageToRgba } from '@/utils/images/rgba';
 import { sanitizeSvgServer, svgOptimizerServer } from '@/utils/images/server';
 import { sanitizeSvg } from '@/utils/images/svg-optimizer';
 import {
+  MAX_DOCUMENT_SIZE_MB,
   MAX_IMAGE_EDGE,
   MAX_IMAGE_PIXELS,
   MAX_IMAGE_SIZE,
@@ -921,6 +927,51 @@ const PNG_SIGNATURE = Uint8Array.from([
   0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
 ]);
 
+describe('XML escaping across the sanitiser', () => {
+  /**
+   * DOMPurify serializes as HTML, where an attribute value needs no escaping
+   * for `<`. What this file stores and serves is `image/svg+xml`, where it
+   * does — so a legal value came back through the sanitiser as raw `<` and the
+   * final XML parse rejected the whole upload with the generic
+   * sanitisation-failed message.
+   */
+  const attributeValue = (markup: string, attribute: string): string | null => {
+    // eslint-disable-next-line security/detect-non-literal-regexp -- `attribute` is a literal from the cases below, never input
+    const match = new RegExp(`${attribute}="([^"]*)"`).exec(markup);
+    return match?.[1] ?? null;
+  };
+
+  test.each([
+    ['a less-than', 'a&lt;b', 'a&lt;b'],
+    ['a greater-than', 'a&gt;b', 'a&gt;b'],
+    ['an ampersand', 'a&amp;b', 'a&amp;b'],
+    ['a quote', 'a&quot;b', 'a&quot;b'],
+  ])('%s in an attribute survives as XML', (_label, encoded, expected) => {
+    const result = clean(
+      `<svg xmlns="${SVG_NS}" width="10" height="10"><text font-family="${encoded}">x</text></svg>`
+    );
+
+    expect(result.isValid).toBe(true);
+    expect(attributeValue(result.cleanedSvg, 'font-family')).toBe(expected);
+  });
+
+  test('the output re-parses as XML, which is the grammar it is served as', () => {
+    const result = clean(
+      `<svg xmlns="${SVG_NS}"><text font-family="a&lt;b">x</text></svg>`
+    );
+    const reparsed = new JSDOM('', {
+      runScripts: 'outside-only',
+    }).window.DOMParser;
+    const doc = new reparsed().parseFromString(
+      result.cleanedSvg,
+      'image/svg+xml'
+    );
+
+    expect(doc.querySelector('parsererror')).toBeNull();
+    expect(doc.documentElement.localName).toBe('svg');
+  });
+});
+
 describe('the SVG content boundary', () => {
   // `validateSvgFile` used to live here: an exported helper that read `file.type`,
   // `file.name` and `file.size` and never opened the file, so PNG bytes named
@@ -1473,6 +1524,53 @@ describe('validateMagicBytes', () => {
   });
 });
 
+/**
+ * A `Content-Type` may legally carry parameters, and a browser's `FormData`
+ * round-trip preserves whatever the client set on the part.
+ */
+describe('a declared type carrying parameters', () => {
+  const IMAGE_TARGET = { kinds: ['image'] as const };
+
+  function part(bytes: Uint8Array, type: string, name = 'f'): File {
+    return new File([bytes as unknown as BlobPart], name, { type });
+  }
+
+  test('resolves to the allowlist entry its essence names', async () => {
+    const admitted = await admitUpload(
+      part(stillWebp, 'image/webp; charset=utf-8', 'still.webp'),
+      IMAGE_TARGET
+    );
+    expect(admitted.mimeType).toBe('image/webp');
+    expect(admitted.spec.extension).toBe('webp');
+  });
+
+  test('does NOT skip animation detection', async () => {
+    // The gap: the allowlist lookup normalized and the byte-level checks
+    // compared the raw string, so `hasRasterSignature` answered false for a
+    // parameterised type and `validateMagicBytes` returned `{ valid: true }`
+    // for an animated WebP. It survived only because `processImage` later
+    // refused the raw string — a check whose job is something else entirely.
+    expect(
+      admitUpload(
+        part(animatedWebp, 'image/webp; charset=utf-8', 'anim.webp'),
+        IMAGE_TARGET
+      )
+    ).rejects.toThrow(uploadMsg.animatedNotAllowed('anim'));
+  });
+
+  test('does NOT skip SVG sanitisation', async () => {
+    const hostile = new TextEncoder().encode(
+      '<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>'
+    );
+    const admitted = await admitUpload(
+      part(hostile, 'image/svg+xml; charset=utf-8', 'x.svg'),
+      IMAGE_TARGET
+    );
+    expect(admitted.validatedSvg).toBeDefined();
+    expect(admitted.validatedSvg?.cleanedSvg).not.toContain('script');
+  });
+});
+
 describe('validateMagicBytes — the animated-WebP branch', () => {
   test('an animated WebP is refused with { valid: false, animated: true }', () => {
     expect(validateMagicBytes(animatedWebp, 'image/webp')).toEqual({
@@ -1639,6 +1737,50 @@ describe('validateMagicBytes — the animated-PNG branch', () => {
 // The per-user upload budget, in megapixels
 // ─────────────────────────────────────────────────────────────────────────────
 
+describe('the encoder shape the blurhash decoder depends on', () => {
+  /**
+   * `utils/images/rgba.ts` is not a general PNG decoder. It reads exactly what
+   * `Bun.Image(...).png({ compressionLevel: 0 })` emits — 8-bit,
+   * non-interlaced, colour type 0/2/4/6 — because everything it decodes comes
+   * from that encoder. A runtime change to any of those is what would silently
+   * stop every placeholder being produced, and nothing asserted it.
+   */
+  const IHDR = { width: 16, depth: 24, colourType: 25, interlace: 28 } as const;
+
+  async function encodedHeader(source: Buffer) {
+    const png = await new Bun.Image(source)
+      .resize(32, 32, { fit: 'inside' })
+      .png({ compressionLevel: 0 })
+      .bytes();
+    const buf = Buffer.from(png);
+    return {
+      signature: buf.readUInt32BE(0),
+      ihdr: buf.toString('ascii', 12, 16),
+      bitDepth: buf.readUInt8(IHDR.depth),
+      colourType: buf.readUInt8(IHDR.colourType),
+      interlace: buf.readUInt8(IHDR.interlace),
+    };
+  }
+
+  test('a PNG round-trips as the one shape the decoder accepts', async () => {
+    const header = await encodedHeader(realPng);
+
+    expect(header.signature).toBe(0x89_50_4e_47);
+    expect(header.ihdr).toBe('IHDR');
+    expect(header.bitDepth).toBe(8);
+    expect([0, 2, 4, 6]).toContain(header.colourType);
+    expect(header.interlace).toBe(0);
+  });
+
+  test('the pixels come back as RGBA at the requested bound', async () => {
+    const { width, height, rgba } = await imageToRgba(realPng, 32);
+
+    expect(width).toBeLessThanOrEqual(32);
+    expect(height).toBeLessThanOrEqual(32);
+    expect(rgba.length).toBe(width * height * 4);
+  });
+});
+
 describe('the upload budget is charged in megapixels', () => {
   /**
    * The unit the limiter spends, and the two ceilings it derives.
@@ -1670,6 +1812,20 @@ describe('the upload budget is charged in megapixels', () => {
     expect(worstCase).toBeLessThanOrEqual(UPLOAD_MEGAPIXEL_BUDGET);
     // And the worst case really is bounded: four such uploads per window.
     expect(Math.floor(UPLOAD_MEGAPIXEL_BUDGET / worstCase)).toBe(4);
+  });
+
+  test('a maximum-size document still fits in one window', () => {
+    // The same invariant on the OTHER budget, which had the prose and not the
+    // check: raising `MAX_DOCUMENT_SIZE_MB` past the budget makes every
+    // maximum-size document answer 429 forever, because `rateLimit` refuses
+    // `cost > limit` without a write. `lib/media/upload.ts` throws at load if
+    // this stops holding; importing it above is what runs that check.
+    const worstCase = Math.max(DOCUMENT_REQUEST_UNIT, MAX_DOCUMENT_SIZE_MB);
+
+    expect(worstCase).toBeLessThanOrEqual(DOCUMENT_BYTE_BUDGET_MIB);
+    expect(Math.floor(DOCUMENT_BYTE_BUDGET_MIB / worstCase)).toBe(6);
+    // `BUDGET / UNIT` is the request ceiling when every document is small.
+    expect(DOCUMENT_BYTE_BUDGET_MIB / DOCUMENT_REQUEST_UNIT).toBe(30);
   });
 
   test.each([

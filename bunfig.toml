@@ -59,3 +59,25 @@ coverageReporter = ["text", "lcov"]
 # directory never sees this.
 [run]
 bun = true
+
+# The install-side half of the repository's release-age policy.
+#
+# `renovate.json` extends `security:minimumReleaseAgeNpm`, which holds an npm
+# release back for three days so malware scanners and unpublishes have time to
+# land. Nothing applied that to a developer typing `bun add` or `bun update`, so
+# the one path a compromised release is most likely to arrive through — someone
+# pulling a fix the moment it ships — was the one path with no delay. 259 200
+# seconds is the same three days, in the units Bun takes (verified on 1.4.2: an
+# unreachable floor refuses the resolve outright rather than silently ignoring
+# the key).
+#
+# `vulnerabilityAlerts` in `renovate.json` sets `minimumReleaseAge: null` so a
+# SECURITY fix is never delayed. There is no per-advisory equivalent here, so an
+# urgent patch inside the window is installed with
+# `--minimum-release-age=0` on the command line, deliberately and once.
+[install]
+minimumReleaseAge = 259200
+# Bun's own runtime and its types move together and are pinned by
+# `packageManager`, so the window buys nothing for them and would block the
+# matching pair landing on the same day.
+minimumReleaseAgeExcludes = ["bun", "@types/bun", "bun-types"]

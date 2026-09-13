@@ -26,11 +26,50 @@ class SmtpDeadlineExceeded extends Error {
   }
 }
 
+/** A transport Nodemailer has already resolved a host for. */
+type ResolvedTransport = SMTPTransportOptions & { host: string };
+
+/**
+ * The transport is checked at the one point where it is fully resolved:
+ * `service` is merged into `host`/`port`/`secure` by Nodemailer's constructor,
+ * so neither `smtpTransportOptions()` nor this module's own argument carries the
+ * answer — only the options handed to `getSocket` do.
+ *
+ * Refused rather than defaulted, because each default is a silent downgrade of
+ * what the caller asked for: an unresolved host becomes `localhost`, and a
+ * transport without implicit TLS negotiates STARTTLS only if the peer offers it,
+ * so a stripped EHLO would send the message — an OTP code — in cleartext.
+ *
+ * `ignoreTLS` is the one way past the second check, and it is Nodemailer's own
+ * flag rather than a local invention: renouncing transport security has to be
+ * written down in the transport options, where it is greppable, instead of
+ * following from the absence of a field. The only sender is Gmail
+ * (`secure: true`); the loopback peers in `tests/fixtures` are what sets it.
+ */
+function resolveTransport(
+  options: SMTPTransportOptions
+): ResolvedTransport | Error {
+  if (!options.host)
+    return new Error(
+      'SMTP transport resolved no host; configure `service` or `host`'
+    );
+  if (
+    options.secure !== true &&
+    options.requireTLS !== true &&
+    options.ignoreTLS !== true
+  )
+    return new Error(
+      `SMTP transport for ${options.host} has neither implicit TLS (\`secure\`) ` +
+        'nor mandatory STARTTLS (`requireTLS`); set `ignoreTLS` to send in cleartext'
+    );
+  return { ...options, host: options.host };
+}
+
 function openSocket(
-  options: SMTPTransportOptions,
+  options: ResolvedTransport,
   callback: (error: Error | null, socket: Socket) => void
 ): Socket {
-  const host = options.host ?? 'localhost';
+  const { host } = options;
   const port = Number(options.port) || (options.secure ? 465 : 587);
   const socket = options.secure
     ? tls.connect({
@@ -69,9 +108,14 @@ export async function sendMailWithDeadline(
       resolved: SMTPTransportOptions,
       callback: SMTPTransportGetSocketCallback
     ) => {
-      owned.socket = openSocket(resolved, (error, socket) => {
+      const peer = resolveTransport(resolved);
+      if (peer instanceof Error) {
+        callback(peer);
+        return;
+      }
+      owned.socket = openSocket(peer, (error, socket) => {
         if (error) callback(error);
-        else callback(null, { connection: socket, secured: resolved.secure });
+        else callback(null, { connection: socket, secured: peer.secure });
       });
     },
   });

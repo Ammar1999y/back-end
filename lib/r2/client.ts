@@ -33,6 +33,25 @@ const validateR2Config = !!(
   R2_SECRET_ACCESS_KEY
 );
 
+/**
+ * The deadlines the SDK does not have.
+ *
+ * Installed Smithy defaults BOTH `connectionTimeout` and `requestTimeout` to 0,
+ * which is off (`DEFAULT_REQUEST_TIMEOUT = 0` in
+ * `@smithy/node-http-handler`), so a hung R2 socket outlives the route's
+ * connection ceiling and keeps one of the process's sockets. `requestTimeout`
+ * ALSO needs `throwOnRequestTimeout`: without it the handler logs a warning and
+ * lets the request run on, which is a deadline that does not bound anything.
+ *
+ * `requestTimeout` covers the whole exchange, body upload included, so it has to
+ * fit the largest object this application writes (`MAX_DOCUMENT_SIZE_MB`).
+ * Fifteen seconds is ~700 KiB/s for a 10 MB document, far under a server-side
+ * link, and three attempts keeps the total under the destructive media routes'
+ * declared `timeoutSeconds`.
+ */
+const R2_CONNECTION_TIMEOUT_MS = 3000;
+const R2_REQUEST_TIMEOUT_MS = 15_000;
+
 const r2Client = new S3Client({
   endpoint: `https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com`,
   credentials: {
@@ -43,6 +62,25 @@ const r2Client = new S3Client({
   // The signing scope Cloudflare documents. `weur` (the location hint) was also
   // accepted when measured, but a hint is not a signing region.
   region: 'auto',
+  // The OPTIONS object, not a constructed handler: `requestHandler` accepts
+  // `NodeHttpHandlerOptions` and the client calls `NodeHttpHandler.create` on
+  // it, so this needs no import of `@smithy/node-http-handler` — which reaches
+  // this project only as a transitive dependency of the SDK.
+  requestHandler: {
+    connectionTimeout: R2_CONNECTION_TIMEOUT_MS,
+    requestTimeout: R2_REQUEST_TIMEOUT_MS,
+    throwOnRequestTimeout: true,
+  },
+  // The SDK's own default, stated: it is what the worst-case arithmetic behind
+  // every route timeout that reaches R2 is built on, and a transitive default
+  // is not a number this application gets to assume.
+  maxAttempts: 3,
+  // Wire integrity as a client contract rather than a per-call convention.
+  // `WHEN_SUPPORTED` is also the SDK's current default, and the same reasoning
+  // applies: a transitive default that changes would silently stop checksumming
+  // the uploads `uploadToR2` requires a digest for.
+  requestChecksumCalculation: 'WHEN_SUPPORTED',
+  responseChecksumValidation: 'WHEN_SUPPORTED',
 });
 
 export type BucketType = 'public' | 'private';
@@ -128,8 +166,13 @@ export async function uploadToR2(params: {
    * Hex SHA-256 of `file`. Sent as the object's checksum, which R2 verifies on
    * the write and returns on a later `HeadObject` of that object (measured; a
    * copy does not inherit it).
+   *
+   * REQUIRED, because it is what makes the write verifiable end to end and what
+   * `settleKeyCollision` reads back to tell this client's own retry from a
+   * foreign object at the same key. Optional, a future caller could drop it and
+   * change the integrity of the wire without changing a line here.
    */
-  sha256?: string;
+  sha256: string;
   /**
    * Refuse to overwrite: `If-None-Match: *`. Every key this application writes
    * is derived from a fresh row id, so something at the key is either a bug or
@@ -164,9 +207,7 @@ export async function uploadToR2(params: {
       CacheControl: cacheControl,
       ContentDisposition: contentDisposition,
       Metadata: metadata,
-      ...(sha256 && {
-        ChecksumSHA256: Buffer.from(sha256, 'hex').toString('base64'),
-      }),
+      ChecksumSHA256: Buffer.from(sha256, 'hex').toString('base64'),
       ...(ifNoneMatch && { IfNoneMatch: '*' }),
     })
   );
@@ -220,11 +261,17 @@ export async function deleteObjectsFromR2(params: {
         Delete: { Objects: chunk.map((Key) => ({ Key })), Quiet: true },
       })
     );
-    const refused = new Set(
-      (result.Errors ?? []).flatMap((entry) =>
-        typeof entry.Key === 'string' ? [entry.Key] : []
-      )
-    );
+    const errors = result.Errors ?? [];
+    // An error entry without a `Key` says something went wrong and does not say
+    // for which object — the SDK's type permits it. Counting only the KEYED
+    // errors labelled every other requested key deleted, and the caller then
+    // removed rows for objects whose deletion was never confirmed. Nothing is
+    // confirmed for the chunk in that case.
+    if (errors.some((entry) => typeof entry.Key !== 'string')) {
+      failed.push(...chunk);
+      continue;
+    }
+    const refused = new Set(errors.map((entry) => entry.Key));
     for (const key of chunk) (refused.has(key) ? failed : deleted).push(key);
   }
   return { deleted, failed };

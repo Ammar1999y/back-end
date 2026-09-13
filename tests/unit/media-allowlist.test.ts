@@ -957,4 +957,46 @@ describe('legacy compound files', () => {
       reason: 'container',
     });
   });
+
+  test('a DIFAT that names one FAT sector thousands of times is refused before the table is built', () => {
+    // The amplification the caps exist to stop, and the caps did not: the
+    // per-sector list was checked only AFTER it was complete, and `readTable`
+    // then read `entriesPerFatSector` u32 for every ENTRY — a 20 KB file
+    // produced 3.25 million numbers and 17 MB of heap for a file that is
+    // refused anyway. `.doc`/`.xls` are disabled today, and `DISABLED_FILE_TYPES`
+    // says re-enabling one is deleting it from a set.
+    const SECTOR_SHIFT = 12;
+    const SECTOR_SIZE = 1 << SECTOR_SHIFT;
+    const PER_SECTOR = SECTOR_SIZE / 4;
+    const DIFAT_SECTORS = 3;
+    const FAT_SECTOR = DIFAT_SECTORS;
+
+    const bytes = Buffer.alloc(SECTOR_SIZE * (DIFAT_SECTORS + 2));
+    Buffer.from([0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1]).copy(bytes);
+    bytes.writeUInt16LE(SECTOR_SHIFT, 30);
+    bytes.writeUInt16LE(6, 32);
+    bytes.writeUInt32LE(1, 44);
+    bytes.writeUInt32LE(4096, 56);
+    bytes.writeUInt32LE(0, 68);
+    bytes.writeUInt32LE(DIFAT_SECTORS, 72);
+    for (let i = 0; i < 109; i++) bytes.writeUInt32LE(FAT_SECTOR, 76 + i * 4);
+    for (let d = 0; d < DIFAT_SECTORS; d++) {
+      const base = (d + 1) * SECTOR_SIZE;
+      for (let i = 0; i < PER_SECTOR - 1; i++)
+        bytes.writeUInt32LE(FAT_SECTOR, base + i * 4);
+      bytes.writeUInt32LE(
+        d + 1 < DIFAT_SECTORS ? d + 1 : 0xff_ff_ff_fe,
+        base + (PER_SECTOR - 1) * 4
+      );
+    }
+
+    const started = Bun.nanoseconds();
+    expect(detectCompoundFile(bytes, 'word')).toEqual({
+      ok: false,
+      reason: 'container',
+    });
+    // Generous, and still two orders of magnitude under what building the table
+    // cost. The assertion is the SHAPE of the work, not a latency budget.
+    expect((Bun.nanoseconds() - started) / 1e6).toBeLessThan(20);
+  });
 });

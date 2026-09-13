@@ -79,8 +79,7 @@ export function canEvaluateOtp(stored: string): boolean {
  * Two cases deliberately DO throw, because both mean an operator has to act and
  * neither is a wrong code: a key id the keyring no longer holds (below), and a
  * malformed legacy `p1:` envelope, which `verifyPassword` rejects with
- * `PasswordHashFormatError`. The second is unchanged from before this module
- * existed, when every OTP went through `verifyPassword`.
+ * `PasswordHashFormatError`.
  *
  * `timingSafeEqual` throws on a length mismatch rather than returning false, so
  * the length is checked first. That check is not itself a leak: the MAC length is

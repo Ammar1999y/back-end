@@ -59,11 +59,9 @@
  *         `const schema = z.string(idRequired).min(1, idRequired);`
  *       (prefer adding `.regex(UUID_V7_REGEX, ...)` for strict validation).
  *
- *     In `preprocess`, the fallback is `0` for number and `''` (or null) for UUID.
- *
- *  b) The exported `idSchema` type:
- *     - For `number`: the second type in `ZodPipe` is `z.ZodInt`.
- *     - For `UUID`:   the second type in `ZodPipe` is `z.ZodString`.
+ *     In `preprocess`, the fallback is `0` for number and `''` for UUID. It has
+ *     to be of the id's own type, so a malformed id is rejected as a bad format
+ *     rather than as a wrong type.
  *
  * ────────────────────────────────────────────────────────────
  * General notes

@@ -2,6 +2,8 @@ export const uploadMsg = {
   noFiles: 'لم يتم إرسال ملفات',
   noValidFiles: 'لم يتم إرسال ملفات صالحة',
   maxFiles: (max: number) => `الحد الأقصى ${max} ملفات في الطلب الواحد`,
+  /** Any part beyond the single expected file field. */
+  unexpectedFormField: (name: string) => `حقل غير متوقع في الطلب: ${name}`,
   fileTooLarge: (name: string, maxMB: number) =>
     `حجم الملف ${name} كبير جداً. الحد الأقصى: ${maxMB}MB`,
   invalidType: (name: string) =>

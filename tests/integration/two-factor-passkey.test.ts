@@ -18,6 +18,7 @@ import { db } from '@/db';
 import {
   auditLogs,
   passkeys,
+  sessions as sessionsTable,
   trustedDevices,
   twoFactorCredentials,
   twoFactorMethods,
@@ -125,7 +126,11 @@ beforeAll(async () => {
 describe('registering a passkey', () => {
   const RP_ID = new URL(PUBLIC_ORIGIN).hostname;
 
-  async function register(user: SeededUser, userVerified: boolean) {
+  async function register(
+    user: SeededUser,
+    userVerified: boolean,
+    extraBody: Record<string, unknown> = {}
+  ) {
     const signedIn = await signIn(user);
     expect(signedIn.status).toBe(HTTP_STATUS.OK);
 
@@ -169,10 +174,14 @@ describe('registering a passkey', () => {
     const verified = await call(
       'POST',
       '/api/auth/passkey/verify-registration',
-      { response: ceremony.response, grant },
+      { response: ceremony.response, grant, ...extraBody },
       jar
     );
-    return { verified, credentialId: ceremony.credentialId };
+    return {
+      verified,
+      credentialId: ceremony.credentialId,
+      cookie: signedIn.cookie,
+    };
   }
 
   test('refuses inputs this schema could not store', async () => {
@@ -295,6 +304,41 @@ describe('registering a passkey', () => {
         )
       );
     expect(added).toHaveLength(1);
+  });
+
+  test('refuses the library flag that would sign the user out on success', async () => {
+    // ⚠️ `createSession` is the plugin's own body field: it mints a SECOND
+    // session and sets its cookie on the response. The enrolment that follows
+    // rotates the user's sessions and keeps only the one the REQUEST arrived
+    // on, so that fresh row is deleted after its cookie is already on the wire
+    // — the browser is left holding a token for a row that does not exist,
+    // `/get-session` keeps answering 200 from the cookie cache, and every path
+    // that checks liveness answers 401. Forced off is also the only correct
+    // direction: a session minted here has completed no second factor, and the
+    // account has one from this request onwards.
+    const user = await seedUser();
+    const { verified, cookie } = await register(user, true, {
+      createSession: true,
+    });
+
+    expect(verified.status).toBe(HTTP_STATUS.OK);
+    expect(await verified.json()).not.toHaveProperty('session');
+
+    const rows = await db
+      .select({ id: sessionsTable.id })
+      .from(sessionsTable)
+      .where(eq(sessionsTable.userId, user.userId));
+    expect(rows).toHaveLength(1);
+
+    // The session the caller arrived on is the one that survives, and it still
+    // authenticates a request that checks liveness against the database.
+    const methods = await call(
+      'GET',
+      '/api/auth/two-factor/methods',
+      undefined,
+      cookie
+    );
+    expect(methods.status).toBe(HTTP_STATUS.OK);
   });
 });
 

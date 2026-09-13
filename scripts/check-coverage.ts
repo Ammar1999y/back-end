@@ -27,25 +27,36 @@
  * sees `--coverage` in a workflow stops looking for one.
  *
  * Usage: `bun scripts/check-coverage.ts [path/to/lcov.info]`
+ *
+ * The report has to come from the tier the floors were measured on and from the
+ * run that just finished; `coverage/provenance.json`, written by
+ * `tests/helpers/run.ts`, is what says so.
  */
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync, statSync } from 'node:fs';
 import path from 'node:path';
+
+import { reportDigest } from '../tests/helpers/coverage';
 
 /**
  * Floors, a few points under the measured rate so ordinary variation between
  * runs does not flap while a real collapse fails.
  *
- * Measured on the integration tier — from THIS gate's own numbers: 60.02% of
- * lines and 73.51% of functions across 115 files, 14,716 lines and 853
- * functions. They do not match the `text` reporter's `All files` row on the same
- * run: that row and these totals are computed differently, and the summed lcov
- * counters are what this file asserts, so they are what the floors are set from.
- * Do not copy a number out of the job log into here.
+ * Measured on the integration tier — from THIS gate's own numbers, over three
+ * runs: 71.65%–80.70% of lines and 75.76%–82.92% of functions across 181 files,
+ * 25.2k–25.7k lines and 1.6k–1.7k functions. They do not match the `text`
+ * reporter's `All files` row on the same run: that row and these totals are
+ * computed differently, and the summed lcov counters are what this file
+ * asserts, so they are what the floors are set from. Do not copy a number out
+ * of the job log into here.
+ *
+ * Set under the WORST of those runs, not the best. The tier does not load an
+ * identical set of files every time under `--coverage` — the three runs
+ * executed 525, 554 and 579 tests — so a floor set against a good run flaps.
  *
  * RAISE these as the rate rises; never lower one to make a red run green — that
  * is the move this file exists to make visible.
  */
-const FLOORS = { lines: 0.54, functions: 0.68 } as const;
+const FLOORS = { lines: 0.66, functions: 0.72 } as const;
 
 /**
  * Floors on the DENOMINATOR, and they are what make the ratios above mean
@@ -58,17 +69,132 @@ const FLOORS = { lines: 0.54, functions: 0.68 } as const;
  * exercised the uncovered one leaves one file at 100% and passes. A gate whose
  * stated purpose is "the suite must not collapse" was rewarding the collapse.
  *
- * `files === 0` was the only guard, and a suite cut to a single test still
- * clears it. These are the same measurement as the rates above, with the same
- * margin: a real deletion moves them by far more than run-to-run variation does.
+ * `files === 0` alone is no guard at all: a suite cut to a single test clears
+ * it. These are the same measurement as the rates above, with the same margin —
+ * a real deletion moves them by far more than run-to-run variation does.
  */
 const MINIMUMS = {
-  files: 100,
-  linesFound: 13_000,
-  functionsFound: 750,
+  files: 150,
+  linesFound: 22_000,
+  functionsFound: 1400,
 } as const;
 
 const DEFAULT_REPORT = path.join('coverage', 'lcov.info');
+
+/**
+ * The tier whose loaded files `FLOORS` and `MINIMUMS` were measured against.
+ *
+ * lcov records neither a tier nor a time, so this gate has no way to tell one
+ * report from another: it accepted a five-day-old file from a DIFFERENT tier,
+ * containing files the thresholds here do not describe, and reported `coverage
+ * ok`. CI happens to order the steps so the right report is on disk; a local
+ * run, a reordered job or a cached `coverage/` directory does not.
+ * `tests/helpers/run.ts` writes the sidecar this reads.
+ */
+const EXPECTED_TIER = 'integration';
+
+/**
+ * How old a report may be and still describe THIS run.
+ *
+ * Generous on purpose — the integration tier plus the process tier run between
+ * the stamp and this gate — and still far short of the five days that went
+ * unnoticed.
+ */
+const MAX_REPORT_AGE_MS = 60 * 60 * 1000;
+
+interface Provenance {
+  tier?: unknown;
+  startedAt?: unknown;
+  finishedAt?: unknown;
+  digest?: unknown;
+}
+
+/**
+ * Refuses a report this gate cannot attribute to a just-finished run of the
+ * tier the thresholds describe. Never returns on a refusal.
+ */
+function assertProvenance(report: string): void {
+  const sidecar = path.resolve(path.dirname(report), 'provenance.json');
+  const reject = (reason: string, detail?: Record<string, unknown>): never => {
+    console.error(
+      JSON.stringify({
+        msg: 'coverage report cannot be attributed to this run',
+        reason,
+        expectedTier: EXPECTED_TIER,
+        sidecar,
+        hint: `run: bun run test:${EXPECTED_TIER} -- --coverage`,
+        ...detail,
+      })
+    );
+    process.exit(1);
+  };
+
+  // eslint-disable-next-line security/detect-non-literal-fs-filename -- derived from argv of a developer/CI-invoked script, not from a request
+  if (!existsSync(sidecar)) reject('no provenance sidecar beside the report');
+
+  let stamp: Provenance;
+  try {
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- same
+    stamp = JSON.parse(readFileSync(sidecar, 'utf8')) as Provenance;
+  } catch {
+    return reject('the provenance sidecar is not readable JSON');
+  }
+
+  if (stamp.tier !== EXPECTED_TIER)
+    reject('the report was produced by a different tier', {
+      reportedTier: stamp.tier,
+    });
+
+  const finished =
+    typeof stamp.finishedAt === 'string' ? Date.parse(stamp.finishedAt) : NaN;
+  if (!Number.isFinite(finished))
+    reject('the provenance sidecar carries no finish time');
+  const ageMs = Date.now() - finished;
+  if (ageMs < 0 || ageMs > MAX_REPORT_AGE_MS)
+    reject('the report is not from this run', {
+      finishedAt: stamp.finishedAt,
+      ageMinutes: Math.round(ageMs / 60_000),
+      maxAgeMinutes: MAX_REPORT_AGE_MS / 60_000,
+    });
+
+  const started =
+    typeof stamp.startedAt === 'string' ? Date.parse(stamp.startedAt) : NaN;
+  if (!Number.isFinite(started))
+    reject('the provenance sidecar carries no start time');
+  // A stamp whose run finished before it began describes no run at all, so
+  // nothing below it can be trusted to order anything.
+  if (started > finished)
+    reject('the provenance sidecar finishes before it starts', {
+      startedAt: stamp.startedAt,
+      finishedAt: stamp.finishedAt,
+    });
+
+  // The REPORT's own timestamp, not only the sidecar's. A run that produced no
+  // lcov — the tier invoked without `--coverage`, or the reporter list edited —
+  // leaves a fresh stamp beside a stale file, which is the same hole one layer
+  // in: a single-file integration run stamps but does not rewrite the report.
+  // eslint-disable-next-line security/detect-non-literal-fs-filename -- derived from argv of a developer/CI-invoked script, not from a request
+  const writtenAt = statSync(report).mtimeMs;
+  if (writtenAt < started)
+    reject('the report predates the run that stamped it', {
+      reportWrittenAt: new Date(writtenAt).toISOString(),
+      runStartedAt: stamp.startedAt,
+      hint: 'the tier ran without --coverage, or bunfig stopped declaring the lcov reporter',
+    });
+
+  // And the report's CONTENTS, which is the only thing a timestamp cannot fake.
+  // A later `bun test --coverage`, or a restored `coverage/` directory, replaces
+  // the report in place while the sidecar stays valid for its whole age window;
+  // the counters then read from one run are attributed to another tier's floors.
+  // eslint-disable-next-line security/detect-non-literal-fs-filename -- same
+  const actual = reportDigest(readFileSync(report));
+  if (stamp.digest !== actual)
+    reject('the report is not the one the run stamped', {
+      stampedDigest: stamp.digest,
+      reportDigest: actual,
+      hint: 'coverage/lcov.info was replaced after the tier stamped it; re-run the tier',
+    });
+}
 
 interface Totals {
   linesFound: number;
@@ -136,6 +262,8 @@ if (!existsSync(target)) {
   );
   process.exit(1);
 }
+
+assertProvenance(target);
 
 const totals = readTotals(target);
 

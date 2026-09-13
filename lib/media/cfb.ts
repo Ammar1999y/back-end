@@ -142,18 +142,27 @@ function fatSectorNumbers(layout: Layout): number[] | null {
 
   const fatSectors = sectorNumbersAt(layout, 76, HEADER_DIFAT_ENTRIES);
   let difatSector = data.getUint32(68, true);
-  let walked = 0;
-  while (difatSector !== END_OF_CHAIN && walked < difatSectorCount) {
-    if (!sectorInFile(layout, difatSector)) return null;
+  // The declared count bounds the walk, but it is a number out of the file:
+  // a chain that revisits a sector must terminate on its own, or the bound is
+  // the attacker's to choose.
+  const visited = new Set<number>();
+  while (difatSector !== END_OF_CHAIN && visited.size < difatSectorCount) {
+    if (!sectorInFile(layout, difatSector) || visited.has(difatSector))
+      return null;
+    visited.add(difatSector);
     const base = sectorOffset(layout, difatSector);
     fatSectors.push(
       ...sectorNumbersAt(layout, base, layout.entriesPerFatSector - 1)
     );
+    // INSIDE the loop. Checked only at the end, a 20 KB file naming the cap's
+    // worth of FAT sectors over and over still built the whole list first, and
+    // `readTable` then allocated `entriesPerFatSector` numbers for every one of
+    // them — measured at 3.25 million entries and 17 MB for one refused file.
+    if (fatSectors.length > MAX_FAT_SECTORS) return null;
     difatSector = data.getUint32(
       base + (layout.entriesPerFatSector - 1) * 4,
       true
     );
-    walked += 1;
   }
   return fatSectors.length > MAX_FAT_SECTORS ? null : fatSectors;
 }
@@ -164,8 +173,16 @@ function readTable(
   sectors: readonly number[]
 ): number[] | null {
   const table: number[] = [];
+  // A sector's POSITION in this flat table is its FAT index, so a repeat is not
+  // merely wasteful — it is a file that cannot mean what it says, and every
+  // entry after the repeat would be at the wrong index. Refused rather than
+  // deduplicated for that reason, and it is also what stops one in-file sector
+  // being read `MAX_FAT_SECTORS` times ([MS-CFB] 2.5: each FAT sector is listed
+  // once).
+  const seen = new Set<number>();
   for (const sector of sectors) {
-    if (!sectorInFile(layout, sector)) return null;
+    if (!sectorInFile(layout, sector) || seen.has(sector)) return null;
+    seen.add(sector);
     const base = sectorOffset(layout, sector);
     for (let index = 0; index < layout.entriesPerFatSector; index++)
       table.push(layout.data.getUint32(base + index * 4, true));

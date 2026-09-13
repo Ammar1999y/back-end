@@ -15,6 +15,7 @@ import { db, withTransaction } from '@/db';
 import { files } from '@/db/schema';
 import { sanitizeForLog } from '@/utils';
 import { auditLog } from '@/lib/audit';
+import { MAX_REQUEST_BODY_BYTES } from '@/lib/http/request';
 import { generateUuidV7 } from '@/lib/id';
 import {
   getCacheControlHeader,
@@ -94,30 +95,15 @@ export const UPLOAD_MEGAPIXEL_BUDGET = 100;
 export const UPLOAD_REQUEST_UNIT = 5;
 
 /**
- * A single legal maximum-size image must still fit in one window's budget, or
- * `MAX_IMAGE_PIXELS` would admit a file the limiter can never charge — and
- * `rateLimit` refuses `cost > limit` without a write, so it would be a permanent
- * 429 rather than a slow path. Asserted at load rather than stated in prose,
- * because the two constants live in different files and nothing else connects
- * them.
- */
-const MAX_UPLOAD_COST = Math.max(
-  UPLOAD_REQUEST_UNIT,
-  Math.ceil(MAX_IMAGE_PIXELS / 1_000_000)
-);
-if (MAX_UPLOAD_COST > UPLOAD_MEGAPIXEL_BUDGET)
-  throw new Error(
-    `UPLOAD_MEGAPIXEL_BUDGET (${UPLOAD_MEGAPIXEL_BUDGET}) is below the cost of one ` +
-      `maximum-size upload (${MAX_UPLOAD_COST}); every such upload would answer 429 forever.`
-  );
-
-/**
  * The DOCUMENT budget, in mebibytes per minute per user. A document is not
  * decoded — its cost is the multipart parse, one container inspection and one
  * PUT — so bytes are the honest unit. `max(unit, MiB)`, like the image side.
+ *
+ * Exported with its unit so `tests/unit/upload-validation.test.ts` can state the
+ * derived request ceiling against the real values rather than against a copy.
  */
-const DOCUMENT_BYTE_BUDGET_MIB = 60;
-const DOCUMENT_REQUEST_UNIT = 2;
+export const DOCUMENT_BYTE_BUDGET_MIB = 60;
+export const DOCUMENT_REQUEST_UNIT = 2;
 
 function documentCost(sizeBytes: number): number {
   return Math.max(DOCUMENT_REQUEST_UNIT, Math.ceil(sizeBytes / (1024 * 1024)));
@@ -125,6 +111,89 @@ function documentCost(sizeBytes: number): number {
 
 const MAX_IMAGE_BYTES = MAX_IMAGE_SIZE * 1024 * 1024;
 const MAX_DOCUMENT_BYTES = MAX_DOCUMENT_SIZE_MB * 1024 * 1024;
+
+/**
+ * Mebibytes of multipart body per minute per user that this deployment will
+ * BUFFER, charged from `Content-Length` before the parser touches the stream.
+ *
+ * The kind budgets below can only be charged once the bytes are already in
+ * memory, and they charge the ADMITTED file. A body that is refused — over its
+ * kind's ceiling, the wrong type, not a file at all — was parsed in full and
+ * paid one admission unit, so `UPLOAD_ADMISSION_LIMIT` times
+ * `MAX_REQUEST_BODY_BYTES` was the real per-user buffering ceiling.
+ *
+ * Twice the largest kind budget, so it cannot bind before one of them does: the
+ * heaviest legitimate minute is six maximum-size documents (60 MiB) or twenty
+ * maximum-size images (20 MiB).
+ */
+const UPLOAD_BODY_BUDGET_MIB = 2 * DOCUMENT_BYTE_BUDGET_MIB;
+
+/**
+ * Every budget above, against the cost of the largest request its own ceiling
+ * admits.
+ *
+ * A single legal maximum-size request must still fit in one window, or the size
+ * ceiling admits a request the limiter can never charge — and `rateLimit`
+ * refuses `cost > limit` WITHOUT a write, so it is a permanent 429 rather than a
+ * slow path. Checked at load rather than stated in prose: each budget lives here
+ * and each ceiling in another file, and nothing else connects the pairs.
+ */
+const BUDGET_CEILINGS = [
+  {
+    budgetName: 'UPLOAD_MEGAPIXEL_BUDGET',
+    budget: UPLOAD_MEGAPIXEL_BUDGET,
+    maximumCost: Math.max(
+      UPLOAD_REQUEST_UNIT,
+      Math.ceil(MAX_IMAGE_PIXELS / 1_000_000)
+    ),
+  },
+  {
+    budgetName: 'DOCUMENT_BYTE_BUDGET_MIB',
+    budget: DOCUMENT_BYTE_BUDGET_MIB,
+    maximumCost: documentCost(MAX_DOCUMENT_BYTES),
+  },
+  {
+    budgetName: 'UPLOAD_BODY_BUDGET_MIB',
+    budget: UPLOAD_BODY_BUDGET_MIB,
+    maximumCost: Math.ceil(MAX_REQUEST_BODY_BYTES / (1024 * 1024)),
+  },
+];
+
+const unaffordable = BUDGET_CEILINGS.find(
+  (ceiling) => ceiling.maximumCost > ceiling.budget
+);
+if (unaffordable)
+  throw new Error(
+    `${unaffordable.budgetName} (${unaffordable.budget}) is below the cost of one ` +
+      `maximum-size upload (${unaffordable.maximumCost}); every such upload ` +
+      'would answer 429 forever.'
+  );
+
+/**
+ * Charged BEFORE `readFormData()`, from the only size a request states ahead of
+ * its body.
+ *
+ * A body with no `Content-Length` (chunked) is charged the server-wide ceiling:
+ * that is what the parser may go on to buffer, and a caller who omits the
+ * header must not thereby pay less than one who states it.
+ */
+export async function chargeUploadBodyBudget(
+  userId: EntityID,
+  headers: Headers
+): Promise<void> {
+  const declared = Number(headers.get('content-length'));
+  const bytes =
+    Number.isSafeInteger(declared) && declared > 0
+      ? Math.min(declared, MAX_REQUEST_BODY_BYTES)
+      : MAX_REQUEST_BODY_BYTES;
+  await enforceRateLimit({
+    scope: 'upload.body',
+    identifier: userIdentifier(userId),
+    limit: UPLOAD_BODY_BUDGET_MIB,
+    cost: Math.ceil(bytes / (1024 * 1024)),
+    failClosed: true,
+  });
+}
 
 /** Where an upload goes and what it may be, decided by the route — never by the client. */
 export interface UploadTarget {
@@ -140,6 +209,15 @@ export interface UploadTarget {
 export interface AdmittedUpload {
   file: File;
   buffer: Buffer;
+  /**
+   * `file.type` with its parameters stripped and lowercased — the ONE string
+   * every downstream check must compare against. The allowlist lookup
+   * normalized and the byte-level checks did not, so `image/webp; charset=utf-8`
+   * resolved to the webp spec and then skipped animation detection, and
+   * `image/svg+xml; charset=utf-8` skipped sanitisation; both survived only
+   * because `processImage` happened to refuse the raw string later.
+   */
+  mimeType: string;
   spec: FileTypeSpec;
   validatedSvg?: ValidatedSvgUpload;
 }
@@ -149,10 +227,24 @@ const MAX_FILES_PER_REQUEST = 1;
 /**
  * The one file of a single-file upload form. `formData` is `null` when the
  * body was not multipart at all.
+ *
+ * ⚠️ EXACTLY one part, and nothing beside it. Both upload routes take every
+ * other input from the query string, and the published multipart schema is
+ * `additionalProperties: false` over this one field — but only the named field
+ * was ever counted, while `request.formData()` has already BUFFERED every part
+ * it was sent. A request could therefore carry a 1 KiB admitted file next to
+ * megabytes of parts nothing reads, up to the server-wide
+ * `MAX_REQUEST_BODY_BYTES`, and pay the byte budget of the small one.
  */
 export function takeSingleFile(formData: FormData | null, field: string): File {
   if (!formData)
     throw new CustomError(uploadMsg.noFiles, HTTP_STATUS.BAD_REQUEST);
+  for (const [name] of formData)
+    if (name !== field)
+      throw new CustomError(
+        uploadMsg.unexpectedFormField(sanitizeFilename(name)),
+        HTTP_STATUS.BAD_REQUEST
+      );
   const entries = formData.getAll(field);
   if (entries.length === 0)
     throw new CustomError(uploadMsg.noFiles, HTTP_STATUS.BAD_REQUEST);
@@ -204,7 +296,8 @@ export async function admitUpload(
 ): Promise<AdmittedUpload> {
   const safeName = sanitizeFilename(entry.name);
 
-  const spec = fileTypeFor(entry.type);
+  const mimeType = normalizeMimeType(entry.type);
+  const spec = fileTypeFor(mimeType);
   if (!spec)
     throw new CustomError(
       mediaMsg.typeNotAllowed(safeName),
@@ -230,12 +323,12 @@ export async function admitUpload(
       HTTP_STATUS.BAD_REQUEST
     );
 
-  if (spec.kind !== 'image') return { file: entry, buffer, spec };
+  if (spec.kind !== 'image') return { file: entry, buffer, mimeType, spec };
 
   // The image pipeline's own byte checks, kept where they were: animation is a
   // refusal the signature check above cannot see, and the SVG sanitiser is the
   // SVG's only check at all.
-  const magic = validateMagicBytes(buffer, entry.type);
+  const magic = validateMagicBytes(buffer, mimeType);
   if (!magic.valid)
     throw new CustomError(
       magic.animated
@@ -244,11 +337,11 @@ export async function admitUpload(
       HTTP_STATUS.BAD_REQUEST
     );
   const validatedSvg =
-    entry.type === 'image/svg+xml'
+    mimeType === 'image/svg+xml'
       ? validateSvgUpload(buffer, entry.name)
       : undefined;
 
-  return { file: entry, buffer, spec, validatedSvg };
+  return { file: entry, buffer, mimeType, spec, validatedSvg };
 }
 
 /**
@@ -300,6 +393,7 @@ async function prepare(admitted: AdmittedUpload): Promise<Prepared> {
       {
         file: admitted.file,
         buffer: admitted.buffer,
+        mimeType: admitted.mimeType,
         validatedSvg: admitted.validatedSvg,
       },
       SERVER_MAX_IMAGE_SIZE * 1024 * 1024
@@ -325,7 +419,7 @@ async function prepare(admitted: AdmittedUpload): Promise<Prepared> {
   // rather than the client's label with whatever parameters it carried.
   return {
     buffer: admitted.buffer,
-    mimeType: normalizeMimeType(admitted.file.type),
+    mimeType: admitted.mimeType,
     extension: admitted.spec.extension,
     sizeBytes: admitted.buffer.byteLength,
     width: undefined,

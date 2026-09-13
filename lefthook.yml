@@ -74,9 +74,16 @@ pre-push: &full_verify
             fail_text:
               'unreachable file, a handler no routes.ts entry routes (see the
               comment in scripts/find-unused-files.ts), or a knip finding'
-          - name: dedupe
+          # Named for what Bun actually checks. `bun dedupe --check` reports
+          # only duplicates it could COLLAPSE — versions whose ranges overlap —
+          # and passes a lockfile holding several incompatible majors of one
+          # package. A single-version policy would be a different, stronger
+          # invariant, and would need an allowlist to be usable.
+          - name: collapsible-duplicates
             run: bun dedupe --check
-            fail_text: 'a dependency resolves to more than one version'
+            fail_text:
+              'a dependency resolves to several versions that could be collapsed
+              into one (run `bun dedupe`)'
           - name: secrets
             run: mise exec -- gitleaks git . --redact --verbose --no-banner
             fail_text: 'leaked secret, or tools not installed (mise install)'

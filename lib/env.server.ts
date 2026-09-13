@@ -27,8 +27,15 @@ const REQUIRED_SERVER_ENV = [
 // Vars that are only required outside development. The Turnstile module falls
 // back to a Cloudflare-published TEST_SECRET_KEY in dev; keeping that path
 // usable lets local contributors run without provisioning every credential.
+// `SQLITE_MAINTENANCE_TOKEN` is here because `GET /api/health/storage` — the
+// orchestrator's readiness probe — refuses every request without it, so an unset
+// value in production is a container that never becomes healthy. Failing at boot
+// says that once, instead of through a restart loop.
 
-const REQUIRED_IN_PRODUCTION = ['TURNSTILE_SECRET_KEY'] as const;
+const REQUIRED_IN_PRODUCTION = [
+  'TURNSTILE_SECRET_KEY',
+  'SQLITE_MAINTENANCE_TOKEN',
+] as const;
 
 const R2_CREDENTIALS = [
   'R2_ACCOUNT_ID',
@@ -287,10 +294,9 @@ export const CACHE_DB_PATH = path.join(SQLITE_DIR, 'cache.db');
  * guessing begins. A short token is therefore not merely weak, it is weak in a
  * measurable way. `SQLITE_MAINTENANCE_TOKEN=x` used to be accepted at boot.
  *
- * Validated here rather than added to `REQUIRED_IN_PRODUCTION` — the reason
- * above still holds, the variable stays optional, and an EMPTY value keeps
- * meaning "fail closed, and let the health check report it". Only a value that
- * is set and too short is rejected.
+ * The LENGTH rule lives here and the PRESENCE rule in `REQUIRED_IN_PRODUCTION`,
+ * because they hold over different environments: a development or test process
+ * may run without the variable, and neither may run with a weak one.
  */
 const MAINTENANCE_TOKEN_MIN_LENGTH = 32;
 
@@ -306,15 +312,11 @@ function resolveMaintenanceToken(): string {
 }
 
 /**
- * Shared secret for the deep storage check.
+ * Shared secret for `GET /api/health/storage`, cheap probe and `?deep=1` alike.
  *
- * Deliberately NOT in `REQUIRED_IN_PRODUCTION`. That list is enforced at module
- * load and `bun run build` evaluates the route graph, so requiring it there
- * would force the real secret into the build environment for a value only ever
- * used at runtime.
- *
- * Unset makes `?deep=1` answer 401, never "no auth required". Readiness
- * deliberately does NOT report whether it is set: unset is a supported
- * configuration, so failing readiness on it would pull a healthy container.
+ * Unset never means "no auth required" — `maintenanceTokenMatches` refuses an
+ * empty configured value, so a development process that omits it simply has no
+ * readiness surface. In production it is required at boot (see
+ * `REQUIRED_IN_PRODUCTION`), because there the route IS the readiness surface.
  */
 export const SQLITE_MAINTENANCE_TOKEN = resolveMaintenanceToken();

@@ -1,6 +1,5 @@
 import type { FilterColumnSpecs } from '@/lib/data-table/column-specs';
 import type { Handler } from '@/lib/http/contract';
-import type { PermissionAction } from '@/lib/permissions/constants';
 
 import { and, count, eq, sql } from 'drizzle-orm';
 
@@ -37,7 +36,7 @@ import { zodIssueMessage } from '@/utils/validation/rules';
 import { permissionMsg } from './messages';
 
 // See USERS_FILTER_COLUMNS for why the scan-only operator is permitted here.
-const PERMISSIONS_FILTER_COLUMNS: FilterColumnSpecs = {
+export const PERMISSIONS_FILTER_COLUMNS: FilterColumnSpecs = {
   roleName: { type: 'text', allowScanOnly: true },
   description: { type: 'text', allowScanOnly: true },
   isActive: { type: 'boolean' },
@@ -185,7 +184,7 @@ export const POST: Handler = async (ctx) => {
         const permissionsData = validatedData.permissions.map((p) => ({
           roleId: newRole.id,
           pageName: p.name,
-          permissions: p.permissions as Record<PermissionAction, boolean>,
+          permissions: p.permissions,
         }));
         await tx.insert(rolePermissions).values(permissionsData);
         newPermissionsForAudit.push(

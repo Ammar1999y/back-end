@@ -117,7 +117,13 @@ const jsonb = customType<{ data: unknown; driverData: unknown }>({
   fromDriver: (value) => value,
 });
 
-export type PermissionActions = Record<PermissionAction, boolean>;
+/**
+ * PARTIAL by contract: `normalizeActionsForPage` keeps only the actions a page
+ * offers, so a stored matrix names a subset of the actions and an absent key
+ * means "not granted". Readers go through `sanitizePermissions`, which fills the
+ * total shape; nothing may treat a row as total before that.
+ */
+export type PermissionActions = Partial<Record<PermissionAction, boolean>>;
 
 // bun:sql returns `timestamptz` as Date; string mode would reapply host offset.
 const timestamps = {
@@ -873,7 +879,9 @@ export const rolePermissions = pgTable(
       .notNull(),
   },
   (t) => [
-    index('idx_role_permissions_role_id').on(t.roleId),
+    // No `(role_id)` index: it is a strict PREFIX of the unique index below,
+    // which serves every role-keyed read and the per-page upsert's conflict
+    // target alike, so a second one only costs a write and the storage.
     uniqueIndex('ux_role_permissions_role_page').on(t.roleId, t.pageName),
   ]
 );

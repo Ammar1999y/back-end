@@ -91,7 +91,37 @@ export function validateMagicBytes(
  */
 const BLURHASH_BACKGROUND = 0xff;
 
-async function generateBlurhash(imageBuffer: Buffer): Promise<string> {
+/**
+ * `undefined` rather than a throw when the pixels cannot be read.
+ *
+ * A blurhash is a placeholder. `files.blurhash` is nullable and every consumer
+ * already tolerates its absence (an SVG never has one), so a decoder that
+ * cannot read the runtime encoder's output is a defect on THIS side and must
+ * not become a 500 on an upload the user got right. `utils/images/rgba.ts`
+ * accepts exactly one PNG shape — 8-bit, non-interlaced, colour type 0/2/4/6 —
+ * because everything it reads comes from `Bun.Image`'s own encoder; an encoder
+ * change is what would reach this branch, and
+ * `tests/unit/upload-validation.test.ts` pins that shape so the change fails
+ * there rather than silently dropping every placeholder in production.
+ */
+async function generateBlurhash(
+  imageBuffer: Buffer
+): Promise<string | undefined> {
+  try {
+    return await encodeBlurhash(imageBuffer);
+  } catch (error) {
+    console.error(
+      sanitizeForLog({
+        msg: 'image.blurhash skipped',
+        effect: 'the file is stored without a placeholder',
+        errorClass: error instanceof Error ? error.name : typeof error,
+      })
+    );
+    return undefined;
+  }
+}
+
+async function encodeBlurhash(imageBuffer: Buffer): Promise<string> {
   const { width, height, rgba } = await imageToRgba(imageBuffer, 32);
   for (let i = 0; i < rgba.length; i += 4) {
     const alpha = rgba[i + 3] ?? 0xff;
@@ -127,6 +157,8 @@ export interface ValidatedSvgUpload {
 export interface UploadImageInput {
   file: File;
   buffer: Buffer;
+  /** Normalized by `admitUpload`; `file.type` still carries client parameters. */
+  mimeType: string;
   validatedSvg?: ValidatedSvgUpload;
 }
 
@@ -168,23 +200,23 @@ export async function processImage(
   input: UploadImageInput,
   targetSize: number
 ): Promise<ProcessedImage> {
-  const { file } = input;
-  if (!isAllowedImageType(file.type)) {
+  const { file, mimeType } = input;
+  if (!isAllowedImageType(mimeType)) {
     throw new CustomError(
-      uploadMsg.invalidMimeType(file.type),
+      uploadMsg.invalidMimeType(mimeType),
       HTTP_STATUS.BAD_REQUEST
     );
   }
 
   let buffer = input.buffer;
-  let finalMimeType = file.type;
+  let finalMimeType: string = mimeType;
   let finalSize = file.size;
   let width: number | undefined;
   let height: number | undefined;
   let blurhash: string | undefined;
   let finalExtension: string;
 
-  if (file.type === 'image/svg+xml') {
+  if (mimeType === 'image/svg+xml') {
     const sanitizeResult =
       input.validatedSvg ?? validateSvgUpload(buffer, file.name);
 
@@ -200,7 +232,7 @@ export async function processImage(
     // minified above, and a placeholder for a file that arrives in a few
     // kilobytes buys nothing. `files.blurhash` is nullable, so consumers must
     // already tolerate its absence.
-  } else if (shouldOptimizeImage(file.type)) {
+  } else if (shouldOptimizeImage(mimeType)) {
     const optimized = await optimizeImage(buffer, { targetSize });
 
     // `optimized.buffer` is the result object's Buffer field, not a view's
@@ -235,7 +267,7 @@ export async function processImage(
     height,
     blurhash,
     ...(finalMimeType === 'image/webp' && {
-      originalMimeType: file.type,
+      originalMimeType: mimeType,
       originalSize: file.size,
     }),
   };

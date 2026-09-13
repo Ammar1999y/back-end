@@ -1,26 +1,28 @@
 import type { FilterColumnSpec, FilterColumnSpecs } from './column-specs';
 import type { ExtendedColumnFilter, JoinOperator } from '@/types/data-table';
-import type { AnyColumn, SQL, Table } from 'drizzle-orm';
+import type { SQL, Table } from 'drizzle-orm';
 
 import {
   and,
+  Column,
   eq,
+  getTableColumns,
   gt,
   gte,
   ilike,
   inArray,
+  is,
   isNotNull,
   isNull,
   lt,
   lte,
   ne,
-  not,
   notIlike,
   notInArray,
   or,
 } from 'drizzle-orm';
 
-import { isEmpty } from '@/db/queries';
+import { isEmpty, isNotEmpty } from '@/db/queries';
 
 import { HTTP_STATUS } from '@/utils/api-messages';
 import { CustomError } from '@/utils/error-class';
@@ -48,20 +50,18 @@ function invalidFilter(message = MSG_INVALID_FILTER): never {
   throw new CustomError(message, HTTP_STATUS.UNPROCESSABLE);
 }
 
-const STRING_LIKE_TYPES: ReadonlySet<FilterColumnSpec['type']> = new Set([
-  'text',
-  'select',
-  'multiSelect',
-]);
-
 /**
- * Whether the column can actually hold an empty string. `select` /
- * `multiSelect` name a value set, not a storage type: one that declares
- * `values` is a closed set — a PostgreSQL enum in practice — which cannot hold
- * `''`, so `isEmpty` on it would generate `enum_column = ''`, a cast error.
+ * Whether the column can actually hold an empty string, which decides whether
+ * `isEmpty` may compare against `''` at all.
+ *
+ * `select` / `multiSelect` name a value set, not a storage type, and
+ * `FilterColumnSpec` now requires that set — a closed set is a PostgreSQL enum
+ * in practice and cannot hold `''`, so `isEmpty` on one would generate
+ * `enum_column = ''`, a cast error. That leaves `text` as the only string-like
+ * type, and the type system rather than a runtime probe is what says so.
  */
 function isStringLike(spec: FilterColumnSpec): boolean {
-  return STRING_LIKE_TYPES.has(spec.type) && spec.values === undefined;
+  return spec.type === 'text';
 }
 
 /** Every supplied member of a closed-set filter is one of the set's values. */
@@ -129,6 +129,14 @@ function assertFilterAllowed(
 ): 'apply' | 'skip' {
   if (!operatorAllowedForType(spec.type, filter.operator)) invalidFilter();
 
+  // Before the no-value early return, not after it with the value checks. A
+  // no-value operator used to leave `assertFilterAllowed` above the scan-only
+  // gate, so adding one to `SCAN_ONLY_OPERATORS` would have compiled, read as
+  // enforced, and enforced nothing. The policy is a property of the OPERATOR;
+  // nothing about it depends on there being a value.
+  if (isScanOnlyOperator(filter.operator) && !spec.allowScanOnly)
+    invalidFilter();
+
   if (isNoValueOperator(filter.operator)) return 'apply';
 
   const valueIsArray = Array.isArray(filter.value);
@@ -156,9 +164,6 @@ function assertFilterAllowed(
   // A member outside a closed set is a client error, not a PostgreSQL one.
   if (!membersAllowed(spec, filter.value, valueIsArray)) invalidFilter();
 
-  if (isScanOnlyOperator(filter.operator) && !spec.allowScanOnly)
-    invalidFilter();
-
   if (isSearchOperator(filter.operator)) {
     if (typeof filter.value !== 'string') invalidFilter();
     const min = spec.minSearchLength ?? MIN_SEARCH_LENGTH;
@@ -169,7 +174,7 @@ function assertFilterAllowed(
 }
 
 function buildCondition(
-  column: AnyColumn,
+  column: Column,
   filter: ExtendedColumnFilter<Table>,
   spec: FilterColumnSpec
 ): SQL | undefined {
@@ -215,8 +220,14 @@ function buildCondition(
       }
       if (spec.type === 'date') {
         const { start, next } = dayBounds(value);
+        // `NULL < start` and `NULL >= next` are both NULL, so without the
+        // third arm "not on day X" hides every row with no date. Unreachable
+        // while the only registered date columns are the NOT NULL
+        // `createdAt`/`updatedAt`; `users.deleted_at`, `users.locked_until`
+        // and `files.unfiled_at` sit on the same tables and arm it the moment
+        // one is registered.
         return negated
-          ? or(lt(column, start), gte(column, next))
+          ? or(lt(column, start), gte(column, next), isNull(column))
           : and(gte(column, start), lt(column, next));
       }
       if (spec.type === 'number') {
@@ -352,7 +363,7 @@ function buildCondition(
       return isStringLike(spec) ? isEmpty(column) : isNull(column);
     }
     case 'isNotEmpty': {
-      return isStringLike(spec) ? not(isEmpty(column)) : isNotNull(column);
+      return isStringLike(spec) ? isNotEmpty(column) : isNotNull(column);
     }
 
     default: {
@@ -362,7 +373,7 @@ function buildCondition(
 }
 
 function compareNumber(
-  column: AnyColumn,
+  column: Column,
   value: unknown,
   op: typeof lt | typeof lte | typeof gt | typeof gte
 ): SQL {
@@ -398,7 +409,7 @@ export function filterColumns<T extends Table>({
     const spec = Object.hasOwn(specs, filter.id) ? specs[filter.id] : undefined;
     if (!spec) invalidFilter();
 
-    const column = safeGetColumn(table, filter.id);
+    const column = getColumn(table, filter.id);
     // A descriptor without a matching column is a server-side mismatch, not
     // something the client did — surface it as 500, not 422.
     if (!column)
@@ -421,21 +432,24 @@ export function filterColumns<T extends Table>({
   return conditions.length > 0 ? joinFn(...conditions) : undefined;
 }
 
-export function getColumn<T extends Table>(
-  table: T,
-  columnKey: keyof T
-): AnyColumn | null {
-  return safeGetColumn(table, columnKey as string);
-}
-
-/** Returns the column if it exists on the table, otherwise null */
-function safeGetColumn<T extends Table>(
-  table: T,
-  columnKey: string
-): AnyColumn | null {
-  // Client-supplied key: a plain lookup resolves inherited members.
-  if (!Object.hasOwn(table, columnKey)) return null;
-  const col = table[columnKey as keyof T];
-  if (!col || typeof col !== 'object' || !('dataType' in col)) return null;
-  return col as unknown as AnyColumn;
+/**
+ * The column named by a CLIENT-SUPPLIED key, or `null`.
+ *
+ * `string`, not `keyof T`: the key arrives from a query string, so every caller
+ * had to widen it back with an assertion that claimed knowledge nobody had.
+ *
+ * Reads `getTableColumns(table)` rather than the table object, so a key naming
+ * one of Drizzle's own table members cannot resolve to something that is not a
+ * column; `Object.hasOwn` is still required because that record carries
+ * `Object.prototype`, and `constructor` / `toString` would otherwise resolve.
+ * `is(value, Column)` is Drizzle's own guard — it proves the shape instead of
+ * probing for a `dataType` property and asserting through `unknown`, which a
+ * plain `{ dataType: 'x' }` from a future non-column table member would have
+ * satisfied.
+ */
+export function getColumn(table: Table, columnKey: string): Column | null {
+  const columns: Record<string, unknown> = getTableColumns(table);
+  if (!Object.hasOwn(columns, columnKey)) return null;
+  const candidate = columns[columnKey];
+  return is(candidate, Column) ? candidate : null;
 }

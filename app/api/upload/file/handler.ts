@@ -8,6 +8,7 @@ import { mediaMsg } from '@/lib/media/messages';
 import { resolveUploadPurpose } from '@/lib/media/policy';
 import {
   admitUpload,
+  chargeUploadBodyBudget,
   chargeUploadBudget,
   storeUpload,
   takeSingleFile,
@@ -89,6 +90,10 @@ export const POST: Handler = async (ctx) => {
     // Read AFTER the limiter, never before: `readFormData` is a function
     // precisely so the multipart body stays unbuffered until this request has
     // been admitted.
+    // Charged from `Content-Length` while the body is still a stream: the
+    // kind budgets below can only be charged once it has been buffered.
+    await chargeUploadBodyBudget(userId, ctx.headers);
+
     const entry = takeSingleFile(await ctx.readFormData(), 'files');
     const admitted = await admitUpload(entry, purpose);
     await chargeUploadBudget(userId, admitted);

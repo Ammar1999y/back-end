@@ -554,7 +554,7 @@ Scope: whole repository at commit `ca4ed06`, excluding `tests/`. Runtime pins: B
 ### F-58 · Low · `/passkey/verify-registration` honours the library's `createSession` flag and the after-hook then deletes the session it minted
 
 - **Where:** `lib/auth.ts:151-161` (body patch only for `TRUST_DEVICE_STRIPPED_PATHS`), `lib/auth/two-factor-enrolment.ts:875-910` (`revokeOtherSessions` keeps the pre-request session id), `node_modules/@better-auth/passkey/dist/index.mjs:307,384,403,411` (`createSession` accepted, session created, cookie set).
-- **Failure scenario:** A client following `docs/passkey.md:245` passes `createSession: true`; registration succeeds and the user is signed out with a cookie pointing at a deleted row.
+- **Failure scenario:** A client following the Better Auth passkey docs (https://www.better-auth.com/docs/plugins/passkey) passes `createSession: true`; registration succeeds and the user is signed out with a cookie pointing at a deleted row.
 - **Remediation:** Extend the body patch to this path with `createSession: false`.
 - **Tests:** `tests/integration/two-factor-trusted-device.test.ts:220` covers the class for the two verifier paths only.
 

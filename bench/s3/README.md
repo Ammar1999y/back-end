@@ -39,7 +39,7 @@ bench/s3/
   read.test.ts             the read surface this codebase does not have yet
   errors.test.ts           error shapes, header injection, retry semantics
   multipart.test.ts        the streaming writer, partSize, queueSize, aborts
-  bun14.test.ts            Bun 1.4 S3 changes absent from docs/bun-s3.md
+  bun14.test.ts            Bun 1.4 S3 changes absent from the Bun S3 docs (https://bun.com/docs/runtime/s3)
   candidate.test.ts        the port, run against the original
   bunfig.toml              test config; read it, it is load-bearing
   run.ts                   entry point for the suite above
@@ -256,13 +256,13 @@ These reproduce on Bun 1.4.0 and on real R2, and no issue or PR covers them.
 Filing them is the only way they get fixed, and each already has a minimal
 reproduction in this directory:
 
-| Finding                                                                                                                                                            | Reproduction                                                   |
-| ------------------------------------------------------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------- |
-| `write()` never uses multipart with a known-length body, whatever the size — `docs/bun-s3.md` says it does, and `partSize` is ignored                              | `multipart.test.ts` › "write() never goes multipart"           |
-| `write(ReadableStream)` stringifies to `[object ReadableStream]` on all three entry points — **silent data loss**, and `docs/bun-s3.md` lists the type as accepted | `multipart.test.ts` › "every write entry point stringifies it" |
-| `write(new Response(stream))` streams correctly but returns `0` instead of the byte count                                                                          | `multipart.test.ts` › "reports 0 bytes written"                |
-| `fetch("s3://bucket/key")` double-encodes a key containing a space and 404s where `client.file(key)` succeeds                                                      | `read.test.ts` › "double-encodes a key containing a space"     |
-| An open-ended `slice(n)` sends `bytes=n-4503599627370494` rather than `bytes=n-`                                                                                   | `read.test.ts` › "an absurd upper bound"                       |
+| Finding                                                                                                                                                                                             | Reproduction                                                   |
+| --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------- |
+| `write()` never uses multipart with a known-length body, whatever the size — the Bun S3 docs (https://bun.com/docs/runtime/s3) says it does, and `partSize` is ignored                              | `multipart.test.ts` › "write() never goes multipart"           |
+| `write(ReadableStream)` stringifies to `[object ReadableStream]` on all three entry points — **silent data loss**, and the Bun S3 docs (https://bun.com/docs/runtime/s3) lists the type as accepted | `multipart.test.ts` › "every write entry point stringifies it" |
+| `write(new Response(stream))` streams correctly but returns `0` instead of the byte count                                                                                                           | `multipart.test.ts` › "reports 0 bytes written"                |
+| `fetch("s3://bucket/key")` double-encodes a key containing a space and 404s where `client.file(key)` succeeds                                                                                       | `read.test.ts` › "double-encodes a key containing a space"     |
+| An open-ended `slice(n)` sends `bytes=n-4503599627370494` rather than `bytes=n-`                                                                                                                    | `read.test.ts` › "an absurd upper bound"                       |
 
 The `ReadableStream` one is the only member of that list I would call a bug
 rather than a rough edge: it reports success and stores the wrong object.
@@ -347,7 +347,7 @@ streaming are future work.
 | Errors: Bun raises `S3Error` with `code` = the S3 code; aws-sdk sets `name` = the S3 code                                                | neutral; any matcher has to move                                      |
 | `delete()`/`unlink()` resolve `true` while `@types/bun@1.4.0` declares `Promise<void>`                                                   | neutral                                                               |
 | `stat()`'s fields are prototype getters, so `JSON.stringify(stat)` is `{}`                                                               | neutral; matters when logging                                         |
-| `write()` never uses multipart — at 6 MB, 20 MB or 64 MB it sends one `PUT`, and `partSize` is ignored. Only `writer()` chunks.          | contradicts `docs/bun-s3.md`                                          |
+| `write()` never uses multipart — at 6 MB, 20 MB or 64 MB it sends one `PUT`, and `partSize` is ignored. Only `writer()` chunks.          | contradicts the Bun S3 docs (https://bun.com/docs/runtime/s3)         |
 | `write()` given a `ReadableStream` stringifies it: 3 MB of stream becomes a 23-byte `[object ReadableStream]`, on all three entry points | **silent data loss**                                                  |
 | `write(new Response(stream))` streams correctly but returns `0` instead of the byte count                                                | neutral; wrong number in any log                                      |
 | `fetch("s3://bucket/key")` double-encodes a key containing a space and misses the object; `client.file(key)` does not                    | do not use `s3://` here                                               |
@@ -357,7 +357,7 @@ streaming are future work.
 
 [#24422]: https://github.com/oven-sh/bun/issues/24422
 
-The `ReadableStream` item is the one to be careful about: `docs/bun-s3.md` lists
+The `ReadableStream` item is the one to be careful about: the Bun S3 docs (https://bun.com/docs/runtime/s3) lists
 `ReadableStream` in `S3File.write`'s accepted union, `@types/bun@1.4.0` does
 not, and the runtime agrees with the types in the worst available way — it
 stringifies rather than rejecting, so the upload "succeeds". Use a `Response`
@@ -380,7 +380,7 @@ runs all of them:
 - Two direct dependencies removed, and with them the `@aws-sdk/*` and
   `@smithy/*` transitive tree.
 
-### Bun 1.4 items not covered by `docs/bun-s3.md`
+### Bun 1.4 items not covered by the Bun S3 docs (https://bun.com/docs/runtime/s3)
 
 From <https://bun.com/blog/bun-v1.4>. Asserted in `bun14.test.ts` unless noted:
 

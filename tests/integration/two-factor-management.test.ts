@@ -171,10 +171,12 @@ describe('removing one method', () => {
 
     // A session is not enough: removing a factor is a security-state change,
     // and without the password a hijacked session strips factors with no proof.
+    // `contactKind` is required for `otp`: an sms enrolment is the PHONE
+    // possession, and a user may hold an email one at the same time.
     const unproven = await call(
       'POST',
       '/api/auth/two-factor/methods/disable',
-      { method: 'otp' },
+      { method: 'otp', contactKind: 'phone' },
       cookie
     );
     expect(unproven.status).toBe(HTTP_STATUS.UNAUTHORIZED);
@@ -183,10 +185,13 @@ describe('removing one method', () => {
     const removed = await call(
       'POST',
       '/api/auth/two-factor/methods/disable',
-      { method: 'otp', password: user.password },
+      { method: 'otp', contactKind: 'phone', password: user.password },
       cookie
     );
     expect(removed.status).toBe(HTTP_STATUS.OK);
+    expect(await removed.json()).toMatchObject({
+      data: { removedMethod: 'otp:phone' },
+    });
     expect(await methodsOf(user.userId)).toEqual(['totp']);
 
     // The last one. Refused with 409, not silently accepted and not silently
@@ -200,6 +205,45 @@ describe('removing one method', () => {
     );
     expect(last.status).toBe(HTTP_STATUS.CONFLICT);
     expect(await methodsOf(user.userId)).toEqual(['totp']);
+  });
+
+  test('names the OTP destination even when the user holds only one', async () => {
+    // The rule is unconditional, and this is the case that pays for it: one
+    // enrolment makes the request unambiguous, and it is still refused. A
+    // schema that were "optional unless ambiguous" would make the SAME body
+    // valid or invalid depending on state the client cannot see, and the
+    // handlers resolved an unqualified `otp` by ORDER — so a user holding both
+    // lost whichever row sorted first. One shape, always.
+    //
+    // 422 carries `methodUnavailable`, the same text as the 404 for a method the
+    // user has not enrolled; `docs/two-factor-flow.md` §6 records that.
+    const user = await seedUser({
+      phoneNumber: uniquePhone(),
+      phoneNumberVerified: true,
+    });
+    const cookie = await signInCookie(user, false);
+    await enrolTotpBySql(user.userId);
+    await enrol(user.userId, 'otp', 'sms');
+
+    const unqualified = await call(
+      'POST',
+      '/api/auth/two-factor/methods/disable',
+      { method: 'otp', password: user.password },
+      cookie
+    );
+    expect(unqualified.status).toBe(HTTP_STATUS.UNPROCESSABLE);
+    expect(await methodsOf(user.userId)).toEqual(['otp', 'totp']);
+
+    // The default-method endpoint shares the schema, so it shares the refusal —
+    // and it is the one action in this area that needs no password, so a reader
+    // cannot infer the rule from the removal case alone.
+    const unqualifiedDefault = await call(
+      'POST',
+      '/api/auth/two-factor/methods/default',
+      { method: 'otp' },
+      cookie
+    );
+    expect(unqualifiedDefault.status).toBe(HTTP_STATUS.UNPROCESSABLE);
   });
 
   test('is refused when the surviving row is not a factor a challenge would offer', async () => {

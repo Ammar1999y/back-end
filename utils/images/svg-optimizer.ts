@@ -408,14 +408,31 @@ interface SanitizeSvgOptions {
   serializer?: XMLSerializer;
 }
 
-function isSingleSvgRoot(markup: string, parser: DOMParser): boolean {
-  const doc = parser.parseFromString(markup, 'image/svg+xml');
-  if (doc.querySelector('parsererror')) return false;
-  const root = doc.documentElement;
-  return (
-    root?.localName?.toLowerCase() === 'svg' &&
-    root.namespaceURI === 'http://www.w3.org/2000/svg'
-  );
+const SVG_NAMESPACE = 'http://www.w3.org/2000/svg';
+
+/**
+ * The one `<svg>` root of a sanitized fragment, or `null`.
+ *
+ * The fragment, not DOMPurify's string. DOMPurify serializes as HTML, where an
+ * attribute value needs no escaping for `<` — so a LEGAL value such as
+ * `font-family="a&lt;b"` came back as `font-family="a<b"`, and re-parsing that
+ * as XML failed and answered the generic "sanitization failed". Taking the DOM
+ * it built and serializing it with the XML serializer escapes the value for the
+ * grammar this file actually stores.
+ *
+ * It is also the structural check the contract needs, and directly: the
+ * breakout tags (`p`, `div`, `table`, `h1`, `pre`, …) TERMINATE foreign content
+ * in the HTML parser, so those nodes come back as SIBLINGS of the `<svg>` —
+ * visible here as a second child rather than inferred from a re-parse.
+ */
+function singleSvgRoot(fragment: DocumentFragment): Element | null {
+  const [only] = fragment.childNodes;
+  if (!only || fragment.childNodes.length !== 1) return null;
+  const root = only as Element;
+  return root.localName?.toLowerCase() === 'svg' &&
+    root.namespaceURI === SVG_NAMESPACE
+    ? root
+    : null;
 }
 
 /**
@@ -737,34 +754,26 @@ export function sanitizeSvg(
     });
 
     const cleanedSvg = xmlSerializer.serializeToString(svgElement);
-    const sanitized = sanitize(cleanedSvg, {
+    // `RETURN_DOM_FRAGMENT`, not the string: what leaves this function is XML,
+    // and only the serializer writing it can escape it for XML. See
+    // `singleSvgRoot` — the structural check rides on the same fragment.
+    const fragment = sanitize(cleanedSvg, {
       USE_PROFILES: { svg: true, svgFilters: true },
       ADD_TAGS: ['use'],
       FORBID_TAGS: ['style'],
       FORBID_ATTR: ['style'],
+      RETURN_DOM_FRAGMENT: true,
     });
 
-    // STRUCTURAL, not a substring test.
-    //
-    // The sweep above ran on an XML tree, where `<p>` is an ordinary child of
-    // `<svg>`. DOMPurify then re-parses the serialized string as HTML, where the
-    // breakout tags (`p`, `div`, `table`, `h1`, `pre`, …) TERMINATE foreign
-    // content — so those nodes come back out sitting AFTER `</svg>`.
-    // `includes('<svg')` cannot see that, and returned `isValid: true` for two
-    // shapes that both escaped this function's own contract: a 55-byte input
-    // whose output made svgo throw `SvgoParserError` (an unauthenticated,
-    // deterministic 500), and a two-root document that was stored and served as
-    // `image/svg+xml` and which no browser XML parser will render.
-    //
-    // Re-parsing as XML answers exactly the question the contract makes: is this
-    // ONE well-formed SVG root with no sibling content? Text or an element after
-    // `</svg>` is a parse error, and so is a second root.
-    if (!sanitized || !isSingleSvgRoot(sanitized, domParser))
+    const root = singleSvgRoot(fragment);
+    if (!root)
       return {
         isValid: false,
         cleanedSvg: '',
         errors: ['فشل في تنظيف SVG'],
       };
+
+    const sanitized = xmlSerializer.serializeToString(root);
 
     if (new Blob([sanitized]).size > maxSize)
       return {

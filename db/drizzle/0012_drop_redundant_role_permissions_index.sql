@@ -1,0 +1,1 @@
+DROP INDEX "idx_role_permissions_role_id";

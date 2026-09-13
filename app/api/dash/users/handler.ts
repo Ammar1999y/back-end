@@ -51,7 +51,7 @@ import { userMsg } from './messages';
 // `allowScanOnly` enables the "does not contain" operator the UI offers. It is
 // a guaranteed sequential scan, which is acceptable on a dashboard-sized users
 // table; turn it off here first if this table ever grows.
-const USERS_FILTER_COLUMNS: FilterColumnSpecs = {
+export const USERS_FILTER_COLUMNS: FilterColumnSpecs = {
   name: { type: 'text', allowScanOnly: true },
   email: { type: 'text', allowScanOnly: true },
   isActive: { type: 'boolean' },
@@ -173,6 +173,23 @@ export const POST: Handler = async (ctx) => {
 
     if (actorPermissions && isCustomRole && validatedData.permissions?.length)
       validatePermissionScope(actorPermissions, validatedData.permissions);
+
+    // ADDITIVE, never authoritative: the transaction below re-runs both gates
+    // under `FOR SHARE` and remains the deciding read, so refusing here opens no
+    // TOCTOU window — it only moves the refusal ahead of the outbound HIBP
+    // request and the 64 MiB Argon2 hash, which an actor with no authority over
+    // the requested role could otherwise spend on every call up to the route
+    // limit. Same preflight, same reason, as `assertTargetEditable` on PUT.
+    if (!isCustomRole) {
+      await validateAssignableRole(validID(validatedData.roleId), db);
+      if (actorPermissions)
+        await validateRolePermissionScope(
+          actorPermissions,
+          validID(validatedData.roleId),
+          db,
+          'grant'
+        );
+    }
 
     // Run HIBP check before argon2 so we don't pay hashing cost on rejected passwords.
     await checkPasswordCompromise(validatedData.password);

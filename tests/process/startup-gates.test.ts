@@ -104,6 +104,9 @@ function productionEnv(sqliteDir: string): Record<string, string> {
     PUBLIC_URL: `http://localhost:${BOOT_PORT}`,
     BETTER_AUTH_SECRET: 'startup-gates-placeholder-secret-000000',
     TURNSTILE_SECRET_KEY: 'throwaway',
+    // 32 characters minimum, and required in production: the readiness route
+    // refuses every request without it.
+    SQLITE_MAINTENANCE_TOKEN: 'startup-gates-token-000000000000',
     R2_ACCOUNT_ID: 'throwaway',
     R2_ACCESS_KEY_ID: 'throwaway',
     R2_SECRET_ACCESS_KEY: 'throwaway',
@@ -274,6 +277,19 @@ describe('the production environment gate refuses a missing variable', () => {
 
     expect(outcome.exitCode).not.toBe(0);
     expect(outcome.output).toInclude('BETTER_AUTH_SECRET');
+  }, 60_000);
+
+  test('a missing maintenance token fails the boot rather than the health check', async () => {
+    // `GET /api/health/storage` refuses every request without the token, so an
+    // unset value in production is a container the orchestrator can never mark
+    // healthy — a restart loop whose cause is nowhere in the logs.
+    const env = productionEnv(tempSqliteDir());
+    delete env.SQLITE_MAINTENANCE_TOKEN;
+
+    const outcome = await bootWith(env);
+
+    expect(outcome.exitCode).not.toBe(0);
+    expect(outcome.output).toInclude('SQLITE_MAINTENANCE_TOKEN');
   }, 60_000);
 
   test('an enabled OTP channel with no provider credentials fails the boot', async () => {

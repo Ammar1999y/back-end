@@ -14,6 +14,7 @@ import {
   runPasswordTimingGuard,
   verifyPasswordDetailed,
 } from './password';
+import { roleAllowsLoginFor } from './user-eligibility';
 
 /**
  * The lockout thresholds.
@@ -72,8 +73,6 @@ interface VerifyAttemptBase {
   skipTimingGuard?: boolean;
   /** Return a CAS proof and leave the verified hash unchanged for an immediate password mutation */
   returnPasswordProof?: boolean;
-  /** Reuse an existing transaction instead of creating a new one */
-  tx?: Tx;
 }
 
 /**
@@ -162,7 +161,6 @@ export async function verifyLoginAttempt(
     userId,
     skipTimingGuard = false,
     returnPasswordProof = false,
-    tx: externalTx,
     auditMeta,
     purpose,
   } = options;
@@ -192,6 +190,7 @@ export async function verifyLoginAttempt(
         id: users.id,
         email: users.email,
         isActive: users.isActive,
+        roleId: users.roleId,
         failedLoginAttempts: users.failedLoginAttempts,
         lockedUntil: users.lockedUntil,
       })
@@ -326,8 +325,22 @@ export async function verifyLoginAttempt(
       throw new Error('Verified credential account is missing its hash');
     }
 
+    // Clearing the lockout is the one thing a correct password writes, and it
+    // must not happen for an account `session.create.before` will refuse anyway:
+    // that refusal is the same generic 401 a WRONG password gets, so a correct
+    // guess against a role-ineligible account would silently buy an unbounded
+    // run of further guesses. The role is the only gate in that class — an
+    // inactive user is already rejected above, and the contact-verification
+    // gates answer with their own code, so the caller has been told the password
+    // was right and is expected to go and verify.
+    //
+    // Only `sign_in` reaches those gates; the reauth purposes end at this
+    // function and their callers are already authenticated.
+    const eligible =
+      purpose !== 'sign_in' || (await roleAllowsLoginFor(tx, user.roleId));
+
     // Successful — reset attempts (no-op if already 0)
-    if (user.failedLoginAttempts > 0) {
+    if (eligible && user.failedLoginAttempts > 0) {
       await tx
         .update(users)
         .set({ failedLoginAttempts: 0, lockedUntil: null })
@@ -346,8 +359,8 @@ export async function verifyLoginAttempt(
           lockedUntil: user.lockedUntil,
         },
         newData: {
-          failedLoginAttempts: 0,
-          lockedUntil: null,
+          failedLoginAttempts: eligible ? 0 : user.failedLoginAttempts,
+          lockedUntil: eligible ? null : user.lockedUntil,
           // NOT `loginSuccess`: at this point a password has been proven and
           // nothing more. The gates that can still refuse the request run after
           // this returns.
@@ -379,16 +392,14 @@ export async function verifyLoginAttempt(
     };
   };
 
-  const result = externalTx
-    ? await executor(externalTx)
-    : await withTransaction<AttemptResult>(executor);
+  const result = await withTransaction<AttemptResult>(executor);
 
   if (result.outcome === 'success') {
     if (returnPasswordProof) return result.passwordProof;
 
     const verifiedHash = result.passwordProof.expectedHash;
 
-    if (!externalTx && result.passwordUpgrade) {
+    if (result.passwordUpgrade) {
       try {
         const upgradedHash = await upgradePasswordHash({
           password,

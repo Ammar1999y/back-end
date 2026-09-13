@@ -101,6 +101,46 @@ const eslintConfig = [
       'unicorn/no-non-function-verb-prefix': 'off',
       // Explicit comparisons preserve narrowing for optional permission flags.
       'unicorn/no-unnecessary-boolean-comparison': 'off',
+
+      // `!` tells the compiler a value is present without proving it, which is
+      // the same assumption as `as` and fails the same way — silently, at the
+      // first input that breaks it. It lives in typescript-eslint's `stylistic`
+      // set, which this config does not spread, so nothing enforced it: a
+      // separate scanner reported occurrences and exited 0 unless given a
+      // `--fail` no caller passed. One gate, in the one command CI and pre-push
+      // already run.
+      '@typescript-eslint/no-non-null-assertion': 'error',
+
+      // A server-only codebase. `tsconfig`'s `lib` still includes DOM (and
+      // importing jsdom reintroduces it whatever `lib` says), and
+      // typescript-eslint turns `no-undef` off, so both static gates were blind
+      // to the first `window` or `localStorage` anyone wrote. Only the
+      // browser-ONLY names: `fetch`, `Headers`, `Request`, `Blob`,
+      // `TextDecoder` and friends are web standards Bun implements.
+      'no-restricted-globals': [
+        'error',
+        ...[
+          'window',
+          'document',
+          'localStorage',
+          'sessionStorage',
+          'navigator',
+          'history',
+          'location',
+          'alert',
+          'confirm',
+          'prompt',
+          'screen',
+          'frames',
+          'opener',
+          'parent',
+          'XMLHttpRequest',
+          'indexedDB',
+        ].map((name) => ({
+          name,
+          message: `${name} is a browser global; this codebase runs on the server.`,
+        })),
+      ],
     },
   },
   {

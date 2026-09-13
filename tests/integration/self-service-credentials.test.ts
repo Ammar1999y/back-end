@@ -102,6 +102,7 @@ import {
   authedRequest,
   baseHeaders,
   seedUser,
+  signedInUser,
   signIn,
   TEST_IP,
 } from '../helpers/session';
@@ -585,6 +586,46 @@ describe('POST /api/dash/users/me/change-password — refusals', () => {
     expect(await failedAttempts(subject('pwGuard').userId)).toBe(
       before.failedLoginAttempts
     );
+  });
+
+  test('newPassword equal to the STORED one is 400 on the re-auth branch too', async () => {
+    // The branch `currentPassword` does not reach. With an open
+    // re-authentication window the body carries no `currentPassword`, so the
+    // plaintext comparison above has nothing to compare against — and the route
+    // rehashed the existing password, revoked every other session and every
+    // pending proof, and reported a change that did not happen.
+    //
+    // Its own session, not a shared actor: a successful rotation here would
+    // invalidate the seeded password for every later assertion.
+    const session = await signedInUser();
+    const before = await storedHash(session.user.userId);
+
+    const response = await app.handle(
+      authedPost(session, CHANGE_PASSWORD, {
+        newPassword: session.user.password,
+      })
+    );
+
+    expect(response.status).toBe(HTTP_STATUS.BAD_REQUEST);
+    expect(await messageOf(response)).toBe(userMsg.newPasswordSameAsCurrent);
+    // Byte-identical, so nothing was rehashed under a new salt either — a
+    // rehash of the same password would pass a "can still sign in" check while
+    // still being the rotation this refuses.
+    expect(await storedHash(session.user.userId)).toBe(before);
+  });
+
+  test('the re-auth branch still rotates a genuinely different password', async () => {
+    // Without this the entry above is satisfiable by refusing every
+    // re-authenticated change.
+    const session = await signedInUser();
+    const before = await storedHash(session.user.userId);
+
+    const response = await app.handle(
+      authedPost(session, CHANGE_PASSWORD, { newPassword: NEW_PASSWORD })
+    );
+
+    expect(response.status).toBe(HTTP_STATUS.OK);
+    expect(await storedHash(session.user.userId)).not.toBe(before);
   });
 
   test('a breached newPassword is 400, and is refused before the current one is checked', async () => {

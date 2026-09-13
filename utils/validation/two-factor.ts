@@ -201,11 +201,28 @@ export const twoFactorPasswordSchema = z.object({
 
 export const twoFactorTotpConfirmSchema = z.object({ code: otpCodeSchema });
 
-/** Names ONE enrolment: `contactKind` distinguishes a user's two OTP rows. */
-export const twoFactorMethodOptionSchema = z.object({
-  method: z.enum(TWO_FACTOR_METHODS),
-  contactKind: z.enum(['email', 'phone']).optional(),
-});
+/**
+ * Names ONE enrolment: `contactKind` distinguishes a user's two OTP rows.
+ *
+ * Required for `otp`, because a user may hold both an email and a phone
+ * enrolment and the handlers resolve the target by ORDER: `{ method: 'otp' }`
+ * silently disabled — or made default — whichever row sorted first. The methods
+ * listing returns `contactKind` on every entry, so a client naming one always
+ * has it.
+ */
+export const twoFactorMethodOptionSchema = z
+  .object({
+    method: z.enum(TWO_FACTOR_METHODS),
+    contactKind: z.enum(['email', 'phone']).optional(),
+  })
+  .superRefine((value, ctx) => {
+    if (value.method === 'otp' && value.contactKind === undefined)
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['contactKind'],
+        message: 'يجب تحديد وسيلة الإرسال (البريد أو الهاتف)',
+      });
+  });
 
 export const twoFactorMethodDisableSchema = twoFactorMethodOptionSchema.extend({
   password: reauthPasswordSchema,

@@ -59,7 +59,9 @@ export function toElysiaHandler(route: RouteDefinition) {
       if (route.timeoutSeconds !== undefined)
         ctx.server?.timeout(ctx.request, route.timeoutSeconds);
       return toWebResponse(
-        await route.handler(withBodyPolicy(meta, route.body))
+        await route.handler(
+          withBodyPolicy(meta, route.body, route.maxJsonBodyBytes)
+        )
       );
     } catch (error) {
       return toWebResponse(handleApiError(error));

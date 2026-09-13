@@ -61,6 +61,8 @@ export const MSG_DELETE_ERROR = 'حدث خطأ في الحذف';
 
 export const MSG_TOO_MANY_REQUESTS = 'طلبات كثيرة جدًا، حاول مرة أخرى لاحقًا';
 
+export const MSG_BODY_TOO_LARGE = 'حجم البيانات المرسلة أكبر من المسموح به';
+
 export const MSG_SERVICE_UNAVAILABLE =
   'الخدمة غير متاحة مؤقتًا، حاول مرة أخرى بعد قليل';
 
@@ -111,6 +113,7 @@ export const HTTP_STATUS = {
   NOT_FOUND: 404,
   METHOD_NOT_ALLOWED: 405,
   CONFLICT: 409,
+  CONTENT_TOO_LARGE: 413,
   UNPROCESSABLE: 422,
   TOO_MANY_REQUESTS: 429,
   INTERNAL_ERROR: 500,

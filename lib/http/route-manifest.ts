@@ -21,6 +21,8 @@
  */
 import type { BodyPolicy, Handler } from './contract';
 
+import { bodyPolicyCeiling } from './request';
+
 /**
  * Methods this application registers. Deliberately not `string`: the 405
  * boundary advertises this set in `Allow`, and a typo would advertise a method
@@ -126,6 +128,16 @@ export interface RouteDefinition {
    * global ceiling set it — see the upload route.
    */
   timeoutSeconds?: number;
+  /**
+   * Raises this route's JSON body ceiling above `MAX_JSON_BODY_BYTES`.
+   *
+   * Optional, and deliberately opt-in per route: the default is sized for the
+   * schemas that exist, and a route that accepts a genuinely large document —
+   * a rich-text field, say — states its own bound here so the ceiling stays a
+   * per-route contract rather than one number every route inherits. Only
+   * meaningful with `body: 'json'`.
+   */
+  maxJsonBodyBytes?: number;
 }
 
 /** The policy half of a route — everything except the handler function. */
@@ -139,6 +151,16 @@ export interface RouteManifestEntry {
   body: BodyPolicy;
   response: ResponsePolicy;
   query?: readonly RouteQueryParam[];
+  /**
+   * Raises this route's JSON body ceiling above `MAX_JSON_BODY_BYTES`.
+   *
+   * Optional, and deliberately opt-in per route: the default is sized for the
+   * schemas that exist, and a route that accepts a genuinely large document —
+   * a rich-text field, say — states its own bound here so the ceiling stays a
+   * per-route contract rather than one number every route inherits. Only
+   * meaningful with `body: 'json'`.
+   */
+  maxJsonBodyBytes?: number;
 }
 
 /** One sub-path of a prefix, with the methods that path actually answers. */
@@ -175,6 +197,17 @@ export interface RoutePrefix {
   /** Prefix WITHOUT the trailing wildcard, e.g. `/api/auth`. */
   prefix: string;
   /**
+   * What the prefix handler is allowed to read, for the WHOLE prefix.
+   *
+   * Declared here and not per sub-path because the body ceiling is decided at
+   * `onRequest`, before the router has matched anything, and because the mount
+   * reads every sub-path's body through one parser. A prefix whose sub-paths
+   * genuinely disagreed would have to move the field down to
+   * `RoutePrefixPath` and give the boundary the sub-path lookup it currently
+   * does not need.
+   */
+  body: BodyPolicy;
+  /**
    * The exact sub-paths the prefix handler actually serves, each with its own
    * methods.
    *
@@ -202,6 +235,7 @@ export function toManifest(
       body,
       response,
       query,
+      maxJsonBodyBytes,
     }) => ({
       method,
       path,
@@ -212,6 +246,7 @@ export function toManifest(
       body,
       response,
       query,
+      maxJsonBodyBytes,
     })
   );
 }
@@ -335,6 +370,47 @@ export function createRouteLookup(
             if (method === 'GET') methods.add('HEAD');
           }
     return methods;
+  };
+}
+
+/**
+ * Answers "how many body bytes may this pathname carry?" for the admission
+ * boundary in `app.ts`, which has to decide before the router has matched
+ * anything — and for paths the router will never match to a table route at all.
+ *
+ * The ceiling follows the POLICY the table declares, so a caller cannot buy the
+ * multipart allowance for a JSON-only endpoint by writing `multipart/form-data`
+ * on it. A path that matches nothing takes the default: it is about to 404, and
+ * the default is the smaller of the two.
+ *
+ * The LARGEST ceiling wins when two methods on one path disagree: this bound is
+ * coarse by construction (it reads `Content-Length` off the head, for a request
+ * nothing has parsed yet), and the exact per-route value is applied again by the
+ * reader in `withBodyPolicy`. Taking the smallest here would refuse a request
+ * the route it belongs to accepts.
+ */
+export function createBodyCeilingLookup(
+  routes: readonly RouteDefinition[],
+  prefixes: readonly RoutePrefix[]
+): (pathname: string) => number {
+  const compiled = routes.map((route) => ({
+    matcher: compile(route.path),
+    ceiling: bodyPolicyCeiling(route.body, route.maxJsonBodyBytes),
+  }));
+  const prefixCeilings = prefixes.map((entry) => ({
+    prefix: entry.prefix,
+    ceiling: bodyPolicyCeiling(entry.body),
+  }));
+
+  return (pathname: string) => {
+    let ceiling: number | undefined;
+    for (const entry of compiled)
+      if (entry.matcher.test(pathname))
+        ceiling = Math.max(ceiling ?? 0, entry.ceiling);
+    if (ceiling !== undefined) return ceiling;
+    for (const entry of prefixCeilings)
+      if (pathname.startsWith(`${entry.prefix}/`)) return entry.ceiling;
+    return bodyPolicyCeiling('json');
   };
 }
 

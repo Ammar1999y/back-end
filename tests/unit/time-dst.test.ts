@@ -1,5 +1,11 @@
-import { expect, test } from 'bun:test';
+import { describe, expect, test } from 'bun:test';
 
+import { PgDialect } from 'drizzle-orm/pg-core';
+
+import { users } from '@/db/schema';
+import { filterColumns } from '@/lib/data-table/filter-columns';
+
+import { BUSINESS_TIMEZONE } from '@/utils/config';
 /**
  * DST / calendar-boundary probe for utils/time.ts (C-14).
  *
@@ -172,3 +178,119 @@ check(
 check('rejects 2026-02-30', zonedDayStart('2026-02-30', 'UTC') === null);
 check('rejects 2026-13-01', zonedDayStart('2026-13-01', 'UTC') === null);
 check('accepts 9999-12-31', zonedNextDayStart('9999-12-31', 'UTC') !== null);
+
+/**
+ * Every date OPERATOR, through the default-timezone path production uses.
+ *
+ * The cases above all pass an explicit zone, so nothing in this file exercised
+ * `BUSINESS_TIMEZONE` — `dayBounds` in `lib/data-table/filter-columns.ts` calls
+ * `zonedDayStart(day)` / `zonedNextDayStart(day)` with no zone argument, and a
+ * hard-coded `'UTC'` in either default would have shifted every date filter on
+ * every dashboard list by the business offset with the whole suite still green.
+ *
+ * The bounds are checked by round trip through `Intl` rather than against a
+ * recomputed instant: this file must not reimplement `utils/time.ts` to check
+ * it. `formatInBusinessZone` is the independent half — the same
+ * `Intl.DateTimeFormat` the application's helpers build on, but reached
+ * directly, so a default that stops resolving the business zone fails here
+ * whatever the configured zone happens to be.
+ */
+const businessDayFormatter = new Intl.DateTimeFormat('en-CA', {
+  timeZone: BUSINESS_TIMEZONE,
+  year: 'numeric',
+  month: '2-digit',
+  day: '2-digit',
+});
+
+const formatInBusinessZone = (instant: Date): string =>
+  businessDayFormatter.format(instant);
+
+const dialect = new PgDialect();
+
+/** The bound instants one date filter puts on the wire, in order. */
+function dateFilterBounds(operator: string, value: string | string[]): Date[] {
+  const condition = filterColumns({
+    table: users,
+    filters: [
+      {
+        filterId: 'f1',
+        id: 'createdAt',
+        value,
+        operator,
+        variant: 'date',
+      },
+    ] as never,
+    joinOperator: 'and',
+    specs: { createdAt: { type: 'date' } },
+  });
+  if (!condition) throw new Error('filterColumns produced no condition');
+  return dialect
+    .sqlToQuery(condition)
+    .params.map((param) => new Date(param as string));
+}
+
+const DAY = '2026-08-02';
+const NEXT_DAY = '2026-08-03';
+const MS = 1;
+
+describe('date filters resolve through the BUSINESS_TIMEZONE default', () => {
+  test('the day start is the first instant of that calendar day', () => {
+    const [start] = dateFilterBounds('gte', DAY);
+    if (!start) throw new Error('no bound emitted');
+    expect(formatInBusinessZone(start)).toBe(DAY);
+    // The discriminating half: under a UTC default this instant is three hours
+    // into the business day, so the millisecond before it is still inside it.
+    expect(formatInBusinessZone(new Date(start.getTime() - MS))).not.toBe(DAY);
+  });
+
+  test('the exclusive upper bound is the first instant of the NEXT day', () => {
+    const [next] = dateFilterBounds('gt', DAY);
+    if (!next) throw new Error('no bound emitted');
+    expect(formatInBusinessZone(next)).toBe(NEXT_DAY);
+    expect(formatInBusinessZone(new Date(next.getTime() - MS))).toBe(DAY);
+  });
+
+  test('the default path agrees with passing the business zone explicitly', () => {
+    const [start] = dateFilterBounds('gte', DAY);
+    expect(start?.getTime()).toBe(
+      zonedDayStart(DAY, BUSINESS_TIMEZONE)?.getTime()
+    );
+  });
+
+  /**
+   * The labels are calendar-relative, which is the part a reader has to be able
+   * to check: "before X" excludes the whole of X's day, "on or before X"
+   * includes all of it, "after X" starts at the next day.
+   */
+  test.each([
+    ['eq', DAY, ['start', 'next']],
+    ['ne', DAY, ['start', 'next']],
+    ['lt', DAY, ['start']],
+    ['lte', DAY, ['next']],
+    ['gt', DAY, ['next']],
+    ['gte', DAY, ['start']],
+  ] as const)('%s binds %p', (operator, value, expected) => {
+    const start = zonedDayStart(DAY, BUSINESS_TIMEZONE);
+    const next = zonedNextDayStart(DAY, BUSINESS_TIMEZONE);
+    if (!start || !next) throw new Error('the business zone resolved no day');
+    expect(dateFilterBounds(operator, value).map((d) => d.getTime())).toEqual(
+      expected.map((which) =>
+        which === 'start' ? start.getTime() : next.getTime()
+      )
+    );
+  });
+
+  test('isBetween spans the first day start to the last day end', () => {
+    const start = zonedDayStart(DAY, BUSINESS_TIMEZONE);
+    const next = zonedNextDayStart('2026-08-04', BUSINESS_TIMEZONE);
+    if (!start || !next) throw new Error('the business zone resolved no day');
+    expect(
+      dateFilterBounds('isBetween', [DAY, '2026-08-04']).map((d) => d.getTime())
+    ).toEqual([start.getTime(), next.getTime()]);
+  });
+
+  test('the valueless operators bind no instant at all', () => {
+    expect(dateFilterBounds('isEmpty', '')).toEqual([]);
+    expect(dateFilterBounds('isNotEmpty', '')).toEqual([]);
+  });
+});

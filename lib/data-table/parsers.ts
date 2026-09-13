@@ -13,15 +13,27 @@ import { dataTableConfig } from './config';
 export const MAX_SORT_RAW_LENGTH = 4096;
 /** Filters carry values, so they get a larger raw budget than sorts. */
 export const MAX_FILTERS_RAW_LENGTH = MAX_SORT_RAW_LENGTH * 2;
-const MAX_ID_LENGTH = 64;
-const MAX_VALUE_LENGTH = 512;
-const MAX_SORT_ITEMS = 10;
-const MAX_FILTER_ITEMS = 20;
+/**
+ * Exported because every one of these is ENFORCED — an over-cap request is a
+ * 422 — and a caller cannot see them otherwise. `routes.ts` publishes them, so
+ * a generated client can no longer build a request the document accepts and the
+ * runtime rejects.
+ */
+export const MAX_ID_LENGTH = 64;
+export const MAX_VALUE_LENGTH = 512;
+export const MAX_SORT_ITEMS = 10;
+export const MAX_FILTER_ITEMS = 20;
 /** Values inside one filter (`inArray` selections, range tuples). */
-const MAX_FILTER_VALUES = 20;
+export const MAX_FILTER_VALUES = 20;
 
 const validOperators = new Set<string>(dataTableConfig.operators);
-const VALID_JOIN_OPERATORS = new Set<string>(['and', 'or']);
+/**
+ * From `dataTableConfig`, like every other operator set in this file — not a
+ * third literal copy beside the one in `config.ts` and the one `routes.ts`
+ * published. `JoinOperator` is derived from the same array, so a value added
+ * there is accepted, documented and typed in one edit.
+ */
+const VALID_JOIN_OPERATORS = new Set<string>(dataTableConfig.joinOperators);
 
 /**
  * Trigram floor for quick search / text filter operators. Declared here — the
@@ -282,6 +294,13 @@ function parseFiltersState<TData>(
 
 export const MAX_PAGE = 10_000;
 export const MAX_PER_PAGE = 100;
+/**
+ * Page size when the caller asks for none. Never larger than the ceiling in
+ * force for the request: a caller that declares `?maxPerPage=5` and omits
+ * `perPage` was served 10 rows, so the bound it set for itself was exceeded by
+ * the default rather than by anything it sent.
+ */
+export const DEFAULT_PER_PAGE = 10;
 
 export interface GetDataSchema<T = Record<string, unknown>> {
   page: number;
@@ -314,10 +333,34 @@ export const DATA_TABLE_PARAM_KEYS = new Set([
   'joinOperator',
 ]);
 
+export interface ParseSearchParamsOptions<T> {
+  /** Applied when the request expresses no sort the allowlist accepts. */
+  defaultSort?: ExtendedColumnSort<T>;
+  /**
+   * The sortable column ids, so the fallback below is authoritative.
+   *
+   * Without them the parser installed `defaultSort` BEFORE the caller filtered
+   * the list against its allowlist, so a sort naming a real table column that
+   * is not in the spec map — or an unknown id — removed the handler's declared
+   * sort entirely and left only the primary-key tiebreaker. That is invisible
+   * on a table whose id is UUID v7, because v7 roughly follows creation time;
+   * it silently reorders every page anywhere else.
+   */
+  sortableColumnIds?: string[] | Set<string>;
+  /**
+   * Called once per discarded item. The client leaves this unset and stays
+   * lenient; the server passes a handler that rejects.
+   */
+  onFilterDropped?: () => void;
+}
+
 export function parseSearchParams<T = Record<string, unknown>>(
   params: Record<string, string | string[] | undefined>,
-  defaultSort?: ExtendedColumnSort<T>,
-  onFilterDropped?: () => void
+  {
+    defaultSort,
+    sortableColumnIds,
+    onFilterDropped,
+  }: ParseSearchParamsOptions<T> = {}
 ): GetDataSchema<T> {
   // Reported at most once per request. A throwing handler exits on the first
   // call anyway, but a counting or logging one was invoked several times for a
@@ -351,11 +394,15 @@ export function parseSearchParams<T = Record<string, unknown>>(
 
   const maxPerPage = boundedInt(params.maxPerPage, MAX_PER_PAGE, MAX_PER_PAGE);
   const page = boundedInt(params.page, MAX_PAGE, 1);
-  const perPage = boundedInt(params.perPage, maxPerPage, 10);
+  const perPage = boundedInt(
+    params.perPage,
+    maxPerPage,
+    Math.min(DEFAULT_PER_PAGE, maxPerPage)
+  );
 
   const sort = parseSortingState<T>(
     safeParam(params.sort),
-    undefined,
+    sortableColumnIds,
     reportOnce
   );
   const filters = parseFiltersState<T>(

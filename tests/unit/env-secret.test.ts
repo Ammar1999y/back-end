@@ -74,20 +74,20 @@ const SATISFYING_VALUE: Record<string, string> = {
   OTP_HMAC_ACTIVE_ID: '1',
   OTP_HMAC_KEYRING: `{"1":{"generation":1,"secret":"${PEPPER_SECRET}"}}`,
   TURNSTILE_SECRET_KEY: 'turnstile',
+  // 32+ characters; `resolveMaintenanceToken` rejects a shorter configured
+  // value at module load, and production rejects an absent one.
+  SQLITE_MAINTENANCE_TOKEN: 'probe-token-0123456789012345678901',
 };
 
 /**
  * Not in either extracted list, and deliberately: `SQLITE_DIR` has no production
- * default (an unmounted volume must not boot silently) and the maintenance token
- * is enforced at the route rather than at load. Both still have to be present for
- * the module to evaluate under `NODE_ENV=production`. Absolute path, because
+ * default (an unmounted volume must not boot silently), so it is validated by its
+ * own resolver rather than by the flat list. It still has to be present for the
+ * module to evaluate under `NODE_ENV=production`. Absolute path, because
  * production rejects a relative one; nothing here opens the file.
  */
 const ALSO_NEEDED_IN_PRODUCTION = {
   SQLITE_DIR: '/tmp/env-secret-probe',
-  // 32+ characters; `resolveMaintenanceToken` rejects a shorter configured
-  // value at module load.
-  SQLITE_MAINTENANCE_TOKEN: 'probe-token-0123456789012345678901',
   // The object store is validated as RULES rather than a flat list
   // (`r2ConfigurationErrors`): production needs at least one bucket, and a
   // bucket needs credentials. The smallest satisfying set is a private bucket

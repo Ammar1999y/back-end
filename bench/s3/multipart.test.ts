@@ -142,7 +142,7 @@ describe('a ReadableStream body', () => {
     });
 
   test('every write entry point stringifies it, and the object is silently wrong', async () => {
-    // `docs/bun-s3.md` lists `ReadableStream` in `S3File.write`'s accepted
+    // the Bun S3 docs (https://bun.com/docs/runtime/s3) lists `ReadableStream` in `S3File.write`'s accepted
     // union. `@types/bun@1.4.0` does not, and the runtime agrees with the types
     // in the worst available way: it stringifies rather than rejecting, so 3 MB
     // of stream becomes a 23-byte object and the call reports success.

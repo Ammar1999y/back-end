@@ -4,12 +4,24 @@ import path from 'node:path';
 import type { RouteManifestEntry } from '@/lib/http/route-manifest';
 import type { PaginationMeta } from '@/utils/api-response';
 
+import { MEDIA_FILTER_COLUMNS } from '@/app/api/dash/media/handler';
+import { PERMISSIONS_FILTER_COLUMNS } from '@/app/api/dash/permissions/handler';
+import { USERS_FILTER_COLUMNS } from '@/app/api/dash/users/handler';
 import { ROUTES } from '@/routes';
 import { auth } from '@/lib/auth';
 import {
   BETTER_AUTH_ENDPOINTS,
   betterAuthServes,
 } from '@/lib/auth/allowed-paths';
+import { operatorsForSpec } from '@/lib/data-table/column-specs';
+import {
+  MAX_FILTER_ITEMS,
+  MAX_FILTER_VALUES,
+  MAX_FILTERS_RAW_LENGTH,
+  MAX_ID_LENGTH,
+  MAX_SORT_ITEMS,
+  MAX_VALUE_LENGTH,
+} from '@/lib/data-table/parsers';
 import {
   memoiseOpenApiDocument,
   openApiDocument,
@@ -70,6 +82,30 @@ function operationOf(
   return operation as Record<string, unknown>;
 }
 
+/**
+ * Follows a `$ref` into `components.schemas`.
+ *
+ * The document publishes its repeated schemas once and references them — the
+ * media file schema was inlined nine times and the error envelope at every
+ * refusal of every operation — so a test that reads `properties` off a response
+ * has to resolve first or it is asserting against the reference object.
+ */
+function resolveRef(
+  document: unknown,
+  schema: Record<string, unknown>
+): Record<string, unknown> {
+  const ref = schema.$ref;
+  if (typeof ref !== 'string') return schema;
+  const name = ref.replace('#/components/schemas/', '');
+  const components = (document as { components: Record<string, unknown> })
+    .components;
+  const schemas = components.schemas as Record<string, unknown>;
+  const resolved = schemas[name];
+  if (typeof resolved !== 'object' || resolved === null)
+    throw new Error(`unresolvable $ref ${ref}`);
+  return resolved as Record<string, unknown>;
+}
+
 function responseSchemaOf(
   document: unknown,
   pathName: string,
@@ -81,7 +117,7 @@ function responseSchemaOf(
   const response = responses[status] as Record<string, unknown>;
   const content = response.content as Record<string, unknown>;
   const json = content['application/json'] as Record<string, unknown>;
-  return json.schema as Record<string, unknown>;
+  return resolveRef(document, json.schema as Record<string, unknown>);
 }
 
 function requestSchemaOf(
@@ -94,7 +130,7 @@ function requestSchemaOf(
   const requestBody = operation.requestBody as Record<string, unknown>;
   const content = requestBody.content as Record<string, unknown>;
   const media = content[mediaType] as Record<string, unknown>;
-  return media.schema as Record<string, unknown>;
+  return resolveRef(document, media.schema as Record<string, unknown>);
 }
 
 function visitObjects(
@@ -148,20 +184,35 @@ function documentOperations(document: unknown): Array<{
 describe('the OpenAPI document', () => {
   test('email commits document revoking every session and the required client alert on both routes', () => {
     const document = openApiDocument(toPublishedManifest(ROUTES));
+    const descriptionOf = (path: string): string =>
+      String(
+        objectProperty(
+          objectProperty(operationOf(document, path, 'post'), 'responses'),
+          '200'
+        ).description
+      );
+
     for (const path of [
       '/api/dash/users/me/change-email',
       '/api/dash/users/me/change-email/verify',
     ]) {
-      const response = objectProperty(
-        objectProperty(operationOf(document, path, 'post'), 'responses'),
-        '200'
+      expect(descriptionOf(path)).toContain(
+        'every session is revoked, including the current one'
       );
-      expect(response.description).toContain(
-        'every session is revoked, including the current session'
-      );
-      expect(response.description).toContain('must show an alert');
-      expect(response.description).toContain('data.verified is false');
+      expect(descriptionOf(path)).toContain('show an alert');
     }
+
+    // Each operation names the fields IT returns. The start operation answers
+    // `otpSent` or `autoVerified` and never `verified`, so prose telling a
+    // client to branch on `data.verified` there described a response that
+    // cannot arrive and stranded it before code entry.
+    const start = descriptionOf('/api/dash/users/me/change-email');
+    expect(start).toContain('data.otpSent');
+    expect(start).toContain('data.autoVerified');
+    expect(start).not.toContain('data.verified');
+    expect(descriptionOf('/api/dash/users/me/change-email/verify')).toContain(
+      'data.verified'
+    );
   });
 
   test('credential proof fields describe the optional reauthentication window and errors preserve their code', () => {
@@ -204,6 +255,28 @@ describe('the OpenAPI document', () => {
 
     expect(paths.length).toBeGreaterThan(0);
     expect(paths.filter((path) => path.startsWith('/api/dev'))).toEqual([]);
+  });
+
+  test('refuses a path the table and the Better Auth prefix both claim, whatever the methods', () => {
+    // The generator ASSIGNS `paths[full]` for every Better Auth endpoint, so a
+    // table operation on a shared path is dropped whether or not the two share a
+    // method. A same-method duplicate is the obvious case; this is the one that
+    // passed validation and then disappeared from the document, which is the
+    // failure mode a published contract cannot afford.
+    const collision: RouteManifestEntry = {
+      method: 'POST',
+      path: '/api/auth/get-session',
+      preAuth: 'ip-limit',
+      auth: 'public',
+      captcha: false,
+      handlerRateLimit: false,
+      body: 'json',
+      response: 'envelope',
+    };
+
+    expect(() => openApiDocument([...toManifest(ROUTES), collision])).toThrow(
+      /\/api\/auth\/get-session is declared by the route table/
+    );
   });
 
   test('names no /api/internal path — those routes no longer exist', () => {
@@ -553,7 +626,18 @@ describe('request and response contract fidelity', () => {
     expect(Array.isArray(item.allOf)).toBe(true);
   });
 
-  test('both list routes publish the complete bounded query DSL and its 422', () => {
+  /**
+   * Every route that runs the shared list parser, MEDIA INCLUDED — it was the
+   * one left out, so nothing checked that its published contract matched the
+   * descriptor map it enforces.
+   */
+  const LIST_ROUTES = [
+    ['/api/dash/users', USERS_FILTER_COLUMNS],
+    ['/api/dash/permissions', PERMISSIONS_FILTER_COLUMNS],
+    ['/api/dash/media', MEDIA_FILTER_COLUMNS],
+  ] as const;
+
+  test('every list route publishes the complete bounded query DSL and its 422', () => {
     const expected = [
       'filters',
       'joinOperator',
@@ -563,7 +647,7 @@ describe('request and response contract fidelity', () => {
       'search',
       'sort',
     ];
-    for (const pathName of ['/api/dash/users', '/api/dash/permissions']) {
+    for (const [pathName] of LIST_ROUTES) {
       const operation = operationOf(document, pathName, 'get');
       const parameters = operation.parameters as Record<string, unknown>[];
       expect(
@@ -571,6 +655,9 @@ describe('request and response contract fidelity', () => {
           .map((parameter) => parameter.name)
           .filter((name): name is string => typeof name === 'string')
           .toSorted(byText)
+          // Media adds `folder` and `scope` of its own; this test owns the
+          // shared DSL, and the media-specific pair is covered below.
+          .filter((name) => expected.includes(name))
       ).toEqual(expected);
       const perPage = parameters.find(
         (parameter) => parameter.name === 'perPage'
@@ -595,6 +682,74 @@ describe('request and response contract fidelity', () => {
       expect(search?.schema).toEqual({ type: 'string' });
       expect(search?.description).toContain('ignored rather than rejected');
       expect(statusesOf(document, pathName, 'get')).toContain('422');
+    }
+  });
+
+  /**
+   * The published allowlist IS the enforced one.
+   *
+   * The ids used to be a comma-separated string written beside the descriptor
+   * map instead of taken from it, so a column added to the map and not the
+   * prose — or removed from the map and left in the prose — published a
+   * contract the runtime does not honour. Asserting containment in both
+   * directions is what makes that impossible rather than merely unlikely.
+   */
+  test('the published filter contract is derived from the enforced descriptors', () => {
+    for (const [pathName, specs] of LIST_ROUTES) {
+      const parameters = operationOf(document, pathName, 'get')
+        .parameters as Record<string, unknown>[];
+      const describedBy = (name: string): string => {
+        const parameter = parameters.find((p) => p.name === name);
+        return String(parameter?.description ?? '');
+      };
+      const filters = describedBy('filters');
+      const sort = describedBy('sort');
+
+      /** One column's clause, so an operator is checked against ITS column. */
+      const clauseFor = (id: string): string => {
+        const opens = filters.indexOf(`\`${id}\` (`);
+        expect(opens).toBeGreaterThanOrEqual(0);
+        const closes = filters.indexOf(')', opens);
+        return filters.slice(opens, closes);
+      };
+
+      for (const [id, spec] of Object.entries(specs)) {
+        expect(sort).toContain(`\`${id}\``);
+        const clause = clauseFor(id);
+        expect(clause).toContain(spec.type);
+        // Operators the column really accepts, and no operator it refuses:
+        // `notILike` is gated by `allowScanOnly` and is a 422 without it.
+        for (const operator of operatorsForSpec(spec))
+          expect(clause).toContain(operator);
+        if (!spec.allowScanOnly) expect(clause).not.toContain('notILike');
+        const members = spec.values ?? [];
+        for (const member of members) expect(clause).toContain(member);
+      }
+
+      // Nothing published that is not enforced. Counted on the clause opener,
+      // not the bare id: the prose above the list names the `id` FIELD of each
+      // filter object, which is not a column.
+      for (const id of ['password', 'deletedAt', 'roleId', 'id'])
+        if (!Object.hasOwn(specs, id))
+          expect(filters).not.toContain(`\`${id}\` (`);
+      expect(filters.split('` (').length - 1).toBe(Object.keys(specs).length);
+
+      // Every enforced cap reaches the caller.
+      for (const cap of [
+        MAX_FILTER_ITEMS,
+        MAX_FILTER_VALUES,
+        MAX_ID_LENGTH,
+        MAX_VALUE_LENGTH,
+      ])
+        expect(filters).toContain(String(cap));
+      expect(sort).toContain(String(MAX_SORT_ITEMS));
+      expect(sort).toContain(String(MAX_ID_LENGTH));
+
+      const filtersParameter = parameters.find((p) => p.name === 'filters');
+      expect(filtersParameter?.schema).toMatchObject({
+        type: 'string',
+        maxLength: MAX_FILTERS_RAW_LENGTH,
+      });
     }
   });
 
@@ -723,14 +878,34 @@ describe('request and response contract fidelity', () => {
     // `Passkey` is contributed by the passkey plugin, so the set depends on
     // which 2FA methods this deployment enables. Asserted against that rather
     // than against a fixed list, which would fail for a correct configuration
-    // with passkey off.
+    // with passkey off. The project's own shared schemas sit beside them: the
+    // media file schema alone was inlined nine times, so a generator emitted
+    // nine anonymous copies of one type.
     expect(Object.keys(schemas).toSorted(byText)).toEqual(
       [
+        'ErrorEnvelope',
+        'MediaFile',
+        'MediaFileDetails',
+        'MediaFolder',
+        'MediaFolderHit',
+        'MediaUsage',
         'Session',
         'User',
         ...(isTwoFactorMethodEnabled('passkey') ? ['Passkey'] : []),
       ].toSorted(byText)
     );
+
+    // Every published `$ref` resolves inside this document. A name that does
+    // not is a client that cannot be generated at all.
+    const refs: string[] = [];
+    visitObjects(document, (object) => {
+      if (typeof object.$ref === 'string') refs.push(object.$ref);
+    });
+    expect(refs.length).toBeGreaterThan(0);
+    for (const ref of refs) {
+      expect(ref.startsWith('#/components/schemas/')).toBe(true);
+      expect(schemas).toHaveProperty(ref.slice('#/components/schemas/'.length));
+    }
     const user = schemas.User as Record<string, unknown>;
     expect(
       Object.keys(user.properties as Record<string, unknown>)
@@ -1276,9 +1451,12 @@ describe('the refusals an operation declares for its own authorisation', () => {
       expect(statusesOf(document, routePath, 'delete')).toContain('400');
   });
 
-  test('storage health declares its raw bodies and conditional authorization', () => {
+  test('storage health declares its raw bodies and its token requirement', () => {
     const document = openApiDocument(manifest);
     const operation = operationOf(document, '/api/health/storage', 'get');
+    // No 429: the route carries no limiter at all now that every caller has to
+    // authenticate, which is what keeps the readiness probe off the limiter's
+    // write lock.
     expect(
       Object.keys(operation.responses as Record<string, unknown>).toSorted(
         byText
@@ -1294,12 +1472,15 @@ describe('the refusals an operation declares for its own authorisation', () => {
       'status',
       'checks',
     ]);
+    // Every caller that gets a body at all carries the token, so the breakdown
+    // is no longer conditional.
+    expect(schema.required).toEqual(['status', 'checks']);
     expect(operation.parameters).toEqual(
       expect.arrayContaining([
         expect.objectContaining({
           name: 'x-maintenance-token',
           in: 'header',
-          required: false,
+          required: true,
         }),
       ])
     );
@@ -1317,7 +1498,10 @@ describe('the refusals an operation declares for its own authorisation', () => {
       const response = operation.responses[status] as Record<string, unknown>;
       const content = response.content as Record<string, unknown>;
       const json = content['application/json'] as Record<string, unknown>;
-      const schema = json.schema as Record<string, unknown>;
+      const schema = resolveRef(
+        document,
+        json.schema as Record<string, unknown>
+      );
       expect(
         Object.keys(schema.properties as Record<string, unknown>)
       ).toContain('message');
@@ -1684,7 +1868,16 @@ describe('the statuses each Better Auth operation declares', () => {
           ),
         ]).toEqual([
           endpoint.path,
-          [...(MEASURED[endpoint.path] ?? [])].toSorted(byText),
+          [
+            ...(MEASURED[endpoint.path] ?? []),
+            // Derived from the METHOD, not measured on the path: the body
+            // ceiling is enforced by the boundary in `app.ts` before the library
+            // is called, so every body-bearing operation under this prefix
+            // publishes it and no GET does. Added here rather than pasted into
+            // thirty entries of a map whose whole point is that each line was
+            // probed.
+            ...(method === 'POST' ? ['413'] : []),
+          ].toSorted(byText),
         ]);
   });
 

@@ -1,10 +1,11 @@
 import { beforeEach, describe, expect, test } from 'bun:test';
 
-import { eq } from 'drizzle-orm';
+import { eq, inArray } from 'drizzle-orm';
 
 import { app } from '@/app';
 import { db } from '@/db';
-import { sessions, users } from '@/db/schema';
+import { sessions, users, verifications } from '@/db/schema';
+import { PUBLIC_ORIGIN } from '@/lib/env';
 
 import { HTTP_STATUS } from '@/utils/api-messages';
 
@@ -85,5 +86,64 @@ describe('a read with a valid cookie cache', () => {
 
     const response = await read(session.cookie);
     expect(response.status).toBe(HTTP_STATUS.OK);
+  });
+});
+
+describe('signing out takes the session artifacts with it', () => {
+  /**
+   * `revokeSessionArtifacts` says every path that deletes a session owes it the
+   * call, and `/sign-out` is a path this codebase does not own: Better Auth
+   * deletes the row through its own adapter. The three `verifications` rows keyed
+   * by the SESSION id — the two-factor proof and both re-authentication windows —
+   * store no user id, so a session deleted without them leaves rows nothing can
+   * find again until they expire. The `session.delete.after` database hook in
+   * `lib/auth.ts` is what makes the invariant true for the library's deletes.
+   */
+  test('the re-authentication window opened on it is gone', async () => {
+    // `signedInUser` opens the window, which is what writes the rows: a fixture
+    // that only signed in would make this vacuous.
+    const session = await signedInUser();
+    const [row] = await db
+      .select({ id: sessions.id })
+      .from(sessions)
+      .where(eq(sessions.userId, session.user.userId));
+    const sessionId = row?.id;
+    expect(sessionId).toBeString();
+
+    const identifiers = [
+      `2fa-proven-${sessionId}`,
+      `reauth-method-${sessionId}`,
+      `reauth-passkey-${sessionId}`,
+    ];
+    const artifacts = () =>
+      db
+        .select({ identifier: verifications.identifier })
+        .from(verifications)
+        .where(inArray(verifications.identifier, identifiers));
+
+    expect(await artifacts()).not.toBeEmpty();
+
+    const response = await app.handle(
+      new Request('http://localhost/api/auth/sign-out', {
+        method: 'POST',
+        headers: baseHeaders({
+          'content-type': 'application/json',
+          cookie: session.cookie,
+          // Better Auth's router-level origin check refuses a cookie-carrying
+          // non-GET without one (403), before the endpoint runs at all.
+          origin: PUBLIC_ORIGIN,
+        }),
+        body: '{}',
+      })
+    );
+    expect(response.status).toBe(HTTP_STATUS.OK);
+
+    expect(
+      await db
+        .select({ id: sessions.id })
+        .from(sessions)
+        .where(eq(sessions.id, sessionId as string))
+    ).toBeEmpty();
+    expect(await artifacts()).toBeEmpty();
   });
 });

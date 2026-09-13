@@ -1,5 +1,3 @@
-import type { EntityID } from '@/types';
-
 import * as z from 'zod';
 
 import { normalizeArabicDigits, UUID_V7_REGEX, validID } from '..';
@@ -129,29 +127,22 @@ function reflectKeys(keys: readonly PropertyKey[]): string {
   return hidden > 0 ? `${named.join('، ')} (+${hidden})` : named.join('، ');
 }
 
-function getIDSchema(
-  props: {
-    optional?: boolean;
-  } = {}
-) {
-  const { optional = false } = props;
-
+function getIDSchema() {
   // when EntityID is number
   // const schema = z.int(idRequired).min(1, idRequired).max(MAX_ID, idRequired);
   // when EntityID is UUID
   const schema = z.string(idRequired).regex(UUID_V7_REGEX, idRequired);
 
   return z.preprocess(
-    (v: EntityID) => validID(v) || (optional ? null : 0),
-
-    optional ? schema.nullish() : schema
+    // The rejected sentinel has to be of the ID's own type, or a malformed ID
+    // of the right type is answered as `invalid_type` instead of as a bad
+    // format. when EntityID is number: `validID(v) || 0`.
+    (v: unknown) => validID(v) || '',
+    schema
   );
 }
 
-export const idSchema = getIDSchema({ optional: false }) as z.ZodPipe<
-  z.ZodTransform<EntityID, EntityID>,
-  z.ZodString /* when EntityID is UUID, use ZodString, and when EntityID is number, use ZodInt */
->;
+export const idSchema = getIDSchema();
 
 export const emailSchema = z.preprocess(
   (v: string) =>

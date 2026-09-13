@@ -36,6 +36,18 @@ type RolePolicyTarget =
   { roleName?: string | null; scope?: string | null } | null | undefined;
 
 /**
+ * `FOR SHARE` is only worth taking inside a transaction. On the autocommit `db`
+ * handle PostgreSQL releases the lock at statement end, so it pins nothing
+ * across the caller's subsequent write and still writes a tuple lock to every
+ * row it touches — pure cost on the read-only paths.
+ *
+ * Derived from the executor rather than a caller flag so a call site cannot ask
+ * for a lock it is structurally unable to hold: `assertTargetReachable` already
+ * carries a `lock` option, and its `lock: false` read went on locking here.
+ */
+const holdsLocks = (executor: DbOrTx): boolean => executor !== db;
+
+/**
  * Reusable predicate for roles that are editable/visible in dashboard handlers.
  * Excludes system-scope roles (created by the developer, not editable via dashboard).
  */
@@ -79,12 +91,10 @@ export async function createCustomRole(
     roleId = existingRoleId;
     // Lock the role row so concurrent writers serialize.
     //
-    // The reason for upsert + prune below is NOT that readers could see an
-    // intermediate empty state — under MVCC no other transaction observes this
-    // one's uncommitted writes, so that earlier justification was wrong. It is
-    // kept because it preserves row identity and timestamps (a DELETE+INSERT
-    // resets `created_at` and breaks anything referencing the row), writes only
-    // what changed, and keeps the audit diff meaningful.
+    // Upsert + prune below, not DELETE + INSERT: it preserves row identity and
+    // `created_at`, writes only what changed, and keeps the audit diff
+    // meaningful. Not for visibility — under MVCC no other transaction can see
+    // this one's intermediate state either way.
     await tx
       .select({ id: roles.id })
       .from(roles)
@@ -110,7 +120,7 @@ export async function createCustomRole(
   const permsData = permissions.map((p) => ({
     roleId,
     pageName: p.name,
-    permissions: p.permissions as Record<PermissionAction, boolean>,
+    permissions: p.permissions,
   }));
 
   // Per-row UPSERT against ux_role_permissions_role_page: unchanged pages keep
@@ -149,14 +159,16 @@ export async function createCustomRole(
  */
 export async function validateAssignableRole(
   roleId: EntityID,
-  tx: Tx
+  executor: DbOrTx
 ): Promise<void> {
-  // FOR SHARE prevents role deactivation/deletion between validation and assignment
-  const [role] = await tx
+  // Under a `tx`, FOR SHARE prevents role deactivation/deletion between
+  // validation and assignment; on `db` this is an advisory preflight only and
+  // the caller must repeat it under its own transaction.
+  const query = executor
     .select({ id: roles.id })
     .from(roles)
-    .where(and(standardRoleFilter(roleId), eq(roles.isActive, true)))
-    .for('share');
+    .where(and(standardRoleFilter(roleId), eq(roles.isActive, true)));
+  const [role] = await (holdsLocks(executor) ? query.for('share') : query);
   if (!role) throw new CustomError(MSG_NOT_FOUND, HTTP_STATUS.NOT_FOUND);
 }
 
@@ -482,21 +494,21 @@ export function collapseToNotFound(error: unknown): never {
   throw new CustomError(MSG_NOT_FOUND, HTTP_STATUS.NOT_FOUND);
 }
 
-/** `FOR SHARE` so the role cannot be re-permissioned between this read and the caller's write. */
+/** Under a `tx`, `FOR SHARE` so the role cannot be re-permissioned between this read and the caller's write. */
 export async function validateRolePermissionScope(
   actorPermissions: Partial<PermissionObject>,
   roleId: EntityID,
   executor: DbOrTx,
   check: RoleScopeCheck
 ): Promise<void> {
-  const perms = await executor
+  const query = executor
     .select({
       pageName: rolePermissions.pageName,
       permissions: rolePermissions.permissions,
     })
     .from(rolePermissions)
-    .where(eq(rolePermissions.roleId, roleId))
-    .for('share');
+    .where(eq(rolePermissions.roleId, roleId));
+  const perms = await (holdsLocks(executor) ? query.for('share') : query);
 
   if (perms.length === 0) return;
 

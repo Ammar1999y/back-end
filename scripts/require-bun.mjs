@@ -194,6 +194,44 @@ function detectManager() {
 }
 
 /**
+ * `--version` from one candidate, or `null` when it cannot be run.
+ *
+ * A Windows `.cmd` shim needs a SHELL. Node refuses to execute one directly —
+ * `execFileSync` answers `EINVAL`, a deliberate change after CVE-2024-27980 —
+ * and the extensionless sibling npm writes beside it is a shell script
+ * `CreateProcess` will not run at all (`ENOENT`). Both measured on this
+ * platform, with Node 24.
+ *
+ * The whole command line goes in the FIRST argument with no `args` array: with
+ * `shell: true` Node concatenates an array without escaping it, which is
+ * `DEP0190` and would print a deprecation warning on every `npm install`. That
+ * is safe here for a reason which has to keep holding: `command` is built from
+ * directories THIS file enumerates, it is quoted (npm's default prefix contains
+ * the user's name, which can contain a space), and the rest is a fixed literal.
+ *
+ * @param {string} command
+ */
+function bunVersionOf(command) {
+  const shimmed = isWindows && /\.(?:cmd|bat)$/i.test(command);
+  try {
+    const output = shimmed
+      ? execFileSync(`"${command}" --version`, {
+          encoding: 'utf8',
+          shell: true,
+          stdio: ['ignore', 'pipe', 'ignore'],
+        })
+      : execFileSync(command, ['--version'], {
+          encoding: 'utf8',
+          stdio: ['ignore', 'pipe', 'ignore'],
+        });
+    return parseVersion(output);
+  } catch {
+    // Not there, or not executable. The caller tries the next candidate.
+    return null;
+  }
+}
+
+/**
  * Where Bun is and what version it reports, or `null` when it is not installed.
  *
  * `~/.bun/bin` is probed after `PATH` because a process that has just run the
@@ -206,34 +244,46 @@ function detectManager() {
  * probes silently missed a Bun that was installed — reported as "Bun is not
  * installed" on the exact machines the fallback exists for.
  *
+ * The npm global directory is probed for the same reason, and it is the case
+ * this guard is most likely to meet: it runs as an npm `preinstall`, under
+ * NODE, and `npm install -g bun` writes `bun`, `bun.cmd` and `bun.ps1` there.
+ * None of the three was reachable, so a machine with Bun installed that way was
+ * told Bun was missing and auto-install put a SECOND copy on disk whose
+ * precedence `PATH` order decided.
+ *
  * @returns {{ path: string, version: number[] } | null}
  */
 function findBun() {
   const bunInstall = process.env.BUN_INSTALL;
+  // `npm_config_prefix` is set by npm for its own lifecycle scripts, which is
+  // exactly when this matters; `%APPDATA%\npm` is npm's Windows default for a
+  // developer who ran this script by hand.
+  const npmPrefix =
+    process.env.npm_config_prefix ||
+    (isWindows && process.env.APPDATA
+      ? path.join(process.env.APPDATA, 'npm')
+      : '');
   const directories = [
     ...(bunInstall ? [path.join(bunInstall, 'bin')] : []),
     path.join(homedir(), '.bun', 'bin'),
+    ...(npmPrefix ? [isWindows ? npmPrefix : path.join(npmPrefix, 'bin')] : []),
   ];
   const candidates = [
     'bun',
     ...directories.flatMap((directory) =>
       isWindows
-        ? [path.join(directory, 'bun.exe'), path.join(directory, 'bun')]
+        ? [
+            path.join(directory, 'bun.exe'),
+            path.join(directory, 'bun.cmd'),
+            path.join(directory, 'bun'),
+          ]
         : [path.join(directory, 'bun')]
     ),
   ];
 
   for (const candidate of candidates) {
-    try {
-      const output = execFileSync(candidate, ['--version'], {
-        encoding: 'utf8',
-        stdio: ['ignore', 'pipe', 'ignore'],
-      });
-      const version = parseVersion(output);
-      if (version) return { path: candidate, version };
-    } catch {
-      // Not on PATH, or not executable. Try the next candidate.
-    }
+    const version = bunVersionOf(candidate);
+    if (version) return { path: candidate, version };
   }
   return null;
 }

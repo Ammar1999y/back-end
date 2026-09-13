@@ -10,6 +10,7 @@ import { mediaMsg } from '@/lib/media/messages';
 import { DEFAULT_UPLOAD_PURPOSE } from '@/lib/media/policy';
 import {
   admitUpload,
+  chargeUploadBodyBudget,
   chargeUploadBudget,
   storeUpload,
   takeSingleFile,
@@ -65,6 +66,10 @@ export const POST: Handler = async (ctx) => {
       limit: UPLOAD_ADMISSION_LIMIT,
       failClosed: true,
     });
+
+    // Charged from `Content-Length` while the body is still a stream: the
+    // kind budgets below can only be charged once it has been buffered.
+    await chargeUploadBodyBudget(userId, ctx.headers);
 
     const entry = takeSingleFile(await ctx.readFormData(), 'file');
     const admitted = await admitUpload(entry, DEFAULT_UPLOAD_PURPOSE);

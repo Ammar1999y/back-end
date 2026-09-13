@@ -563,7 +563,17 @@ export const twoFactorEnrolment = () =>
           body: z.record(z.string(), z.unknown()),
           use: [sessionMiddleware],
           metadata: {
-            openapi: envelopeResponse('The method was removed.'),
+            openapi: envelopeResponse('The method was removed.', {
+              type: 'object',
+              properties: {
+                removedMethod: {
+                  type: 'string',
+                  description:
+                    'The option that is gone, `otp:email` / `otp:phone` / `totp` / `backup_code` / `passkey`.',
+                },
+              },
+              required: ['removedMethod'],
+            }),
           },
         },
         async (ctx) => {
@@ -578,15 +588,15 @@ export const twoFactorEnrolment = () =>
           const contactKind = parsed.data.contactKind as
             ContactKind | undefined;
 
-          await withTransaction(async (tx) => {
+          const removed = await withTransaction(async (tx) => {
             await lockUser(tx, userId);
             const enrolled = await listEnrolledMethods(userId, tx);
+            // `contactKind` is required for `otp` by the schema, so this names
+            // exactly one row rather than whichever sorted first.
             const target = enrolled.find(
               (entry) =>
                 entry.method === method &&
-                (method !== 'otp' ||
-                  !contactKind ||
-                  entry.contactKind === contactKind)
+                (method !== 'otp' || entry.contactKind === contactKind)
             );
             if (!target) throw notFound();
             if (enrolled.length === 1) throw conflict(twoFactorMsg.lastMethod);
@@ -594,19 +604,27 @@ export const twoFactorEnrolment = () =>
             if (removalStrandsTwoFactor(state, method, target.contactKind))
               throw conflict(twoFactorMsg.lastMethod);
 
+            const removedOption = optionId(method, target.contactKind);
             await removeMethodIntent(tx, userId, method, target.contactKind);
             await clearCapabilityFor(tx, userId, method);
             await auditLifecycle(tx, ctx, session, {
-              twoFactorMethodRemoved: optionId(method, target.contactKind),
+              twoFactorMethodRemoved: removedOption,
               remaining: enrolled.length - 1,
             });
             // Removing a factor keeps the caller's sessions and drops every
             // standing skip of it: a trust row granted against the factor being
             // removed is a bypass of a factor that no longer exists.
             await revokeTwoFactorState(tx, userId);
+            return removedOption;
           });
 
-          return ctx.json({ success: true, message: twoFactorMsg.disabled });
+          // The option is named back: the caller sent a method and a contact
+          // kind, and a bare success cannot show WHICH possession is gone.
+          return ctx.json({
+            success: true,
+            message: twoFactorMsg.disabled,
+            data: { removedMethod: removed },
+          });
         }
       ),
 
@@ -640,9 +658,7 @@ export const twoFactorEnrolment = () =>
             const target = enrolled.find(
               (entry) =>
                 entry.method === method &&
-                (method !== 'otp' ||
-                  !contactKind ||
-                  entry.contactKind === contactKind)
+                (method !== 'otp' || entry.contactKind === contactKind)
             );
             if (!target) throw notFound();
 

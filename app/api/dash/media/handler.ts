@@ -34,7 +34,7 @@ import { idRequired } from '@/utils/validation/rules';
  * error. `mimeType` is closed over what may EXIST rather than what may be
  * uploaded, so holding a type back does not hide the rows that already carry it.
  */
-const MEDIA_FILTER_COLUMNS: FilterColumnSpecs = {
+export const MEDIA_FILTER_COLUMNS: FilterColumnSpecs = {
   displayName: { type: 'text' },
   sizeBytes: { type: 'number' },
   mimeType: { type: 'select', values: KNOWN_MIME_TYPES },

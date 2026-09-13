@@ -35,6 +35,11 @@ jobs:
       # No bun-version: the action reads package.json's `packageManager` field,
       # so the version lives in exactly one place and Renovate bumps it there.
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+      - name: Assert the lockfile is present
+        # On the pinned Bun, `--frozen-lockfile` installs from `package.json`
+        # and exits 0 when no lockfile exists at all, so a checkout or ignore
+        # mistake removes the supply-chain anchor without failing anything.
+        run: test -f bun.lock
       - run: bun install --frozen-lockfile
       - name: Typecheck and lint
         run: bun run lint
@@ -65,7 +70,10 @@ jobs:
         run: bun scripts/find-unused-files.ts
       - name: Unused files, exports and types
         run: bun run find:unused-files
-      - name: Duplicate dependency versions
+      - name: Collapsible duplicate dependencies
+        # What Bun checks, and not more: duplicates whose ranges OVERLAP, so
+        # one version could serve both. A lockfile carrying two incompatible
+        # majors of one package passes this and is not what it reports on.
         run: bun dedupe --check
       - name: Boot smoke test
         # Replaces `next build`. A Bun server has no build artefact, so this is
@@ -187,6 +195,11 @@ jobs:
       # regenerating `bun.lock`, so every CI install would have failed while
       # every local command passed, because `node_modules` was already
       # populated. No test that assumes an installed tree can detect that.
+      - name: Assert the lockfile is present
+        # On the pinned Bun, `--frozen-lockfile` installs from `package.json`
+        # and exits 0 when no lockfile exists at all, so a checkout or ignore
+        # mistake removes the supply-chain anchor without failing anything.
+        run: test -f bun.lock
       - run: bun install --frozen-lockfile
       - name: Integration tests
         # The harness migration builds the test template, so no separate migrate
@@ -213,6 +226,12 @@ jobs:
         # test here owns a real socket, a real child process or a real signal.
         # It is also the tier where the win32-skipped cases actually run.
         run: bun run test:process
+      - name: Configuration matrix tests
+        # The ONLY tier that boots the disabled, TOTP-only, backup-only,
+        # passkey-only, OTP-email and OTP-WhatsApp configurations, each of which
+        # is decided at MODULE LOAD and therefore unreachable from any other
+        # tier. Nothing ran it: `test:all` did, and no gate calls `test:all`.
+        run: bun run test:matrix
       - name: Coverage floor
         # LAST in this job, and that placement is the point: a coverage dip is a
         # ratchet signal rather than a correctness failure, and sitting ahead of
@@ -241,6 +260,11 @@ jobs:
         with:
           persist-credentials: false
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+      - name: Assert the lockfile is present
+        # On the pinned Bun, `--frozen-lockfile` installs from `package.json`
+        # and exits 0 when no lockfile exists at all, so a checkout or ignore
+        # mistake removes the supply-chain anchor without failing anything.
+        run: test -f bun.lock
       - run: bun install --frozen-lockfile
       - name: Dependency audit
         # `scripts/audit.ts`, not `bun audit`: it retries a registry 5xx and

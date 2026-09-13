@@ -17,12 +17,23 @@
  *   probe. Both take real work and a write lock, so they must not run on every
  *   poll — that would put the health check itself in contention with the limiter.
  *
- * The body reports status only: no paths, schema contents, or row counts. A health
- * endpoint is typically the least-authenticated surface in a deployment.
+ * The WHOLE route requires `x-maintenance-token`, not only `?deep=1`. A health
+ * endpoint is otherwise the least-authenticated surface in a deployment, and the
+ * only bound available to an anonymous one here is deployment-wide: `ipIdentifier`
+ * answers 503 without a trusted proxy header and the container's own probe carries
+ * none, so a per-IP limiter would refuse exactly the caller this route exists for
+ * while a shared budget hands any anonymous caller a restart switch — spend it at
+ * 4 req/s and the orchestrator's own `curl -f` starts reading 429 as unhealthy.
+ * The token removes both: the probe carries it (a Coolify CMD health check runs
+ * inside the container with its environment — see reports/coolify-deployment.md
+ * §7), so the route needs no limiter and writes nothing to the limiter store.
+ *
+ * `SQLITE_MAINTENANCE_TOKEN` is therefore required in production; an unset one
+ * makes every request here 401, which is a boot failure rather than a surprise.
  *
  * The body is `apiRaw`, not the standard envelope: the deployed health check
- * reads `status` and `checks` at the top level, so wrapping it would break a
- * deployment rather than a client we control.
+ * reads `status` at the top level, so wrapping it would break a deployment
+ * rather than a client we control.
  *
  * What this CANNOT prove: that the volume is actually persistent. SQLite will
  * create the same path inside the container layer just as happily. Only surviving
@@ -65,16 +76,13 @@ async function postgresReachable(): Promise<boolean> {
 }
 
 export const GET: Handler = async (ctx) => {
-  const deepRequested = ctx.query.get('deep') === '1';
-  const deep =
-    deepRequested &&
-    maintenanceTokenMatches(ctx.headers.get('x-maintenance-token'));
-
-  if (deepRequested && !deep)
+  if (!maintenanceTokenMatches(ctx.headers.get('x-maintenance-token')))
     return apiRaw({
       body: { status: 'unauthorized' },
       status: HTTP_STATUS.UNAUTHORIZED,
     });
+
+  const deep = ctx.query.get('deep') === '1';
 
   try {
     const store = getRateLimitStore();

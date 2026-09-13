@@ -29,6 +29,7 @@
 import { SQL } from 'bun';
 import path from 'node:path';
 
+import { stampCoverageProvenance } from './coverage';
 import { loadTestEnv } from './env-file';
 import { newRunToken } from './names';
 import {
@@ -310,6 +311,7 @@ async function teardown(): Promise<void> {
   run.created = [];
 }
 
+const startedAt = Date.now();
 let exitCode = 1;
 try {
   if (tier.database) run.created = await provision();
@@ -355,6 +357,16 @@ try {
   }
 } finally {
   await teardown();
+  // Written after the child exits, so the stamp cannot outlive a run that never
+  // finished — and only for a run that asked for coverage, so a later tier
+  // cannot claim the report an earlier one produced.
+  await stampCoverageProvenance({
+    coverageDir: path.join(REPO_ROOT, 'coverage'),
+    tier: tierName,
+    selection,
+    flags: forwardedFlags,
+    startedAt,
+  });
 }
 
 process.exit(exitCode);

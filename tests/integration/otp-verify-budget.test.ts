@@ -93,7 +93,21 @@ const CHANGE_PURPOSES = new Set<OtpPurpose>(['change_email', 'change_phone']);
 
 /** Purposes this file spends the budget across, and one it leaves pristine. */
 const SPEND_PURPOSES = OTP_PURPOSES.slice(0, ROWS_TO_EXHAUST);
-const UNTOUCHED_PURPOSE = OTP_PURPOSES[ROWS_TO_EXHAUST];
+const UNTOUCHED_PURPOSE = untouchedPurpose();
+
+/**
+ * Asserted rather than asserted-away: `OTP_PURPOSES[ROWS_TO_EXHAUST]` is only
+ * defined while the list outgrows the arithmetic above, and `!` would turn the
+ * day it stops into `undefined` reaching a NOT NULL column.
+ */
+function untouchedPurpose(): OtpPurpose {
+  const purpose = OTP_PURPOSES[ROWS_TO_EXHAUST];
+  if (!purpose)
+    throw new Error(
+      `OTP_PURPOSES has ${OTP_PURPOSES.length} entries and this file spends ${ROWS_TO_EXHAUST}; it needs one more to leave pristine`
+    );
+  return purpose;
+}
 
 interface ProofOptions {
   userId: string;
@@ -320,7 +334,7 @@ describe('one budget per identity', () => {
     const pristine = await seedProof({
       userId,
       channel: 'sms',
-      purpose: UNTOUCHED_PURPOSE!,
+      purpose: UNTOUCHED_PURPOSE,
       identifier: PHONE,
     });
 
@@ -353,7 +367,9 @@ describe('one budget per identity', () => {
       observed.push(seen);
       expected.push(want);
       // Every guess on this row was charged to the row it was made on.
-      const row = await proofRow(spendRows[index]!);
+      const spendRow = spendRows[index];
+      if (!spendRow) throw new Error(`no seeded row at index ${index}`);
+      const row = await proofRow(spendRow);
       expect(row?.verifyAttemptDaily).toBe(seen.length);
     }
 
@@ -372,7 +388,7 @@ describe('one budget per identity', () => {
     const denied = await verify({
       userId,
       channel: 'sms',
-      purpose: UNTOUCHED_PURPOSE!,
+      purpose: UNTOUCHED_PURPOSE,
       identifier: PHONE,
       code: WRONG_CODE,
     });
@@ -496,13 +512,13 @@ describe('one budget per identity', () => {
     const phonePristine = await seedProof({
       userId,
       channel: 'sms',
-      purpose: UNTOUCHED_PURPOSE!,
+      purpose: UNTOUCHED_PURPOSE,
       identifier: PHONE,
     });
     const phoneDenied = await verify({
       userId,
       channel: 'sms',
-      purpose: UNTOUCHED_PURPOSE!,
+      purpose: UNTOUCHED_PURPOSE,
       identifier: PHONE,
       code: WRONG_CODE,
     });
@@ -986,13 +1002,13 @@ describe('the ANCHORED fixed 24-hour window', () => {
     const pristine = await seedProof({
       userId,
       channel: 'whatsapp',
-      purpose: UNTOUCHED_PURPOSE!,
+      purpose: UNTOUCHED_PURPOSE,
       identifier: PHONE,
     });
     const denied = await verify({
       userId,
       channel: 'whatsapp',
-      purpose: UNTOUCHED_PURPOSE!,
+      purpose: UNTOUCHED_PURPOSE,
       identifier: PHONE,
       code: WRONG_CODE,
     });
