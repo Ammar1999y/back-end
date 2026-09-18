@@ -20,26 +20,39 @@ export const ROLE_SCOPE = {
   CUSTOM: CUSTOM_ROLE_VALUE,
 } as const;
 
-export const DASHBOARD_PAGES = {
+/**
+ * The dashboard pages, IN ORDER, and the single place that order is written.
+ *
+ * A tuple rather than the keys of the label map, because this list is also the
+ * `page_name` PostgreSQL enum and its value order is part of the database
+ * schema. `Object.keys` returns `string[]`, so deriving the enum from the map
+ * needs an assertion in `db/schema.ts` that would compile for any list, empty
+ * included.
+ *
+ * ⚠️ Adding an entry requires a generated migration — `bun run db:generate`,
+ * gated by `bun run check:schema-drift`. Without it the first permission write
+ * for the new page fails with PostgreSQL `22P02`.
+ */
+export const DASHBOARD_PAGE_NAMES = [
+  'home',
+  'users',
+  'permissions',
+  'media',
+] as const;
+
+export type DashboardPage = (typeof DASHBOARD_PAGE_NAMES)[number];
+
+/**
+ * Typed as a total `Record`, so a page added above without a label here — or a
+ * label here for a page not above — is a compile error rather than a lookup
+ * that returns `undefined` at runtime.
+ */
+export const DASHBOARD_PAGES: Record<DashboardPage, string> = {
   home: 'الرئيسية',
   users: 'المستخدمين',
   permissions: 'الصلاحيات',
   media: 'الملفات',
-} as const;
-
-/**
- * The page keys as a list, for consumers that need values rather than a lookup —
- * today the `resource` query parameter's enum in the OpenAPI contract.
- *
- * Derived, never written out again: a second hand-maintained copy of these keys
- * would be one page away from disagreeing with the map the permission checker
- * reads. `db/schema.ts` derives the `page_name` pgEnum from the same object and
- * deliberately keeps its own cast — the enum's VALUE ORDER is part of the
- * database schema, so it must not start reading from a general-purpose list.
- */
-export const DASHBOARD_PAGE_NAMES = Object.keys(
-  DASHBOARD_PAGES
-) as readonly DashboardPage[];
+};
 
 /**
  * Permissions available on each page.
@@ -74,7 +87,6 @@ export const PERMISSION_ACTIONS = {
   publish: 'نشر',
 } as const;
 
-export type DashboardPage = keyof typeof DASHBOARD_PAGES;
 export type PermissionAction = keyof typeof PERMISSION_ACTIONS;
 export type PermissionObject = Record<
   DashboardPage,

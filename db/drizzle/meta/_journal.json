@@ -92,6 +92,55 @@
       "when": 1789206884827,
       "tag": "0012_drop_redundant_role_permissions_index",
       "breakpoints": true
+    },
+    {
+      "idx": 13,
+      "version": "7",
+      "when": 1789361657215,
+      "tag": "0013_totp_replay_step",
+      "breakpoints": true
+    },
+    {
+      "idx": 14,
+      "version": "7",
+      "when": 1789363905291,
+      "tag": "0014_file_transition_owner",
+      "breakpoints": true
+    },
+    {
+      "idx": 15,
+      "version": "7",
+      "when": 1789429968721,
+      "tag": "0015_backup_code_set_id",
+      "breakpoints": true
+    },
+    {
+      "idx": 16,
+      "version": "7",
+      "when": 1789429988115,
+      "tag": "0016_drop_backup_code_version",
+      "breakpoints": true
+    },
+    {
+      "idx": 17,
+      "version": "7",
+      "when": 1789489997842,
+      "tag": "0017_file_cleanup_requests",
+      "breakpoints": true
+    },
+    {
+      "idx": 18,
+      "version": "7",
+      "when": 1789510761126,
+      "tag": "0018_orphaned_objects",
+      "breakpoints": true
+    },
+    {
+      "idx": 19,
+      "version": "7",
+      "when": 1789517186771,
+      "tag": "0019_orphan_object_demands",
+      "breakpoints": true
     }
   ]
 }

@@ -43,11 +43,27 @@ const LOCAL_FRAGMENT = /^#[^\s#"'<>]+$/u;
  * uploaded directly were refused by the byte checks. The payload is decoded and
  * held to those same checks below.
  */
-const SAFE_DATA_URI = /^data:(image\/(?:png|webp));base64,([\w+/=]+)$/i;
+const SAFE_DATA_URI =
+  /^data:(image\/(?:png|webp));base64,([\w+/=\t\n\f\r ]+)$/i;
+
+/**
+ * The base64 payload tolerates ASCII whitespace because renderers do, and
+ * because the tools that produce these files emit it: Inkscape wraps embedded
+ * image data at 76 columns, and XML attribute-value normalisation turns each of
+ * those newlines into a space before this string is ever read. Rejecting it
+ * dropped the whole `<image>` from an ordinary Inkscape export while the
+ * unwrapped equivalent was kept.
+ *
+ * It is stripped before decoding and the attribute is rewritten to the
+ * canonical form, so what is STORED is a data URI with no whitespace in it.
+ */
+const ASCII_WHITESPACE = /[\t\n\f\r ]+/g;
 
 const MSG_ANIMATION_UNSUPPORTED = 'الصور المتحركة غير مدعومة';
 const MSG_RASTER_TOO_LARGE =
   'الصورة المضمّنة داخل ملف SVG تتجاوز الحد المسموح للأبعاد';
+const MSG_RASTER_UNREADABLE =
+  'الصورة المضمّنة داخل ملف SVG غير صالحة أو من نوع غير مدعوم';
 
 /**
  * Every attribute on `element` that DEREFERENCES a URL, whatever prefix it
@@ -78,6 +94,8 @@ function referenceAttributeNames(element: Element): string[] {
 
 interface InlineRaster {
   bytes: Uint8Array;
+  /** The reference with whitespace removed — what is written back. */
+  canonical: string;
   height: number;
   mimeType: string;
   width: number;
@@ -86,15 +104,18 @@ interface InlineRaster {
 /** The declared type and decoded bytes of an inline raster, or `null`. */
 function decodeInlineRaster(
   reference: string
-): { mimeType: string; bytes: Uint8Array } | null {
+): { mimeType: string; bytes: Uint8Array; canonical: string } | null {
   const match = SAFE_DATA_URI.exec(reference);
   if (!match) return null;
-  const [, declared = '', payload = ''] = match;
+  const [, declared = '', rawPayload = ''] = match;
+  const payload = rawPayload.replaceAll(ASCII_WHITESPACE, '');
+  const mimeType = declared.toLowerCase();
 
   try {
     const binary = atob(payload);
     return {
-      mimeType: declared.toLowerCase(),
+      mimeType,
+      canonical: `data:${mimeType};base64,${payload}`,
       bytes: Uint8Array.from(
         binary,
         (character) => character.codePointAt(0) ?? 0
@@ -124,13 +145,16 @@ function analyzeInlineRaster(reference: string): InlineRaster | null {
  * directly, declared with SMIL, or inlined here — and all three now answer 400
  * with `animatedNotAllowed`.
  *
- * An unsupported TYPE is a different axis and keeps the reference answer: a
- * `data:image/gif` is refused for being a type `ALLOWED_IMAGE_TYPES` does not
- * carry, exactly as an `https:` reference is, and never reaches the bytes. That
- * is why an animated GIF is stripped where an APNG is refused — the GIF never
- * got as far as being asked about animation.
+ * The same answer for an unsupported TYPE: a `data:` reference the sanitizer
+ * cannot read is refused, not stripped — the caller asked to store a picture,
+ * and a 200 carrying a document with that picture gone is the failure this
+ * policy exists to remove. An `https:` reference is still stripped; there the
+ * caller supplied a pointer, not a picture.
  */
-type RasterLimitViolation = 'edge-too-long' | 'too-many-pixels';
+type RasterLimitViolation =
+  'edge-too-long' | 'invalid-inline-raster' | 'too-many-pixels';
+
+const DATA_URI = /^data:/i;
 
 function rasterLimitViolation(
   element: Element,
@@ -139,8 +163,12 @@ function rasterLimitViolation(
   for (const name of referenceAttributeNames(element)) {
     const raw = element.getAttribute(name);
     if (raw === null) continue;
-    const size = analyze(raw.trim());
-    if (size === null) continue;
+    const reference = raw.trim();
+    const size = analyze(reference);
+    if (size === null) {
+      if (DATA_URI.test(reference)) return 'invalid-inline-raster';
+      continue;
+    }
     if (size.width * size.height > MAX_IMAGE_PIXELS) return 'too-many-pixels';
     if (size.width > MAX_IMAGE_EDGE || size.height > MAX_IMAGE_EDGE)
       return 'edge-too-long';
@@ -436,6 +464,49 @@ function singleSvgRoot(fragment: DocumentFragment): Element | null {
 }
 
 /**
+ * ⚠️ The pre-parse passes below must stay index scans, never regular
+ * expressions. They run on ADMITTED but unparsed bytes, and the expressions that
+ * express them are quadratic on unterminated markup — a lazy `[\s\S]*?` restarts
+ * at each `<!--`, `<[^>]+>` rescans to end of input at each `<` with no `>` —
+ * so the 410 KB an upload may carry becomes tens of seconds of synchronous work
+ * the route timeout cannot interrupt.
+ *
+ * Each `indexOf` here starts where the previous match ended, so the regions
+ * scanned are disjoint and the whole pass is linear.
+ */
+function stripDelimited(source: string, open: string, close: string): string {
+  let index = source.indexOf(open);
+  if (index === -1) return source;
+
+  let out = '';
+  let cursor = 0;
+  while (index !== -1) {
+    const end = source.indexOf(close, index + open.length);
+    // Unterminated: no later opener can find a closer either, so stop here and
+    // keep the rest rather than scanning on.
+    if (end === -1) break;
+    out += source.slice(cursor, index);
+    cursor = end + close.length;
+    index = source.indexOf(open, cursor);
+  }
+  return out + source.slice(cursor);
+}
+
+/** `<[^>]+>` occurrences: a `<`, at least one character, then the first `>`. */
+function countTags(source: string): number {
+  let count = 0;
+  let cursor = 0;
+  for (;;) {
+    const open = source.indexOf('<', cursor);
+    if (open === -1) return count;
+    const close = source.indexOf('>', open + 1);
+    if (close === -1) return count;
+    if (close > open + 1) count += 1;
+    cursor = close + 1;
+  }
+}
+
+/**
  * Client-side SVG sanitizer
  * For server-side usage, use sanitizeSvgServer from './server'
  */
@@ -462,18 +533,21 @@ export function sanitizeSvg(
     };
   }
 
-  if (trimmed.includes('<!--')) {
-    trimmed = trimmed.replaceAll(/<!--[\s\S]*?-->/g, '');
+  const withoutComments = stripDelimited(trimmed, '<!--', '-->');
+  if (withoutComments !== trimmed) {
+    trimmed = withoutComments;
     errors.push('تم إزالة XML comments');
   }
 
-  if (trimmed.includes('<![CDATA[')) {
-    trimmed = trimmed.replaceAll(/<!\[CDATA\[[\s\S]*?\]\]>/g, '');
+  const withoutCdata = stripDelimited(trimmed, '<![CDATA[', ']]>');
+  if (withoutCdata !== trimmed) {
+    trimmed = withoutCdata;
     errors.push('تم إزالة CDATA sections');
   }
 
-  if (trimmed.includes('<?')) {
-    trimmed = trimmed.replaceAll(/<\?[\s\S]*?\?>/g, '');
+  const withoutInstructions = stripDelimited(trimmed, '<?', '?>');
+  if (withoutInstructions !== trimmed) {
+    trimmed = withoutInstructions;
     errors.push('تم إزالة Processing Instructions');
   }
 
@@ -495,7 +569,7 @@ export function sanitizeSvg(
     };
   }
 
-  const elementCount = (trimmed.match(/<[^>]+>/g) || []).length;
+  const elementCount = countTags(trimmed);
   if (elementCount > SVG_MAX_ELEMENTS) {
     return {
       isValid: false,
@@ -576,7 +650,11 @@ export function sanitizeSvg(
       return {
         isValid: false,
         cleanedSvg: '',
-        errors: [MSG_RASTER_TOO_LARGE],
+        errors: [
+          rasterLimit === 'invalid-inline-raster'
+            ? MSG_RASTER_UNREADABLE
+            : MSG_RASTER_TOO_LARGE,
+        ],
         reason: rasterLimit,
       };
 
@@ -657,7 +735,7 @@ export function sanitizeSvg(
         const reference = raw.trim();
         const raster = allowsDataUri ? analyzeRaster(reference) : null;
         if (raster !== null || LOCAL_FRAGMENT.test(reference)) {
-          element.setAttribute(name, reference);
+          element.setAttribute(name, raster?.canonical ?? reference);
           keptReference = true;
           if (raster !== null)
             embeddedRasterPixels += raster.width * raster.height;

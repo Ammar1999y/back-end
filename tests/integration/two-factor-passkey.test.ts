@@ -14,7 +14,8 @@ import type { SeededUser } from '../helpers/session';
 import { and, eq, sql } from 'drizzle-orm';
 
 import { app } from '@/app';
-import { db } from '@/db';
+import { twoFactorMsg } from '@/app/api/auth/otp/messages';
+import { db, withTransaction } from '@/db';
 import {
   auditLogs,
   passkeys,
@@ -27,8 +28,9 @@ import {
 import { symmetricEncrypt } from 'better-auth/crypto';
 import { advancePasskeyCounter } from '@/lib/auth/passkey-assertion';
 import { PUBLIC_ORIGIN } from '@/lib/env';
+import { generateUuidV7 } from '@/lib/id';
 
-import { HTTP_STATUS } from '@/utils/api-messages';
+import { HTTP_STATUS, MSG_INVALID_INPUT } from '@/utils/api-messages';
 import { NAME_MAX } from '@/utils/validation/constants';
 
 import { resetTables } from '../helpers/database';
@@ -193,13 +195,17 @@ describe('registering a passkey', () => {
     const user = await seedUser();
     const signedIn = await signIn(user);
 
+    // A WELL-FORMED id, so the refusal can only be the name. `crypto.randomUUID`
+    // is v4 and `validID` takes v7, so the id guard answered for both cases and
+    // the name bound was asserted by nothing.
     const overlong = await call(
       'POST',
       '/api/auth/passkey/update-passkey',
-      { id: crypto.randomUUID(), name: 'x'.repeat(NAME_MAX + 1) },
+      { id: generateUuidV7(), name: 'x'.repeat(NAME_MAX + 1) },
       signedIn.cookie
     );
     expect(overlong.status).toBe(HTTP_STATUS.UNPROCESSABLE);
+    expect(await overlong.text()).toContain(MSG_INVALID_INPUT);
 
     const malformed = await call(
       'POST',
@@ -208,6 +214,19 @@ describe('registering a passkey', () => {
       signedIn.cookie
     );
     expect(malformed.status).toBe(HTTP_STATUS.UNPROCESSABLE);
+
+    // ⚠️ In the COLUMN's unit. `varchar(NAME_MAX)` counts CHARACTERS, so a name
+    // of exactly `NAME_MAX` astral code points fits and this bound must let it
+    // through — `String#length` calls the same name 2 × NAME_MAX and turns a
+    // storable one into a 422. The passkey does not exist, so the answer is a
+    // refusal either way; what is asserted is which refusal.
+    const astral = await call(
+      'POST',
+      '/api/auth/passkey/update-passkey',
+      { id: generateUuidV7(), name: '\u{1F600}'.repeat(NAME_MAX) },
+      signedIn.cookie
+    );
+    expect(await astral.text()).not.toContain(MSG_INVALID_INPUT);
   });
 
   test('refuses a ceremony with no re-authentication grant', async () => {
@@ -266,6 +285,222 @@ describe('registering a passkey', () => {
     // Refused BEFORE the row is written, not cleaned up afterwards.
     expect(rows).toHaveLength(0);
   });
+
+  test('a credential deleted between the write and the enrolment hook is refused', async () => {
+    // The real interleaving, driven through HTTP rather than described: the
+    // plugin persists the credential and returns, and the enrolment hook takes
+    // the user lock only afterwards, so a delete fits between the two. This test
+    // OCCUPIES that gap — it holds `FOR NO KEY UPDATE` on the user row, which
+    // the plugin's insert (a foreign key, so `FOR KEY SHARE`) does not conflict
+    // with and the hook's own `FOR UPDATE` does, deletes the credential while
+    // the hook waits, and then commits.
+    //
+    // What the registration must NOT answer is 200: a second factor the account
+    // does not hold is a lockout at the next sign-in, announced as success.
+    const user = await seedUser();
+    const signedIn = await signIn(user);
+    expect(signedIn.status).toBe(HTTP_STATUS.OK);
+
+    const granted = await call(
+      'POST',
+      '/api/auth/two-factor/passkey/grant',
+      { password: user.password },
+      signedIn.cookie
+    );
+    const grant = ((await granted.json()) as { data?: { grant?: string } }).data
+      ?.grant;
+    const optionsResponse = await call(
+      'GET',
+      '/api/auth/passkey/generate-register-options',
+      undefined,
+      signedIn.cookie
+    );
+    const options = (await optionsResponse.json()) as { challenge: string };
+    const jar = [
+      signedIn.cookie,
+      cookieHeader(optionsResponse.headers.getSetCookie()),
+    ]
+      .filter(Boolean)
+      .join('; ');
+    const ceremony = buildRegistrationResponse({
+      challenge: options.challenge,
+      origin: PUBLIC_ORIGIN,
+      rpId: RP_ID,
+      userVerified: true,
+    });
+
+    const { promise: gap, resolve: openTheGap } = Promise.withResolvers<void>();
+    const holdingTheGap = withTransaction(async (tx) => {
+      await tx
+        .select({ id: users.id })
+        .from(users)
+        .where(eq(users.id, user.userId))
+        .for('no key update');
+      await gap;
+      await tx.delete(passkeys).where(eq(passkeys.userId, user.userId));
+    });
+
+    const pending = call(
+      'POST',
+      '/api/auth/passkey/verify-registration',
+      { response: ceremony.response, grant },
+      jar
+    );
+
+    // Not awaited: the request is blocked inside the hook. Wait for the row the
+    // plugin wrote to become visible, which is the moment the gap opens.
+    const written = await Promise.race([
+      (async () => {
+        for (let attempt = 0; attempt < 200; attempt++) {
+          const rows = await db
+            .select({ id: passkeys.id })
+            .from(passkeys)
+            .where(eq(passkeys.userId, user.userId));
+          if (rows.length === 1) return true;
+          await Bun.sleep(25);
+        }
+        return false;
+      })(),
+      pending.then(() => false),
+    ]);
+    expect(written).toBe(true);
+
+    openTheGap();
+    await holdingTheGap;
+
+    const verified = await pending;
+    expect(verified.status).toBe(HTTP_STATUS.CONFLICT);
+    expect((await verified.json()) as { message?: string }).toMatchObject({
+      message: twoFactorMsg.passkeyNotSaved,
+    });
+
+    const remaining = await db
+      .select({ id: passkeys.id })
+      .from(passkeys)
+      .where(eq(passkeys.userId, user.userId));
+    expect(remaining).toHaveLength(0);
+    const methods = await db
+      .select({ method: twoFactorMethods.method })
+      .from(twoFactorMethods)
+      .where(eq(twoFactorMethods.userId, user.userId));
+    expect(methods).toEqual([]);
+    const [row] = await db
+      .select({ enabled: users.twoFactorEnabled })
+      .from(users)
+      .where(eq(users.id, user.userId));
+    expect(row?.enabled).toBe(false);
+  }, 30_000);
+
+  test('an unrelated older credential does not stand in for the one just registered', async () => {
+    // The same gap, for an account that already holds a passkey. Turning 2FA
+    // off deliberately KEEPS registered credentials, so "does this user have a
+    // passkey" answers yes for one the ceremony had nothing to do with — and
+    // the registration then reports the key the user just presented as enrolled
+    // while it is gone, which is the lockout this refusal exists to prevent.
+    const user = await seedUser();
+    const retained = 'retained-after-a-disable';
+    await db.insert(passkeys).values({
+      userId: user.userId,
+      credentialID: retained,
+      publicKey: Buffer.from('not-a-real-key').toString('base64'),
+      counter: 0,
+      deviceType: 'singleDevice',
+      backedUp: false,
+    });
+
+    const signedIn = await signIn(user);
+    expect(signedIn.status).toBe(HTTP_STATUS.OK);
+    const granted = await call(
+      'POST',
+      '/api/auth/two-factor/passkey/grant',
+      { password: user.password },
+      signedIn.cookie
+    );
+    const grant = ((await granted.json()) as { data?: { grant?: string } }).data
+      ?.grant;
+    const optionsResponse = await call(
+      'GET',
+      '/api/auth/passkey/generate-register-options',
+      undefined,
+      signedIn.cookie
+    );
+    const options = (await optionsResponse.json()) as { challenge: string };
+    const jar = [
+      signedIn.cookie,
+      cookieHeader(optionsResponse.headers.getSetCookie()),
+    ]
+      .filter(Boolean)
+      .join('; ');
+    const ceremony = buildRegistrationResponse({
+      challenge: options.challenge,
+      origin: PUBLIC_ORIGIN,
+      rpId: RP_ID,
+      userVerified: true,
+    });
+
+    const { promise: gap, resolve: openTheGap } = Promise.withResolvers<void>();
+    const holdingTheGap = withTransaction(async (tx) => {
+      await tx
+        .select({ id: users.id })
+        .from(users)
+        .where(eq(users.id, user.userId))
+        .for('no key update');
+      await gap;
+      // Only the new one. The retained credential is what a check for "any
+      // passkey" would find instead.
+      await tx
+        .delete(passkeys)
+        .where(eq(passkeys.credentialID, ceremony.credentialId));
+    });
+
+    const pending = call(
+      'POST',
+      '/api/auth/passkey/verify-registration',
+      { response: ceremony.response, grant },
+      jar
+    );
+
+    const written = await Promise.race([
+      (async () => {
+        for (let attempt = 0; attempt < 200; attempt++) {
+          const rows = await db
+            .select({ id: passkeys.id })
+            .from(passkeys)
+            .where(eq(passkeys.credentialID, ceremony.credentialId));
+          if (rows.length === 1) return true;
+          await Bun.sleep(25);
+        }
+        return false;
+      })(),
+      pending.then(() => false),
+    ]);
+    expect(written).toBe(true);
+
+    openTheGap();
+    await holdingTheGap;
+
+    const verified = await pending;
+    expect(verified.status).toBe(HTTP_STATUS.CONFLICT);
+    expect((await verified.json()) as { message?: string }).toMatchObject({
+      message: twoFactorMsg.passkeyNotSaved,
+    });
+
+    const remaining = await db
+      .select({ credentialID: passkeys.credentialID })
+      .from(passkeys)
+      .where(eq(passkeys.userId, user.userId));
+    expect(remaining.map((row) => row.credentialID)).toEqual([retained]);
+    const methods = await db
+      .select({ method: twoFactorMethods.method })
+      .from(twoFactorMethods)
+      .where(eq(twoFactorMethods.userId, user.userId));
+    expect(methods).toEqual([]);
+    const [row] = await db
+      .select({ enabled: users.twoFactorEnabled })
+      .from(users)
+      .where(eq(users.id, user.userId));
+    expect(row?.enabled).toBe(false);
+  }, 30_000);
 
   test('accepts an authenticator that did', async () => {
     const user = await seedUser();

@@ -14,7 +14,9 @@ interface Outcome {
   elapsedMs: number;
 }
 
-async function runChild(mode: 'clean' | 'half-sent'): Promise<Outcome> {
+async function runChild(
+  mode: 'clean' | 'half-sent' | 'slow-request'
+): Promise<Outcome> {
   const started = performance.now();
   const child = Bun.spawn(['bun', '--no-env-file', CHILD, mode], {
     cwd: path.join(import.meta.dir, '..', '..'),
@@ -62,5 +64,22 @@ describe('shutdown', () => {
     expect(outcome.exitCode).toBe(0);
     expect(messages(outcome)).toContain('all stores closed');
     expect(outcome.elapsedMs).toBeLessThan(30_000);
+  }, 60_000);
+
+  test('a request that outlives the grace interval is completed, not reset', async () => {
+    // The half-sent case above forces the escalation to `app.stop(true)` to
+    // exist at all; this is the case it must not catch. Measured before the
+    // fix: an eight-second handler was RESET at the five-second mark, mid
+    // deploy, while the route budget allowed it two more minutes.
+    const outcome = await runChild('slow-request');
+
+    expect(outcome.exitCode).toBe(0);
+    expect(outcome.lines.find((line) => line.msg === 'inflight')?.outcome).toBe(
+      'status 200'
+    );
+    expect(messages(outcome)).toContain(
+      'graceful stop still draining in-flight requests'
+    );
+    expect(messages(outcome)).toContain('all stores closed');
   }, 60_000);
 });

@@ -37,9 +37,22 @@ import {
 } from '@/utils/api-response';
 import { CustomError } from '@/utils/error-class';
 import { collapseProofThrottle, processOtpVerify } from '@/utils/otp';
+import { OTP_MAX_VERIFY_ATTEMPTS } from '@/utils/validation/constants';
 import { OTP_ENABLED, resetPasswordSchema } from '@/utils/validation/otp';
 
 import { ensureMinDelay, otpMsg } from '../../otp/messages';
+
+/**
+ * Argon2id hashes one address may buy per minute on this route.
+ *
+ * Sized against what the process can actually do — ~10 hashes/second across the
+ * whole process, measured — rather than against a request count, and floored by
+ * what a real reset costs: `OTP_MAX_VERIFY_ATTEMPTS` is 5, so one user working
+ * through a mistyped code must never meet this before the OTP quota answers.
+ * Fifteen leaves that whole cycle plus a fresh one, and still cuts what a single
+ * address can claim from six seconds of the pool per minute to one and a half.
+ */
+const RESET_HASH_BUDGET_PER_MINUTE = OTP_MAX_VERIFY_ATTEMPTS * 3;
 
 /**
  * Forgot-password step 2: verify the code (purpose=forgot_password) and, in the
@@ -86,6 +99,25 @@ export const POST: Handler = async (ctx) => {
       channel === 'email' ? parsed.data.email : parsed.data.phoneNumber;
 
     await enforceOtpVerifyQuota({ channel, identifier, surface: 'recovery' });
+
+    // The pre-proof work, priced separately from the request that carries it.
+    // The admission counter above bounds SIGHTINGS of this route; what follows
+    // is an outbound HIBP request and a 64 MiB Argon2id hash, and both run for
+    // any syntactically valid body — before the account is looked up or the
+    // code is checked, deliberately (see below).
+    //
+    // Its own scope rather than a heavier `cost` on the admission counter: the
+    // captcha budget and the hashing budget answer different questions, and
+    // collapsing them would make the cheap refusals below consume the expensive
+    // allowance. Still per IP and still account-independent, so it is not an
+    // existence oracle. A human resetting a password spends one or two.
+    await enforceRateLimit({
+      scope: 'forgot.reset.work.ip',
+      identifier: ipIdentifier(ctx.headers),
+      limit: RESET_HASH_BUDGET_PER_MINUTE,
+      window: 60,
+      failClosed: true,
+    });
 
     // Breach screen + hash BEFORE the transaction (account-independent, so it
     // leaks nothing about whether the identifier exists) and so we never hold a

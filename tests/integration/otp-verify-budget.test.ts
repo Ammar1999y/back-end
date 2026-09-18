@@ -42,7 +42,7 @@ import type {
   OtpChannel,
   OtpPurpose,
   PhoneOtpChannel,
-} from '@/utils/validation/otp';
+} from '@/utils/validation/enums';
 
 import { and, eq, sql } from 'drizzle-orm';
 
@@ -59,7 +59,7 @@ import {
   OTP_MAX_DAILY_VERIFY_ATTEMPTS,
   OTP_MAX_VERIFY_ATTEMPTS,
 } from '@/utils/validation/constants';
-import { OTP_PURPOSES, PHONE_OTP_CHANNELS } from '@/utils/validation/otp';
+import { OTP_PURPOSES, PHONE_OTP_CHANNELS } from '@/utils/validation/enums';
 
 import { resetTables } from '../helpers/database';
 import { seedUser } from '../helpers/session';

@@ -17,6 +17,9 @@ export const uploadMsg = {
   invalidMimeType: (type: string) =>
     `نوع الملف غير مسموح: ${type}. الأنواع المسموحة: PNG, WebP, SVG`,
   invalidSvg: 'ملف SVG غير صالح',
+  /** A `data:` picture inside an SVG that this application will not store. */
+  invalidInlineRaster:
+    'الصورة المضمّنة داخل ملف SVG غير صالحة. الأنواع المسموحة داخل SVG: PNG, WebP',
   /** The pixel-bomb guard. A rejection, so it must not read as a server fault. */
   tooManyPixels: (maxMegapixels: number) =>
     `أبعاد الصورة كبيرة جداً. الحد الأقصى ${maxMegapixels} ميجابكسل`,
@@ -26,6 +29,9 @@ export const uploadMsg = {
   /** Truncated transfer, or bytes that are not the format they claim to be. */
   undecodable: 'تعذّرت قراءة الصورة. الملف تالف أو غير مكتمل',
   targetUnreachable: 'تعذّر ضغط الصورة إلى الحجم المطلوب',
+  /** The only input metadata the encoder copies into what we publish. */
+  iccProfileTooLarge: (maxKib: number) =>
+    `ملف تعريف الألوان (ICC) المرفق بالصورة كبير جداً. الحد الأقصى ${maxKib}KB`,
   processingBusy: 'خدمة معالجة الصور مشغولة حالياً. حاول لاحقاً',
   invalidResource: 'المورد المطلوب رفع الصورة له غير صالح',
 };

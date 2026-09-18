@@ -7,7 +7,8 @@ import { MSG_CUSTOM_ROLE_NEEDS_PERMISSIONS } from '@/utils/api-messages';
 import { PHONE_ENABLED, PHONE_REQUIRED } from '@/utils/config';
 
 import { NAME_MAX } from './constants';
-import { otpCodeSchema, PHONE_OTP_CHANNELS } from './otp';
+import { PHONE_OTP_CHANNELS } from './enums';
+import { otpCodeSchema } from './otp';
 import { permissionsArraySchema } from './permissions';
 import {
   emailSchema,
@@ -18,6 +19,8 @@ import {
   phoneSchema,
   reauthPasswordSchema,
   sanitizeStrictSingleLine,
+  STRICT_SINGLE_LINE_DESCRIPTION,
+  strictTextMaximum,
 } from './rules';
 
 export const loginSchema = z.object({
@@ -48,6 +51,10 @@ const userRoleSchema = z.object({
       .string()
       .min(2, 'الاسم مطلوب')
       .max(NAME_MAX, `الاسم يجب أن لا يتجاوز ${NAME_MAX} حرفاً`)
+      .meta({
+        maxLength: undefined,
+        description: `${STRICT_SINGLE_LINE_DESCRIPTION} ${strictTextMaximum(NAME_MAX)}`,
+      })
   ),
   isActive: z.boolean().default(true),
   // The `error` param is not optional decoration. A union failure carries Zod's

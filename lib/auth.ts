@@ -1,13 +1,13 @@
 import type { AcceptedPasswordHashes } from './auth/login-guard';
 import type { EntityID } from '@/types';
-import type { TwoFactorMethod } from '@/utils/validation/two-factor';
+import type { TwoFactorMethod } from '@/utils/validation/enums';
 
 import { eq } from 'drizzle-orm';
 
 import { twoFactorMsg } from '@/app/api/auth/otp/messages';
 import { db, withTransaction } from '@/db';
 import { users } from '@/db/schema';
-import { sanitizeForLog, validID } from '@/utils';
+import { exceedsCodePoints, sanitizeForLog, validID } from '@/utils';
 import { betterAuth } from 'better-auth';
 import { drizzleAdapter } from 'better-auth/adapters/drizzle';
 import {
@@ -321,8 +321,10 @@ function assertPasskeyInputBounds(ctx: HookContext, path: string): void {
       : {};
 
   const name = body.name;
+  // `varchar(NAME_MAX)` counts CHARACTERS, so this has to as well; the plugin's
+  // own schema is `z.string().trim()`, so the trim is what reaches the column.
   const overlongName =
-    typeof name === 'string' && name.trim().length > NAME_MAX;
+    typeof name === 'string' && exceedsCodePoints(name.trim(), NAME_MAX);
   const id = body.id;
   const malformedId =
     PASSKEY_ID_PATHS.has(path) && (typeof id !== 'string' || !validID(id));
@@ -347,7 +349,14 @@ function rejectOverlongPassword(body: unknown): void {
   if (!body || typeof body !== 'object') return;
   const supplied = (body as Record<string, unknown>).password;
   if (typeof supplied !== 'string') return;
-  if (normalizePasswordInput(supplied).length <= PASSWORD_MAX) return;
+  // `passwordSchema`'s own bound, in `passwordSchema`'s own unit. This runs
+  // ahead of it on every Better Auth path and is all a password meets before
+  // `/sign-in/email` parses it, so counting UTF-16 units here refused logins
+  // with a password the rotation routes — which reach only the schema — had
+  // already accepted and stored (reproduced in
+  // `tests/integration/self-service-credentials.test.ts`).
+  if (!exceedsCodePoints(normalizePasswordInput(supplied), PASSWORD_MAX))
+    return;
   throw new APIError(HTTP_STATUS.UNPROCESSABLE, {
     message: MSG_INVALID_INPUT,
     code: CUSTOM_CODE,
@@ -624,6 +633,15 @@ export const auth = betterAuth({
         // The plaintext stops here: Better Auth's handler re-reads the account
         // and calls `password.verify` with whatever hash the row now holds, and
         // the proof accepts exactly the hashes this verification made valid.
+        //
+        // ⚠️ This body is MERGED, not substituted — `runBeforeHooks` combines it
+        // with the caller's through `defuReplaceArrays`, so every key named
+        // here wins and every key omitted survives. `callbackURL` is the one
+        // that matters: the route echoes it into `Location` and `url`, and what
+        // keeps that from being an open redirect is the library's global
+        // `originCheckMiddleware` against `baseURL` (no `trustedOrigins` is
+        // configured), not this return. Asserted in
+        // `tests/integration/sign-in-controls.test.ts`.
         return {
           context: {
             ...ctx,

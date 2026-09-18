@@ -1,5 +1,5 @@
 import type { Handler } from '@/lib/http/contract';
-import type { OtpChannel } from '@/utils/validation/otp';
+import type { OtpChannel } from '@/utils/validation/enums';
 
 import { eq } from 'drizzle-orm';
 

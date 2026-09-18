@@ -90,6 +90,7 @@ import {
   MSG_PASSWORD_COMPROMISED,
 } from '@/utils/api-messages';
 import { OTP_AUTO_VERIFY, PHONE_ENABLED } from '@/utils/config';
+import { PASSWORD_MAX } from '@/utils/validation/constants';
 import {
   EMAIL_OTP_AVAILABLE,
   PHONE_OTP_AVAILABLE,
@@ -680,6 +681,78 @@ describe('POST /api/dash/users/me/change-password — refusals', () => {
     expect(await auditRows(subject('pwGuard').userId, 'accounts')).toHaveLength(
       auditBefore.length
     );
+  });
+});
+
+/**
+ * `PASSWORD_MAX` has to be ONE bound, and two validators measure it.
+ *
+ * `passwordSchema` is a Zod string maximum, which Zod counts in code points; the
+ * early guard in `lib/auth.ts` runs ahead of it on the Better Auth paths and is
+ * the only thing a password reaching `/sign-in/email` meets first. An astral
+ * character is one code point and two UTF-16 units, so it is the only input that
+ * can tell the two rules apart — and a disagreement here is not a validation
+ * nicety: the rotation stores a password that every later login refuses.
+ */
+describe('the password maximum is one bound, not two', () => {
+  /** 67 code points, 129 UTF-16 units — just past the maximum on the wrong ruler. */
+  const ASTRAL_SHORT = `Aa1!a${'\u{1F600}'.repeat(62)}`;
+  /** Exactly `PASSWORD_MAX` code points, and twice that in UTF-16 units. */
+  const ASTRAL_AT_MAX = `Aa1!${'\u{1F600}'.repeat(PASSWORD_MAX - 4)}`;
+  /** One code point over. */
+  const ASTRAL_OVER_MAX = `Aa1!${'\u{1F600}'.repeat(PASSWORD_MAX - 3)}`;
+
+  test('NFKC leaves the fixtures alone, so both rulers see what is written here', () => {
+    for (const secret of [ASTRAL_SHORT, ASTRAL_AT_MAX, ASTRAL_OVER_MAX])
+      expect(secret.normalize('NFKC')).toBe(secret);
+    expect([[...ASTRAL_SHORT].length, ASTRAL_SHORT.length]).toEqual([67, 129]);
+    expect([...ASTRAL_AT_MAX].length).toBe(PASSWORD_MAX);
+    expect([...ASTRAL_OVER_MAX].length).toBe(PASSWORD_MAX + 1);
+  });
+
+  for (const [label, secret] of [
+    ['past the maximum in UTF-16 units only', ASTRAL_SHORT],
+    ['at the maximum in code points', ASTRAL_AT_MAX],
+  ] as const)
+    test(`a rotation to a password ${label} still signs in`, async () => {
+      const user = await seedUser();
+      const session = await signIn(user);
+
+      const changed = await app.handle(
+        authedPost(session, CHANGE_PASSWORD, {
+          currentPassword: user.password,
+          newPassword: secret,
+        })
+      );
+      expect(changed.status).toBe(HTTP_STATUS.OK);
+
+      // The whole point: the schema accepted it, so the guard in front of
+      // sign-in has to accept it too, or the account is locked out of every
+      // fresh password login by its own successful password change.
+      const fresh = await signInResponse(user.email, secret);
+      expect(fresh.status).toBe(HTTP_STATUS.OK);
+      expect(fresh.headers.getSetCookie().length).toBeGreaterThan(0);
+    });
+
+  test('one code point over the maximum is refused by the rotation and by sign-in alike', async () => {
+    const user = await seedUser();
+    const session = await signIn(user);
+    const before = await storedHash(user.userId);
+
+    const refused = await app.handle(
+      authedPost(session, CHANGE_PASSWORD, {
+        currentPassword: user.password,
+        newPassword: ASTRAL_OVER_MAX,
+      })
+    );
+    expect(refused.status).toBe(HTTP_STATUS.UNPROCESSABLE);
+    expect(await storedHash(user.userId)).toBe(before);
+
+    // And the guard still refuses it before anything hashes it, which is what
+    // it is there for.
+    const attempted = await signInResponse(user.email, ASTRAL_OVER_MAX);
+    expect(attempted.status).toBe(HTTP_STATUS.UNPROCESSABLE);
+    expect(attempted.headers.getSetCookie()).toEqual([]);
   });
 });
 

@@ -74,6 +74,16 @@ pre-push: &full_verify
             fail_text:
               'unreachable file, a handler no routes.ts entry routes (see the
               comment in scripts/find-unused-files.ts), or a knip finding'
+          # Generation is a MANUAL step, so nothing else notices a schema
+          # constant raised without the SQL to match: it typechecks, and the
+          # test template is migrated from `db/drizzle/`, so it enforces the old
+          # rule — the same disagreement a deployed database will have, reached
+          # only by whichever test happens to exercise that constraint.
+          - name: schema-drift
+            run: bun run check:schema-drift
+            fail_text:
+              'db/schema.ts has changes db/drizzle/ does not carry (run `bun run
+              db:generate`)'
           # Named for what Bun actually checks. `bun dedupe --check` reports
           # only duplicates it could COLLAPSE — versions whose ranges overlap —
           # and passes a lockfile holding several incompatible majors of one

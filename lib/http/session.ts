@@ -58,8 +58,10 @@ export async function requirePermission(
   });
 
   // AFTER the permission check, so a caller with no grant learns nothing about
-  // whether a proof would have helped.
-  if (opts.reauth && result.userId && result.sessionId) {
+  // whether a proof would have helped — which `throwError: false` would defeat,
+  // because then a refused caller reaches this line. A route that branches on
+  // `scope` must ask for the window itself, once it knows the branch needs one.
+  if (opts.reauth && result.allowed && result.userId && result.sessionId) {
     const proven = await hasAdminReauth(result.sessionId, result.userId);
     if (!proven)
       throw new CustomError(

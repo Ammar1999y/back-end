@@ -13,7 +13,7 @@ import type {
   ResolvedChallenge,
 } from './two-factor-challenge';
 import type { EntityID } from '@/types';
-import type { OtpChannel } from '@/utils/validation/otp';
+import type { OtpChannel } from '@/utils/validation/enums';
 
 import { and, eq, isNull } from 'drizzle-orm';
 
@@ -26,6 +26,7 @@ import * as z from 'zod';
 import { CUSTOM_AUTH_CODE, HTTP_STATUS } from '@/utils/api-messages';
 import { CustomError } from '@/utils/error-class';
 import {
+  OTP_BASE_RESEND_DELAY_S,
   otpGuessWasEvaluated,
   processOtpSend,
   processOtpVerify,
@@ -146,7 +147,15 @@ export const twoFactorOtp = () =>
           metadata: {
             openapi: envelopeResponse('A second-factor code was sent.', {
               type: 'object',
-              properties: { nextAllowedIn: { type: 'integer' } },
+              // The row's own exponential delay, not the anonymous surfaces'
+              // constant: this endpoint is behind a session or a challenge
+              // cookie, so there is nothing here for a countdown to leak.
+              properties: {
+                nextAllowedIn: {
+                  type: 'integer',
+                  minimum: OTP_BASE_RESEND_DELAY_S,
+                },
+              },
               required: ['nextAllowedIn'],
             }),
           },

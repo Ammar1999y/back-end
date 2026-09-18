@@ -1,0 +1,1 @@
+ALTER TABLE "orphaned_objects" ADD COLUMN "cleanup_requests" integer DEFAULT 0 NOT NULL;

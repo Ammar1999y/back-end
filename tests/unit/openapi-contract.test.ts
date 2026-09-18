@@ -23,6 +23,8 @@ import {
   MAX_VALUE_LENGTH,
 } from '@/lib/data-table/parsers';
 import {
+  BETTER_AUTH_OVERRIDDEN_RESPONSES,
+  BETTER_AUTH_TRUSTED_RESPONSES,
   memoiseOpenApiDocument,
   openApiDocument,
   resolveOpenApiDocument,
@@ -34,8 +36,13 @@ import {
 } from '@/lib/http/route-manifest';
 import { ALLOWED_MIME_TYPES } from '@/lib/media/allowlist';
 
-import { MAX_DOCUMENT_SIZE_MB } from '@/utils/validation/constants';
-import { isChannelEnabled, OTP_CHANNELS } from '@/utils/validation/otp';
+import {
+  MAX_DOCUMENT_SIZE_MB,
+  PASSWORD_MAX,
+  PASSWORD_MIN,
+} from '@/utils/validation/constants';
+import { OTP_CHANNELS } from '@/utils/validation/enums';
+import { isChannelEnabled } from '@/utils/validation/otp';
 import { isTwoFactorMethodEnabled } from '@/utils/validation/two-factor';
 
 const REPO_ROOT = path.join(import.meta.dir, '..', '..');
@@ -583,12 +590,21 @@ describe('request and response contract fidelity', () => {
       'post'
     );
     const passwordProperties = objectProperty(passwordBody, 'properties');
-    expect(
-      objectProperty(passwordProperties, 'currentPassword').pattern
-    ).toBeString();
-    expect(
-      objectProperty(passwordProperties, 'newPassword').pattern
-    ).toBeString();
+    // NOT a pattern, and not the bounds either: NFKC runs before every one of
+    // them, so each was refusing passwords the server accepts. What survives is
+    // the prose — see `passwordSchema`.
+    for (const field of ['currentPassword', 'newPassword']) {
+      const leaf = objectProperty(passwordProperties, field);
+      expect([field, leaf.pattern, leaf.minLength, leaf.maxLength]).toEqual([
+        field,
+        undefined,
+        undefined,
+        undefined,
+      ]);
+      expect(String(leaf.description)).toContain(
+        `${PASSWORD_MIN} to ${PASSWORD_MAX} characters`
+      );
+    }
 
     const phoneBody = requestSchemaOf(
       document,
@@ -1256,6 +1272,27 @@ describe('the refusals an operation declares for its own authorisation', () => {
     }
   });
 
+  test('the two-factor challenge scheme names the cookie the library sets', async () => {
+    // The six operations that complete a sign-in answer 401 without it, so
+    // publishing them as anonymous made a generated client omit it for the
+    // whole second step. A scheme naming a cookie nobody sets would be the same
+    // failure with more words, so the name is read from the library.
+    const document = openApiDocument(manifest);
+    const components = (document as { components: Record<string, unknown> })
+      .components;
+    const schemes = components.securitySchemes as Record<
+      string,
+      Record<string, unknown>
+    >;
+    const context = await auth.$context;
+
+    expect(schemes.twoFactorChallengeCookie?.name).toBe(
+      context.createAuthCookie('two_factor').name
+    );
+    expect(schemes.twoFactorChallengeCookie?.in).toBe('cookie');
+    expect(schemes.twoFactorChallengeCookie?.type).toBe('apiKey');
+  });
+
   test('no dashboard route is public', () => {
     // The independent half. Everything above proves the document agrees with the
     // field, which a mistyped field satisfies too — flipping `GET
@@ -1724,6 +1761,7 @@ describe('the statuses each Better Auth operation declares', () => {
       '403',
       '422',
     ],
+    // 409 is a `setId` naming a set another tab has already replaced.
     '/two-factor/backup-codes/acknowledge': [
       '200',
       '404',
@@ -1732,6 +1770,7 @@ describe('the statuses each Better Auth operation declares', () => {
       '503',
       '401',
       '403',
+      '409',
       '422',
     ],
     '/passkey/generate-register-options': [
@@ -1742,6 +1781,8 @@ describe('the statuses each Better Auth operation declares', () => {
       '503',
       '401',
     ],
+    // 409 is a credential deleted between the library's write and the enrolment
+    // hook, which leaves nothing to offer as a second factor.
     '/passkey/verify-registration': [
       '200',
       '404',
@@ -1751,6 +1792,7 @@ describe('the statuses each Better Auth operation declares', () => {
       '400',
       '401',
       '403',
+      '409',
       '422',
     ],
     '/passkey/list-user-passkeys': ['200', '404', '429', '500', '503', '401'],
@@ -1879,6 +1921,174 @@ describe('the statuses each Better Auth operation declares', () => {
             ...(method === 'POST' ? ['413'] : []),
           ].toSorted(byText),
         ]);
+  });
+
+  test('every served success response is overridden or explicitly attested', () => {
+    // The generated Better Auth contract describes the plugin's INTENDED
+    // shapes, and two of them were wrong: both verifiers answer `{token, user}`
+    // through one shared `valid()`, while the document published
+    // `{status: boolean}` for one and a required `{user, session}` for the
+    // other. This makes "nobody has checked" a failing state rather than a
+    // silent default.
+    const unaccounted = BETTER_AUTH_ENDPOINTS.map(
+      (endpoint) => endpoint.path
+    ).filter(
+      (endpointPath) =>
+        !BETTER_AUTH_OVERRIDDEN_RESPONSES.has(endpointPath) &&
+        !BETTER_AUTH_TRUSTED_RESPONSES.has(endpointPath)
+    );
+    expect(unaccounted).toEqual([]);
+  });
+
+  test('the backup-code endpoints publish the set id that binds them', () => {
+    // Generation returns a `setId` and acknowledgement REQUIRES it; publishing
+    // only the password made every generated client send a body the handler
+    // answers 422. The pair is asserted together because the value the client
+    // must echo is what links them.
+    const document = openApiDocument(toManifest(ROUTES));
+    const generated = responseSchemaOf(
+      document,
+      '/api/auth/two-factor/generate-backup-codes',
+      'post',
+      '200'
+    );
+    const data = (
+      generated.properties as Record<string, Record<string, unknown>>
+    ).data;
+    expect(data?.required).toEqual(['backupCodes', 'setId']);
+
+    const acknowledge = requestSchemaOf(
+      document,
+      '/api/auth/two-factor/backup-codes/acknowledge',
+      'post'
+    );
+    expect(
+      Object.keys(acknowledge.properties as Record<string, unknown>).toSorted(
+        byText
+      )
+    ).toEqual(['password', 'setId']);
+    expect(acknowledge.required).toEqual(['setId']);
+  });
+
+  test('the two plugin verifiers publish the body their shared valid() returns', () => {
+    const document = openApiDocument(toManifest(ROUTES));
+    for (const endpointPath of [
+      '/two-factor/verify-totp',
+      '/two-factor/verify-backup-code',
+    ]) {
+      const schema = responseSchemaOf(
+        document,
+        `/api/auth${endpointPath}`,
+        'post',
+        '200'
+      );
+      expect([endpointPath, schema.required]).toEqual([
+        endpointPath,
+        ['token', 'user'],
+      ]);
+    }
+  });
+
+  test('every credential-gated operation publishes the cookie requirement', () => {
+    // The document decided security from path SPELLING and published
+    // `security: []` for every operation behind `sessionMiddleware` or behind
+    // the two-factor challenge cookie. It reads the endpoint's own metadata
+    // now, so this asserts the two agree rather than restating a list.
+    const document = openApiDocument(toManifest(ROUTES));
+    const expected = {
+      session: [{ sessionCookie: [] }],
+      optional: [{}, { sessionCookie: [] }],
+      challenge: [{ twoFactorChallengeCookie: [] }],
+      'session-or-challenge': [
+        { sessionCookie: [] },
+        { twoFactorChallengeCookie: [] },
+      ],
+      none: [],
+    } as const;
+
+    for (const endpoint of BETTER_AUTH_ENDPOINTS)
+      for (const method of endpoint.methods) {
+        const operation = operationOf(
+          document,
+          `/api/auth${endpoint.path}`,
+          method.toLowerCase()
+        );
+        expect([endpoint.path, method, operation.security]).toEqual([
+          endpoint.path,
+          method,
+          expected[endpoint.session],
+        ]);
+      }
+
+    // The premise: at least one endpoint of each kind exists, so a table that
+    // silently collapsed to one value could not satisfy the loop vacuously.
+    const kinds = new Set(
+      BETTER_AUTH_ENDPOINTS.map((endpoint) => endpoint.session)
+    );
+    expect([...kinds].toSorted(byText)).toEqual([
+      'challenge',
+      'none',
+      'optional',
+      'session',
+      'session-or-challenge',
+    ]);
+  });
+
+  test('a transformed field publishes the constraint that fits its INPUT', () => {
+    // `z.toJSONSchema` describes what the validator sees AFTER `z.preprocess`.
+    // The email schema lowercases and trims first, so the emitted allowlist
+    // pattern rejected ` User@Gmail.com ` — an address the server accepts.
+    //
+    // No `format: 'email'` either, and that is the same rule rather than an
+    // omission: `format` asserts under a validator that turns assertion on, and
+    // a padded address is not an email address by that rule. The RESPONSE
+    // schemas keep it, because a stored address is already normalised.
+    const document = openApiDocument(toManifest(ROUTES));
+    const email = requestSchemaOf(document, '/api/dash/users', 'post')
+      .properties as Record<string, { pattern?: string; format?: string }>;
+
+    expect(email.email?.format).toBeUndefined();
+    /* eslint-disable-next-line security/detect-non-literal-regexp -- the
+       pattern comes from the document this file builds, which is the thing
+       under test */
+    const pattern = new RegExp(email.email?.pattern ?? '(?!)');
+    expect(pattern.test('user@gmail.com')).toBe(true);
+    expect(pattern.test('User@Gmail.COM')).toBe(true);
+    expect(pattern.test(' User@Gmail.com ')).toBe(true);
+    expect(pattern.test('someone@example.com')).toBe(false);
+  });
+
+  test('a partial-update body publishes that it cannot be empty', () => {
+    // Every property optional plus a `.refine` the converter drops: the
+    // document described `{}` as a valid request that answers 422.
+    const document = openApiDocument(toManifest(ROUTES));
+    for (const path of [
+      '/api/dash/media/folders/{id}',
+      '/api/dash/media/files/{id}',
+    ]) {
+      const schema = requestSchemaOf(document, path, 'put');
+      const names = Object.keys(
+        (schema.properties ?? {}) as Record<string, unknown>
+      ).toSorted(byText);
+      expect([path, schema.anyOf]).toEqual([
+        path,
+        names.map((name) => ({ required: [name] })),
+      ]);
+    }
+  });
+
+  test('a normalised name publishes the characters its refinement rejects', () => {
+    const document = openApiDocument(toManifest(ROUTES));
+    const schema = requestSchemaOf(document, '/api/dash/media/folders', 'post');
+    const name = (schema.properties as Record<string, { pattern?: string }>)
+      .name;
+    /* eslint-disable-next-line security/detect-non-literal-regexp -- same: the
+       document's own published pattern is the assertion */
+    const pattern = new RegExp(name?.pattern ?? '(?!)');
+
+    expect(pattern.test('My Folder')).toBe(true);
+    expect(pattern.test('a/b')).toBe(false);
+    expect(pattern.test('..')).toBe(false);
   });
 
   test('a path with its own limiter declares BOTH throttle body shapes', () => {

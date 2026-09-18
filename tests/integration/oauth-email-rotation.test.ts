@@ -23,6 +23,7 @@ import { auth } from '@/lib/auth';
 import { hasAdminReauth } from '@/lib/auth/admin-reauth';
 import * as challenges from '@/lib/auth/two-factor-challenge';
 import { PUBLIC_ORIGIN } from '@/lib/env';
+import { generateUuidV7 } from '@/lib/id';
 
 import { hashOtpCode } from '@/utils/otp';
 
@@ -305,7 +306,9 @@ test.each(['otp', 'passkey', 'totp', 'backup_code'] as const)(
         deviceType: 'singleDevice',
         backedUp: false,
       });
-    else if (method === 'totp' || method === 'backup_code')
+    else if (method === 'totp' || method === 'backup_code') {
+      // Both ids the same: that pairing IS "these codes were acknowledged".
+      const setId = generateUuidV7();
       await db.insert(twoFactorCredentials).values({
         userId: owner.userId,
         secret: await symmetricEncrypt({
@@ -318,9 +321,11 @@ test.each(['otp', 'passkey', 'totp', 'backup_code'] as const)(
         }),
         verified: true,
         backupCodesAcknowledgedAt: new Date(),
-        backupCodesAcknowledgedVersion: 0,
+        backupCodesSetId: setId,
+        backupCodesAcknowledgedSetId: setId,
         backupCodesRemaining: 1,
       });
+    }
     await db
       .update(users)
       .set({ twoFactorEnabled: true })

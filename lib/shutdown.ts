@@ -23,9 +23,107 @@ export function shutdownTimeoutMs(input: {
   );
 }
 
+export interface GracefulStopDeps {
+  /** Elysia's `app.stop`; `true` closes active connections. */
+  stop: (closeActiveConnections?: boolean) => Promise<unknown>;
+  /** Bun's in-flight request count — `Server.pendingRequests`. */
+  pendingRequests: () => number;
+  /** How long this phase may take before the shutdown deadline is reached. */
+  budgetMs: number;
+  error: (line: Record<string, unknown>) => void;
+  graceMs?: number;
+  now?: () => number;
+  sleep?: (ms: number) => Promise<void>;
+}
+
+/**
+ * Stop the listener, waiting for real work and force-closing only what is not.
+ *
+ * `app.stop()` alone can hang on a HALF-SENT request — a client that wrote
+ * headers and no body keeps the connection open and the promise pending — so a
+ * hard escalation to `app.stop(true)` after a fixed grace is required to make
+ * a deploy terminate at all.
+ *
+ * What that fixed grace cannot tell apart is a half-sent connection from an
+ * image upload in its ninth second — both are simply still open, and the route
+ * and shutdown budgets allow the upload another two minutes. So
+ * `pendingRequests` is what decides: a request in flight buys another grace
+ * interval, up to the caller's budget; nothing in flight escalates immediately,
+ * which is the half-sent case the escalation exists for.
+ *
+ * Never throws for slowness — a stop that ran out of budget still force-closes
+ * and returns. Only a rejection from `stop` itself propagates, because that
+ * means the listener's own teardown faulted, which is not a clean exit.
+ */
+export async function stopServerGracefully(
+  deps: GracefulStopDeps
+): Promise<void> {
+  const now = deps.now ?? Date.now;
+  const sleep = deps.sleep ?? Bun.sleep;
+  const graceMs = deps.graceMs ?? SHUTDOWN_POLICY.gracefulStopMs;
+  const deadline = now() + deps.budgetMs;
+
+  // Settled through a state object rather than by racing the raw promise: the
+  // same promise is raced once per interval, and a rejection observed by no
+  // race — because an earlier interval force-closed and returned — is an
+  // unhandled rejection.
+  const state: { done: boolean; failure: unknown } = {
+    done: false,
+    failure: null,
+  };
+  const graceful = deps
+    .stop()
+    .then(() => {
+      state.done = true;
+    })
+    .catch((error: unknown) => {
+      state.done = true;
+      state.failure = error ?? new Error('server stop rejected');
+    });
+
+  for (;;) {
+    const timedOut = Symbol('graceful-stop-timeout');
+    // Clamped to what is LEFT, not the full interval: an unclamped wait can
+    // outlive the caller's deadline by a whole interval, and the forced-exit
+    // timer then fires while this is still draining.
+    const waitMs = Math.min(graceMs, Math.max(0, deadline - now()));
+    const outcome = await Promise.race([
+      graceful,
+      sleep(waitMs).then(() => timedOut),
+    ]);
+    if (outcome !== timedOut) {
+      if (state.failure !== null) throw state.failure;
+      return;
+    }
+
+    const pendingRequests = deps.pendingRequests();
+    const remainingMs = deadline - now();
+    if (pendingRequests > 0 && remainingMs > 0) {
+      deps.error({
+        msg: 'graceful stop still draining in-flight requests',
+        pendingRequests,
+        remainingMs,
+      });
+      continue;
+    }
+
+    deps.error({
+      msg: 'graceful stop timed out, closing active connections',
+      graceMs,
+      pendingRequests,
+      budgetExhausted: remainingMs <= 0,
+    });
+    await deps.stop(true);
+    return;
+  }
+}
+
 export interface ShutdownDeps {
-  /** Stops accepting requests and drains or closes the ones in flight. */
-  stopServer: () => Promise<void>;
+  /**
+   * Stops accepting requests and drains or closes the ones in flight, within
+   * the shutdown budget still unspent when it is called.
+   */
+  stopServer: (budgetMs: number) => Promise<void>;
   /** Prevents further sweep firings and waits for a running one; true when idle. */
   stopSweeps: (timeoutMs: number) => Promise<boolean>;
   /** Waits for queued post-response work; true when the queue is observably empty. */
@@ -114,7 +212,7 @@ export function createShutdown(
     // never means the listener is still admitting requests. It does mean the
     // stop did not complete cleanly, so the exit code says so.
     try {
-      await deps.stopServer();
+      await deps.stopServer(remaining());
     } catch (error) {
       state.exitCode = Math.max(state.exitCode, 1);
       deps.error({

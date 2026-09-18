@@ -23,6 +23,7 @@ import { PUBLIC_ORIGIN } from '@/lib/env';
 import { elysiaRouteConfig, toElysiaHandler } from '@/lib/http/adapters/elysia';
 import { runAfterResponse } from '@/lib/http/after-response';
 import {
+  allowlistedPathScope,
   enforcePreAuthIpLimit,
   UNKNOWN_PREFIX_SCOPE,
 } from '@/lib/http/pre-auth';
@@ -450,12 +451,16 @@ function register(instance: typeof base): typeof base {
           try {
             // Admission must precede Better Auth plugins that perform outbound work.
             // The allowlist decides the SCOPE, not just the budget. An
-            // allowlisted path gets its own key and its own limit; everything
-            // else shares ONE fixed key, so rotating `/api/auth/<random>` can
-            // neither multiply the budget nor the `rate_limit` keyspace.
+            // allowlisted path gets its OWN key — the whole sub-path, so a
+            // budget declared per path is also counted per path — and
+            // everything else shares ONE fixed key, so rotating
+            // `/api/auth/<random>` can neither multiply the budget nor the
+            // `rate_limit` keyspace.
             await enforcePreAuthIpLimit(buildRequestMeta(request), {
               limit: known?.preAuthLimit,
-              scope: known ? undefined : UNKNOWN_PREFIX_SCOPE,
+              scope: known
+                ? allowlistedPathScope(`${prefix.prefix}${known.path}`)
+                : UNKNOWN_PREFIX_SCOPE,
             });
             // Unreachable auth paths answer with this API's envelope like every
             // other unknown path, instead of Better Auth's own bodyless 404 — and

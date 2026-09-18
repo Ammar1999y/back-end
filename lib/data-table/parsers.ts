@@ -43,6 +43,106 @@ const VALID_JOIN_OPERATORS = new Set<string>(dataTableConfig.joinOperators);
  */
 export const MIN_SEARCH_LENGTH = 3;
 export const MAX_SEARCH_LENGTH = 200;
+
+/**
+ * Unicode code points, not UTF-16 code units: the floor exists to keep
+ * `ILIKE '%term%'` on the trigram index, and PostgreSQL counts characters.
+ * `'😀😀'.length` is 4, so `.length` clears the floor on a term for which
+ * `show_trgm` returns no trigrams at all and the planner falls back to a
+ * sequential scan.
+ */
+export function searchTermLength(term: string): number {
+  return [...term].length;
+}
+
+/** Where the pattern this term becomes puts its `%`, which decides its boundaries. */
+export type SearchAnchor = 'contains' | 'prefix' | 'suffix';
+
+/**
+ * pg_trgm's `ISWORDCHR`, as closely as a JavaScript class expresses it —
+ * `t_isalpha || t_isdigit` under the SERVER's ctype, which is why this is an
+ * approximation and not a definition.
+ *
+ * ⚠️ The ctype belongs to the deployment, not to this file, and the two
+ * directions of a mismatch do not cost the same. A character this admits that
+ * the server will NOT index is the scan an authorized user can repeat at will —
+ * the whole reason the floor exists. A character this refuses that the server
+ * would index only costs that search. So the class errs toward refusing:
+ * `\p{Nl}` and `\p{Nd}` are in because the server indexes Roman numerals and
+ * Arabic-Indic digits, `\p{No}` and the combining marks are out because it does
+ * not, and `\p{Alphabetic}` is not used because it carries `Other_Alphabetic` —
+ * the harakat and the circled letters, which the server treats as punctuation.
+ *
+ * `tests/integration/trigram-floor.test.ts` re-measures the class against
+ * whichever PostgreSQL it runs on, and its admission direction is strict: a
+ * ctype that indexes less than this admits fails the tier by name.
+ */
+const WORD_CHARACTER = /[\p{L}\p{Nl}\p{Nd}]/u;
+
+/** Above this, `wchar_t` is too narrow for the server to classify anything. */
+const BMP_MAX = 0xff_ff;
+
+/**
+ * The class, plus the one bound no property expresses.
+ *
+ * PostgreSQL passes each character through `char2wchar` before asking the C
+ * library about it, and where `wchar_t` is 16 bits — every Windows build —
+ * nothing above the BMP survives that conversion. pg_trgm therefore treats every
+ * astral code point as a separator, letters and digits alike, so admitting one
+ * is the scan this guard exists to refuse.
+ *
+ * A build with 32-bit `wchar_t` classifies them normally, and there this bound
+ * costs a search in a script this application's data does not contain — the
+ * cheaper of the two mistakes, which is the rule the class above follows too.
+ */
+function isWordCharacter(character: string): boolean {
+  return (
+    (character.codePointAt(0) ?? 0) <= BMP_MAX && WORD_CHARACTER.test(character)
+  );
+}
+
+/**
+ * Whether PostgreSQL can answer `ILIKE` over this term from the GIN trigram
+ * index, which is the property `MIN_SEARCH_LENGTH` was standing in for. Three
+ * code points are not enough on their own: `!!!`, `---` and `😀😀😀` all
+ * clear the floor and produce no trigram at all.
+ *
+ * pg_trgm pads each run of word characters with two leading and one trailing
+ * blank, but only where the boundary is KNOWN — and a `%` is not a boundary. So
+ * a run yields a trigram when it is three characters long, or one character
+ * against a known left boundary (`  b`), or two against a known right one
+ * (`ab `). An anchored operator supplies the missing edge: `startsWith` knows
+ * its left, `endsWith` its right.
+ */
+export function isTrigramIndexable(
+  term: string,
+  anchor: SearchAnchor = 'contains'
+): boolean {
+  const characters = [...term];
+  let runStart: number | null = null;
+
+  for (let index = 0; index <= characters.length; index++) {
+    const character = characters[index];
+    if (character !== undefined && isWordCharacter(character)) {
+      runStart ??= index;
+      continue;
+    }
+    if (runStart === null) continue;
+
+    const length = index - runStart;
+    const leftKnown = runStart > 0 || anchor === 'prefix';
+    const rightKnown = index < characters.length || anchor === 'suffix';
+    if (
+      length >= 3 ||
+      (leftKnown && length >= 1) ||
+      (rightKnown && length >= 2)
+    )
+      return true;
+    runStart = null;
+  }
+  return false;
+}
+
 const validVariants = new Set<string>(dataTableConfig.filterVariants);
 /** Operators that are complete without a value. */
 const VALUELESS_OPERATORS = new Set<string>(['isEmpty', 'isNotEmpty']);

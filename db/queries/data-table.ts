@@ -12,10 +12,12 @@ import {
 } from '@/lib/data-table/filter-columns';
 import {
   DATA_TABLE_PARAM_KEYS,
+  isTrigramIndexable,
   MAX_PER_PAGE,
   MAX_SEARCH_LENGTH,
   MIN_SEARCH_LENGTH,
   parseSearchParams,
+  searchTermLength,
 } from '@/lib/data-table/parsers';
 
 import { HTTP_STATUS } from '@/utils/api-messages';
@@ -114,14 +116,18 @@ export function parseDataTableParams<T extends Table>(
   // statement about malformed input: a dropped structured predicate widens an
   // `and` query to rows the caller never asked for, whereas dropping a
   // standalone search term returns the caller's ordinary authorized list. A
-  // bookmarked 1-2 character URL is a compatibility case, not an attack.
+  // bookmarked 1-2 character URL is a compatibility case, not an attack. A term
+  // that clears the floor but yields no trigram — `!!!`, `😀😀😀` — is dropped by
+  // the same rule, for the scan it would otherwise force.
 
   const rawSearch = (searchParams.get('search') ?? '')
     .replaceAll(/\p{Cc}/gu, '')
     .trim();
+  const rawSearchLength = searchTermLength(rawSearch);
   const search =
-    rawSearch.length >= MIN_SEARCH_LENGTH &&
-    rawSearch.length <= MAX_SEARCH_LENGTH
+    rawSearchLength >= MIN_SEARCH_LENGTH &&
+    rawSearchLength <= MAX_SEARCH_LENGTH &&
+    isTrigramIndexable(rawSearch)
       ? rawSearch
       : '';
 

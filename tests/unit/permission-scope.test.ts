@@ -82,7 +82,7 @@ describe('the two answers this function used to get wrong', () => {
 
 describe('denial is the default', () => {
   test('an empty matrix denies every action on every page', () => {
-    for (const page of DASHBOARD_PAGE_NAMES as DashboardPage[])
+    for (const page of DASHBOARD_PAGE_NAMES)
       for (const action of Object.keys(
         PERMISSION_ACTIONS
       ) as PermissionAction[])

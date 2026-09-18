@@ -29,17 +29,23 @@ import {
 import type { SignedInSession } from '../helpers/session';
 import type { FileTypeSpec } from '@/lib/media/allowlist';
 
-import { and, eq, sql } from 'drizzle-orm';
+import { and, eq, inArray, sql } from 'drizzle-orm';
 
 import { app } from '@/app';
 import { db, withTransaction } from '@/db';
-import { auditLogs, files } from '@/db/schema';
+import { auditLogs, files, orphanedObjects } from '@/db/schema';
+import * as purge from '@/lib/cloudflare/purge';
 import { generateUuidV7 } from '@/lib/id';
 import { FILE_TYPES } from '@/lib/media/allowlist';
 import { claimFiles, sweepFiles } from '@/lib/media/lifecycle';
 import { attachFiles, linkFiles, promoteForLink } from '@/lib/media/link';
 import { mediaMsg } from '@/lib/media/messages';
-import { retryTransitions, transitionFile } from '@/lib/media/visibility';
+import {
+  ORPHAN_DRAIN_BATCH,
+  retryTransitions,
+  sweepOrphanedObjects,
+  transitionFile,
+} from '@/lib/media/visibility';
 import * as r2 from '@/lib/r2/client';
 
 import { HTTP_STATUS } from '@/utils/api-messages';
@@ -50,6 +56,7 @@ import {
   clearObjectStoreFailures,
   corruptNextCopy,
   failObjectStore,
+  failObjectStoreKey,
   preconditionFailNextPut,
   storedObject,
   storeHas,
@@ -210,6 +217,20 @@ async function auditActions(id: string): Promise<string[]> {
   return rows.map((row) => row.action);
 }
 
+/**
+ * Which buckets a delete swept for `key`, sorted.
+ *
+ * Deleting a file removes the key from EVERY enabled bucket, not the one the row
+ * names — an abandoned publish can have left a copy in the other one, and the row
+ * is the last thing that records the key. So the buckets are the assertion.
+ */
+function deletedBucketsFor(key: string): string[] {
+  return storeOpsOf('DeleteObjects')
+    .filter((op) => (op.keys ?? []).includes(key))
+    .flatMap((op) => (op.bucket === undefined ? [] : [op.bucket]))
+    .toSorted(byText);
+}
+
 const sessions: { admin?: SignedInSession; viewer?: SignedInSession } = {};
 function admin() {
   if (!sessions.admin) throw new Error('admin not seeded');
@@ -342,9 +363,9 @@ describe('upload into a folder', () => {
     const swept = await sweepFiles();
     expect(swept.removed).toBe(1);
     expect(await rowOf(row?.id ?? '')).toBeNull();
-    expect(storeOpsOf('DeleteObjects').flatMap((op) => op.keys ?? [])).toEqual([
-      row?.r2Key ?? '',
-    ]);
+    expect(deletedBucketsFor(row?.r2Key ?? '')).toEqual(
+      [PRIVATE_BUCKET, PUBLIC_BUCKET].toSorted(byText)
+    );
   });
 
   test('a 412 is resolved by looking: our own retried write succeeds, a foreign object removes the row, an empty key keeps it', async () => {
@@ -874,6 +895,754 @@ describe('publish and unpublish', () => {
     expect(storeHas(PUBLIC_BUCKET, key)).toBe(true);
   });
 
+  test('a sweep already deleting the target cannot be overtaken by the flip it gave up on', async () => {
+    // The interleaving a marker re-read cannot catch, because the re-read
+    // happens BEFORE the external delete and the flip lands during it:
+    //
+    //   sweep   : reads a stalled `to_public`, starts deleting the PUBLIC copy
+    //   publish : flips the row to public, then deletes the PRIVATE source
+    //   sweep   : its delete of the public copy completes
+    //
+    // Measured before the fix: an `active` row naming `public` with no object
+    // in either bucket. The transition token is what makes the two exclusive —
+    // the sweep claims it, so the flip fails its own guard.
+    const folderId = await createFolder(admin(), 'Sweep overtake');
+    const file = await upload(admin(), folderId, svgForm('overtake.svg'));
+    const key = await keyOf(file.id);
+
+    const copied = Promise.withResolvers<void>();
+    const flipAttempted = Promise.withResolvers<void>();
+    const realHead = r2.headObjectInR2;
+    const realDelete = r2.deleteFromR2;
+    const heads = { count: 0 };
+    const headSpy = spyOn(r2, 'headObjectInR2').mockImplementation(
+      async (params) => {
+        heads.count += 1;
+        // The second HEAD is the target verification: the copy has landed and
+        // the row still says `to_public`.
+        if (heads.count === 2) {
+          copied.resolve();
+          await flipAttempted.promise;
+        }
+        return realHead(params);
+      }
+    );
+    const deleteSpy = spyOn(r2, 'deleteFromR2').mockImplementation(
+      async (params) => {
+        // The sweep's delete of the public copy: hold it open, let the publish
+        // run to completion, and only then finish.
+        if (params.bucketType === 'public') {
+          flipAttempted.resolve();
+          await Bun.sleep(150);
+        }
+        return realDelete(params);
+      }
+    );
+
+    try {
+      const stalled = transitionFile({
+        id: file.id,
+        to: 'public',
+        actor: actorOf(admin()),
+      });
+      await copied.promise;
+      await until(
+        () => storeHas(PUBLIC_BUCKET, key),
+        'the publish to have copied into the public bucket'
+      );
+
+      await db
+        .update(files)
+        .set({ updatedAt: sql`now() - interval '11 minutes'` })
+        .where(eq(files.id, file.id));
+
+      const swept = retryTransitions();
+      await expect(stalled).rejects.toThrow(mediaMsg.fileBusy);
+      expect(await swept).toMatchObject({ reverted: 1, finished: 0 });
+    } finally {
+      copied.resolve();
+      flipAttempted.resolve();
+      headSpy.mockRestore();
+      deleteSpy.mockRestore();
+    }
+
+    // The whole point: the row is back where it started and the bytes are
+    // still there.
+    expect(await rowOf(file.id)).toMatchObject({
+      bucketType: 'private',
+      transition: null,
+    });
+    expect(storeHas(PRIVATE_BUCKET, key)).toBe(true);
+    expect(storeHas(PUBLIC_BUCKET, key)).toBe(false);
+  });
+
+  test('a copy that lands after the sweep gave up is removed even when its verification fails', async () => {
+    // The sibling error path of the case below, and the one a token-only guard
+    // silently drops: the copy is verified there and FAILS here, so the saga
+    // reaches its catch block instead of its flip. Both have lost the row to
+    // the sweep by then, and the copy in the target bucket is the same public
+    // object either way — readable at the file's own URL, and invisible to a
+    // sweep that cleared the marker on its way out.
+    const folderId = await createFolder(admin(), 'Verification failed');
+    const file = await upload(admin(), folderId, svgForm('unverified.svg'));
+    const key = await keyOf(file.id);
+
+    const copying = Promise.withResolvers<void>();
+    const swept = Promise.withResolvers<void>();
+    const realHead = r2.headObjectInR2;
+    const realCopy = r2.copyFileInR2;
+    const heads = { count: 0 };
+
+    const copySpy = spyOn(r2, 'copyFileInR2').mockImplementation(
+      async (params) => {
+        // Paused BEFORE the bytes land, so the sweep finds nothing to remove
+        // and the copy arrives after it has cleared the marker.
+        copying.resolve();
+        await swept.promise;
+        return realCopy(params);
+      }
+    );
+    const headSpy = spyOn(r2, 'headObjectInR2').mockImplementation(
+      async (params) => {
+        heads.count += 1;
+        // The second HEAD is the target verification.
+        if (heads.count === 2) throw new Error('head timed out');
+        return realHead(params);
+      }
+    );
+
+    try {
+      const stalled = transitionFile({
+        id: file.id,
+        to: 'public',
+        actor: actorOf(admin()),
+      });
+      await copying.promise;
+
+      await db
+        .update(files)
+        .set({ updatedAt: sql`now() - interval '11 minutes'` })
+        .where(eq(files.id, file.id));
+      expect(await retryTransitions()).toMatchObject({ reverted: 1 });
+      expect(await rowOf(file.id)).toMatchObject({ transition: null });
+
+      swept.resolve();
+      await expect(stalled).rejects.toThrow(mediaMsg.storeFailed);
+    } finally {
+      copying.resolve();
+      swept.resolve();
+      copySpy.mockRestore();
+      headSpy.mockRestore();
+    }
+
+    // The request failed, and the bucket the row does not name is empty anyway.
+    expect(await rowOf(file.id)).toMatchObject({
+      bucketType: 'private',
+      transition: null,
+    });
+    expect(storeHas(PRIVATE_BUCKET, key)).toBe(true);
+    expect(storeHas(PUBLIC_BUCKET, key)).toBe(false);
+  });
+
+  test('the copy a sweep abandoned is removed under a fresh claim, not beside a live publish', async () => {
+    // The other half of the token's job, and the one a pre-delete row read
+    // cannot do. A publish that loses its saga to the sweep still holds a copy
+    // in the target bucket — readable at the file's own public URL, and invisible
+    // to the sweep, which cleared the marker on its way out. Removing it is
+    // right; removing it UNFENCED is the loss:
+    //
+    //   publish A : copy lands, saga taken over by the sweep, flip refused
+    //   publish B : starts, copies into public, commits the public bucket
+    //   publish A : its delete of "its own" copy completes — on B's object
+    //
+    // So the cleanup claims the row first, and B is refused while it runs.
+    const folderId = await createFolder(admin(), 'Abandoned copy');
+    const file = await upload(admin(), folderId, svgForm('abandoned.svg'));
+    const key = await keyOf(file.id);
+
+    const copied = Promise.withResolvers<void>();
+    const swept = Promise.withResolvers<void>();
+    const cleaning = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const realHead = r2.headObjectInR2;
+    const realDelete = r2.deleteFromR2;
+    const heads = { count: 0 };
+    const publicDeletes = { count: 0 };
+
+    const headSpy = spyOn(r2, 'headObjectInR2').mockImplementation(
+      async (params) => {
+        heads.count += 1;
+        // The second HEAD verifies the target copy. Answered BEFORE the pause,
+        // so the publish carries a verification the sweep has not invalidated
+        // and reaches its flip — which is the step that has to fail.
+        const found = await realHead(params);
+        if (heads.count === 2) {
+          copied.resolve();
+          await swept.promise;
+        }
+        return found;
+      }
+    );
+    const deleteSpy = spyOn(r2, 'deleteFromR2').mockImplementation(
+      async (params) => {
+        if (params.bucketType === 'public') {
+          publicDeletes.count += 1;
+          // 1 is the sweep's. 2 is the abandoned publish removing what it left.
+          if (publicDeletes.count === 2) {
+            cleaning.resolve();
+            await release.promise;
+          }
+        }
+        return realDelete(params);
+      }
+    );
+
+    try {
+      const stalled = transitionFile({
+        id: file.id,
+        to: 'public',
+        actor: actorOf(admin()),
+      });
+      await copied.promise;
+      await until(
+        () => storeHas(PUBLIC_BUCKET, key),
+        'the publish to have copied into the public bucket'
+      );
+
+      await db
+        .update(files)
+        .set({ updatedAt: sql`now() - interval '11 minutes'` })
+        .where(eq(files.id, file.id));
+      expect(await retryTransitions()).toMatchObject({ reverted: 1 });
+      // The marker is gone, so nothing links the row to the publish that is
+      // still running.
+      expect(await rowOf(file.id)).toMatchObject({ transition: null });
+      swept.resolve();
+
+      await cleaning.promise;
+      // The claim the cleanup took is what refuses this. Without it the publish
+      // below commits the public bucket and the delete above removes its object.
+      await expect(
+        transitionFile({ id: file.id, to: 'public', actor: actorOf(admin()) })
+      ).rejects.toThrow(mediaMsg.fileBusy);
+
+      release.resolve();
+      await expect(stalled).rejects.toThrow(mediaMsg.fileBusy);
+    } finally {
+      copied.resolve();
+      swept.resolve();
+      cleaning.resolve();
+      release.resolve();
+      headSpy.mockRestore();
+      deleteSpy.mockRestore();
+    }
+
+    expect(await rowOf(file.id)).toMatchObject({
+      bucketType: 'private',
+      transition: null,
+    });
+    expect(storeHas(PRIVATE_BUCKET, key)).toBe(true);
+    expect(storeHas(PUBLIC_BUCKET, key)).toBe(false);
+  });
+
+  /**
+   * The overlap the token alone cannot close: the losing attempt's copy lands
+   * WHILE the owner's delete of that same bucket is in flight, so the delete
+   * misses it and the clear that follows would erase the only record that work
+   * is outstanding. Both branches that abandon a copy are driven through it —
+   * the refused flip and the failed target verification — because they differ
+   * only in which step noticed.
+   *
+   * Measured before `files.cleanup_requests`: a private row, no marker, no
+   * pending sweep work, and the object readable at the file's public URL.
+   */
+  for (const failure of ['flip', 'verification'] as const)
+    test(`a copy landing during the owner's delete is removed, ${failure} branch`, async () => {
+      const folderId = await createFolder(admin(), `Overlap ${failure}`);
+      const file = await upload(admin(), folderId, svgForm(`${failure}.svg`));
+      const key = await keyOf(file.id);
+
+      const copying = Promise.withResolvers<void>();
+      const deleting = Promise.withResolvers<void>();
+      const release = Promise.withResolvers<void>();
+      const realCopy = r2.copyFileInR2;
+      const realHead = r2.headObjectInR2;
+      const realDelete = r2.deleteFromR2;
+      const heads = { count: 0 };
+      const publicDeletes = { count: 0 };
+
+      const copySpy = spyOn(r2, 'copyFileInR2').mockImplementation(
+        async (params) => {
+          // Held until the sweep's delete has already run, so the bytes land in
+          // a bucket that has just been emptied.
+          copying.resolve();
+          await deleting.promise;
+          return realCopy(params);
+        }
+      );
+      const headSpy = spyOn(r2, 'headObjectInR2').mockImplementation(
+        async (params) => {
+          heads.count += 1;
+          if (failure === 'verification' && heads.count === 2)
+            throw new Error('head timed out');
+          return realHead(params);
+        }
+      );
+      const deleteSpy = spyOn(r2, 'deleteFromR2').mockImplementation(
+        async (params) => {
+          if (params.bucketType !== 'public') return realDelete(params);
+          publicDeletes.count += 1;
+          const removed = await realDelete(params);
+          // The sweep's own delete: the object store has answered, the caller
+          // has not heard yet. That gap is the whole scenario.
+          if (publicDeletes.count === 1) {
+            deleting.resolve();
+            await release.promise;
+          }
+          return removed;
+        }
+      );
+
+      try {
+        const stalled = transitionFile({
+          id: file.id,
+          to: 'public',
+          actor: actorOf(admin()),
+        });
+        await copying.promise;
+
+        await db
+          .update(files)
+          .set({ updatedAt: sql`now() - interval '11 minutes'` })
+          .where(eq(files.id, file.id));
+        const swept = retryTransitions();
+
+        await expect(stalled).rejects.toThrow(
+          failure === 'flip' ? mediaMsg.fileBusy : mediaMsg.storeFailed
+        );
+        await until(
+          () => storeHas(PUBLIC_BUCKET, key),
+          'the abandoned copy to have landed in the public bucket'
+        );
+
+        release.resolve();
+        expect(await swept).toMatchObject({ reverted: 1, failed: 0 });
+      } finally {
+        copying.resolve();
+        deleting.resolve();
+        release.resolve();
+        copySpy.mockRestore();
+        headSpy.mockRestore();
+        deleteSpy.mockRestore();
+      }
+
+      // The second delete is the demand the losing attempt recorded.
+      expect(publicDeletes.count).toBe(2);
+      expect(await rowOf(file.id)).toMatchObject({
+        bucketType: 'private',
+        transition: null,
+      });
+      expect(storeHas(PRIVATE_BUCKET, key)).toBe(true);
+      expect(storeHas(PUBLIC_BUCKET, key)).toBe(false);
+      // Nothing left for a later pass to find, which is what made the leftover
+      // permanent.
+      expect(await retryTransitions()).toEqual({
+        reverted: 0,
+        finished: 0,
+        failed: 0,
+        hasMore: false,
+      });
+    });
+
+  /**
+   * The lifecycle the transition token and its cleanup counter cannot reach: the
+   * row they both live on is gone. A publish that lost its saga still holds a
+   * copy in the other bucket, and a delete that judges by `bucket_type` alone
+   * removes the row while that copy stays readable at the file's own public URL.
+   *
+   * Measured before the fix: `deleted: 1`, no row, no private object, and the
+   * public object still there with nothing left that could name it.
+   */
+  test('deleting a file removes the copy an abandoned publish left in the other bucket', async () => {
+    const folderId = await createFolder(admin(), 'Deleted mid-publish');
+    const file = await upload(admin(), folderId, svgForm('mid-publish.svg'));
+    const key = await keyOf(file.id);
+
+    const copying = Promise.withResolvers<void>();
+    const swept = Promise.withResolvers<void>();
+    const landed = Promise.withResolvers<void>();
+    const removed = Promise.withResolvers<void>();
+    const realCopy = r2.copyFileInR2;
+    const realHead = r2.headObjectInR2;
+    const heads = { count: 0 };
+
+    const copySpy = spyOn(r2, 'copyFileInR2').mockImplementation(
+      async (params) => {
+        // Held until the sweep has been and gone, so it finds nothing to remove
+        // and clears the marker on its way out.
+        copying.resolve();
+        await swept.promise;
+        return realCopy(params);
+      }
+    );
+    const headSpy = spyOn(r2, 'headObjectInR2').mockImplementation(
+      async (params) => {
+        heads.count += 1;
+        // The target verification: the copy has landed and the private source is
+        // still there, which is the moment the delete arrives.
+        if (heads.count === 2) {
+          landed.resolve();
+          await removed.promise;
+        }
+        return realHead(params);
+      }
+    );
+
+    try {
+      const stalled = transitionFile({
+        id: file.id,
+        to: 'public',
+        actor: actorOf(admin()),
+      });
+      await copying.promise;
+
+      await db
+        .update(files)
+        .set({ updatedAt: sql`now() - interval '11 minutes'` })
+        .where(eq(files.id, file.id));
+      expect(await retryTransitions()).toMatchObject({ reverted: 1 });
+      swept.resolve();
+      await landed.promise;
+
+      // Private, active and unmarked, so this is an ordinary delete — nothing
+      // about the request knows a publish is still running.
+      const answer = await call(admin(), 'DELETE', '/api/dash/media/files', {
+        ids: [file.id],
+      });
+      expect([answer.status, answer.body.success]).toEqual([
+        HTTP_STATUS.OK,
+        true,
+      ]);
+
+      removed.resolve();
+      await expect(stalled).rejects.toThrow();
+    } finally {
+      copying.resolve();
+      swept.resolve();
+      landed.resolve();
+      removed.resolve();
+      copySpy.mockRestore();
+      headSpy.mockRestore();
+    }
+
+    expect(await rowOf(file.id)).toBeNull();
+    expect(storeHas(PRIVATE_BUCKET, key)).toBe(false);
+    // The whole point: a file the API reported deleted is not still readable.
+    expect(storeHas(PUBLIC_BUCKET, key)).toBe(false);
+  });
+
+  /**
+   * The same abandonment one step later in the delete: the copy lands BETWEEN
+   * the two bucket passes. Public has already been swept and answered, private
+   * has not, so the row is still there to be removed - and the publisher that
+   * follows finds no row, no marker and no counter, because all three lived on
+   * it. Only the writer itself still knows the key it wrote.
+   *
+   * Driven three ways, because the writer noticing is only half of it: what it
+   * does when its own delete or purge is REFUSED has nowhere to go once the row
+   * is gone, and an unrecorded best-effort call there is indistinguishable from
+   * a leftover nothing will ever remove.
+   *
+   * `beforeCleanup` runs after the row is gone and before the writer resumes,
+   * which is the only window in which a failure hits the missing-row branch and
+   * nothing else.
+   */
+  async function deleteWhileACopyLands(
+    label: string,
+    beforeCleanup: () => void = () => {}
+  ): Promise<{ id: string; key: string }> {
+    const folderId = await createFolder(admin(), label);
+    const file = await upload(admin(), folderId, svgForm(`${label}.svg`));
+    const key = await keyOf(file.id);
+
+    const copying = Promise.withResolvers<void>();
+    const publicSwept = Promise.withResolvers<void>();
+    const copyLanded = Promise.withResolvers<void>();
+    const rowRemoved = Promise.withResolvers<void>();
+    const realCopy = r2.copyFileInR2;
+    const realHead = r2.headObjectInR2;
+    const realDeleteObjects = r2.deleteObjectsFromR2;
+    const heads = { count: 0 };
+
+    const copySpy = spyOn(r2, 'copyFileInR2').mockImplementation(
+      async (params) => {
+        // Held past the sweep that reverts this saga AND past the delete's
+        // public pass, so the bytes land in a bucket the delete has finished
+        // with while its private source is still there to copy from.
+        copying.resolve();
+        await publicSwept.promise;
+        const copied = await realCopy(params);
+        copyLanded.resolve();
+        return copied;
+      }
+    );
+    const headSpy = spyOn(r2, 'headObjectInR2').mockImplementation(
+      async (params) => {
+        heads.count += 1;
+        // The target verification, held until the row itself is gone: the state
+        // neither the transition token nor `cleanup_requests` can survive.
+        if (heads.count === 2) await rowRemoved.promise;
+        return realHead(params);
+      }
+    );
+    const deleteSpy = spyOn(r2, 'deleteObjectsFromR2').mockImplementation(
+      async (params) => {
+        const outcome = await realDeleteObjects(params);
+        if (params.bucketType === 'public') {
+          publicSwept.resolve();
+          await copyLanded.promise;
+        }
+        return outcome;
+      }
+    );
+
+    try {
+      const stalled = transitionFile({
+        id: file.id,
+        to: 'public',
+        actor: actorOf(admin()),
+      });
+      await copying.promise;
+
+      await db
+        .update(files)
+        .set({ updatedAt: sql`now() - interval '11 minutes'` })
+        .where(eq(files.id, file.id));
+      expect(await retryTransitions()).toMatchObject({ reverted: 1 });
+
+      const answer = await call(admin(), 'DELETE', '/api/dash/media/files', {
+        ids: [file.id],
+      });
+      expect([answer.status, answer.body.data]).toEqual([
+        HTTP_STATUS.OK,
+        { deleted: [file.id], pending: [] },
+      ]);
+      expect(await rowOf(file.id)).toBeNull();
+
+      beforeCleanup();
+      rowRemoved.resolve();
+      await expect(stalled).rejects.toThrow(mediaMsg.fileBusy);
+    } finally {
+      copying.resolve();
+      publicSwept.resolve();
+      copyLanded.resolve();
+      rowRemoved.resolve();
+      copySpy.mockRestore();
+      headSpy.mockRestore();
+      deleteSpy.mockRestore();
+    }
+
+    expect(storeHas(PRIVATE_BUCKET, key)).toBe(false);
+    return { id: file.id, key };
+  }
+
+  /** The demands `removeOrphanedObject` has recorded, as `(key, bucket)` pairs. */
+  async function orphanDemands(): Promise<string[]> {
+    const rows = await db
+      .select({
+        r2Key: orphanedObjects.r2Key,
+        bucketType: orphanedObjects.bucketType,
+      })
+      .from(orphanedObjects);
+    return rows.map((row) => `${row.bucketType}/${row.r2Key}`).toSorted(byText);
+  }
+
+  test('a copy landing between the two bucket deletes is removed by the writer whose row is gone', async () => {
+    const { key } = await deleteWhileACopyLands('between');
+
+    expect(storeHas(PUBLIC_BUCKET, key)).toBe(false);
+    // Recorded before the delete and cleared after it, so a clean run leaves
+    // nothing owed.
+    expect(await orphanDemands()).toEqual([]);
+    // Nothing is left that could have found it, which is what made the leftover
+    // permanent: the transition sweep reads rows, and reconciliation only
+    // reports.
+    expect(await retryTransitions()).toEqual({
+      reverted: 0,
+      finished: 0,
+      failed: 0,
+      hasMore: false,
+    });
+  });
+
+  test('a refused delete in that cleanup is owed, not forgotten, and the drain finishes it', async () => {
+    const { key } = await deleteWhileACopyLands('between-delete-fails', () => {
+      failObjectStore('DeleteObject');
+    });
+
+    // The object is still there and its row is gone, which before the durable
+    // record meant nothing in the process would ever look at it again.
+    expect(storeHas(PUBLIC_BUCKET, key)).toBe(true);
+    expect(await orphanDemands()).toEqual([`public/${key}`]);
+    // And no sweep that reads `files` can see it, which is why the demand has to
+    // exist at all.
+    expect(await retryTransitions()).toMatchObject({ failed: 0 });
+    const swept = await sweepFiles();
+    expect(swept.removed).toBe(0);
+
+    clearObjectStoreFailures();
+    expect(await sweepOrphanedObjects()).toEqual({
+      removed: 1,
+      failed: 0,
+      hasMore: false,
+    });
+    expect(storeHas(PUBLIC_BUCKET, key)).toBe(false);
+    expect(await orphanDemands()).toEqual([]);
+  });
+
+  test('a refused purge in that cleanup is owed too, and the drain purges once the service is back', async () => {
+    const purgeState = { failing: false };
+    const purgeSpy = spyOn(purge, 'purgeUrls').mockImplementation(
+      async (urls) =>
+        purgeState.failing
+          ? { attempted: urls.length, purged: 0, failed: [...urls] }
+          : { attempted: urls.length, purged: urls.length, failed: [] }
+    );
+
+    try {
+      const { key } = await deleteWhileACopyLands('between-purge-fails', () => {
+        purgeState.failing = true;
+      });
+
+      // The origin object IS gone, so reconciliation has nothing to report; the
+      // edge copy is the only thing left and only this record remembers it.
+      expect(storeHas(PUBLIC_BUCKET, key)).toBe(false);
+      expect(await orphanDemands()).toEqual([`public/${key}`]);
+
+      purgeState.failing = false;
+      expect(await sweepOrphanedObjects()).toEqual({
+        removed: 1,
+        failed: 0,
+        hasMore: false,
+      });
+      expect(await orphanDemands()).toEqual([]);
+    } finally {
+      purgeSpy.mockRestore();
+    }
+  });
+
+  /**
+   * The demand a cleanup is answerable for is the one IT recorded, and the
+   * unique index cannot express that: two abandoned writers holding a copy of
+   * the same key in the same bucket share one row, and the second one's demand
+   * lands while the first one's delete is already in flight. Clearing by
+   * `(r2_key, bucket_type)` — or by the row id alone — then deleted the retry
+   * the second writer was relying on, and no later pass found any work.
+   *
+   * Driven against both clears, because they are the same mistake in two
+   * callers: the writer's own, and the drain's.
+   */
+  function bumpDemandDuringDelete() {
+    const realDelete = r2.deleteFromR2;
+    return spyOn(r2, 'deleteFromR2').mockImplementation(async (params) => {
+      await db
+        .update(orphanedObjects)
+        .set({ cleanupRequests: sql`${orphanedObjects.cleanupRequests} + 1` })
+        .where(eq(orphanedObjects.r2Key, params.key));
+      return realDelete(params);
+    });
+  }
+
+  test("a demand recorded while the writer is deleting outlives that writer's clear", async () => {
+    const deleteSpy = bumpDemandDuringDelete();
+    let key: string;
+    try {
+      ({ key } = await deleteWhileACopyLands('between-overlap'));
+    } finally {
+      deleteSpy.mockRestore();
+    }
+
+    // This writer's own delete SUCCEEDED, which is exactly the case that used
+    // to drop the row: the object is gone and the newer demand is still owed.
+    expect(storeHas(PUBLIC_BUCKET, key)).toBe(false);
+    expect(await orphanDemands()).toEqual([`public/${key}`]);
+
+    expect(await sweepOrphanedObjects()).toEqual({
+      removed: 1,
+      failed: 0,
+      hasMore: false,
+    });
+    expect(await orphanDemands()).toEqual([]);
+  });
+
+  test("a demand recorded while the drain is deleting outlives the drain's clear", async () => {
+    const key = `orphan/${generateUuidV7()}.bin`;
+    await db
+      .insert(orphanedObjects)
+      .values({ r2Key: key, bucketType: 'private' });
+
+    const deleteSpy = bumpDemandDuringDelete();
+    try {
+      // Removed from the store, but not settled: the row belongs to whoever
+      // bumped it, so the pass still has work to report.
+      expect(await sweepOrphanedObjects()).toEqual({
+        removed: 1,
+        failed: 0,
+        hasMore: true,
+      });
+    } finally {
+      deleteSpy.mockRestore();
+    }
+    expect(await orphanDemands()).toEqual([`private/${key}`]);
+
+    expect(await sweepOrphanedObjects()).toEqual({
+      removed: 1,
+      failed: 0,
+      hasMore: false,
+    });
+    expect(await orphanDemands()).toEqual([]);
+  });
+
+  test('a full batch of failing demands yields its place to the healthy work behind it', async () => {
+    const stuck = Array.from(
+      { length: ORPHAN_DRAIN_BATCH },
+      () => `stuck/${generateUuidV7()}.bin`
+    );
+    await db
+      .insert(orphanedObjects)
+      .values(
+        stuck.map((r2Key) => ({ r2Key, bucketType: 'private' as const }))
+      );
+    for (const r2Key of stuck) failObjectStoreKey('DeleteObject', r2Key);
+    const healthy = `healthy/${generateUuidV7()}.bin`;
+    await db
+      .insert(orphanedObjects)
+      .values({ r2Key: healthy, bucketType: 'private' });
+
+    try {
+      // Oldest-first, every pass selected this same prefix and the removable
+      // row behind it was never attempted.
+      expect(await sweepOrphanedObjects()).toEqual({
+        removed: 0,
+        failed: ORPHAN_DRAIN_BATCH,
+        hasMore: true,
+      });
+      expect(await sweepOrphanedObjects()).toEqual({
+        removed: 1,
+        failed: ORPHAN_DRAIN_BATCH - 1,
+        hasMore: true,
+      });
+      expect(await orphanDemands()).toEqual(
+        stuck.map((key) => `private/${key}`).toSorted(byText)
+      );
+    } finally {
+      clearObjectStoreFailures();
+      await db
+        .delete(orphanedObjects)
+        .where(inArray(orphanedObjects.r2Key, stuck));
+    }
+  });
+
   test('a revert that cannot remove the target keeps its marker, and the sweep reverts it later', async () => {
     const folderId = await createFolder(admin(), 'Revert deferred');
     const file = await upload(admin(), folderId, svgForm('deferred.svg'));
@@ -910,6 +1679,7 @@ describe('publish and unpublish', () => {
       reverted: 1,
       finished: 0,
       failed: 0,
+      hasMore: false,
     });
     expect(await rowOf(file.id)).toMatchObject({
       bucketType: 'private',
@@ -956,6 +1726,7 @@ describe('publish and unpublish', () => {
       reverted: 0,
       finished: 1,
       failed: 0,
+      hasMore: false,
     });
     expect(await rowOf(file.id)).toMatchObject({ transition: null });
     expect(storeHas(PUBLIC_BUCKET, key)).toBe(false);
@@ -1024,7 +1795,13 @@ describe('deletion and the composite foreign key', () => {
     expect(deleted.body.data).toEqual({ deleted: [file.id], pending: [] });
     expect(await rowOf(file.id)).toBeNull();
     expect(storeHas(PRIVATE_BUCKET, key)).toBe(false);
-    expect(storeOps().map((op) => op.kind)).toEqual(['DeleteObjects']);
+    expect(storeOps().map((op) => op.kind)).toEqual([
+      'DeleteObjects',
+      'DeleteObjects',
+    ]);
+    expect(deletedBucketsFor(key)).toEqual(
+      [PRIVATE_BUCKET, PUBLIC_BUCKET].toSorted(byText)
+    );
     expect(await auditActions(file.id)).toContain('DELETE');
   });
 
@@ -1069,6 +1846,139 @@ describe('deletion and the composite foreign key', () => {
     expect(swept.removed).toBe(1);
     expect(await rowOf(file.id)).toBeNull();
     expect(storeHas(PRIVATE_BUCKET, key)).toBe(false);
+  });
+
+  /**
+   * Dropping a bucket from the environment drops neither the objects in it nor
+   * the rows that name it. `ENABLED_VISIBILITIES` is the set `finishDeleting`
+   * sweeps, so an unaddressed bucket would otherwise read as clean and the row -
+   * the last record of the key - would go while the object stayed stored, and in
+   * the public bucket, readable at its own URL.
+   */
+  test('a row naming a bucket this deployment cannot address is retained; its sibling still goes', async () => {
+    const folderId = await createFolder(admin(), 'Dropped public bucket');
+    const published = await upload(admin(), folderId, svgForm('published.svg'));
+    const kept = await upload(admin(), folderId, svgForm('kept.svg'));
+    const publicKey = await keyOf(published.id);
+    const privateKey = await keyOf(kept.id);
+    await transitionFile({
+      id: published.id,
+      to: 'public',
+      actor: actorOf(admin()),
+    });
+
+    let answer: Answer;
+    const restore = withoutBucket('public');
+    try {
+      answer = await call(admin(), 'DELETE', '/api/dash/media/files', {
+        ids: [published.id, kept.id],
+      });
+    } finally {
+      restore();
+    }
+
+    expect(answer.status).toBe(HTTP_STATUS.OK);
+    expect(answer.body.data).toEqual({
+      deleted: [kept.id],
+      pending: [published.id],
+    });
+    expect(await rowOf(published.id)).toMatchObject({ status: 'deleting' });
+    expect(storeHas(PUBLIC_BUCKET, publicKey)).toBe(true);
+    // The bucket that IS configured is still swept, so nothing waits on the one
+    // that is not.
+    expect(await rowOf(kept.id)).toBeNull();
+    expect(storeHas(PRIVATE_BUCKET, privateKey)).toBe(false);
+
+    // Configured again, the retention pass finishes what it refused to guess at.
+    const finished = await sweepFiles();
+    expect(finished.removed).toBeGreaterThanOrEqual(1);
+    expect(await rowOf(published.id)).toBeNull();
+    expect(storeHas(PUBLIC_BUCKET, publicKey)).toBe(false);
+  });
+
+  test('the retention pass makes the same judgement for a dropped private bucket', async () => {
+    const folderId = await createFolder(admin(), 'Dropped private bucket');
+    const file = await upload(admin(), folderId, svgForm('private-only.svg'));
+    const key = await keyOf(file.id);
+    // Phase A only. The route would finish the delete here, and the retention
+    // path is what this case is about.
+    await db
+      .update(files)
+      .set({ status: 'deleting' })
+      .where(eq(files.id, file.id));
+
+    let swept: Awaited<ReturnType<typeof sweepFiles>>;
+    const restore = withoutBucket('private');
+    try {
+      swept = await sweepFiles();
+    } finally {
+      restore();
+    }
+
+    expect(swept).toMatchObject({ degraded: true, hasMore: true });
+    expect(await rowOf(file.id)).toMatchObject({ status: 'deleting' });
+    expect(storeHas(PRIVATE_BUCKET, key)).toBe(true);
+
+    const finished = await sweepFiles();
+    expect(finished.removed).toBeGreaterThanOrEqual(1);
+    expect(await rowOf(file.id)).toBeNull();
+    expect(storeHas(PRIVATE_BUCKET, key)).toBe(false);
+  });
+
+  /**
+   * The purge is decided on the PUBLIC delete alone. Once the origin object is
+   * gone the edge copy is what stays readable, for the full
+   * `max-age=31536000`, and an unrelated private-bucket outage must not be what
+   * keeps it there - the row is retained for that outage either way.
+   */
+  test('a private-bucket failure retains the row and still purges the public origin it removed', async () => {
+    const folderId = await createFolder(admin(), 'Purge despite private');
+    const file = await upload(admin(), folderId, svgForm('cached.svg'));
+    const key = await keyOf(file.id);
+    await transitionFile({
+      id: file.id,
+      to: 'public',
+      actor: actorOf(admin()),
+    });
+
+    const realDeleteObjects = r2.deleteObjectsFromR2;
+    const purged: string[][] = [];
+    const deleteSpy = spyOn(r2, 'deleteObjectsFromR2').mockImplementation(
+      async (params) => {
+        if (params.bucketType === 'private')
+          throw new Error('private bucket unreachable');
+        return realDeleteObjects(params);
+      }
+    );
+    // Spied rather than configured: the tier leaves the Cloudflare pair unset,
+    // so the real `purgeUrls` is a no-op and could not tell the two outcomes
+    // apart.
+    const purgeSpy = spyOn(purge, 'purgeUrls').mockImplementation(
+      async (urls) => {
+        purged.push([...urls]);
+        return { attempted: urls.length, purged: urls.length, failed: [] };
+      }
+    );
+
+    let answer: Answer;
+    try {
+      answer = await call(admin(), 'DELETE', '/api/dash/media/files', {
+        ids: [file.id],
+      });
+    } finally {
+      deleteSpy.mockRestore();
+      purgeSpy.mockRestore();
+    }
+
+    expect(answer.status).toBe(HTTP_STATUS.OK);
+    expect(answer.body.data).toEqual({ deleted: [], pending: [file.id] });
+    expect(await rowOf(file.id)).toMatchObject({ status: 'deleting' });
+    expect(storeHas(PUBLIC_BUCKET, key)).toBe(false);
+    expect(purged).toEqual([[`${PUBLIC_URL}/${key}`]]);
+
+    const finished = await sweepFiles();
+    expect(finished.removed).toBeGreaterThanOrEqual(1);
+    expect(await rowOf(file.id)).toBeNull();
   });
 
   test('a missing id is 404 and nothing in the batch is touched', async () => {
@@ -1838,6 +2748,23 @@ async function until(
     await Bun.sleep(20);
   }
   throw new Error(`timed out waiting for ${label}`);
+}
+
+/**
+ * Runs the rest of the case as a deployment that no longer configures `bucket`,
+ * and hands back the restore. The membership of this set is what every consumer
+ * reads; the environment variable behind it is read once at module load.
+ */
+function withoutBucket(bucket: r2.BucketType): () => void {
+  const enabled = r2.ENABLED_VISIBILITIES as Set<r2.BucketType>;
+  const configured = [...enabled];
+  enabled.delete(bucket);
+  return () => {
+    // Rebuilt rather than re-added: the iteration order is the order
+    // `finishDeleting` sweeps the buckets in.
+    enabled.clear();
+    for (const entry of configured) enabled.add(entry);
+  };
 }
 
 /** Drops the recorded operations but keeps the objects — the objects ARE the fixture. */

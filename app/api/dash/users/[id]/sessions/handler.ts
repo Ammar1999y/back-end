@@ -10,7 +10,10 @@ import { roles, sessions, users } from '@/db/schema';
 import { validID } from '@/utils';
 import * as z from 'zod';
 import { auditLog, getAuditMeta } from '@/lib/audit';
-import { revokeSessionArtifacts } from '@/lib/auth/rotation';
+import {
+  revokeSessionArtifacts,
+  revokeTrustedDevices,
+} from '@/lib/auth/rotation';
 import { requirePermission } from '@/lib/http/session';
 import { validateRolePermissionScope } from '@/lib/permissions/utils';
 import { enforceRateLimit, userIdentifier } from '@/lib/rate-limit';
@@ -325,6 +328,20 @@ export const DELETE: Handler = async (ctx) => {
         tx,
         deleted.map((s) => s.id)
       );
+
+      // "Sign out everywhere" has to mean it. A trusted device is the ONE
+      // mechanism in this system that skips the second factor, it is keyed by
+      // its own cookie rather than by any session, and it outlives every
+      // session by design — so an operator containing a suspected compromise
+      // deleted the sessions and left the attacker able to sign back in with
+      // the password alone, past 2FA, on the device they were already using.
+      //
+      // Only on `revokeAll`. Ending named sessions is housekeeping — a stale
+      // laptop in the list — and un-remembering every device the user
+      // deliberately remembered is not what that asked for. Every DESTRUCTIVE
+      // 2FA state change already clears these (`revokeTwoFactorState`); this is
+      // the containment action joining them.
+      if (revokeAll) await revokeTrustedDevices(tx, targetId);
 
       if (deleted.length > 0) {
         await auditLog(tx, {

@@ -22,6 +22,7 @@ import {
   createShutdown,
   SHUTDOWN_POLICY,
   shutdownTimeoutMs,
+  stopServerGracefully,
 } from '@/lib/shutdown';
 
 const BUDGET_MS = 400;
@@ -537,5 +538,71 @@ describe('the runbook copy of the shutdown policy', () => {
       // is the only spelling allowed.
       expect(document).not.toMatch(/MAX_ROUTE_TIMEOUT_SECONDS\) \+ \d+\)/);
     }
+  });
+});
+
+describe('the graceful stop spends the budget it was handed, and no more', () => {
+  /**
+   * A virtual clock, so the assertions are about the ARITHMETIC rather than
+   * about how long a test is willing to wait. `sleep` advances it and records
+   * what was asked for; `stop()` never settles, which is the half-sent
+   * connection the escalation exists for.
+   */
+  function harness(input: { budgetMs: number; pendingRequests: number }) {
+    let clock = 0;
+    const waits: number[] = [];
+    const stops: (boolean | undefined)[] = [];
+    return {
+      waits,
+      stops,
+      elapsed: () => clock,
+      run: () =>
+        stopServerGracefully({
+          stop: (closeActiveConnections?: boolean) => {
+            stops.push(closeActiveConnections);
+            return closeActiveConnections === true
+              ? Promise.resolve()
+              : new Promise(() => {});
+          },
+          pendingRequests: () => input.pendingRequests,
+          budgetMs: input.budgetMs,
+          error: () => {},
+          graceMs: 5000,
+          now: () => clock,
+          sleep: (ms: number) => {
+            waits.push(ms);
+            clock += ms;
+            return Promise.resolve();
+          },
+        }),
+    };
+  }
+
+  test('a request in flight buys another interval, up to the budget', async () => {
+    const h = harness({ budgetMs: 20_000, pendingRequests: 1 });
+    await h.run();
+
+    expect(h.waits).toEqual([5000, 5000, 5000, 5000]);
+    expect(h.elapsed()).toBe(20_000);
+    expect(h.stops).toEqual([undefined, true]);
+  });
+
+  test('the last wait is clamped to what is left, never a whole interval past it', async () => {
+    // Unclamped, one second of budget bought a five-second sleep, and
+    // `createShutdown`'s forced-exit timer fired while this was still draining.
+    const h = harness({ budgetMs: 11_000, pendingRequests: 1 });
+    await h.run();
+
+    expect(h.waits).toEqual([5000, 5000, 1000]);
+    expect(h.elapsed()).toBe(11_000);
+    expect(h.elapsed()).toBeLessThanOrEqual(11_000);
+  });
+
+  test('nothing in flight escalates at the first interval', async () => {
+    const h = harness({ budgetMs: 20_000, pendingRequests: 0 });
+    await h.run();
+
+    expect(h.waits).toEqual([5000]);
+    expect(h.stops).toEqual([undefined, true]);
   });
 });

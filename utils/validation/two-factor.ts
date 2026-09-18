@@ -5,30 +5,20 @@
  * `ENABLED_TWO_FACTOR_METHODS`, so a disabled method's endpoints answer 404
  * rather than being merely hidden.
  */
-import type { OtpChannel } from './otp';
+import type { OtpChannel, TwoFactorMethod } from './enums';
 
 import * as z from 'zod';
 
 import { PHONE_ENABLED } from '../config';
+import { isPhoneChannel, OTP_CHANNELS, TWO_FACTOR_METHODS } from './enums';
 import { parseEnvEnumList } from './env-list';
 import {
   CHANNEL_CREDENTIALS,
   EMAIL_OTP_AVAILABLE,
-  isPhoneChannel,
-  OTP_CHANNELS,
   otpCodeSchema,
   PHONE_OTP_AVAILABLE,
 } from './otp';
 import { idSchema, reauthPasswordSchema } from './rules';
-
-export const TWO_FACTOR_METHODS = [
-  'totp',
-  'otp',
-  'backup_code',
-  'passkey',
-] as const;
-
-export type TwoFactorMethod = (typeof TWO_FACTOR_METHODS)[number];
 
 const METHODS_VAR = 'NEXT_PUBLIC_ENABLED_2FA_METHODS';
 const CHANNELS_VAR = 'NEXT_PUBLIC_ENABLED_2FA_OTP_CHANNELS';
@@ -200,6 +190,31 @@ export const twoFactorPasswordSchema = z.object({
 });
 
 export const twoFactorTotpConfirmSchema = z.object({ code: otpCodeSchema });
+
+/**
+ * Which SET of backup codes is being acknowledged.
+ *
+ * Required, and that is the whole point: without it the acknowledgement lands on
+ * whichever set is current, which enables the method and revokes every other
+ * session for ten codes the user never saw. The value comes back from `POST
+ * /two-factor/generate-backup-codes` beside the codes it names, so a client
+ * always holds the one for the set it displayed.
+ */
+export const twoFactorBackupAcknowledgeSchema = z.object({
+  setId: idSchema,
+});
+
+/**
+ * What the endpoint actually accepts, and therefore what the document publishes.
+ *
+ * The handler parses `setId` alone — the password is read and proven by
+ * `requireReauthPassword`, as it is on every sibling that takes one, so putting
+ * it through this schema would answer 422 for a stored credential that no longer
+ * satisfies the current policy. The published body must still carry both, or a
+ * generated client sends a request the server refuses.
+ */
+export const twoFactorBackupAcknowledgeBodySchema =
+  twoFactorPasswordSchema.extend(twoFactorBackupAcknowledgeSchema.shape);
 
 /**
  * Names ONE enrolment: `contactKind` distinguishes a user's two OTP rows.

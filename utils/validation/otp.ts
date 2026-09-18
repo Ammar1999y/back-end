@@ -1,59 +1,30 @@
+import type { OtpChannel } from './enums';
+
 import * as z from 'zod';
 
 import { OTP_AUTO_VERIFY, PHONE_ENABLED } from '../config';
 import { OTP_CODE_LENGTH } from './constants';
+import {
+  EMAIL_OTP_CHANNELS,
+  isPhoneChannel,
+  OTP_CHANNELS,
+  PHONE_OTP_CHANNELS,
+} from './enums';
 import { parseEnvEnumList } from './env-list';
 import {
   emailSchema,
   passwordSchema,
   phoneSchema,
   sanitizeStrictSingleLine,
+  STRICT_SINGLE_LINE_DESCRIPTION,
 } from './rules';
-
-// The email/phone split is declared HERE and nowhere else: `isPhoneChannel`,
-// the per-contact quota grouping, the phone-only schemas and the availability
-// flags all derive from these two lists. `OTP_CHANNELS` is the concatenation,
-// so its order — which the `otp_channel` pgEnum depends on — stays stable.
-// ⚠️ Changing these requires a DB migration (otp_channel pgEnum).
-const EMAIL_OTP_CHANNELS = ['email'] as const;
-export const PHONE_OTP_CHANNELS = ['sms', 'whatsapp'] as const;
-export const OTP_CHANNELS = [
-  ...EMAIL_OTP_CHANNELS,
-  ...PHONE_OTP_CHANNELS,
-] as const;
-
-export type OtpChannel = (typeof OTP_CHANNELS)[number];
-export type PhoneOtpChannel = (typeof PHONE_OTP_CHANNELS)[number];
-
-// Every verification session is purpose-bound so a proof cannot authorize a
-// different action. All values are wired except the reserved 'change_password'.
-// ⚠️ Changing this list requires a DB migration (otp_purpose pgEnum).
-export const OTP_PURPOSES = [
-  'verify_contact',
-  'passwordless_login',
-  'forgot_password',
-  'change_password',
-  'change_email',
-  'change_phone',
-  'two_factor',
-] as const;
-export type OtpPurpose = (typeof OTP_PURPOSES)[number];
-
-const PHONE_CHANNEL_SET = new Set<OtpChannel>(PHONE_OTP_CHANNELS);
-
-/**
- * sms and whatsapp reach the same destination and cost the same, so every
- * per-contact quota and block must treat them as one.
- */
-export const isPhoneChannel = (c: OtpChannel): c is PhoneOtpChannel =>
-  PHONE_CHANNEL_SET.has(c);
 
 /**
  * The credentials each channel's provider needs, and it is a startup
  * requirement rather than a runtime one.
  *
- * Names live here, beside the channel list, because this module is the single
- * place that answers "is this OTP configuration coherent?" — `lib/env.server.ts`
+ * Names live here because this module is the single place that answers "is
+ * this OTP configuration coherent?" — `lib/env.server.ts`
  * is the natural home for a required-variable list, but importing this module
  * there would pull jsdom and DOMPurify into the startup gate. The variables
  * themselves are read in `utils/otp.ts`.
@@ -222,6 +193,25 @@ export const otpCodeSchema = z.preprocess(
     .string('رمز التحقق مطلوب')
     .length(OTP_CODE_LENGTH, `رمز التحقق يجب أن يكون ${OTP_CODE_LENGTH} أرقام`)
     .regex(/^[0-9]+$/, 'رمز التحقق يجب أن يحتوي على أرقام فقط')
+    // The one sanitized leaf whose rule a raw-input `pattern` can carry, so it
+    // does: `length()` publishes an exact 6 that refuses the pasted ` 123456 `
+    // this schema trims and accepts — the common shape for a code copied out of
+    // a message.
+    //
+    // ⚠️ The separator class is "not a digit", not whitespace. The sanitizer
+    // removes every character outside its allow-list, and a zero-width space
+    // (U+200B, which `\s` does not match) is exactly the kind a rich-text copy
+    // leaves behind: `12\u200B3456` is accepted as `123456`. The pattern is
+    // therefore laxer than the schema — it also admits separators the sanitizer
+    // KEEPS, like `12.3456`, which the digits-only check then refuses — and that
+    // is the direction to err in, because only the other one refuses a request
+    // the server would have answered.
+    .meta({
+      minLength: undefined,
+      maxLength: undefined,
+      pattern: `^[^0-9]*(?:[0-9][^0-9]*){${OTP_CODE_LENGTH}}$`,
+      description: STRICT_SINGLE_LINE_DESCRIPTION,
+    })
 );
 
 const codeSchema = otpCodeSchema;

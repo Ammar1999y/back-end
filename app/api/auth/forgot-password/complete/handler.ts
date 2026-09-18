@@ -1,6 +1,6 @@
 import type { RecoveryVerdict } from '@/lib/auth/recovery-second-factor';
 import type { Handler } from '@/lib/http/contract';
-import type { OtpChannel } from '@/utils/validation/otp';
+import type { OtpChannel } from '@/utils/validation/enums';
 
 import { and, eq, isNull } from 'drizzle-orm';
 

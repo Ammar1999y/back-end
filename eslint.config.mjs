@@ -96,6 +96,8 @@ const eslintConfig = [
       'unicorn/no-for-each': 'off',
       'unicorn/no-negated-array-predicate': 'off',
       'unicorn/no-computed-property-existence-check': 'off',
+      'unicorn/prefer-ternary': 'off',
+      'unicorn/prefer-early-return': 'off',
 
       // Schema and action values follow the same verb-based naming as handlers.
       'unicorn/no-non-function-verb-prefix': 'off',
@@ -110,6 +112,10 @@ const eslintConfig = [
       // `--fail` no caller passed. One gate, in the one command CI and pre-push
       // already run.
       '@typescript-eslint/no-non-null-assertion': 'error',
+      '@typescript-eslint/no-extra-non-null-assertion': 'error',
+      '@typescript-eslint/no-non-null-asserted-optional-chain': 'error',
+      '@typescript-eslint/no-non-null-asserted-nullish-coalescing': 'error',
+      '@typescript-eslint/no-confusing-non-null-assertion': 'error',
 
       // A server-only codebase. `tsconfig`'s `lib` still includes DOM (and
       // importing jsdom reintroduces it whatever `lib` says), and

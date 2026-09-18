@@ -62,10 +62,13 @@ export interface StoreFailureLog {
  * six static values (`preauth.auth.forgot-password`, `preauth.auth.passwordless`,
  * `preauth.dash.{permissions,roles,users}`, `preauth.upload.image`); dynamic path
  * segments never survive `preAuthScope`'s two-segment slice, and no scope
- * contains a colon. There is deliberately no runtime validation here, because no
- * reachable path needs one — and the counts above are no longer maintained by
- * hand: `tests/unit/rate-limit-log-boundary.test.ts` derives the set from
- * `ROUTES` and asserts the property over every member.
+ * contains a colon. The Better Auth wildcard adds `allowlistedPathScope` on top
+ * of that, which keeps the WHOLE sub-path — bounded because it only runs after
+ * the path matched `BETTER_AUTH_ENDPOINTS`, a compile-time list. There is
+ * deliberately no runtime validation here, because no reachable path needs one —
+ * and the counts above are no longer maintained by hand:
+ * `tests/unit/rate-limit-log-boundary.test.ts` derives the set from `ROUTES` and
+ * asserts the property over every member.
  *
  * There is no `attempt` field any more: the retry loop it counted was shaped for
  * transient HTTP failures. A local store failure means a broken disk or schema,

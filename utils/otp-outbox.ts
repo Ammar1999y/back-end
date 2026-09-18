@@ -5,7 +5,7 @@
  * back, and nowhere else. `utils/validation/otp.ts` refuses the mode in
  * production, so nothing in this file can run there.
  */
-import type { OtpChannel, OtpPurpose } from './validation/otp';
+import type { OtpChannel, OtpPurpose } from './validation/enums';
 
 export interface OutboxDelivery {
   channel: OtpChannel;

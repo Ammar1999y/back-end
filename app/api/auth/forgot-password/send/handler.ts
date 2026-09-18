@@ -21,13 +21,13 @@ import {
   requireJsonBody,
 } from '@/utils/api-response';
 import { CustomError } from '@/utils/error-class';
-import { processOtpSend } from '@/utils/otp';
+import { OTP_BASE_RESEND_DELAY_S, processOtpSend } from '@/utils/otp';
 import { OTP_ENABLED, sendOtpSchema } from '@/utils/validation/otp';
 
 import { ensureMinDelay, otpMsg } from '../../otp/messages';
 
 // Same privacy-preserving generic payload as otp/send.
-const GENERIC_SEND_DATA = { nextAllowedIn: 30 };
+const GENERIC_SEND_DATA = { nextAllowedIn: OTP_BASE_RESEND_DELAY_S };
 
 /**
  * Forgot-password step 1: send a code (purpose=forgot_password) to whichever

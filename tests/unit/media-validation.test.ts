@@ -6,6 +6,8 @@
  */
 import { describe, expect, test } from 'bun:test';
 
+import * as z from 'zod';
+
 import {
   FOLDER_NAME_MAX,
   IDS_ARRAY_MAX,
@@ -139,4 +141,89 @@ describe('the bodies', () => {
       deleteFilesSchema.safeParse({ ids: [ID], extra: true }).success
     ).toBe(false);
   });
+});
+
+/**
+ * The published `pattern` is compiled by CONSUMERS, on their own thread, against
+ * whatever a caller typed. Its cost is therefore part of the contract in a way
+ * the runtime schema's is not — the server never runs it.
+ */
+describe('the published name pattern', () => {
+  const patternOf = (schema: z.core.$ZodType) => {
+    const emitted = z.toJSONSchema(schema, {
+      io: 'input',
+      unrepresentable: 'any',
+    }) as { pattern?: string };
+    if (!emitted.pattern) throw new Error('no pattern emitted');
+    return emitted.pattern;
+  };
+
+  const SCHEMAS = [
+    ['folder', folderNameSchema],
+    ['display', displayNameSchema],
+  ] as const;
+
+  test.each(SCHEMAS)(
+    '%s: refuses a long run of whitespace without backtracking over it',
+    (name, schema) => {
+      /* eslint-disable-next-line security/detect-non-literal-regexp -- the
+         schema's own published pattern, which is the thing under test */
+      const compiled = new RegExp(patternOf(schema));
+      const spaces = ' '.repeat(64_000);
+      const started = Bun.nanoseconds();
+      expect(compiled.test(spaces)).toBe(false);
+      const ms = (Bun.nanoseconds() - started) / 1e6;
+
+      // The shape this replaced re-scanned the same suffix from every position
+      // and took ~4.3 s here; this one takes ~0.1 ms. The ceiling is loose
+      // enough that a loaded worker cannot fail it and tight enough that the
+      // quadratic shape cannot pass it.
+      expect([name, ms < 1000]).toEqual([name, true]);
+    }
+  );
+
+  test.each(SCHEMAS)(
+    '%s: admits every value the schema accepts, over each discriminating shape',
+    (name, schema) => {
+      /* eslint-disable-next-line security/detect-non-literal-regexp -- as above */
+      const compiled = new RegExp(patternOf(schema));
+      // One representative of every class the pattern distinguishes: allowed
+      // characters, ASCII space and the other whitespace forms, the refused
+      // separators, the dot names, a combining sequence, and the control
+      // characters at both ends of the excluded ranges.
+      const alphabet = [
+        'a',
+        '9',
+        ' ',
+        '\t',
+        '\n',
+        '/',
+        '\\',
+        '.',
+        'e\u{0301}',
+        '\u{0000}',
+        '\u{007F}',
+        '\u{00A0}',
+      ];
+      const seen: string[] = [];
+      const build = (depth: number, prefix: string) => {
+        if (depth === 0) {
+          seen.push(prefix);
+          return;
+        }
+        for (const character of alphabet) build(depth - 1, prefix + character);
+      };
+      for (let depth = 0; depth <= 3; depth++) build(depth, '');
+
+      // Only where the runtime ACCEPTS. The pattern is deliberately laxer (it
+      // cannot express `\p{Cf}`), so a value it admits and the server refuses is
+      // the tolerated direction; one it refuses and the server accepts is the
+      // defect.
+      const refusedButAccepted = seen.filter(
+        (value) => z.safeParse(schema, value).success && !compiled.test(value)
+      );
+      expect([name, refusedButAccepted]).toEqual([name, []]);
+      expect(seen.length).toBeGreaterThan(1000);
+    }
+  );
 });

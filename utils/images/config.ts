@@ -37,7 +37,11 @@ export type SanitizeResult =
       isValid: false;
       cleanedSvg: '';
       errors: string[];
-      reason?: 'animated' | 'edge-too-long' | 'too-many-pixels';
+      reason?:
+        | 'animated'
+        | 'edge-too-long'
+        | 'invalid-inline-raster'
+        | 'too-many-pixels';
     };
 
 export const SVG_MAX_ELEMENTS = 500;

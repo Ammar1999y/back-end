@@ -96,6 +96,21 @@ function returnURL(input: string | undefined) {
   }
 }
 
+/**
+ * Everything `POST /oauth/google/callback` may hand to `GET /oauth/result`.
+ *
+ * A closed union, and validated on the way OUT rather than trusted: the value
+ * round-trips through a `verification` row as JSON, so this is the boundary that
+ * decides the endpoint's contract. Each branch is LOOSE so the fields its
+ * envelope carries beyond the discriminator — the session body's user, the
+ * challenge's options — survive without being restated here, where they would
+ * be a second copy of two shapes owned elsewhere.
+ */
+const oauthResultSchema = z.union([
+  z.looseObject({ success: z.literal(true) }),
+  z.looseObject({ twoFactorRedirect: z.literal(true) }),
+]);
+
 async function completeResponse(
   ctx: AuthContext,
   body: object,
@@ -435,16 +450,16 @@ export const oauth = () =>
                 `oauth-result-${token}`
               );
             if (!owner || !result) throw authenticationDenied();
-            const body: unknown = JSON.parse(result.value);
-            if (
-              !body ||
-              typeof body !== 'object' ||
-              Array.isArray(body) ||
-              !('success' in body) ||
-              body.success !== true
-            )
-              throw authenticationDenied();
-            return ctx.json(body);
+            const parsed = oauthResultSchema.safeParse(
+              JSON.parse(result.value)
+            );
+            // Both records were consumed above, so a rejection here is
+            // unrecoverable — the user cannot retry, only sign in again. Every
+            // envelope the callback can store has to be a branch of the union,
+            // including the two-factor challenge, which carries
+            // `twoFactorRedirect` and no `success`.
+            if (!parsed.success) throw authenticationDenied();
+            return ctx.json(parsed.data);
           }
         ),
       }),

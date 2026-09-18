@@ -12,7 +12,7 @@ import { eq } from 'drizzle-orm';
 
 import { app } from '@/app';
 import { db } from '@/db';
-import { trustedDevices, twoFactorCredentials } from '@/db/schema';
+import { sessions, trustedDevices, twoFactorCredentials } from '@/db/schema';
 import { symmetricDecrypt } from 'better-auth/crypto';
 import { auth } from '@/lib/auth';
 import { PUBLIC_ORIGIN } from '@/lib/env';
@@ -21,7 +21,12 @@ import { HTTP_STATUS } from '@/utils/api-messages';
 
 import { resetTables } from '../helpers/database';
 import { scriptEgress } from '../helpers/egress';
-import { baseHeaders, mergeCookies, seedUser } from '../helpers/session';
+import {
+  baseHeaders,
+  mergeCookies,
+  seedUser,
+  signedInUser,
+} from '../helpers/session';
 import { resetSqliteStores } from '../helpers/sqlite';
 
 const TURNSTILE_HOST = 'challenges.cloudflare.com';
@@ -183,13 +188,14 @@ async function enrolTotp(
     );
     if (generated.status !== HTTP_STATUS.OK)
       throw new Error(`generate-backup-codes returned ${generated.status}`);
-    backupCodes =
-      ((await generated.json()) as { data?: { backupCodes?: string[] } }).data
-        ?.backupCodes ?? [];
+    const generatedSet = (await generated.json()) as {
+      data?: { backupCodes?: string[]; setId?: string };
+    };
+    backupCodes = generatedSet.data?.backupCodes ?? [];
     const acknowledged = await request(
       'POST',
       '/api/auth/two-factor/backup-codes/acknowledge',
-      { password: user.password },
+      { password: user.password, setId: generatedSet.data?.setId },
       first.cookie,
       ip
     );
@@ -498,5 +504,108 @@ describe('the skip, and taking it away', () => {
       .from(trustedDevices)
       .where(eq(trustedDevices.id, victim?.id ?? ''));
     expect(survivor).toBeDefined();
+  });
+});
+
+/**
+ * Containment. `DELETE /api/dash/users/:id/sessions` with `revokeAll` is the
+ * non-destructive action an operator reaches for on suspicious activity, and
+ * a trusted device is the only thing in this system that skips the second
+ * factor — keyed by its own cookie, outliving every session by design. Ending
+ * the sessions and leaving the devices contained nothing: the password holder
+ * signed straight back in, past 2FA, on the device they were already using.
+ */
+describe('bulk session revocation and the second-factor skip', () => {
+  test('revokeAll takes the trusted devices with it', async () => {
+    const owner = await seedUser();
+    const enrolled = await enrolTotp(owner);
+    const granted = await request(
+      'POST',
+      '/api/auth/two-factor/trust-device',
+      {},
+      enrolled.jar
+    );
+    expect(granted.status).toBe(HTTP_STATUS.OK);
+    expect(
+      await db
+        .select({ id: trustedDevices.id })
+        .from(trustedDevices)
+        .where(eq(trustedDevices.userId, owner.userId))
+    ).toHaveLength(1);
+
+    // Full grant: `assertTargetReachable` refuses a target whose role carries
+    // permissions the actor does not hold, which would be a 404 for a reason
+    // this case is not about.
+    const operator = await signedInUser();
+    const revoked = await request(
+      'POST',
+      `/api/dash/users/${owner.userId}/sessions`,
+      { revokeAll: true },
+      operator.cookie
+    );
+    // The route is DELETE; `request` only speaks GET/POST, so go direct.
+    expect(revoked.status).toBe(HTTP_STATUS.METHOD_NOT_ALLOWED);
+
+    const deleted = await app.handle(
+      new Request(`http://localhost/api/dash/users/${owner.userId}/sessions`, {
+        method: 'DELETE',
+        headers: baseHeaders({
+          'content-type': 'application/json',
+          origin: PUBLIC_ORIGIN,
+          cookie: operator.cookie,
+        }),
+        body: JSON.stringify({ revokeAll: true }),
+      })
+    );
+    expect(deleted.status).toBe(HTTP_STATUS.OK);
+
+    expect(
+      await db
+        .select({ id: trustedDevices.id })
+        .from(trustedDevices)
+        .where(eq(trustedDevices.userId, owner.userId))
+    ).toHaveLength(0);
+  });
+
+  test('revoking NAMED sessions leaves them, because that is housekeeping', async () => {
+    const owner = await seedUser();
+    const enrolled = await enrolTotp(owner);
+    const granted = await request(
+      'POST',
+      '/api/auth/two-factor/trust-device',
+      {},
+      enrolled.jar
+    );
+    expect(granted.status).toBe(HTTP_STATUS.OK);
+
+    const [live] = await db
+      .select({ id: sessions.id })
+      .from(sessions)
+      .where(eq(sessions.userId, owner.userId));
+    expect(live).toBeDefined();
+
+    // Full grant: `assertTargetReachable` refuses a target whose role carries
+    // permissions the actor does not hold, which would be a 404 for a reason
+    // this case is not about.
+    const operator = await signedInUser();
+    const deleted = await app.handle(
+      new Request(`http://localhost/api/dash/users/${owner.userId}/sessions`, {
+        method: 'DELETE',
+        headers: baseHeaders({
+          'content-type': 'application/json',
+          origin: PUBLIC_ORIGIN,
+          cookie: operator.cookie,
+        }),
+        body: JSON.stringify({ sessionIds: [live?.id] }),
+      })
+    );
+    expect(deleted.status).toBe(HTTP_STATUS.OK);
+
+    expect(
+      await db
+        .select({ id: trustedDevices.id })
+        .from(trustedDevices)
+        .where(eq(trustedDevices.userId, owner.userId))
+    ).toHaveLength(1);
   });
 });

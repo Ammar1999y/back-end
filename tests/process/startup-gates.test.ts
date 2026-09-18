@@ -269,6 +269,23 @@ describe('the production environment gate refuses a missing variable', () => {
     expect(outcome.output).toInclude('R2_PUBLIC_URL');
   }, 60_000);
 
+  test('a public origin without the purge pair boots, but says so', async () => {
+    // NOT a refusal: an uncached public origin needs no purge and the
+    // configuration cannot distinguish the two. But the combination is the one
+    // where unpublish removes the origin object, answers 200, and leaves the
+    // edge serving the bytes for the full `max-age=31536000` — so the operator
+    // has to be told, at boot, rather than discovering it from a privacy
+    // complaint. Booted with `expectListen` because it must NOT exit.
+    const env = productionEnv(tempSqliteDir());
+    delete env.CLOUDFLARE_ZONE_ID;
+    delete env.CLOUDFLARE_CACHE_PURGE_TOKEN;
+
+    const outcome = await bootWith(env, { expectListen: true });
+
+    expect(outcome.output).toInclude('media.cache-purge is not configured');
+    expect(outcome.output).toInclude('server started');
+  }, 60_000);
+
   test('the Better Auth default secret fails the boot', async () => {
     const outcome = await bootWith({
       ...productionEnv(tempSqliteDir()),

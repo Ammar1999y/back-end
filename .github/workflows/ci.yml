@@ -64,6 +64,14 @@ jobs:
         # `tests/unit/harness-layout.test.ts` close it from both ends — the
         # latter fails if any file under `tests/` is in no tier.
         run: bun run test
+      - name: Schema drift
+        # Migration generation is manual, and nothing else here notices that it
+        # was skipped: a CHECK constraint, column width, FK action or enum label
+        # raised in `db/schema.ts` alone typechecks and lints, and the test
+        # template is migrated from `db/drizzle/` rather than from the schema —
+        # so it enforces the OLD rule, exactly as a deployed database will.
+        # Needs no service container: `drizzle-kit generate` never connects.
+        run: bun run check:schema-drift
       - name: Unreachable files and unregistered handlers
         # This scanner checks handler registration; Knip below covers files under
         # `tests/`, which this import graph treats as entry points.

@@ -6,7 +6,11 @@
 import { existsSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import type { Handler } from './contract';
-import type { HttpMethod, RouteManifestEntry } from './route-manifest';
+import type {
+  HttpMethod,
+  RouteManifestEntry,
+  RoutePrefixPath,
+} from './route-manifest';
 
 import { deleteSessionsSchema } from '@/app/api/dash/users/[id]/sessions/handler';
 import { SESSION_CURSOR_PATTERN } from '@/app/api/dash/users/[id]/sessions/pagination';
@@ -24,6 +28,7 @@ import {
 } from '@/lib/auth/allowed-paths';
 import { googleStartSchema } from '@/lib/auth/oauth';
 import { reauthPasskeySchema } from '@/lib/auth/reauth';
+import { TWO_FACTOR_COOKIE_NAME } from '@/lib/auth/two-factor-challenge';
 import { CAPTCHA_TOKEN_MAX_LENGTH } from '@/lib/captcha';
 import {
   ALLOWED_MIME_TYPES,
@@ -37,6 +42,7 @@ import {
 
 import { apiRaw } from '@/utils/api-response';
 import { PHONE_ENABLED, PHONE_REQUIRED } from '@/utils/config';
+import { OTP_BASE_RESEND_DELAY_S } from '@/utils/otp';
 import {
   adminReauthSchema,
   adminUpdateUserBodySchema,
@@ -79,6 +85,7 @@ import {
 } from '@/utils/validation/permissions';
 import {
   ownedRowSchema,
+  twoFactorBackupAcknowledgeBodySchema,
   twoFactorMethodDisableSchema,
   twoFactorMethodOptionSchema,
   twoFactorOtpSendSchema,
@@ -96,6 +103,36 @@ type JsonSchema = Record<string, unknown>;
 
 const BETTER_AUTH_OPENAPI = await auth.api.generateOpenAPISchema();
 const BETTER_AUTH_CONTEXT = await auth.$context;
+
+/** The cookie as the library actually names it — prefix, and `__Secure-` where it applies. */
+const TWO_FACTOR_CHALLENGE_COOKIE_NAME = BETTER_AUTH_CONTEXT.createAuthCookie(
+  TWO_FACTOR_COOKIE_NAME
+).name;
+
+/**
+ * What each declared credential publishes, in one place so the kinds cannot be
+ * spelled differently at two call sites. A list with several entries is an
+ * either/or, which is how `optional` publishes "with or without a cookie".
+ *
+ * The challenge cookie gets a scheme of its own rather than reusing the session
+ * one: the operations that complete a sign-in answer 401 without it, so
+ * publishing them as anonymous made a generated non-browser client omit it for
+ * the whole second step, and publishing `sessionCookie` would name a cookie they
+ * do not read.
+ */
+const SECURITY_FOR_SESSION: Record<
+  RoutePrefixPath['session'],
+  readonly JsonSchema[]
+> = {
+  session: [{ sessionCookie: [] }],
+  optional: [{}, { sessionCookie: [] }],
+  challenge: [{ twoFactorChallengeCookie: [] }],
+  'session-or-challenge': [
+    { sessionCookie: [] },
+    { twoFactorChallengeCookie: [] },
+  ],
+  none: [],
+};
 
 /**
  * Request bodies, keyed by `METHOD path` exactly as the manifest spells them.
@@ -523,7 +560,7 @@ const BETTER_AUTH_BODIES: Record<string, z.ZodType> = {
   '/two-factor/totp/start': twoFactorPasswordSchema,
   '/two-factor/totp/confirm': twoFactorTotpConfirmSchema,
   '/two-factor/generate-backup-codes': twoFactorPasswordSchema,
-  '/two-factor/backup-codes/acknowledge': twoFactorPasswordSchema,
+  '/two-factor/backup-codes/acknowledge': twoFactorBackupAcknowledgeBodySchema,
   '/two-factor/passkey/grant': twoFactorPasswordSchema,
   '/two-factor/otp/send': twoFactorOtpSendSchema,
   '/two-factor/otp/verify': twoFactorOtpVerifySchema,
@@ -853,6 +890,32 @@ function requireContactKindForOtp(schema: JsonSchema): JsonSchema {
   };
 }
 
+/**
+ * The `.refine` that makes an EMPTY body invalid, which the converter drops.
+ *
+ * Both update bodies have every property optional and refuse `{}` at runtime,
+ * so the document published a request that deterministically answers 422.
+ * `anyOf` rather than `minProperties`, because `additionalProperties: false` is
+ * already set: naming the keys says which ones count.
+ */
+function requireAtLeastOneProperty(schema: JsonSchema): JsonSchema {
+  if (!isJsonSchema(schema.properties)) return schema;
+  const names = Object.keys(schema.properties);
+  if (names.length === 0) return schema;
+  return {
+    ...schema,
+    anyOf: names.map((name) => ({ required: [name] })),
+    description:
+      `${String(schema.description ?? '')} At least one property must be present; an empty object is rejected.`.trim(),
+  };
+}
+
+/** The routes whose body is a partial update that must not be empty. */
+const NON_EMPTY_UPDATE_ROUTES = new Set([
+  'PUT /api/dash/media/folders/:id',
+  'PUT /api/dash/media/files/:id',
+]);
+
 function applyRequestContractRules(
   key: string | undefined,
   schema: JsonSchema,
@@ -866,6 +929,8 @@ function applyRequestContractRules(
     result = restrictToEnabledChannels(result);
   if (key !== undefined && OTP_CONTACT_KIND_ROUTES.has(key))
     result = requireContactKindForOtp(result);
+  if (key !== undefined && NON_EMPTY_UPDATE_ROUTES.has(key))
+    result = requireAtLeastOneProperty(result);
   return result;
 }
 
@@ -1054,7 +1119,29 @@ const CREATED_ID_SCHEMA: JsonSchema = {
 };
 const OTP_SENT_SCHEMA: JsonSchema = {
   type: 'object',
-  properties: { nextAllowedIn: { const: 30 } },
+  // A `const`, and it has to stay one: the ANONYMOUS surfaces answer identically
+  // for a real and an invented identifier, so the value cannot vary with the
+  // row. Read from the ladder rather than written out, so the document cannot
+  // publish a delay the server does not enforce. Only the purposes in
+  // `FLAT_RESEND_PURPOSES` qualify — a surface that returns its row's own
+  // countdown gets `OTP_LADDER_SENT_SCHEMA` below.
+  properties: { nextAllowedIn: { const: OTP_BASE_RESEND_DELAY_S } },
+  required: ['nextAllowedIn'],
+  additionalProperties: false,
+};
+/**
+ * The surfaces that reach a caller who already proved something — a session or a
+ * recovery grant — and therefore return the row's real exponential delay.
+ *
+ * `lib/auth/two-factor-otp.ts` publishes the same shape for `/two-factor/otp/send`
+ * through Better Auth's own metadata; this is the entry for the recovery second
+ * factor, which is served by this application.
+ */
+const OTP_LADDER_SENT_SCHEMA: JsonSchema = {
+  type: 'object',
+  properties: {
+    nextAllowedIn: { type: 'integer', minimum: OTP_BASE_RESEND_DELAY_S },
+  },
   required: ['nextAllowedIn'],
   additionalProperties: false,
 };
@@ -1416,23 +1503,46 @@ const MEDIA_FILE_DETAILS_SCHEMA: JsonSchema = {
  * these schemas are BUILT from another's properties, and a `$ref` cannot be
  * spread — so what is shared is the published form, not the definition.
  */
-const COMPONENT_SCHEMAS: Record<string, JsonSchema> = {
+const COMPONENT_SCHEMAS = {
   MediaFile: MEDIA_FILE_SCHEMA,
   MediaFileDetails: MEDIA_FILE_DETAILS_SCHEMA,
   MediaFolder: MEDIA_FOLDER_SCHEMA,
   MediaFolderHit: MEDIA_FOLDER_HIT_SCHEMA,
   MediaUsage: MEDIA_USAGE_SCHEMA,
   ErrorEnvelope: ERROR_ENVELOPE_SCHEMA,
-};
+  // `satisfies`, not an annotation: `Record<string, JsonSchema>` widens `keyof`
+  // to `string`, and `componentRef` then accepts any name at all — which is how
+  // a reference to a schema this object does not define passed the build.
+} satisfies Record<string, JsonSchema>;
 
-/** A reference to one of the above. The name is checked at build time. */
+/** A reference to one of the above, checked at build time. */
 function componentRef(name: keyof typeof COMPONENT_SCHEMAS): JsonSchema {
+  return { $ref: `#/components/schemas/${name}` };
+}
+
+/**
+ * A reference to a schema BETTER AUTH's document defines, which this one merges
+ * in through `referencedBetterAuthSchemas`.
+ *
+ * Checked at load rather than by the type system: the name belongs to the
+ * library, so a rename in an upgrade is what this has to catch, and no type can
+ * see it. Fail-closed like `assertConsistent` below — `routes.ts` imports this
+ * module, so the refusal is a boot refusal, which is the same answer this file
+ * already gives to a document that disagrees with the route table.
+ */
+function libraryComponentRef(name: string): JsonSchema {
+  const schemas = BETTER_AUTH_OPENAPI.components.schemas;
+  if (!isJsonSchema(schemas) || !(name in schemas))
+    throw new Error(
+      `Better Auth's generated document no longer defines components.schemas '${name}'; ` +
+        'every $ref this file emits for it would resolve to nothing.'
+    );
   return { $ref: `#/components/schemas/${name}` };
 }
 
 const SUCCESS_DATA_SCHEMAS: Record<string, JsonSchema> = {
   'POST /api/auth/forgot-password/reset': RESET_OUTCOME_SCHEMA,
-  'POST /api/auth/forgot-password/second-factor/send': OTP_SENT_SCHEMA,
+  'POST /api/auth/forgot-password/second-factor/send': OTP_LADDER_SENT_SCHEMA,
   'POST /api/auth/forgot-password/complete': {
     type: 'object',
     properties: { reset: { const: true } },
@@ -1921,9 +2031,12 @@ const BETTER_AUTH_PATH_STATUSES: Record<
   '/two-factor/methods/disable': ['401', '403', '404', '409', '422'],
   '/two-factor/methods/default': ['401', '403', '404', '422'],
   '/two-factor/passkey/grant': ['401', '403', '404', '422'],
-  '/two-factor/backup-codes/acknowledge': ['401', '403', '422'],
+  // 409 is the refusal to acknowledge a set another tab has already replaced.
+  '/two-factor/backup-codes/acknowledge': ['401', '403', '409', '422'],
   '/passkey/generate-register-options': ['401'],
-  '/passkey/verify-registration': ['400', '401', '403', '422'],
+  // 409 is a credential deleted between the library's write and the enrolment
+  // hook, which leaves nothing to offer as a factor.
+  '/passkey/verify-registration': ['400', '401', '403', '409', '422'],
   '/passkey/list-user-passkeys': ['401'],
   // 404 is a passkey that is not the caller's; 409 the last-method refusal.
   '/passkey/delete-passkey': ['400', '401', '403', '404', '409', '422'],
@@ -2083,6 +2196,94 @@ function withTwoFactorChallengeBranch(response: unknown): JsonSchema {
   };
 }
 
+/**
+ * What a path's 200 actually is, where the library's generated document is
+ * wrong about it.
+ *
+ * The parallel of `BETTER_AUTH_BODIES`, and needed for the same reason: the
+ * generated contract describes the plugin's INTENDED shapes, not the ones these
+ * handlers return. Both verifiers answer through the shared `valid()` in
+ * `better-auth/plugins/two-factor/verify-two-factor.mjs`, which returns
+ * `{ token, user }` — while the document published `{ status: boolean }` for
+ * one and a required `{ user, session }` for the other. A generated client read
+ * an absent `status`, and a response validator rejected every successful
+ * backup-code sign-in.
+ *
+ * ⚠️ Every served success response must be either overridden here or listed in
+ * `BETTER_AUTH_TRUSTED_RESPONSES` — `tests/unit/openapi-contract.test.ts`
+ * refuses a path in neither, so a new endpoint cannot inherit an unexamined
+ * shape.
+ */
+const VERIFIER_SESSION_SCHEMA: JsonSchema = {
+  type: 'object',
+  description:
+    'The second factor was accepted and a session cookie is set. `token` is that session’s token; the cookie is what subsequent requests use.',
+  properties: {
+    token: { type: 'string' },
+    user: libraryComponentRef('User'),
+  },
+  required: ['token', 'user'],
+};
+
+const BETTER_AUTH_RESPONSES: Record<string, JsonSchema> = {
+  '/two-factor/verify-totp': {
+    description:
+      'The authenticator code was accepted and the sign-in is complete.',
+    content: { 'application/json': { schema: VERIFIER_SESSION_SCHEMA } },
+  },
+  '/two-factor/verify-backup-code': {
+    description:
+      'The backup code was accepted, consumed, and the sign-in is complete.',
+    content: { 'application/json': { schema: VERIFIER_SESSION_SCHEMA } },
+  },
+};
+
+/**
+ * Paths whose generated 200 was READ and found to match what is served.
+ *
+ * An explicit attestation rather than a default, so "nobody has checked" and
+ * "checked and correct" are different states in this file.
+ */
+export const BETTER_AUTH_TRUSTED_RESPONSES: ReadonlySet<string> = new Set([
+  '/capabilities',
+  '/reauth/methods',
+  '/reauth/passkey/options',
+  '/reauth/passkey/verify',
+  '/get-session',
+  '/sign-out',
+  '/sign-in/email',
+  '/passwordless/verify',
+  '/oauth/google/start',
+  '/oauth/google/callback',
+  '/oauth/result',
+  '/two-factor/disable',
+  '/two-factor/get-totp-uri',
+  '/two-factor/totp/start',
+  '/two-factor/totp/confirm',
+  '/two-factor/trust-device',
+  '/two-factor/trusted-devices',
+  '/two-factor/trusted-devices/revoke',
+  '/two-factor/methods',
+  '/two-factor/methods/disable',
+  '/two-factor/methods/default',
+  '/two-factor/backup-codes/acknowledge',
+  '/two-factor/generate-backup-codes',
+  '/two-factor/otp/send',
+  '/two-factor/otp/verify',
+  '/two-factor/passkey/grant',
+  '/two-factor/passkey/options',
+  '/two-factor/passkey/verify',
+  '/passkey/generate-register-options',
+  '/passkey/verify-registration',
+  '/passkey/list-user-passkeys',
+  '/passkey/delete-passkey',
+  '/passkey/update-passkey',
+]);
+
+export const BETTER_AUTH_OVERRIDDEN_RESPONSES: ReadonlySet<string> = new Set(
+  Object.keys(BETTER_AUTH_RESPONSES)
+);
+
 function betterAuthResponses(path: string, method: HttpMethod): JsonSchema {
   const statuses = [
     '200',
@@ -2104,11 +2305,14 @@ function betterAuthResponses(path: string, method: HttpMethod): JsonSchema {
   }
 
   for (const status of statuses) {
-    const generated = generatedBetterAuthResponse(
-      path,
-      method,
-      status === '422' ? '400' : status
-    );
+    const generated =
+      status === '200' && path in BETTER_AUTH_RESPONSES
+        ? BETTER_AUTH_RESPONSES[path]
+        : generatedBetterAuthResponse(
+            path,
+            method,
+            status === '422' ? '400' : status
+          );
     responses[status] = {
       ...generated,
       ...(status in BETTER_AUTH_STATUS_DESCRIPTIONS && {
@@ -2742,11 +2946,9 @@ export function openApiDocument(
           'validation and response shapes under this prefix. Every path under ' +
           'it that is not documented here is answered 404.',
         responses: betterAuthResponses(endpoint.path, method),
-        security: endpoint.path.startsWith('/reauth/')
-          ? [{ sessionCookie: [] }]
-          : endpoint.path === '/get-session' || endpoint.path === '/sign-out'
-            ? [{}, { sessionCookie: [] }]
-            : [],
+        // From the endpoint's own metadata, never from its path spelling — see
+        // `RoutePrefixPath.session`.
+        security: SECURITY_FOR_SESSION[endpoint.session],
       };
       const parameters: JsonSchema[] = [];
       if (
@@ -2879,6 +3081,13 @@ export function openApiDocument(
           type: 'apiKey',
           in: 'cookie',
           name: BETTER_AUTH_CONTEXT.authCookies.sessionToken.name,
+        },
+        twoFactorChallengeCookie: {
+          type: 'apiKey',
+          in: 'cookie',
+          name: TWO_FACTOR_CHALLENGE_COOKIE_NAME,
+          description:
+            'Issued by a first factor that needs a second one, and required by every operation that completes the challenge.',
         },
       },
     },

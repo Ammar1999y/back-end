@@ -135,8 +135,24 @@ export async function revokeTwoFactorState(
   tx: Tx,
   userId: EntityID
 ): Promise<void> {
-  await tx.delete(trustedDevices).where(eq(trustedDevices.userId, userId));
+  await revokeTrustedDevices(tx, userId);
   await revokeVerificationArtifacts(tx, userId);
+}
+
+/**
+ * Every standing second-factor skip this user holds, and nothing else.
+ *
+ * Split out of `revokeTwoFactorState` for the containment case: bulk session
+ * revocation must remove the trusted devices — they are keyed by their own
+ * cookie and outlive every session, so signing out everywhere without them
+ * leaves the attacker's device still skipping 2FA — but must NOT touch the
+ * user's enrolment or an in-flight challenge, which that function also clears.
+ */
+export async function revokeTrustedDevices(
+  tx: Tx,
+  userId: EntityID
+): Promise<void> {
+  await tx.delete(trustedDevices).where(eq(trustedDevices.userId, userId));
 }
 
 /** Revoke every auth session for the user except the one making the request. */

@@ -27,7 +27,7 @@
  */
 import { beforeEach, describe, expect, test } from 'bun:test';
 import type { SeedOptions } from '../helpers/session';
-import type { OtpPurpose } from '@/utils/validation/otp';
+import type { OtpPurpose } from '@/utils/validation/enums';
 
 import { and, eq } from 'drizzle-orm';
 

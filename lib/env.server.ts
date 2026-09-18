@@ -108,6 +108,25 @@ function r2ConfigurationErrors(production: boolean): string[] {
     errors.push(
       'CLOUDFLARE_ZONE_ID and CLOUDFLARE_CACHE_PURGE_TOKEN must be set together, or both left unset'
     );
+  else if (production && publicUrl && !zoneId)
+    // A warning, not a refusal: an uncached public origin needs no purge, and
+    // this cannot tell one from a cached custom domain. But the combination is
+    // the one where unpublish LIES — public objects are served
+    // `max-age=31536000, immutable`, the origin object is deleted, the route
+    // answers 200, and the edge keeps serving the bytes for up to a year with
+    // nothing in the response saying so. Whoever configured the public origin
+    // has to decide which case this is.
+    //
+    // Production only, like the `r2.dev` warning above: it is a statement about
+    // a deployment that has real public objects behind a real CDN, and several
+    // tests assert the exact set of diagnostics a boot produces.
+    console.warn(
+      JSON.stringify({
+        msg: 'media.cache-purge is not configured',
+        detail:
+          'R2_PUBLIC_URL is set without CLOUDFLARE_ZONE_ID and CLOUDFLARE_CACHE_PURGE_TOKEN. Unpublishing or deleting a public file removes the origin object only; a cached edge copy stays readable for its full max-age (one year). Set the purge pair, or confirm this origin is uncached.',
+      })
+    );
 
   if (publicBucket && privateBucket && publicBucket === privateBucket)
     errors.push(

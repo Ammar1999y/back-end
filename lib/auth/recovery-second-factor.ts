@@ -17,10 +17,10 @@ import { and, eq } from 'drizzle-orm';
 
 import { db, withTransaction } from '@/db';
 import { twoFactorCredentials } from '@/db/schema';
-import { createOTP } from '@better-auth/utils/otp';
 import { symmetricDecrypt, symmetricEncrypt } from 'better-auth/crypto';
 
 import { auth } from '../auth';
+import { consumeTotpCode } from './totp-replay';
 
 export type RecoveryVerdict = 'matched' | 'rejected' | 'unavailable';
 
@@ -56,9 +56,13 @@ export async function verifyRecoveryTotp(
     data: credential.secret,
   }).catch(() => null);
   if (!secret) return 'unavailable';
-  return (await createOTP(secret).verify(code, { window: 1 }))
-    ? 'matched'
-    : 'rejected';
+  // Spent, not merely compared: recovery is one of three verifiers sharing this
+  // secret, and a code accepted by any of them must not be accepted again by
+  // this one. `'replayed'` reaches the caller as `'rejected'` — the recovery
+  // path answers every failure with one message, and distinguishing them here
+  // would tell a holder of a captured code that their capture was good.
+  const verdict = await consumeTotpCode(userId, secret, code);
+  return verdict === 'matched' ? 'matched' : 'rejected';
 }
 
 /**
@@ -78,13 +82,18 @@ export async function consumeRecoveryBackupCode(
     .select({
       id: twoFactorCredentials.id,
       backupCodes: twoFactorCredentials.backupCodes,
-      acknowledgedVersion: twoFactorCredentials.backupCodesAcknowledgedVersion,
-      version: twoFactorCredentials.backupCodesVersion,
+      acknowledgedSetId: twoFactorCredentials.backupCodesAcknowledgedSetId,
+      setId: twoFactorCredentials.backupCodesSetId,
     })
     .from(twoFactorCredentials)
     .where(eq(twoFactorCredentials.userId, userId))
     .limit(1);
-  if (!credential || credential.acknowledgedVersion !== credential.version)
+  // Both ids are NULL before the first generation, where equality alone would
+  // read as "acknowledged" — see `backupCodesReady`.
+  if (
+    credential?.acknowledgedSetId == null ||
+    credential.acknowledgedSetId !== credential.setId
+  )
     return 'unavailable';
 
   const decrypted = await symmetricDecrypt({

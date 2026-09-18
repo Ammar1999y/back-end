@@ -11,10 +11,17 @@
  * `/two-factor/send-otp` and `/two-factor/verify-otp` inert, so the second
  * factor's codes run on this project's own OTP system instead.
  */
-import type { AuthContext } from './two-factor-challenge';
+import type { TotpVerdict } from './totp-replay';
+import type { AuthContext, ResolvedChallenge } from './two-factor-challenge';
+import type { EntityID } from '@/types';
+import type { Passkey } from '@better-auth/passkey';
 import type { BetterAuthPlugin } from 'better-auth';
 
+import { eq } from 'drizzle-orm';
+
 import { twoFactorMsg } from '@/app/api/auth/otp/messages';
+import { db } from '@/db';
+import { twoFactorCredentials } from '@/db/schema';
 import { sanitizeForLog, validID } from '@/utils';
 import { passkey } from '@better-auth/passkey';
 import {
@@ -23,6 +30,7 @@ import {
   createAuthMiddleware,
   isAPIError,
 } from 'better-auth/api';
+import { symmetricDecrypt } from 'better-auth/crypto';
 import { twoFactor } from 'better-auth/plugins/two-factor';
 import { PUBLIC_ORIGIN } from '@/lib/env';
 
@@ -40,6 +48,8 @@ import {
 import { authAuditMeta } from './audit-meta';
 import { RP_ID } from './passkey-assertion';
 import { submittedRememberMe } from './remember-me';
+import { consumeTotpCode, DELEGATED_TOTP_WINDOW } from './totp-replay';
+import { transactionBoundContext } from './transaction';
 import { trustedDevicePlugin } from './trusted-device';
 import {
   issueTwoFactorChallenge,
@@ -66,7 +76,17 @@ import { twoFactorPasskeyPlugins } from './two-factor-passkey';
  */
 const TWO_FACTOR_TABLE = 'twoFactorCredentials';
 
+function challengeMissing(): APIError {
+  return new APIError(HTTP_STATUS.UNAUTHORIZED, {
+    message: twoFactorMsg.challengeMissing,
+    code: CUSTOM_AUTH_CODE,
+  });
+}
+
 /**
+ * The challenge a plugin verifier is answering, and the refusal of the branch
+ * where there is none.
+ *
  * Sign-in mode only, and that is a security invariant rather than a routing
  * detail: with a request session the plugin's own verifier used to run DIRECTLY,
  * outside `withTwoFactorChallengeTransaction`, so neither the challenge's
@@ -77,35 +97,118 @@ const TWO_FACTOR_TABLE = 'twoFactorCredentials';
  * layer out, with the same answer. Kept in both places because that fence lives
  * in another module and is keyed by path, and this is the function that owns
  * verification.
+ *
+ * Separate from `runPluginVerifier` so a verifier can do work that must NOT be
+ * inside the transaction, with the challenge already in hand — see the TOTP step
+ * reservation.
  */
-async function runPluginVerifier<T>(
-  ctx: AuthContext,
-  verify: () => Promise<T>
-) {
+async function resolveVerifierChallenge(
+  ctx: AuthContext
+): Promise<ResolvedChallenge> {
   if (await resolveRequestSession(ctx))
     throw new APIError(HTTP_STATUS.BAD_REQUEST, {
       message: MSG_INVALID_INPUT,
       code: CUSTOM_AUTH_CODE,
     });
   const challenge = await resolveTwoFactorChallenge(ctx);
-  const result = challenge
-    ? await withTwoFactorChallengeTransaction(ctx, challenge, async () => {
-        try {
-          return { response: await verify() };
-        } catch (error) {
-          // Invalid-code attempts must commit their counters before returning the error.
-          if (isAPIError(error)) return { error };
-          throw error;
-        }
-      })
-    : null;
-  if (!result)
-    throw new APIError(HTTP_STATUS.UNAUTHORIZED, {
-      message: twoFactorMsg.challengeMissing,
-      code: CUSTOM_AUTH_CODE,
-    });
+  if (!challenge) throw challengeMissing();
+  return challenge;
+}
+
+/**
+ * Runs one of the library's verifiers inside the challenge transaction.
+ *
+ * `verify` is handed the auth context with its adapter bound to that
+ * transaction; `transactionBoundContext` says why the library's own would not
+ * be. Every caller must pass it through to the endpoint it delegates to.
+ */
+async function runPluginVerifier<T>(
+  ctx: AuthContext,
+  challenge: ResolvedChallenge,
+  verify: (context: AuthContext['context']) => Promise<T>
+) {
+  const result = await withTwoFactorChallengeTransaction(
+    ctx,
+    challenge,
+    async () => {
+      const bound = await transactionBoundContext(ctx.context);
+      try {
+        return { response: await verify(bound) };
+      } catch (error) {
+        // Invalid-code attempts must commit their counters before returning the error.
+        if (isAPIError(error)) return { error };
+        throw error;
+      }
+    }
+  );
+  if (!result) throw challengeMissing();
   if ('error' in result) throw result.error;
   return result.response;
+}
+
+/**
+ * Reserve the step the submitted code names, before the library spends it.
+ *
+ * Reads and decrypts the credential itself rather than asking the plugin, which
+ * exposes no hook between "this code is valid" and "here is your session". A
+ * missing credential, an undecryptable secret or a code matching no step in the
+ * window all answer `'rejected'` — the library is about to answer that too, with
+ * its own counters and message, and this must not pre-empt it.
+ *
+ * ⚠️ Called BEFORE `withTwoFactorChallengeTransaction` opens. The claim is a
+ * single guarded UPDATE, atomic on its own, and outside the transaction it also
+ * outlives a rollback — a step this accepted stays spent even when the request
+ * that spent it fails afterwards, which is the conservative half of a choice
+ * either way would be defensible on.
+ *
+ * Moving it inside is not otherwise blocked, but it would have to travel with
+ * the transaction's executor — `consumeTotpCode`'s `executor`, which states why.
+ * Nothing about the credential row's LOCK is what forces that: the claim is one
+ * autocommitted UPDATE whose lock is gone before the verifier runs, and the
+ * library's own writes reach that row through the adapter
+ * `transactionBoundContext` bound to this transaction, so they would be on the
+ * connection already holding it. The cost of getting it wrong is the pool:
+ * measured, a pooled claim from inside the transaction answers one request in
+ * 3.6 s and wedges ten concurrent ones past 30 s.
+ */
+/**
+ * What is submitted to the library's verifier in place of a code the
+ * reservation found already spent.
+ *
+ * It has to be a code no secret can ever produce, and non-digits are that:
+ * `createOTP().verify` compares against `generateHOTP`, whose output is
+ * `toString().padStart(digits, '0')` — decimal digits only, at every step of
+ * every window. The library then walks its normal wrong-code path, so a replay
+ * and a guess cost the same and read the same.
+ */
+const SPENT_TOTP_CODE = 'spent!';
+
+async function reserveSignInTotpStep(
+  ctx: AuthContext,
+  userId: EntityID
+): Promise<TotpVerdict> {
+  const code = (ctx.body as { code?: unknown } | undefined)?.code;
+  if (typeof code !== 'string') return 'rejected';
+
+  const [credential] = await db
+    .select({
+      secret: twoFactorCredentials.secret,
+      verified: twoFactorCredentials.verified,
+    })
+    .from(twoFactorCredentials)
+    .where(eq(twoFactorCredentials.userId, userId))
+    .limit(1);
+  if (!credential?.verified) return 'rejected';
+
+  const secret = await symmetricDecrypt({
+    key: ctx.context.secretConfig,
+    data: credential.secret,
+  }).catch(() => null);
+  if (!secret) return 'rejected';
+
+  return consumeTotpCode(userId, secret, code, {
+    window: DELEGATED_TOTP_WINDOW,
+  });
 }
 
 function forwardVerifierHeaders(ctx: AuthContext, headers: Headers) {
@@ -133,6 +236,21 @@ function userIdOf(returned: unknown): unknown {
   const user = (returned as { user?: unknown }).user;
   if (!user || typeof user !== 'object') return null;
   return (user as { id?: unknown }).id;
+}
+
+/**
+ * The credential row `/passkey/verify-registration` just wrote.
+ *
+ * The endpoint answers with the persisted row — `Passkey` from
+ * `@better-auth/passkey` — and that `id` is the only thing naming WHICH
+ * credential the ceremony produced. Shape-checked rather than cast: `returned`
+ * is the library's, and an enrolment recorded against a credential this could
+ * not name is the failure `recordPasskeyEnrolment` exists to refuse.
+ */
+function registeredPasskeyId(returned: unknown): EntityID | null {
+  if (!returned || typeof returned !== 'object') return null;
+  const row = returned as Partial<Passkey>;
+  return validID(row.id) || null;
 }
 
 /**
@@ -211,8 +329,59 @@ const twoFactorAuth = () => {
         endpoints.verifyTOTP.path,
         { ...endpoints.verifyTOTP.options, use: [] },
         async (ctx) => {
-          const result = await runPluginVerifier(ctx, () =>
-            endpoints.verifyTOTP({ ...ctx, returnHeaders: true })
+          const challenge = await resolveVerifierChallenge(ctx);
+
+          // The step is reserved BEFORE the library verifies, because after it
+          // verifies there is a session and cookies to undo. EVERY verdict then
+          // falls through to the library, which owns the attempt counter, the
+          // account lockout and the invalid-code answer.
+          //
+          // A reserved step spent on a request the library then refuses for
+          // some other reason is the accepted cost: it burns at most the
+          // remainder of one 30-second period for that account.
+          const reserved = await reserveSignInTotpStep(ctx, challenge.user.id);
+
+          const result = await runPluginVerifier(
+            ctx,
+            challenge,
+            async (context) => {
+              const verified = await endpoints.verifyTOTP({
+                ...ctx,
+                // A replay is delegated as a WRONG code rather than refused
+                // here, and that is the whole point: refusing here skipped
+                // `beginAttempt`, `recordTwoFactorFailure` and the library's own
+                // message, so six replays of one captured code left a challenge
+                // that a sixth wrong guess would have destroyed. The cost is
+                // what tells the holder their capture was good; matching the
+                // status and the message is not enough.
+                body:
+                  reserved === 'replayed'
+                    ? { ...ctx.body, code: SPENT_TOTP_CODE }
+                    : ctx.body,
+                context,
+                returnHeaders: true,
+              });
+
+              // ⚠️ The invariant the whole reservation rests on: a completed
+              // TOTP sign-in spent a step. The library THROWS on a bad code, so
+              // reaching here is an acceptance, and an acceptance the
+              // reservation did not claim would hand out a session while
+              // leaving the code replayable.
+              //
+              // Checked rather than assumed, because the two verifiers agree
+              // only by construction: they read the clock at different instants
+              // (`DELEGATED_TOTP_WINDOW` is what covers that) and the
+              // credential row at different instants too, so a concurrent
+              // enrolment confirmation flipping `verified` between the two
+              // reads would also land here. A plain `Error` rolls the
+              // transaction back — the new session with it — where an
+              // `APIError` would commit it.
+              if (reserved !== 'matched')
+                throw new Error(
+                  'TOTP verification accepted a step the replay reservation did not claim'
+                );
+              return verified;
+            }
           );
           forwardVerifierHeaders(ctx, result.headers);
           return ctx.json(result.response);
@@ -222,8 +391,15 @@ const twoFactorAuth = () => {
         endpoints.verifyBackupCode.path,
         { ...endpoints.verifyBackupCode.options, use: [] },
         async (ctx) => {
-          const result = await runPluginVerifier(ctx, () =>
-            endpoints.verifyBackupCode({ ...ctx, returnHeaders: true })
+          const result = await runPluginVerifier(
+            ctx,
+            await resolveVerifierChallenge(ctx),
+            (context) =>
+              endpoints.verifyBackupCode({
+                ...ctx,
+                context,
+                returnHeaders: true,
+              })
           );
           forwardVerifierHeaders(ctx, result.headers);
           return ctx.json(result.response);
@@ -269,15 +445,44 @@ const twoFactorAuth = () => {
             if (isAPIError(ctx.context.returned)) return;
             const requestSession = await resolveRequestSession(ctx);
             if (!requestSession) return;
-            if (!(await recordPasskeyEnrolment(ctx, requestSession)))
-              console.error(
-                sanitizeForLog({
-                  msg: 'twoFactor.enrolPasskey.intentUnrecorded',
-                  userId: requestSession.userId,
-                  effect:
-                    'the credential exists but is not offered as a factor',
-                })
-              );
+            const credentialId = registeredPasskeyId(ctx.context.returned);
+            const outcome = credentialId
+              ? await recordPasskeyEnrolment(ctx, requestSession, credentialId)
+              : 'failed';
+            if (outcome === 'recorded') return;
+            console.error(
+              sanitizeForLog({
+                msg: 'twoFactor.enrolPasskey.intentUnrecorded',
+                userId: requestSession.userId,
+                effect: credentialId
+                  ? outcome === 'no-passkey'
+                    ? 'the credential was deleted before it could be enrolled'
+                    : 'the credential exists but is not offered as a factor'
+                  : 'the registration response did not name the credential it wrote',
+              })
+            );
+            // The registration's own 200 said a second factor was added, and
+            // none was. An `APIError` thrown from an `after` hook replaces the
+            // response and carries its own status — the endpoint sets none — so
+            // the client learns the ceremony did not achieve what it was for.
+            //
+            // The credential the plugin wrote is deliberately NOT removed on
+            // `'failed'`: that path is a write that already failed, so a
+            // compensating write is the least likely thing to succeed, and it
+            // would delete a credential the authenticator now holds on the
+            // strength of it. The message names the state instead.
+            const credentialGone = outcome === 'no-passkey';
+            throw new APIError(
+              credentialGone
+                ? HTTP_STATUS.CONFLICT
+                : HTTP_STATUS.INTERNAL_ERROR,
+              {
+                message: credentialGone
+                  ? twoFactorMsg.passkeyNotSaved
+                  : twoFactorMsg.passkeyNotEnrolled,
+                code: CUSTOM_AUTH_CODE,
+              }
+            );
           }),
         },
       ],

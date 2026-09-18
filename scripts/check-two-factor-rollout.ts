@@ -13,6 +13,12 @@
  * Read-only, and it takes the proposed configuration as ARGUMENTS rather than
  * from the environment: the point is to ask before the environment changes.
  *
+ * ⚠️ Everything imported here has to be free of load-time environment reads, or
+ * that is not true. `utils/validation/enums.ts` exists for it: importing the two
+ * runtime modules instead made the preflight print `twoFactor.disabled` before
+ * examining anything, and made a malformed CURRENT value throw — which is
+ * exactly the state an operator runs this to get out of.
+ *
  *   bun scripts/check-two-factor-rollout.ts totp,backup_code
  *   bun scripts/check-two-factor-rollout.ts totp,otp sms
  *
@@ -21,6 +27,14 @@
  * because it has to run against a database this process does not otherwise open.
  */
 import { SQL } from 'bun';
+
+import { PHONE_ENABLED } from '../utils/config';
+import {
+  isPhoneChannel,
+  OTP_CHANNELS,
+  TWO_FACTOR_METHODS,
+} from '../utils/validation/enums';
+import { parseEnumList } from '../utils/validation/env-list';
 
 const [methodsArg, channelsArg] = process.argv.slice(2);
 if (!methodsArg)
@@ -31,21 +45,38 @@ if (!methodsArg)
 const databaseUrl = process.env.DATABASE_URL;
 if (!databaseUrl) throw new Error('DATABASE_URL is not set');
 
-const KNOWN_METHODS = new Set(['totp', 'otp', 'backup_code', 'passkey']);
-const KNOWN_CHANNELS = new Set(['email', 'sms', 'whatsapp']);
+/**
+ * ⚠️ The RUNTIME's parser and the runtime's lists, never a copy of either. A
+ * copy is free to fall behind `TWO_FACTOR_METHODS` and `OTP_CHANNELS`, and to be
+ * lenient where the server is not — empty entries and duplicates are a refusal
+ * to boot — so this gate would certify a configuration the deployment rejects.
+ */
+const methods = parseEnumList(methodsArg, {
+  name: 'NEXT_PUBLIC_ENABLED_2FA_METHODS',
+  allowed: TWO_FACTOR_METHODS,
+  noun: 'method',
+  unsetMeans: 'disable two-factor authentication entirely',
+});
 
-const parseList = (raw: string | undefined, known: Set<string>, noun: string) =>
-  (raw ?? '')
-    .split(',')
-    .map((entry) => entry.trim())
-    .filter((entry) => entry.length > 0)
-    .map((entry) => {
-      if (!known.has(entry)) throw new Error(`unknown ${noun}: ${entry}`);
-      return entry;
-    });
-
-const methods = parseList(methodsArg, KNOWN_METHODS, 'method');
-const channels = parseList(channelsArg, KNOWN_CHANNELS, 'channel');
+/**
+ * The EFFECTIVE channel list, after the same `PHONE_ENABLED` filter the runtime
+ * applies — otherwise this certifies `email,sms` on a deployment with phone
+ * support off, where the runtime drops `sms` and refuses every phone-only user
+ * at sign-in. The dropped entries are reported below rather than swallowed:
+ * an operator who typed `sms` has to be told it will not take effect.
+ */
+const requestedChannels = parseEnumList(channelsArg, {
+  name: 'NEXT_PUBLIC_ENABLED_2FA_OTP_CHANNELS',
+  allowed: OTP_CHANNELS,
+  noun: 'channel',
+  unsetMeans: 'disable the OTP second factor',
+});
+const channels = requestedChannels.filter(
+  (channel) => PHONE_ENABLED || !isPhoneChannel(channel)
+);
+const droppedChannels = requestedChannels.filter(
+  (channel) => !channels.includes(channel)
+);
 
 /**
  * Bun's SQL driver binds a JS array as a comma-joined STRING, which Postgres
@@ -53,7 +84,7 @@ const channels = parseList(channelsArg, KNOWN_CHANNELS, 'channel');
  * against a closed allow-list above, so the literal cannot carry anything but
  * those names.
  */
-const asArrayLiteral = (values: string[]) => `{${values.join(',')}}`;
+const asArrayLiteral = (values: readonly string[]) => `{${values.join(',')}}`;
 
 interface StrandedRow {
   id: string;
@@ -76,7 +107,8 @@ try {
         AND (
           (m.method = 'totp' AND c.verified IS TRUE)
           OR (m.method = 'backup_code'
-              AND c.backup_codes_acknowledged_version = c.backup_codes_version
+              AND c.backup_codes_acknowledged_set_id IS NOT NULL
+              AND c.backup_codes_acknowledged_set_id = c.backup_codes_set_id
               AND c.backup_codes_remaining > 0)
           OR (m.method = 'passkey'
               AND EXISTS (SELECT 1 FROM passkeys p WHERE p.user_id = m.user_id))
@@ -93,6 +125,12 @@ try {
     FROM users u
     WHERE u.two_factor_enabled IS TRUE
       AND u.deleted_at IS NULL
+      -- The same eligibility predicate the sign-in path uses
+      -- (lockEligibleAuthUser). A suspended account cannot reach the second
+      -- factor at all, so it cannot be stranded by this change — counting it
+      -- failed the gate over accounts nobody can sign in to, and the
+      -- administrative resets it demanded would have been busywork.
+      AND u.is_active IS TRUE
       AND u.id NOT IN (SELECT user_id FROM usable)
     ORDER BY u.email
   `;
@@ -100,7 +138,9 @@ try {
   const [enabled] = await sql<{ total: number }[]>`
     SELECT count(*)::int AS total
     FROM users
-    WHERE two_factor_enabled IS TRUE AND deleted_at IS NULL
+    WHERE two_factor_enabled IS TRUE
+      AND deleted_at IS NULL
+      AND is_active IS TRUE
   `;
 
   console.log(
@@ -109,6 +149,10 @@ try {
         msg: 'twoFactor.rolloutPreflight',
         proposedMethods: methods,
         proposedOtpChannels: channels,
+        ...(droppedChannels.length > 0 && {
+          ignoredOtpChannels: droppedChannels,
+          ignoredBecause: 'PHONE_NUMBER_MODE is disabled in utils/config.ts',
+        }),
         accountsWithTwoFactor: enabled?.total ?? 0,
         strandedAccounts: stranded.length,
         // Bounded: the count is the decision, the sample is for the ticket.

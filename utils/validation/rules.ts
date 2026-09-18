@@ -1,6 +1,11 @@
 import * as z from 'zod';
 
-import { normalizeArabicDigits, UUID_V7_REGEX, validID } from '..';
+import {
+  normalizeArabicDigits,
+  UUID_V7_FRAGMENT,
+  UUID_V7_REGEX,
+  validID,
+} from '..';
 import { sanitizeSvg } from '../images/svg-optimizer';
 import { safeDate } from '../time';
 import {
@@ -31,6 +36,44 @@ export const sanitizeStrictSingleLine = (v: unknown) =>
         .trim()
     : v;
 
+/**
+ * What the two sanitizers above do, for the OpenAPI document.
+ *
+ * `z.toJSONSchema` sees neither preprocess, so every `min`/`max` on a sanitized
+ * leaf describes the string AFTER stripping and trimming while the document
+ * presents it as a rule about the raw input. Both sanitizers only ever SHORTEN,
+ * which decides what each published keyword is worth:
+ *
+ *  - `minLength` cannot refuse a valid request — a raw value shorter than the
+ *    floor cannot grow past it — so it stays. It is merely lax: `"a "` against
+ *    `minLength: 2` passes the document and is refused by the server, which
+ *    keeps one character.
+ *  - `maxLength` can, and so it goes. A hundred and fifty characters plus two
+ *    spaces is trimmed to 150 and ACCEPTED, while a validator measures 152
+ *    against `maxLength: 150` and refuses a request the server would have
+ *    answered — and the amount a strippable character or a space can shrink a
+ *    value by is unbounded, so no finite ceiling is true of raw input. The
+ *    number travels as prose instead (`strictTextMaximum`); the request is still
+ *    bounded, by the body ceiling in `app.ts`.
+ *
+ * The stripped class cannot become a `pattern` either — a JSON Schema pattern
+ * has no `u` flag, so `\p{L}` is inexpressible. Where a leaf's rule CAN be
+ * written against raw input it is, and then the bound rides in the pattern: see
+ * `otpCodeSchema` and the media names.
+ */
+export const STRICT_TEXT_DESCRIPTION =
+  'Characters outside letters, marks, digits, spaces and `. , ! ? : / \\ ; - + = ( ) [ ] \' " ؟ ، ؛ @ # _ & %` are removed and the value is trimmed before the length rules apply, so it may be sent as typed';
+
+/** `sanitizeStrictSingleLine` additionally folds every whitespace run to one space. */
+export const STRICT_SINGLE_LINE_DESCRIPTION = `${STRICT_TEXT_DESCRIPTION}. Line breaks and repeated spaces are collapsed to a single space.`;
+
+/**
+ * The ceiling, as prose, for a leaf whose `maxLength` cannot be published — and
+ * the marker that the omission is a decision rather than an oversight.
+ */
+export const strictTextMaximum = (max: number) =>
+  `After that it must be at most ${max} characters.`;
+
 export const idRequired =
   'رقم المعرف غير صحيح، اعد تحميل الصفحة ثم حاول مرة اخرى';
 
@@ -40,9 +83,8 @@ const MSG_CHECK_INPUT = 'قم بالتحقق من البيانات المدخل�
  * A server-owned Arabic message per issue code, for every schema node that did
  * not author one.
  *
- * No `invalid_union` entry: it mapped to `MSG_CHECK_INPUT`, which is exactly
- * what the `?? MSG_CHECK_INPUT` below already yields — dead by the same standard
- * as the dead message constants this map replaced.
+ * An issue code absent from this map takes `MSG_CHECK_INPUT` from the `??`
+ * below, so `invalid_union` needs no entry — that is the message it would carry.
  *
  * Mapped HERE rather than at each node, because a node is exactly where it gets
  * forgotten. Measured across the dashboard write schemas, 14 client-facing
@@ -127,11 +169,24 @@ function reflectKeys(keys: readonly PropertyKey[]): string {
   return hidden > 0 ? `${named.join('، ')} (+${hidden})` : named.join('، ');
 }
 
+const ID_DESCRIPTION =
+  'Surrounding whitespace is trimmed and the value lowercased before the pattern applies, so it may be sent as received.';
+
+/**
+ * The published rule for the RAW value, which is not `UUID_V7_PATTERN`: the
+ * preprocess trims, so the anchored form refuses a padded id the server accepts.
+ * Case needs nothing — the fragment already admits both.
+ */
+const ID_INPUT_PATTERN = String.raw`^\s*${UUID_V7_FRAGMENT}\s*$`;
+
 function getIDSchema() {
   // when EntityID is number
   // const schema = z.int(idRequired).min(1, idRequired).max(MAX_ID, idRequired);
   // when EntityID is UUID
-  const schema = z.string(idRequired).regex(UUID_V7_REGEX, idRequired);
+  const schema = z
+    .string(idRequired)
+    .regex(UUID_V7_REGEX, idRequired)
+    .meta({ pattern: ID_INPUT_PATTERN, description: ID_DESCRIPTION });
 
   return z.preprocess(
     // The rejected sentinel has to be of the ID's own type, or a malformed ID
@@ -144,6 +199,73 @@ function getIDSchema() {
 
 export const idSchema = getIDSchema();
 
+/** For the id leaves outside this module, which normalise the same way. */
+export { ID_DESCRIPTION, ID_INPUT_PATTERN };
+
+/**
+ * The consumer providers this deployment accepts, as data.
+ *
+ * As data because two things need the SAME list and were reading it out of a
+ * regular expression: the runtime check below, and the pattern the document
+ * publishes for the address the user typed. See `reports/should-ignore.md`
+ * known issue 10 for why the allowlist exists.
+ */
+const EMAIL_PROVIDER_DOMAINS = [
+  'gmail.com',
+  'outlook.com',
+  'hotmail.com',
+  'live.com',
+  'yahoo.com',
+] as const;
+
+/* eslint-disable-next-line security/detect-non-literal-regexp -- built from the
+   module-local literal tuple above, which no caller can influence */
+const EMAIL_ALLOWLIST_PATTERN = new RegExp(
+  `^[A-Za-z0-9._%+-]+@(?:${EMAIL_PROVIDER_DOMAINS.map((domain) =>
+    domain.replaceAll('.', String.raw`\.`)
+  ).join('|')})$`
+);
+
+/**
+ * One literal, spelled so a flagless pattern matches it case-insensitively.
+ *
+ * JSON Schema patterns are ECMA-262 with no flags, so `i` is not available and
+ * the insensitivity has to live in the character classes.
+ */
+function caseInsensitiveLiteral(literal: string): string {
+  return [...literal]
+    .map((character) => {
+      const lower = character.toLowerCase();
+      const upper = character.toUpperCase();
+      if (lower !== upper) return `[${lower}${upper}]`;
+      return /[a-zA-Z0-9]/.test(character) ? character : `\\${character}`;
+    })
+    .join('');
+}
+
+/**
+ * The published rule for the RAW address, which is none of the three constraints
+ * the converter emits from the schema below.
+ *
+ * The preprocess collapses whitespace, trims and lowercases, so the allowlist
+ * pattern (case-sensitive) refuses `User@Gmail.com` and the anchors refuse
+ * ` user@gmail.com ` — both of which the server accepts. The length bound is the
+ * same problem in the other direction, and `.max()` cannot describe raw input at
+ * all once unbounded padding is legal — so the bound moves INTO the pattern as
+ * the longest local part any allowed domain leaves room for, and `maxLength` is
+ * dropped. That is exact in the direction that matters: every address the server
+ * accepts matches, and the only thing left unbounded is surrounding whitespace.
+ *
+ * Generated from `EMAIL_PROVIDER_DOMAINS` rather than typed out, so the document
+ * cannot fall behind the allowlist.
+ */
+const EMAIL_LOCAL_MAX =
+  EMAIL_MAX - 1 - Math.min(...EMAIL_PROVIDER_DOMAINS.map((d) => d.length));
+
+const EMAIL_INPUT_PATTERN = String.raw`^\s*[A-Za-z0-9._%+-]{1,${EMAIL_LOCAL_MAX}}@(?:${EMAIL_PROVIDER_DOMAINS.map(
+  (domain) => caseInsensitiveLiteral(domain)
+).join('|')})\s*$`;
+
 export const emailSchema = z.preprocess(
   (v: string) =>
     typeof v === 'string' ? v.replaceAll(/\s+/g, ' ').trim().toLowerCase() : '',
@@ -151,9 +273,27 @@ export const emailSchema = z.preprocess(
     .email('يرجى إدخال بريد إلكتروني صحيح')
     .max(EMAIL_MAX, `يجب أن لا يتجاوز البريد الإلكتروني ${EMAIL_MAX} حرفاً`)
     .regex(
-      /^[A-Za-z0-9._%+-]+@(?:gmail\.com|outlook\.com|hotmail\.com|live\.com|yahoo\.com)$/,
+      EMAIL_ALLOWLIST_PATTERN,
       'نعتذر، حالياً نقبل التسجيل فقط عبر بريد Gmail أو Outlook أو Hotmail أو Yahoo. يرجى استخدام أحد هذه العناوين.'
     )
+    // The document's whole request rule for this field: `pattern` REPLACES the
+    // `allOf` the two checks above convert to. See `EMAIL_INPUT_PATTERN`.
+    //
+    // ⚠️ No `format: 'email'`, deliberately, and it is not an oversight that it
+    // is absent where the RESPONSE schemas carry it. `format` asserts under a
+    // validator configured to assert it (Ajv does by default), and
+    // ` user@gmail.com ` is not an email address by that rule — while this
+    // schema trims and accepts it. A response carries the stored value, which is
+    // already normalised, so there it is true and stays.
+    .meta({
+      maxLength: undefined,
+      allOf: undefined,
+      pattern: EMAIL_INPUT_PATTERN,
+      description:
+        `Email address. Whitespace is collapsed and trimmed and the address is lowercased before validation, so it may be sent as typed; after that it must be at most ${EMAIL_MAX} characters. Only these providers are accepted: ` +
+        EMAIL_PROVIDER_DOMAINS.join(', ') +
+        '.',
+    })
 );
 
 /**
@@ -168,6 +308,14 @@ export const emailSchema = z.preprocess(
 export const normalizePasswordInput = (v: string) =>
   typeof v === 'string' ? v.normalize('NFKC') : v;
 
+/**
+ * The whole rule as prose, because the normalisation below leaves no published
+ * keyword true of raw input — and in the runtime's own terms rather than a
+ * paraphrase. Rounding any clause to "a letter" or "a character" describes a
+ * schema that refuses passwords this one accepts.
+ */
+const PASSWORD_DESCRIPTION = `Unicode-normalised (NFKC) before validation, so it may be sent as typed and every rule below measures the normalised form: ${PASSWORD_MIN} to ${PASSWORD_MAX} characters counted as Unicode code points, containing at least one ASCII lowercase letter (a-z), one ASCII uppercase letter (A-Z), one ASCII digit (0-9), and at least one character outside those three ranges. A character that NFKC folds into one of those ranges counts as it. The line terminators U+000A, U+000D, U+2028 and U+2029 are rejected anywhere in the value.`;
+
 export const passwordSchema = z.preprocess(
   normalizePasswordInput,
   z
@@ -177,12 +325,34 @@ export const passwordSchema = z.preprocess(
     .regex(/^(?=.*[a-z])(?=.*[A-Z])(?=.*[0-9])(?=.*[^a-zA-Z0-9]).*$/, {
       error: 'تحقق من صحة كلمة المرور',
     })
+    // ⚠️ Nothing of the four rules above survives into the document, and every
+    // one of them was refusing requests this schema accepts. NFKC folds an
+    // unbounded, non-enumerable set of characters into the ASCII classes — a
+    // fullwidth or mathematical capital, the Kelvin sign — so no published
+    // class can be true of raw input; and it changes LENGTH in both directions
+    // — a ligature expands one character into three, a combining sequence
+    // composes two into one — so neither bound can be either. Measured: six
+    // passwords the server accepts and the published leaf refused.
+    //
+    // Same conclusion as the sanitized leaves reach for the same reason
+    // (`STRICT_TEXT_DESCRIPTION`), and the rules travel as prose. The request
+    // stays bounded by the body ceiling in `app.ts`, and `.max()` above still
+    // refuses an over-long password before anything hashes it.
+    .meta({
+      minLength: undefined,
+      maxLength: undefined,
+      pattern: undefined,
+      description: PASSWORD_DESCRIPTION,
+    })
 );
 
+// Carried forward rather than replaced: a description on the wrapper is the one
+// the converter emits, so `.describe()` alone published the window note and
+// dropped every password rule with it.
 export const reauthPasswordSchema = passwordSchema
   .optional()
   .describe(
-    'May be omitted while this session has an open password/passkey reauthentication window. Otherwise omission returns 401 REAUTH_REQUIRED.'
+    `${PASSWORD_DESCRIPTION} May be omitted while this session has an open password/passkey reauthentication window. Otherwise omission returns 401 REAUTH_REQUIRED.`
   );
 
 // Saudi phone: strips non-digits, accepts 966XXXXXXXXX / 05XXXXXXXX / 5XXXXXXXX
@@ -299,6 +469,9 @@ export const getColorSchema = (
  * Unreferenced today — which makes it a trap rather than a live bug, and the
  * reason to fix it with the class rather than after it becomes one.
  */
+/** The slug ceiling, named because the document now carries it as prose. */
+const SLUG_MAX = 150;
+
 const slugPreprocess = (v: unknown) => {
   if (typeof v !== 'string') return v;
 
@@ -314,7 +487,11 @@ export const slugSchema = z.preprocess(
   slugPreprocess,
   z
     .string()
-    .max(150, 'الـ slug طويل جداً')
+    .max(SLUG_MAX, 'الـ slug طويل جداً')
+    .meta({
+      maxLength: undefined,
+      description: `Lowercased, trimmed, and whitespace and repeated hyphens collapsed to single hyphens before validation, so it may be sent as typed. ${strictTextMaximum(SLUG_MAX)}`,
+    })
     .refine(
       (v) => v === '' || /^[a-z0-9-]+$/.test(v),
       'الـ slug يحتوي على أحرف غير مسموحة'

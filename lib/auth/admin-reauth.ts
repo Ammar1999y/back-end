@@ -76,14 +76,23 @@ export async function mintAdminReauth(
   return { expiresIn: ADMIN_REAUTH_MAX_AGE_S };
 }
 
-// Read without consuming: repeated actions share the window, but still require this live session and their permissions.
+/**
+ * Read without consuming: repeated actions share the window, but still require
+ * this live session and their permissions.
+ *
+ * `executor` is not optional decoration. A caller that already holds a
+ * transaction must pass it: `MAX_POOL_CONNECTIONS` is 10, so ten concurrent
+ * sensitive admin edits asking the POOL for an eleventh connection while each
+ * holds a locked row wait for the driver's timeout and fail as 500.
+ */
 export async function hasAdminReauth(
   sessionId: string,
-  actorUserId: EntityID
+  actorUserId: EntityID,
+  executor: Tx | typeof db = db
 ): Promise<boolean> {
   if (!sessionId) return false;
 
-  const [row] = await db
+  const [row] = await executor
     .select({ value: verifications.value })
     .from(verifications)
     .where(
@@ -94,7 +103,7 @@ export async function hasAdminReauth(
     )
     .limit(1);
   if (validID(row?.value) !== actorUserId) return false;
-  const [method] = await db
+  const [method] = await executor
     .select({ value: verifications.value })
     .from(verifications)
     .where(
@@ -103,16 +112,19 @@ export async function hasAdminReauth(
         gt(verifications.expiresAt, new Date())
       )
     );
-  const available: readonly string[] =
-    await availableReauthMethods(actorUserId);
+  const available: readonly string[] = await availableReauthMethods(
+    actorUserId,
+    executor
+  );
   return available.includes(method?.value ?? '');
 }
 
 export async function requireReauthWindow(
   userId: EntityID,
-  sessionId: string
+  sessionId: string,
+  executor: Tx | typeof db = db
 ): Promise<void> {
-  if (!(await hasAdminReauth(sessionId, userId)))
+  if (!(await hasAdminReauth(sessionId, userId, executor)))
     throw new CustomError(
       MSG_REAUTH_REQUIRED,
       HTTP_STATUS.UNAUTHORIZED,

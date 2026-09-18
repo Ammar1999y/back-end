@@ -6,7 +6,13 @@ import {
   IDS_ARRAY_MAX,
   MEDIA_DISPLAY_NAME_MAX,
 } from './constants';
-import { idRequired, idSchema } from './rules';
+import {
+  ID_DESCRIPTION,
+  ID_INPUT_PATTERN,
+  idRequired,
+  idSchema,
+  strictTextMaximum,
+} from './rules';
 
 export const mediaValidationMsg = {
   folderNameRequired: 'اسم المجلد مطلوب',
@@ -37,6 +43,47 @@ const normalizeName = (value: unknown) =>
     ? value.normalize('NFC').replaceAll(/\s+/g, ' ').trim()
     : value;
 
+/**
+ * The refinement above, as far as an ECMA-262 `pattern` can carry it — and
+ * written against the RAW value, not the normalised one.
+ *
+ * A JSON Schema pattern has no `u` flag, so `\p{Cf}` cannot be expressed and the
+ * format characters are left to the description. What it does carry is the part
+ * a client can act on: no ASCII control character, no `/`, no `\`, and — for a
+ * folder — not `.` or `..`. Published because `z.toJSONSchema` sees neither the
+ * refinement nor the normalisation, so the document accepted `"a/b"` for a
+ * server that answers 422.
+ *
+ * Whitespace is admitted inside the value, not only around it, and that is not a
+ * relaxation of the refinement either — a name with a line break in it arrives
+ * at the check as one with a space. The floor rides here too: at least one
+ * non-space character, where `minLength: 1` passed an all-whitespace name the
+ * server answers 422.
+ *
+ * ⚠️ The floor is written as ONE mandatory character followed by a free mix,
+ * not as a repeated `\s+(?=CHAR)` alternative, and the difference is quadratic:
+ * the lookahead form re-scans the same whitespace suffix from every position when
+ * no non-space character follows it, and a consumer compiling this pattern spent
+ * 1.06 s rejecting 32 000 spaces where this shape spends 0.07 ms. Both accept the
+ * same language.
+ *
+ * ⚠️ The LENGTH does not, and no pattern and no `maxLength` can carry it. NFC
+ * runs before the bound is measured and it is not length-preserving in either
+ * direction: a combining acute after `e` composes two characters into one,
+ * so 200 raw characters are a legal 100-character name, and a
+ * composition-excluded singleton decomposes one into two. Whitespace collapse
+ * then removes an unbounded amount on top. So the maximum travels as prose,
+ * like every other leaf whose normalisation can change a length
+ * (`strictTextMaximum`), and the request stays bounded by the body ceiling in
+ * `app.ts`.
+ */
+const NAME_CHARACTER_CLASS = String.raw`[^\s\u0000-\u001F\u007F/\\]`;
+const NAMED = String.raw`\s*${NAME_CHARACTER_CLASS}(?:${NAME_CHARACTER_CLASS}|\s)*`;
+const NAME_PATTERN = `^${NAMED}$`;
+const FOLDER_NAME_PATTERN = String.raw`^(?!\s*\.{1,2}\s*$)${NAMED}$`;
+const NAME_DESCRIPTION =
+  'Unicode-normalised (NFC), inner whitespace collapsed to single spaces and trimmed before validation, so it may be sent as typed, and the length rule measures what is left. Control and format characters, `/` and `\\` are rejected';
+
 export const folderNameSchema = z.preprocess(
   normalizeName,
   z
@@ -48,6 +95,12 @@ export const folderNameSchema = z.preprocess(
         !FORBIDDEN_NAME_CHARACTERS.test(name) && name !== '.' && name !== '..',
       mediaValidationMsg.folderNameInvalid
     )
+    .meta({
+      minLength: undefined,
+      maxLength: undefined,
+      pattern: FOLDER_NAME_PATTERN,
+      description: `${NAME_DESCRIPTION}, as are the names \`.\` and \`..\`. ${strictTextMaximum(FOLDER_NAME_MAX)}`,
+    })
 );
 
 export const displayNameSchema = z.preprocess(
@@ -60,12 +113,22 @@ export const displayNameSchema = z.preprocess(
       (name) => !FORBIDDEN_NAME_CHARACTERS.test(name),
       mediaValidationMsg.folderNameInvalid
     )
+    .meta({
+      minLength: undefined,
+      maxLength: undefined,
+      pattern: NAME_PATTERN,
+      description: `${NAME_DESCRIPTION}. ${strictTextMaximum(MEDIA_DISPLAY_NAME_MAX)}`,
+    })
 );
 
 /** `null` means the root; a missing key means "unchanged" where that applies. */
 const nullableIdSchema = z.preprocess(
   (value) => (value == null ? null : validID(value) || 0),
-  z.string(idRequired).regex(UUID_V7_REGEX, idRequired).nullable()
+  z
+    .string(idRequired)
+    .regex(UUID_V7_REGEX, idRequired)
+    .meta({ pattern: ID_INPUT_PATTERN, description: ID_DESCRIPTION })
+    .nullable()
 );
 
 export const createFolderSchema = z

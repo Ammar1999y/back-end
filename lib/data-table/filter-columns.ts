@@ -1,5 +1,10 @@
 import type { FilterColumnSpec, FilterColumnSpecs } from './column-specs';
-import type { ExtendedColumnFilter, JoinOperator } from '@/types/data-table';
+import type { SearchAnchor } from './parsers';
+import type {
+  ExtendedColumnFilter,
+  FilterOperator,
+  JoinOperator,
+} from '@/types/data-table';
 import type { SQL, Table } from 'drizzle-orm';
 
 import {
@@ -35,10 +40,21 @@ import {
   isSearchOperator,
   operatorAllowedForType,
 } from './column-specs';
-import { MIN_SEARCH_LENGTH } from './parsers';
+import {
+  isTrigramIndexable,
+  MIN_SEARCH_LENGTH,
+  searchTermLength,
+} from './parsers';
 
 export const MSG_INVALID_FILTER = 'أحد عوامل التصفية غير صالح، أعد ضبط التصفية';
-const MSG_SHORT_SEARCH = `نص البحث في التصفية يجب أن يكون ${MIN_SEARCH_LENGTH} أحرف على الأقل`;
+const MSG_SHORT_SEARCH = `نص البحث في التصفية يجب أن يتضمن ${MIN_SEARCH_LENGTH} أحرف أو أرقام على الأقل`;
+
+/** Which edge of the `ILIKE` pattern this operator anchors — see `isTrigramIndexable`. */
+function searchAnchorOf(operator: FilterOperator): SearchAnchor {
+  if (operator === 'startsWith') return 'prefix';
+  if (operator === 'endsWith') return 'suffix';
+  return 'contains';
+}
 
 /**
  * Reject instead of silently dropping. A dropped filter does not merely
@@ -167,7 +183,15 @@ function assertFilterAllowed(
   if (isSearchOperator(filter.operator)) {
     if (typeof filter.value !== 'string') invalidFilter();
     const min = spec.minSearchLength ?? MIN_SEARCH_LENGTH;
-    if (filter.value.length < min) invalidFilter(MSG_SHORT_SEARCH);
+    if (searchTermLength(filter.value) < min) invalidFilter(MSG_SHORT_SEARCH);
+    // The floor is a proxy; this is the property. Not applied to the scan-only
+    // operator, whose predicate can never use the index however the term is
+    // spelled — requiring trigrams there would refuse a filter for no gain.
+    if (
+      !isScanOnlyOperator(filter.operator) &&
+      !isTrigramIndexable(filter.value, searchAnchorOf(filter.operator))
+    )
+      invalidFilter(MSG_SHORT_SEARCH);
   }
 
   return 'apply';

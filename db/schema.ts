@@ -6,7 +6,6 @@
 //   db/migrations/001_add_trgm_indexes.sql
 // Without a trgm index, ILIKE '%text%' queries will cause full table scans.
 import type {
-  DashboardPage,
   PermissionAction,
   SessionMetadata,
 } from '@/lib/permissions/constants';
@@ -34,7 +33,7 @@ import { API_PATH_MAX, USER_AGENT_MAX } from '@/lib/audit/constants';
 import { generateUuidV7 as generateId } from '@/lib/id';
 import {
   CUSTOM_ROLE_VALUE,
-  DASHBOARD_PAGES,
+  DASHBOARD_PAGE_NAMES,
   REQUIRE_ROLE_FOR_LOGIN,
   ROLE_SCOPE,
 } from '@/lib/permissions/constants';
@@ -57,8 +56,11 @@ import {
   URL_MAX,
   VERIFICATION_IDENTIFIER_MAX,
 } from '@/utils/validation/constants';
-import { OTP_CHANNELS, OTP_PURPOSES } from '@/utils/validation/otp';
-import { TWO_FACTOR_METHODS } from '@/utils/validation/two-factor';
+import {
+  OTP_CHANNELS,
+  OTP_PURPOSES,
+  TWO_FACTOR_METHODS,
+} from '@/utils/validation/enums';
 
 /**
  * `jsonb`, replacing `drizzle-orm/pg-core`'s — which double-encodes under
@@ -143,10 +145,7 @@ const timestamps = {
 };
 
 export const bucketTypeEnum = ['public', 'private'] as const;
-export const pageNameValues = Object.keys(DASHBOARD_PAGES) as unknown as [
-  DashboardPage,
-  ...DashboardPage[],
-];
+export const pageNameValues = DASHBOARD_PAGE_NAMES;
 /**
  * Role Scope Values:
  * - 'system': Protected/immutable roles created by developer (e.g., superAdmin) - cannot be modified or deleted
@@ -481,15 +480,21 @@ export const twoFactorCredentials = pgTable(
       withTimezone: true,
       precision: 2,
     }),
-    // ⚠️ Acknowledgement is bound to a SET, not to the column above. Regenerating
-    // replaces every code and bumps `backupCodesVersion`; an acknowledgement of
-    // the previous set then no longer matches, so the method stops being offered
-    // until the user confirms the new codes. Without the pairing, one
-    // acknowledgement in 2023 kept advertising whatever set exists today.
-    backupCodesVersion: integer('backup_codes_version').default(0).notNull(),
-    backupCodesAcknowledgedVersion: integer(
-      'backup_codes_acknowledged_version'
-    ),
+    /**
+     * ⚠️ Acknowledgement is bound to a SET, not to the column above.
+     * Regenerating replaces every code and mints a new id; an acknowledgement
+     * naming the previous set then no longer matches, so the method stops being
+     * offered until the user confirms the new codes. Without the pairing, one
+     * acknowledgement in 2023 kept advertising whatever set exists today.
+     *
+     * An ID rather than a counter, because the counter restarted: this row is
+     * deleted by `/two-factor/disable` and recreated by the next generation, so
+     * a per-row sequence hands set two of the new row the same name as set one
+     * of the old — and an acknowledgement held by a stale tab then lands on a
+     * set the user never saw. NULL until the first generation.
+     */
+    backupCodesSetId: uuid('backup_codes_set_id'),
+    backupCodesAcknowledgedSetId: uuid('backup_codes_acknowledged_set_id'),
     // How many of that set are unspent. An exhausted set is not recovery
     // material, and the encrypted blob cannot be counted without the key, so the
     // count is kept here. See `lib/auth/two-factor-enrolment.ts` for who writes
@@ -497,6 +502,19 @@ export const twoFactorCredentials = pgTable(
     backupCodesRemaining: integer('backup_codes_remaining')
       .default(0)
       .notNull(),
+    /**
+     * The highest TOTP time step this credential has ever accepted.
+     *
+     * RFC 6238 §5.2: a one-time password must be usable once, and a code stays
+     * arithmetically valid for its whole period plus the ±1 window either side.
+     * Advanced under a guarded UPDATE, so two requests holding the same code
+     * cannot both claim it.
+     *
+     * `bigint` because a step is `floor(unixSeconds / 30)`, and `number` mode
+     * because that value stays inside `Number.MAX_SAFE_INTEGER` for the next
+     * 8.5 billion years.
+     */
+    lastTotpStep: bigint('last_totp_step', { mode: 'number' }),
     ...timestamps,
   },
   (t) => [
@@ -729,6 +747,32 @@ export const files = pgTable(
     status: fileStatus('status').notNull().default('pending'),
     kind: fileKind('kind').notNull(),
     transition: fileTransition('transition'),
+    /**
+     * Which ATTEMPT owns the transition above.
+     *
+     * The marker alone is a value, not an identity, and two actors legitimately
+     * write the same value: the request performing a publish, and the sweep
+     * recovering one it believes was abandoned. Re-reading the marker before an
+     * external delete is a check, not a fence — the flip can land while that
+     * delete is in flight, leaving an active row with neither object. Every
+     * destructive step is guarded on still holding this token, so exactly one of
+     * the two proceeds.
+     *
+     * NULL exactly when `transition` is NULL (`chk_files_transition_owner`).
+     */
+    transitionId: uuid('transition_id'),
+    /**
+     * How many times a caller that could NOT claim the row has asked whoever
+     * owns it to delete the copy in the bucket the row does not name.
+     *
+     * A losing caller has a copy to remove and no marker to hand it to. Bumping
+     * this in the same statement that fails to claim is what makes the demand
+     * durable: the owner reads the counter before it issues its delete and may
+     * only clear its marker while the value is unchanged, so a copy that landed
+     * during that delete cannot be forgotten by the clear that follows it.
+     * Monotonic — the value itself means nothing, only that it moved.
+     */
+    cleanupRequests: integer('cleanup_requests').notNull().default(0),
     folderId: uuid('folder_id').references(() => folders.id),
     displayName: varchar('display_name', {
       length: MEDIA_DISPLAY_NAME_MAX,
@@ -771,6 +815,12 @@ export const files = pgTable(
     index('idx_files_transition')
       .on(t.transition, t.updatedAt)
       .where(sql`transition IS NOT NULL`),
+    // The token exists exactly while a transition does, so neither an
+    // unowned saga nor an orphaned token can be written by any path.
+    check(
+      'chk_files_transition_owner',
+      sql`(transition IS NULL) = (transition_id IS NULL)`
+    ),
     check('chk_size_bytes_positive', sql`size_bytes >= 0`),
     check('chk_width_positive', sql`width IS NULL OR width > 0`),
     check('chk_height_positive', sql`height IS NULL OR height > 0`),
@@ -778,6 +828,62 @@ export const files = pgTable(
       'chk_files_sha256_hex',
       sql`sha256 IS NULL OR sha256 ~ '^[0-9a-f]{64}$'`
     ),
+  ]
+);
+
+/**
+ * Objects that must leave the store, and have no `files` row left to carry the
+ * demand.
+ *
+ * One situation reaches this, and it is the one the transition token cannot
+ * cover. A publish whose saga `retryTransitions` took over lands its copy AFTER
+ * an ordinary delete has swept that bucket and removed the row. The writer
+ * notices and deletes what it wrote (`removeStaleCopy` in
+ * `lib/media/visibility.ts`) — but a refused delete, or a public URL the edge
+ * cache would not drop, then has nowhere to go: the transition marker, the
+ * cleanup counter and the `deleting` status all lived on the row that is gone.
+ * `ux_files_r2_key` proves the key belongs to nobody; it does not remember that
+ * removing it is still owed.
+ *
+ * Deliberately NOT a `files` row. A row there asserts a display name, a kind, a
+ * size and an uploader, none of which is true of anything any more, and it would
+ * resurrect a primary key the audit trail has already recorded a DELETE for.
+ *
+ * Written BEFORE the delete is attempted and removed only once it has succeeded,
+ * so a crash in between leaves the demand rather than losing the object. Drained
+ * by `sweepOrphanedObjects`: an attempt that fails reports the retention sweep
+ * `degraded`, and rows a bounded pass never reached report `hasMore`.
+ *
+ * `updated_at` doubles as the drain's queue position — it takes the least
+ * recently touched rows and restamps whatever it could not finish, so a failing
+ * prefix cannot hold the batch against the work behind it.
+ */
+export const orphanedObjects = pgTable(
+  'orphaned_objects',
+  {
+    id: uuid('id').primaryKey().$defaultFn(generateId),
+    r2Key: varchar('r2_key', { length: URL_MAX }).notNull(),
+    bucketType: bucketType('bucket_type').notNull(),
+    /**
+     * How many writers have recorded this same leftover.
+     *
+     * The unique index identifies the OBJECT; it does not identify which write
+     * a successful delete covered. Two abandoned writers can hold a copy of the
+     * same key in the same bucket, and the second one's demand arrives while
+     * the first one's delete is already in flight — so the first one's clear
+     * would remove the retry the second was promised and the object would be
+     * owed to nobody. Every enqueue advances this, and every clear is refused
+     * unless the value is still the one its own enqueue saw. Monotonic — the
+     * value itself means nothing, only that it moved. Same fence as
+     * `files.cleanupRequests`, for the same reason.
+     */
+    cleanupRequests: integer('cleanup_requests').notNull().default(0),
+    ...timestamps,
+  },
+  (t) => [
+    // One ROW per object, however many writers demand it; `cleanup_requests`
+    // is what counts the demands on it.
+    uniqueIndex('ux_orphaned_objects_key_bucket').on(t.r2Key, t.bucketType),
   ]
 );
 

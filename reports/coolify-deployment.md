@@ -188,7 +188,34 @@ comment; no code reads it.)
   `bun run db:migrate`, which applies both phases — generated migrations in
   `db/drizzle/`, then the hand-written SQL in `db/migrations/` (`pg_trgm` and
   the GIN indexes). It needs only `DATABASE_URL`, so it is safe to run from a
-  maintenance shell.
+  maintenance shell — **except for the `0013`–`0019` release, which must not
+  serve between the migration and the swap. Read §13.4a before deploying it.**
+- **`db:migrate` now refuses BEFORE it applies anything** when the ledger in
+  `drizzle.__drizzle_migrations` disagrees with `db/drizzle/meta/_journal.json`
+  over an already-applied entry — an edited migration file, a row for a
+  migration this checkout does not have, or more rows than journal entries. The
+  message names the file. Nothing is applied, so the database is exactly as the
+  command found it and the deployment can be held while the divergence is
+  resolved; do not work around it by editing the ledger without first knowing
+  which statements the database actually ran.
+- **A file delete now addresses every configured R2 bucket and purges the key's
+  public URL**, not only the bucket the row names — a stale visibility transition
+  can leave a copy in the other one. Budget for it: one extra `DeleteObjects` per
+  delete batch, and a Cloudflare purge call on private deletes too where
+  `CLOUDFLARE_CACHE_PURGE_TOKEN` is configured (batched at 30 URLs per call,
+  charged against the same outbound ceiling as every other purge). The purge is
+  submitted on the PUBLIC delete's own result, so an unrelated private-bucket
+  outage does not hold back the eviction of content already gone from the origin.
+- **Never unset `R2_PUBLIC_BUCKET` or `R2_PRIVATE_BUCKET` while rows still name
+  that visibility.** The variable is the only thing that goes; the objects and
+  the rows stay. Deleting such a file answers 200 with the id under `pending`
+  rather than `deleted`, the row keeps its `deleting` marker, and the nightly
+  retention sweep reports `scheduled sweep degraded` with
+  `media.delete row names a bucket this deployment cannot address` on every pass
+  until the bucket is configured again. That is deliberate — the alternative is
+  dropping the last record of a key whose object is still stored, and for the
+  public bucket, still readable. To retire a bucket, move its files to the other
+  visibility first, then remove the variable.
 - Before routing traffic, run `bun run preflight:credentials` with production
   `DATABASE_URL` and password-pepper variables. It fails if any credential uses
   a malformed envelope or a pepper ID missing from the deployed keyring.
@@ -1490,6 +1517,16 @@ it is broken.
 It deliberately does not touch `audit_logs` or user rows; both decisions are
 recorded on those tables in `db/schema.ts`.
 
+**`orphaned_objects` is a work queue, and a non-empty one is an alert.** A row
+there is an R2 object whose `files` row is already gone and whose delete (or
+whose public-URL purge) was refused — the one leftover no other sweep can find,
+because every other retry hangs off a row in `files`. The retention pass drains
+it and reports `status: "degraded"` while any row survives the attempt, so the
+existing `scheduled sweep degraded` alert covers it. If rows persist across runs,
+the store or the Cloudflare purge token is the thing to check; the objects are
+deliberately left in place until both answer. In normal operation the table is
+empty.
+
 Do not schedule `VACUUM`, and never remove a `-wal` file by hand while the
 database is open.
 
@@ -1725,7 +1762,9 @@ Two CI details that touch this server:
 
 - The `test` job uses a `postgres:18-alpine` service container. **If the
   server's PostgreSQL major is upgraded, update the CI image in the same
-  change** — otherwise a fidelity gap is traded, not closed.
+  change** — otherwise a fidelity gap is traded, not closed. The VARIANT matters
+  as well as the major: `-alpine` is musl and the plain tag is glibc, and the two
+  do not classify Unicode identically. §15 is where that bites.
 - The **Boot smoke test** deliberately points `DATABASE_URL` at the unreachable
   `db.example.com`. That is the only check proving the pool still connects
   lazily (§3.1a). Do not "fix" it by giving it the service container.
@@ -1788,6 +1827,14 @@ Production refuses to boot with no bucket at all, with a public bucket and no
 `R2_PUBLIC_URL`, with a bucket and no credentials, or with one purge variable.
 Every environment refuses to boot with one bucket under both names.
 
+**`R2_PUBLIC_URL` set with no purge pair logs a warning at boot**
+(`media.cache-purge is not configured`) and keeps serving. That is the one
+combination where unpublish and delete are not what they appear: the origin
+object is removed and the route answers 200, but a cached edge copy stays
+readable for the whole `max-age=31536000`. Either set the pair, or confirm the
+public origin is genuinely uncached (a bare `r2.dev` URL is) and treat the
+warning as expected for that deployment.
+
 When the purge pair is set, a delete or unpublish whose purge fails keeps the
 row in its cleanup state and the nightly sweep retries both the object delete
 and the purge; the API reports such rows as `pending` (delete) or with
@@ -1819,6 +1866,45 @@ write-locked for the build. It is a non-event on a `files` table of any size
 this deployment has now; if it ever runs against a large one, take the brief
 write pause into account or run the two statements by hand with
 `DROP INDEX CONCURRENTLY` / `CREATE INDEX CONCURRENTLY` before deploying.
+
+### 13.4a `0013`–`0019`: the one release that must not serve between migrate and swap
+
+**Two of these seven migrations are backward-INCOMPATIBLE, so the deploy window
+has to be closed rather than merely short.** Everywhere else in this runbook
+`db:migrate` may be run from a maintenance shell well ahead of the container
+swap; for this release it must not be. Run `bun run db:migrate` and complete the
+stop-first swap (§6) as ONE step, and if the migration and the swap cannot be
+adjacent, stop the old container first and accept the longer downtime.
+
+Why, per file:
+
+- `0014_file_transition_owner.sql` adds `files.transition_id` and the CHECK
+  `chk_files_transition_owner`, `(transition IS NULL) = (transition_id IS NULL)`.
+  The previous release writes and clears `files.transition` alone
+  (`lib/media/visibility.ts`), so under the new constraint **every publish,
+  unpublish and stale-transition sweep fails with `23514`** — including the
+  clearing write that runs after the stale object was already deleted, which
+  leaves the row at `transition: 'cleanup'` until the nightly sweep of the NEW
+  release picks it up. The migration backfills a token for rows already mid-saga,
+  so nothing existing is refused; only the old code's writes are.
+- `0016_drop_backup_code_version.sql` drops `backup_codes_version` and
+  `backup_codes_acknowledged_version`. The previous release reads them in
+  `lib/auth/two-factor-challenge.ts`, `lib/auth/recovery-second-factor.ts` and
+  `lib/auth/two-factor-enrolment.ts`, so **every second-factor challenge,
+  enrolment and recovery request answers `42703`** for as long as it keeps
+  serving. `0015` must run before it — it is the hand-written backfill that gives
+  each existing set its `backup_codes_set_id` and carries the acknowledgement
+  across — and `db:migrate` applies them in journal order, so this only matters
+  if someone applies files by hand.
+
+The other five are additive and safe in either direction: `0013` adds a nullable
+`last_totp_step`, `0017` adds `files.cleanup_requests` with a default, `0018`
+creates `orphaned_objects` and `0019` adds a column to it.
+
+**Reverting this release means reverting the schema too.** Rolling the container
+back to the previous image without also restoring the database leaves exactly the
+failure above, permanently. There is no down migration; restore from backup
+(§10).
 
 ### 13.5 Proxy limits
 
@@ -2007,3 +2093,71 @@ return to sign-in because every session, including the current one, is revoked.
 - Complete a local email change and check that the link, all sessions and pending
   proof state are invalidated. Check generic failures for unknown identities and
   changed Google emails without logging the provider payload.
+
+## 15. Database ctype and the search floor
+
+The trigram floor in `lib/data-table/parsers.ts` decides whether a search term
+can be answered from the `pg_trgm` GIN index. pg_trgm classifies a character with
+the DATABASE's ctype (`t_isalpha || t_isdigit`, which is the C library's), not
+with Unicode — so the floor is a statement about the PostgreSQL this application
+talks to, and two images can disagree about it.
+
+`tests/integration/trigram-floor.test.ts` re-measures the class against whichever
+database the tier runs on. Its **admission** direction is strict: a character the
+floor lets through that the server will not index is a full table scan any
+authorized user can repeat, so that case fails the tier by name. The opposite
+direction — a character the floor refuses that the server would have indexed —
+is asserted only for the scripts this application's data actually uses; for the
+exotic families the floor errs toward refusing on purpose.
+
+**Record with the deployment, next to the PostgreSQL major:**
+
+- the image and variant, exactly (`postgres:18-alpine` is musl, `postgres:18` is
+  glibc);
+- `datcollate` / `datctype`.
+
+**Required once, and again on any major upgrade, image or variant change, or
+locale change:** run this file against the production-shaped database and keep it
+green. If CI's image and the deployment's differ, CI's green run is not evidence
+about the deployment.
+
+```sql
+-- What the database actually thinks, if the tier cannot be run there.
+select datcollate, datctype from pg_database where datname = current_database();
+show server_version;
+select extversion from pg_extension where extname = 'pg_trgm';
+```
+
+A failure here is not data corruption. Either the floor is refusing a search that
+would have worked — widen the class — or it is admitting a scan, which is the
+finding the floor exists for and the more urgent of the two.
+
+**Recorded for `postgres:18-alpine` (musl), 2026-09-17 — derived, not run.** No
+container runtime was available on the audit host, so this was settled against
+musl's own tables instead: `src/ctype/iswalpha.c` is a bitmap lookup into
+`src/ctype/alpha.h`, and evaluating that bitmap for every BMP code point gives
+musl's answer directly. Two things follow.
+
+- **The tier passes.** `iswalpha` is true for the two families the floor's class
+  was calibrated on glibc for — `Nl` (`Ⅳ` U+2163, `〇` U+3007) and non-ASCII `Nd`
+  (`١` U+0661) — and for every letter the test terms use. musl is in fact wider
+  than the class (it marks combining marks and `ⓐ` alpha, which the class
+  refuses); wider is the refusal direction, which costs a search and nothing
+  else. The image's `ENV LANG=en_US.utf8` is what keeps `iswalpha` in play at
+  all: musl keeps the requested locale NAME even though it loads C.UTF-8
+  behaviour, so `datctype` is not `C` and PostgreSQL does not fall back to
+  `isalpha` on the first byte — which WOULD make every non-ASCII term unindexed.
+  Check `datctype` with the query above before trusting this on a variant that
+  sets the locale differently.
+- **One residual, on musl only.** musl's table predates several Unicode
+  additions the floor's `\p{L}`/`\p{Nl}`/`\p{Nd}` class admits, so those
+  characters are admitted here and NOT indexed there — the scan direction. The
+  full BMP set is U+0870–U+0887, U+0889–U+088F, U+08B5, U+08BE–U+08C9,
+  U+0C5C–U+0C5D, U+0CDC–U+0CDD, U+0D04, U+0E2F, U+0E46, U+170D, U+171F, U+1B4C,
+  U+1C89–U+1C8A, U+2C2F, U+2C5F, U+31BB–U+31BF, U+4DB6–U+4DBF, U+9FF0–U+9FFF,
+  U+A7C0–U+A7C1, U+A7C7–U+A7DC, U+A7F1–U+A7F6, U+AB68–U+AB69 — Arabic
+  Extended-B, recent CJK ideograph additions and a handful of Latin/Cyrillic
+  extensions. None appear in this application's data or in the test set, and
+  narrowing the class to one libc version's vintage would refuse them on the
+  glibc images too; `postgres:18` (glibc) does not have this gap. Deploy on the
+  glibc image if the data will contain those scripts.

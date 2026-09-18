@@ -17,8 +17,7 @@ import type {
   EnrollmentState,
   OfferedOption,
 } from '@/lib/auth/two-factor-challenge';
-import type { OtpChannel } from '@/utils/validation/otp';
-import type { TwoFactorMethod } from '@/utils/validation/two-factor';
+import type { OtpChannel, TwoFactorMethod } from '@/utils/validation/enums';
 
 import { defaultOption, offeredMethods } from '@/lib/auth/two-factor-challenge';
 

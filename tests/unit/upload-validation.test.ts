@@ -41,7 +41,11 @@ import {
   UPLOAD_MEGAPIXEL_BUDGET,
   UPLOAD_REQUEST_UNIT,
 } from '@/lib/media/upload';
-import { measureEncodeCost, optimizeImage } from '@/lib/r2/optimize-image';
+import {
+  MAX_ICC_PROFILE_BYTES,
+  measureEncodeCost,
+  optimizeImage,
+} from '@/lib/r2/optimize-image';
 import {
   ALLOWED_IMAGE_TYPES,
   isAllowedImageType,
@@ -59,7 +63,7 @@ import {
   SVG_MAX_ELEMENTS,
   SVG_MAX_RENDERED_NODES,
 } from '@/utils/images/config';
-import { rasterDimensions } from '@/utils/images/raster-bytes';
+import { iccProfileChunk, rasterDimensions } from '@/utils/images/raster-bytes';
 import { imageToRgba } from '@/utils/images/rgba';
 import { sanitizeSvgServer, svgOptimizerServer } from '@/utils/images/server';
 import { sanitizeSvg } from '@/utils/images/svg-optimizer';
@@ -314,6 +318,34 @@ describe('the structural gates on an SVG', () => {
     expect(result.isValid).toBe(true);
     expect(result.cleanedSvg).not.toInclude('<!--');
   });
+
+  test.each([
+    ['an unterminated comment', '<!--'],
+    ['an unterminated CDATA section', '<![CDATA['],
+    ['an unterminated processing instruction', '<?'],
+    ['an unterminated tag', '<a'],
+  ])(
+    '%s at the size cap is answered without stalling the process',
+    (_label, unit) => {
+      // The pre-parse passes run on ADMITTED but unparsed bytes, and no route
+      // timeout can interrupt synchronous JavaScript. As regular expressions
+      // they were quadratic: 8/16/32 KB of these took 9/40/152 ms, so the
+      // 410 KB the size cap admits projected to tens of seconds per request.
+      const payload = unit.repeat(
+        Math.floor((SVG_SIZE_CAP - 64) / unit.length)
+      );
+      const markup = `<svg xmlns="${SVG_NS}"><desc>${payload}</desc></svg>`;
+      expect(new Blob([markup]).size).toBeGreaterThan(400 * 1024);
+
+      const started = Bun.nanoseconds();
+      const result = clean(markup);
+      const elapsedMs = (Bun.nanoseconds() - started) / 1e6;
+
+      expect(result.isValid).toBe(false);
+      // Generous: the point is the ORDER of magnitude, not a latency budget.
+      expect(elapsedMs).toBeLessThan(2000);
+    }
+  );
 
   test('content over the size cap is refused before it is parsed', () => {
     const oversize = `<svg xmlns="${SVG_NS}"><desc>${'A'.repeat(SVG_SIZE_CAP)}</desc></svg>`;
@@ -1112,6 +1144,44 @@ function buildPng(size: number, height = size, flat = false): Buffer {
   ]);
 }
 
+/**
+ * The same PNG, filled with noise instead of a gradient.
+ *
+ * WebP compresses a gradient to almost nothing, so `buildPng` cannot produce a
+ * result large enough to test a SIZE ceiling. Seeded LCG, not `Math.random`, so
+ * a failure is reproducible.
+ */
+function buildNoisePng(size: number): Buffer {
+  const ihdr = Buffer.alloc(13);
+  ihdr.writeUInt32BE(size, 0);
+  ihdr.writeUInt32BE(size, 4);
+  ihdr[8] = 8;
+  ihdr[9] = 6;
+
+  const stride = 1 + size * 4;
+  const raw = Buffer.alloc(size * stride);
+  let seed = 1;
+  for (let y = 0; y < size; y++) {
+    const row = y * stride;
+    raw[row] = 0;
+    for (let x = 0; x < size; x++) {
+      const pixel = row + 1 + x * 4;
+      seed = (seed * 1_664_525 + 1_013_904_223) >>> 0;
+      raw[pixel] = (seed >>> 16) & 0xff;
+      raw[pixel + 1] = (seed >>> 8) & 0xff;
+      raw[pixel + 2] = seed & 0xff;
+      raw[pixel + 3] = 0xff;
+    }
+  }
+
+  return Buffer.concat([
+    Buffer.from(PNG_SIGNATURE),
+    pngChunk('IHDR', ihdr),
+    pngChunk('IDAT', zlib.deflateSync(raw)),
+    pngChunk('IEND', Buffer.alloc(0)),
+  ]);
+}
+
 /** A RIFF sub-chunk: `FourCC | uint32le size | payload | pad to even`. */
 function riffChunk(fourcc: string, payload: Buffer): Buffer {
   const header = Buffer.alloc(8);
@@ -1374,14 +1444,40 @@ describe('H4 - one side over what WebP can hold', () => {
     expect(out.width).toBe(64);
   });
 
-  test('an unattainable byte target is refused instead of returning oversized output', async () => {
+  test('an unattainable byte target keeps the best rung, up to the hard ceiling', async () => {
+    // The target is a GOAL. Refusing an unreachable one threw away every encode
+    // it had already paid for and made whole image classes unsupported — a
+    // dense screenshot cannot reach 200 KiB at 800 px and quality 50. What may
+    // not be exceeded is `MAX_STORED_IMAGE_BYTES`, asserted below.
+    const out = await optimizeImage(buildPng(64), { targetSize: 1 });
+
+    expect(out.format).toBe('webp');
+    expect(out.size).toBeGreaterThan(1);
+    expect(out.size).toBeLessThanOrEqual(800 * 1024);
+    // Two encodes, not the whole ladder: the floor rung is measured before the
+    // search, so an unreachable target is settled without walking to it.
+    expect(out.iterations).toBe(2);
+  });
+
+  test('and a result over that ceiling is still refused', async () => {
+    // The ceiling is `Math.max(targetSize, MAX_STORED_IMAGE_BYTES)`, so a low
+    // target cannot lower it — the refusal has to come from a rung genuinely
+    // larger than 800 KiB. Pinning `minWidth` and `minQuality` to the top
+    // leaves the ladder a single rung, and 1000px of noise at quality 100 is
+    // about 1.1 MB.
     await expect(
-      optimizeImage(buildPng(64), { targetSize: 1 })
+      optimizeImage(buildNoisePng(1000), {
+        targetSize: 1,
+        initialQuality: 100,
+        minQuality: 100,
+        initialWidth: 1000,
+        minWidth: 1000,
+      })
     ).rejects.toMatchObject({
       status: HTTP_STATUS.UNPROCESSABLE,
       message: uploadMsg.targetUnreachable,
     });
-  });
+  }, 20_000);
 
   test('initialWidth is a longest-edge ceiling for portrait output', async () => {
     const out = await optimizeImage(buildPng(100, 300, true), {
@@ -1937,37 +2033,63 @@ describe('an inline data: raster is held to the upload policy', () => {
     });
   });
 
-  test('a type the upload route does not admit is stripped, not refused', () => {
-    // The OTHER axis, and it keeps the reference answer. GIF is not in
-    // `ALLOWED_IMAGE_TYPES`, so it is refused for its TYPE — exactly as an
-    // `https:` reference is — and its bytes are never reached, which is why an
-    // animated GIF is stripped here where an APNG is refused. Stripping an
-    // unsupported reference is the contract every other unsupported reference
-    // in this file gets.
+  test('a type the upload route does not admit is REFUSED, not stripped', () => {
+    // The OTHER axis. GIF is not in `ALLOWED_IMAGE_TYPES`, and it used to keep
+    // the external-reference answer — stripped, 200, picture silently gone. The
+    // caller supplied a PICTURE here, not a pointer to one, so it now gets the
+    // same disposition an unsupported direct upload gets.
     const gif = Buffer.from('R0lGODlhAQABAAAAACw=', 'base64');
     expect(isAllowedImageType('image/gif')).toBe(false);
 
     const result = clean(inline('image/gif', gif));
-    expect(result.isValid).toBe(true);
-    expect(result.reason).toBeUndefined();
-    expect(result.cleanedSvg).not.toInclude('data:');
+    expect(result.isValid).toBe(false);
+    expect(result.reason).toBe('invalid-inline-raster');
+    expect(result.cleanedSvg).toBe('');
   });
 
-  test('a payload that is not what it declares is stripped', () => {
+  test('a payload that is not what it declares is REFUSED', () => {
     // A declared type nothing verifies is the same hole the magic-byte check
-    // closes on the direct path. Stripped rather than refused: a mismatched
-    // payload is a broken reference, not an animated upload.
+    // closes on the direct path, and it answers the same way.
     const result = clean(inline('image/png', stillWebp));
 
-    expect(result.isValid).toBe(true);
-    expect(result.cleanedSvg).not.toInclude('data:');
+    expect(result.isValid).toBe(false);
+    expect(result.reason).toBe('invalid-inline-raster');
   });
 
-  test('a signature without readable dimensions is stripped', () => {
+  test('a signature without readable dimensions is REFUSED', () => {
     const result = clean(inline('image/png', Buffer.from(PNG_SIGNATURE)));
 
+    expect(result.isValid).toBe(false);
+    expect(result.reason).toBe('invalid-inline-raster');
+  });
+
+  test('an https: reference is still stripped, not refused', () => {
+    // The refusal above is about a supplied picture. A pointer to somebody
+    // else's picture keeps the reference answer it always had.
+    const result = clean(
+      svg('<image width="8" height="8" href="https://attacker.example/p.png"/>')
+    );
+
     expect(result.isValid).toBe(true);
-    expect(result.cleanedSvg).not.toInclude('data:');
+    expect(result.cleanedSvg).not.toInclude('attacker.example');
+  });
+
+  test('line-wrapped base64 survives and is stored unwrapped', () => {
+    // Inkscape wraps embedded image data at 76 columns; XML attribute-value
+    // normalisation turns each newline into a space. That whole `<image>` used
+    // to be dropped from the document while the response still said 200.
+    const payload = realPng.toString('base64');
+    const wrapped = (payload.match(/.{1,76}/g) ?? []).join('\n');
+    expect(wrapped).toInclude('\n');
+
+    const result = clean(
+      svg(
+        `<image width="8" height="8" href="data:image/png;base64,${wrapped}"/>`
+      )
+    );
+
+    expect(result.isValid).toBe(true);
+    expect(result.cleanedSvg).toInclude(`data:image/png;base64,${payload}`);
   });
 
   test('svgo does not delete a raster the sanitiser kept', () => {
@@ -2100,4 +2222,154 @@ describe('an inline data: raster is held to the upload policy', () => {
     if (!result.isValid) throw new Error('expected valid SVG');
     expect(result.embeddedRasterMegapixels).toBe(0);
   });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The ICC profile bound — the one piece of input metadata that reaches output
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** `<name>\0<compression method 0><deflated profile>`, the PNG `iCCP` layout. */
+function iccpChunk(profile: Buffer): Buffer {
+  return pngChunk(
+    'iCCP',
+    Buffer.concat([
+      Buffer.from('p\0', 'latin1'),
+      Buffer.from([0]),
+      zlib.deflateSync(profile),
+    ])
+  );
+}
+
+/** Splices ancillary chunks in immediately after `IHDR`, where a real encoder puts them. */
+function withPngChunks(png: Buffer, ...chunks: Buffer[]): Buffer {
+  const afterIhdr = PNG_SIGNATURE.length + 12 + 13;
+  return Buffer.concat([
+    png.subarray(0, afterIhdr),
+    ...chunks,
+    png.subarray(afterIhdr),
+  ]);
+}
+
+/** An extended WebP carrying `ICCP`. The image payload is irrelevant to the bound. */
+function buildWebpWithIcc(profile: Buffer): Buffer {
+  const vp8x = Buffer.alloc(10);
+  vp8x[0] = 0x20; // the ICC-profile flag
+  vp8x.writeUIntLE(7, 4, 3);
+  vp8x.writeUIntLE(7, 7, 3);
+  const body = Buffer.concat([
+    Buffer.from('WEBP', 'ascii'),
+    riffChunk('VP8X', vp8x),
+    riffChunk('ICCP', profile),
+    riffChunk('VP8L', Buffer.alloc(16)),
+  ]);
+  const header = Buffer.alloc(8);
+  header.write('RIFF', 0, 'ascii');
+  header.writeUInt32LE(body.length, 4);
+  return Buffer.concat([header, body]);
+}
+
+/** Every RIFF chunk type in a WebP, walked independently of the production reader. */
+function webpChunkTypes(bytes: Buffer): string[] {
+  const types: string[] = [];
+  let offset = 12;
+  while (offset + 8 <= bytes.length) {
+    const length = bytes.readUInt32LE(offset + 4);
+    types.push(bytes.toString('ascii', offset, offset + 4));
+    offset += 8 + length + (length % 2);
+  }
+  return types;
+}
+
+describe('the ICC profile bound', () => {
+  const overBound = Buffer.alloc(MAX_ICC_PROFILE_BYTES + 1, 0x5a);
+  const refusal = {
+    status: HTTP_STATUS.UNPROCESSABLE,
+    message: uploadMsg.iccProfileTooLarge(
+      Math.floor(MAX_ICC_PROFILE_BYTES / 1024)
+    ),
+  };
+
+  test('a deflated PNG profile that inflates past the bound is refused', async () => {
+    // The whole point of the bound: the profile is priced by what it EXPANDS to,
+    // not by what it costs to carry. This one is 15 KB on the wire.
+    const bomb = Buffer.alloc(100 * 1024 * 1024, 0x5a);
+    const png = withPngChunks(buildPng(32, 32, true), iccpChunk(bomb));
+
+    expect(png.length).toBeLessThan(200 * 1024);
+    expect(optimizeImage(png)).rejects.toMatchObject(refusal);
+  }, 30_000);
+
+  test('an undeflatable PNG profile is refused rather than handed to the decoder', async () => {
+    const png = withPngChunks(
+      buildPng(32, 32, true),
+      pngChunk(
+        'iCCP',
+        Buffer.concat([
+          Buffer.from('p\0', 'latin1'),
+          Buffer.from([0]),
+          Buffer.from('not deflate at all', 'latin1'),
+        ])
+      )
+    );
+
+    expect(optimizeImage(png)).rejects.toMatchObject(refusal);
+  }, 30_000);
+
+  test('a WebP ICCP over the bound is refused', async () => {
+    // The second container, and the one that stores the profile VERBATIM — the
+    // PNG branch's inflate bound would never fire here.
+    const webp = buildWebpWithIcc(overBound);
+    expect(iccProfileChunk(webp)).toMatchObject({ deflated: false });
+    expect(optimizeImage(webp)).rejects.toMatchObject(refusal);
+  }, 30_000);
+
+  test('the bound is checked before the image is decoded at all', async () => {
+    // A truncated IDAT makes the encode fail; the answer still names the
+    // profile, so the check demonstrably precedes decoding — and therefore the
+    // encoder slot it would otherwise hold while being priced.
+    const valid = buildPng(32, 32, true);
+    const png = withPngChunks(
+      valid.subarray(0, -40),
+      iccpChunk(Buffer.alloc(MAX_ICC_PROFILE_BYTES + 1, 0x5a))
+    );
+
+    expect(optimizeImage(png)).rejects.toMatchObject(refusal);
+  }, 30_000);
+
+  test('a profile under the bound survives into the stored WebP, and nothing else does', async () => {
+    // Kept deliberately: dropping it is a visible colour shift on wide-gamut
+    // PNGs. The second half is the claim the bound RELIES on — if EXIF or XMP
+    // crossed too, one bounded channel would not be the whole policy.
+    const profile = Buffer.alloc(2048, 0x5a);
+    const png = withPngChunks(
+      buildPng(64, 64, true),
+      iccpChunk(profile),
+      pngChunk('eXIf', Buffer.from('MM\0*exif-sentinel', 'latin1')),
+      pngChunk(
+        'iTXt',
+        Buffer.concat([
+          Buffer.from('XML:com.adobe.xmp\0\0\0\0\0', 'latin1'),
+          Buffer.from('xmp-sentinel', 'latin1'),
+        ])
+      )
+    );
+
+    const result = await optimizeImage(png);
+    const output = Buffer.from(result.buffer);
+
+    expect(webpChunkTypes(output)).toContain('ICCP');
+    expect(iccProfileChunk(output)?.data).toEqual(
+      new Uint8Array(profile.buffer, profile.byteOffset, profile.length)
+    );
+    expect(output.includes(Buffer.from('exif-sentinel'))).toBe(false);
+    expect(output.includes(Buffer.from('xmp-sentinel'))).toBe(false);
+  }, 30_000);
+
+  test('an image with no profile is untouched by the check', async () => {
+    const png = buildPng(32, 32, true);
+    expect(iccProfileChunk(png)).toBeNull();
+    await expect(optimizeImage(png)).resolves.toMatchObject({
+      format: 'webp',
+    });
+  }, 30_000);
 });

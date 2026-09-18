@@ -1,7 +1,7 @@
 import crypto from 'node:crypto';
 import type { Tx } from '@/db';
 import type { EntityID } from '@/types';
-import type { OtpChannel, OtpPurpose } from '@/utils/validation/otp';
+import type { OtpChannel, OtpPurpose } from '@/utils/validation/enums';
 import type SMTPTransport from 'nodemailer/lib/smtp-transport';
 
 import { and, eq, gt, isNull, sql } from 'drizzle-orm';
@@ -51,9 +51,40 @@ function generateOtpCode() {
   return crypto.randomInt(100_000, 1_000_000).toString();
 }
 
+/** The first rung, and the whole ladder on the anonymous surfaces. */
+export const OTP_BASE_RESEND_DELAY_S = 30;
+
+/**
+ * Purposes whose send endpoint answers the SAME body for a real identifier and
+ * an invented one, so it cannot report this row's own countdown.
+ *
+ * That privacy contract and an exponential ladder are not compatible: the
+ * response can only advertise a constant, and a client obeying it then has every
+ * request past the first refused INTERNALLY — returned as the same generic
+ * success, with a destination quota unit spent and no message delivered. Flat is
+ * what makes the advertised number true, and it costs nothing the other bounds
+ * were not already providing: `OTP_MAX_ATTEMPTS` caps a cycle at five sends,
+ * `OTP_SURFACE_SEND_CAP_PER_HOUR` caps the destination at five per hour, and the
+ * global daily breaker sits above both.
+ *
+ * The authenticated surfaces keep the ladder: `/two-factor/otp/send` and the
+ * recovery second factor both return the row's real `nextAllowedIn`, so there is
+ * nothing there for a client to disagree with.
+ */
+const FLAT_RESEND_PURPOSES: ReadonlySet<OtpPurpose> = new Set([
+  'verify_contact',
+  'passwordless_login',
+  'forgot_password',
+]);
+
 /** Exponential backoff: 30 * 2^(n-1) seconds (30s, 60s, 120s, 240s, 480s...) */
-function calculateNextAllowedAt(attemptNumber: number): Date {
-  const delaySeconds = 30 * Math.pow(2, attemptNumber - 1);
+function calculateNextAllowedAt(
+  attemptNumber: number,
+  purpose: OtpPurpose
+): Date {
+  const delaySeconds = FLAT_RESEND_PURPOSES.has(purpose)
+    ? OTP_BASE_RESEND_DELAY_S
+    : OTP_BASE_RESEND_DELAY_S * Math.pow(2, attemptNumber - 1);
   return new Date(Date.now() + delaySeconds * 1000);
 }
 
@@ -683,7 +714,7 @@ export async function processOtpSend({
     const expiresAt = calculateOtpExpiry();
 
     const currentAttempts = session?.attemptNumber ?? 0;
-    const nextAllowedAt = calculateNextAllowedAt(currentAttempts + 1);
+    const nextAllowedAt = calculateNextAllowedAt(currentAttempts + 1, purpose);
 
     // Upsert session (atomic) — reset per-cycle verifyAttemptNumber on
     // resend, but KEEP verifyAttemptDaily so attackers can't reset the 24h

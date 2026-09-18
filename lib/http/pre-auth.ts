@@ -27,11 +27,38 @@ const PRE_AUTH_SEGMENT_MAX = 40;
  * keeping a second copy of the list — a copy that had already drifted.
  */
 export function preAuthScope(pathname: string): string {
+  return scopeFrom(pathname, PRE_AUTH_SURFACE_SEGMENTS);
+}
+
+/** How deep `allowlistedPathScope` may go; a bound on the key, not a policy. */
+const PRE_AUTH_PATH_SEGMENTS = 8;
+
+/**
+ * The scope for ONE path on a wildcard prefix's allowlist — the whole path, not
+ * its first two segments.
+ *
+ * Only safe because the caller has already matched the path against a
+ * compile-time list, so the keyspace is that list and nothing a client sends
+ * can widen it. Everything OUTSIDE the list still shares
+ * `UNKNOWN_PREFIX_SCOPE`, which is what bounds path rotation.
+ *
+ * `preAuthScope`'s two-segment surface is wrong for these: the twelve
+ * `/two-factor/*` endpoints declare budgets of 20, 30 and 60 in
+ * `lib/auth/allowed-paths.ts`, and a budget stated per path but counted per
+ * surface is not that budget — a dashboard reading `/two-factor/methods` at
+ * 60/min exhausts the pool `/two-factor/otp/send` needs at 20/min, and a second
+ * user behind the same NAT is refused a code they never over-requested.
+ */
+export function allowlistedPathScope(pathname: string): string {
+  return scopeFrom(pathname, PRE_AUTH_PATH_SEGMENTS);
+}
+
+function scopeFrom(pathname: string, maxSegments: number): string {
   const segments = pathname
     .split('/')
     .filter(Boolean)
     .filter((segment) => segment !== 'api')
-    .slice(0, PRE_AUTH_SURFACE_SEGMENTS)
+    .slice(0, maxSegments)
     .map((segment) => segment.slice(0, PRE_AUTH_SEGMENT_MAX));
   return segments.length > 0 ? `preauth.${segments.join('.')}` : 'preauth.root';
 }

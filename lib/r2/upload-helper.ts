@@ -181,7 +181,9 @@ export function validateSvgUpload(
         ? uploadMsg.tooManyPixels(Math.floor(MAX_IMAGE_PIXELS / 1_000_000))
         : result.reason === 'edge-too-long'
           ? uploadMsg.edgeTooLong(MAX_IMAGE_EDGE)
-          : uploadMsg.invalidSvg,
+          : result.reason === 'invalid-inline-raster'
+            ? uploadMsg.invalidInlineRaster
+            : uploadMsg.invalidSvg,
     result.reason === 'too-many-pixels' || result.reason === 'edge-too-long'
       ? HTTP_STATUS.UNPROCESSABLE
       : HTTP_STATUS.BAD_REQUEST

@@ -1,5 +1,5 @@
 import type { EntityID } from '@/types';
-import type { OtpChannel } from '@/utils/validation/otp';
+import type { OtpChannel } from '@/utils/validation/enums';
 
 import { sanitizeForLog } from '@/utils';
 import { getClientIp } from '@/lib/audit';
@@ -10,7 +10,7 @@ import {
   MSG_TOO_MANY_REQUESTS,
 } from '@/utils/api-messages';
 import { CustomError } from '@/utils/error-class';
-import { isPhoneChannel } from '@/utils/validation/otp';
+import { isPhoneChannel } from '@/utils/validation/enums';
 
 import { rateLimit } from './index';
 

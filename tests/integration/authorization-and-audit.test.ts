@@ -41,7 +41,12 @@ import { db } from '@/db';
 import { SQLITE_MAINTENANCE_TOKEN } from '@/lib/env.server';
 import { generateUuidV7 } from '@/lib/id';
 
-import { HTTP_STATUS, MSG_CREATED, MSG_NOT_FOUND } from '@/utils/api-messages';
+import {
+  HTTP_STATUS,
+  MSG_CREATED,
+  MSG_NOT_FOUND,
+  REAUTH_REQUIRED_CODE,
+} from '@/utils/api-messages';
 
 import { resetTables } from '../helpers/database';
 import {
@@ -49,6 +54,7 @@ import {
   baseHeaders,
   seedUser,
   signedInUser,
+  signIn,
   TEST_IP,
 } from '../helpers/session';
 
@@ -346,6 +352,96 @@ describe('`own` scope on a WRITE — PUT /api/dash/users/:id', () => {
   test('and the same holder may edit the row it created', async () => {
     const response = await putUser(fx().usersOwn, fx().rowOfOwnActor);
     expect(response.status).toBe(HTTP_STATUS.OK);
+  });
+});
+
+/**
+ * `PUT /api/dash/users/:id` reads one permission and then serves two
+ * operations, so the `D12` window cannot be demanded by the gate: asked before
+ * the branch, it answered 401 to a user renaming themselves — whose schema
+ * admits `name` alone — and 401 before 403 to a caller with no grant at all.
+ */
+describe('the re-authentication window on PUT /api/dash/users/:id', () => {
+  const unproven: { self: SignedInSession | null; target: SeededUser | null } =
+    { self: null, target: null };
+
+  beforeAll(async () => {
+    // `signIn`, NOT `signedInUser`: the window must stay closed.
+    const editor = await seedUser({
+      permissions: { users: { view: true, edit: true } },
+    });
+    unproven.self = await signIn(editor);
+    unproven.target = await seedUser({ permissions: {} });
+  });
+
+  test('a self-rename needs no window', async () => {
+    const session = unproven.self;
+    if (!session) throw new Error('fixture not seeded');
+
+    const response = await app.handle(
+      authedRequest(session, `/api/dash/users/${session.user.userId}`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ name: 'Renamed Self' }),
+      })
+    );
+
+    expect(response.status).toBe(HTTP_STATUS.OK);
+  });
+
+  test('a caller with no grant is refused with 403, not 401', async () => {
+    // Ordering: authorization first. A 401 here tells an unauthorized caller
+    // that a password prompt would have been the next obstacle.
+    const target = unproven.target;
+    if (!target) throw new Error('fixture not seeded');
+
+    const response = await putUser(fx().usersViewAll, target);
+
+    expect(response.status).toBe(HTTP_STATUS.FORBIDDEN);
+  });
+
+  test('renaming ANOTHER user, changing nothing sensitive, needs no window', async () => {
+    const session = unproven.self;
+    const target = unproven.target;
+    if (!session || !target) throw new Error('fixture not seeded');
+
+    const response = await putUser(session, target);
+
+    expect(response.status).toBe(HTTP_STATUS.OK);
+  });
+
+  test('but changing that user’s email does', async () => {
+    const session = unproven.self;
+    const target = unproven.target;
+    if (!session || !target) throw new Error('fixture not seeded');
+
+    const response = await putUser(session, target, {
+      email: `moved-${generateUuidV7().replaceAll('-', '')}@gmail.com`,
+    });
+    const body = (await response.json()) as { code?: string };
+
+    expect(response.status).toBe(HTTP_STATUS.UNAUTHORIZED);
+    expect(body.code).toBe(REAUTH_REQUIRED_CODE);
+  });
+
+  test('and the refused email change was rolled back', async () => {
+    const target = unproven.target;
+    if (!target) throw new Error('fixture not seeded');
+
+    const rows = await db.execute<{ email: string }>(
+      sql`select email from users where id = ${target.userId}`
+    );
+    expect(rows[0]?.email).toBe(target.email);
+  });
+
+  test('deactivating that user also needs one', async () => {
+    const session = unproven.self;
+    const target = unproven.target;
+    if (!session || !target) throw new Error('fixture not seeded');
+
+    const response = await putUser(session, target, { isActive: false });
+
+    expect(response.status).toBe(HTTP_STATUS.UNAUTHORIZED);
   });
 });
 

@@ -24,6 +24,7 @@
     "scan:sast": "mise exec -- semgrep scan --config=p/typescript --config=p/secrets --error --metrics=off",
     "prepare": "lefthook install",
     "db:generate": "drizzle-kit generate",
+    "check:schema-drift": "bun scripts/check-schema-drift.ts",
     "db:migrate": "bun scripts/migrate.ts",
     "smoke": "bun scripts/smoke.ts",
     "check:runtime": "bun scripts/require-bun.mjs",

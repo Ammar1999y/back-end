@@ -122,8 +122,12 @@ const { closeDatabase } = await import('./db');
 const { startSchedule } = await import('./lib/schedule');
 const { acquireWriterLock } = await import('./lib/sqlite/writer-lock');
 const { SQLITE_DIR } = await import('./lib/env.server');
-const { createShutdown, SHUTDOWN_POLICY, shutdownTimeoutMs } =
-  await import('./lib/shutdown');
+const {
+  createShutdown,
+  SHUTDOWN_POLICY,
+  shutdownTimeoutMs,
+  stopServerGracefully,
+} = await import('./lib/shutdown');
 
 // One instance per SQLITE_DIR, and it has to be claimed BEFORE `startSchedule`
 // below: the two scheduled sweeps are registered per process and neither is safe
@@ -140,22 +144,13 @@ const SHUTDOWN_TIMEOUT_MS = shutdownTimeoutMs({
   maxRouteTimeoutSeconds: MAX_ROUTE_TIMEOUT_SECONDS,
 });
 
-// Half-sent requests can hold graceful stop open, so force-close after the grace.
-async function stopServer(): Promise<void> {
-  const graceful = app.stop();
-  const timedOut = Symbol('graceful-stop-timeout');
-  const timer = Bun.sleep(SHUTDOWN_POLICY.gracefulStopMs).then(() => timedOut);
-
-  if ((await Promise.race([graceful, timer])) !== timedOut) return;
-
-  console.error(
-    JSON.stringify({
-      msg: 'graceful stop timed out, closing active connections',
-      graceMs: SHUTDOWN_POLICY.gracefulStopMs,
-    })
-  );
-  await app.stop(true);
-}
+const stopServer = (budgetMs: number) =>
+  stopServerGracefully({
+    budgetMs,
+    stop: (closeActiveConnections) => app.stop(closeActiveConnections),
+    pendingRequests: () => app.server?.pendingRequests ?? 0,
+    error: (line) => console.error(JSON.stringify(line)),
+  });
 
 app.listen({ port, idleTimeout: IDLE_TIMEOUT_SECONDS }, (server) => {
   console.log(

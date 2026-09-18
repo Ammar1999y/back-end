@@ -183,7 +183,7 @@ const dataTableQuery = (
   {
     name: 'search',
     required: false,
-    description: `Quick search. Terms outside ${MIN_SEARCH_LENGTH}–${MAX_SEARCH_LENGTH} characters are ignored rather than rejected, so the response is the unfiltered list.`,
+    description: `Quick search. Terms outside ${MIN_SEARCH_LENGTH}–${MAX_SEARCH_LENGTH} characters, and terms carrying no letters or digits the trigram index can key on, are ignored rather than rejected, so the response is the unfiltered list.`,
   },
 ];
 

@@ -7,7 +7,7 @@
  * right one. `hashOtpCode` is the same envelope the real send writes, so the
  * verify path is exercised for real.
  */
-import type { OtpChannel, OtpPurpose } from '@/utils/validation/otp';
+import type { OtpChannel, OtpPurpose } from '@/utils/validation/enums';
 
 import { db } from '@/db';
 import { verificationCodes, verificationSessions } from '@/db/schema';

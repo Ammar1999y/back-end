@@ -21,7 +21,24 @@ interface EnvListSpec<T extends string> {
 
 /** The listed values in order, or `[]` when the variable is unset or blank. */
 export function parseEnvEnumList<T extends string>(spec: EnvListSpec<T>): T[] {
-  const raw = process.env[spec.name]?.trim();
+  return parseEnumList(process.env[spec.name], spec);
+}
+
+/**
+ * The same parse over a string this process was HANDED rather than read from
+ * the environment.
+ *
+ * `scripts/check-two-factor-rollout.ts` takes the proposed configuration on the
+ * command line — the point is to ask before the environment changes — and had
+ * its own lenient copy: it dropped empty entries and accepted duplicates, both
+ * of which the runtime refuses to boot on. A gate that accepts what the server
+ * will not is a gate that certifies a configuration nobody can deploy.
+ */
+export function parseEnumList<T extends string>(
+  value: string | undefined,
+  spec: EnvListSpec<T>
+): T[] {
+  const raw = value?.trim();
   if (!raw) return [];
 
   const valid = spec.allowed.join(', ');

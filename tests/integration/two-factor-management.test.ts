@@ -12,8 +12,10 @@ import type { SeededUser } from '../helpers/session';
 import { and, eq } from 'drizzle-orm';
 
 import { app } from '@/app';
+import { otpMsg } from '@/app/api/auth/otp/messages';
 import { db } from '@/db';
 import {
+  auditLogs,
   twoFactorCredentials,
   twoFactorMethods,
   users,
@@ -294,6 +296,9 @@ describe('backup codes', () => {
       cookie
     );
     expect(enabled.status).toBe(HTTP_STATUS.OK);
+    const setId = ((await enabled.json()) as { data?: { setId?: string } }).data
+      ?.setId;
+    expect(setId).toBeString();
 
     // The set exists in the database...
     const [credential] = await db
@@ -314,7 +319,7 @@ describe('backup codes', () => {
     const unproven = await call(
       'POST',
       '/api/auth/two-factor/backup-codes/acknowledge',
-      {},
+      { setId },
       cookie
     );
     expect(unproven.status).toBe(HTTP_STATUS.UNAUTHORIZED);
@@ -323,10 +328,176 @@ describe('backup codes', () => {
     const acknowledged = await call(
       'POST',
       '/api/auth/two-factor/backup-codes/acknowledge',
-      { password: user.password },
+      { password: user.password, setId },
       cookie
     );
     expect(acknowledged.status).toBe(HTTP_STATUS.OK);
+    expect(await methodsOf(user.userId)).toEqual(['backup_code']);
+  });
+
+  /** Every password `verifyLoginAttempt` has actually checked for this user. */
+  async function passwordProofs(userId: string): Promise<unknown[]> {
+    const rows = await db
+      .select({ newData: auditLogs.newData })
+      .from(auditLogs)
+      .where(eq(auditLogs.userId, userId));
+    return rows.filter(
+      (row) =>
+        (row.newData as { purpose?: unknown } | null)?.purpose ===
+        'reauth_two_factor'
+    );
+  }
+
+  test('a body with no set id is a validation failure, not a stale-set answer', async () => {
+    // Two things at once. The ANSWER: an omitted `setId` used to be told the
+    // set was no longer current, which points a client at regenerating codes it
+    // never needed to regenerate. The ORDER: the parse runs before
+    // `requireReauthPassword`, so a malformed body cannot buy an Argon2id
+    // verification. The status alone cannot show that — it is 422 either way —
+    // so the ORDER is read from the audit row a completed verification writes.
+    const user = await seedUser();
+    const cookie = await signInCookie(user, false);
+    const generated = await call(
+      'POST',
+      '/api/auth/two-factor/generate-backup-codes',
+      { password: user.password },
+      cookie
+    );
+    expect(generated.status).toBe(HTTP_STATUS.OK);
+    // That generation DID prove the password, which is what makes the count
+    // below a real observation rather than a table that is empty anyway.
+    const before = await passwordProofs(user.userId);
+    expect(before.length).toBeGreaterThan(0);
+
+    for (const body of [
+      { password: user.password },
+      { password: user.password, setId: '' },
+      { password: user.password, setId: 'not-a-uuid' },
+    ]) {
+      const answer = await call(
+        'POST',
+        '/api/auth/two-factor/backup-codes/acknowledge',
+        body,
+        cookie
+      );
+      expect([body, answer.status]).toEqual([body, HTTP_STATUS.UNPROCESSABLE]);
+      expect((await answer.json()) as { message?: string }).toMatchObject({
+        message: otpMsg.invalidInput,
+      });
+    }
+
+    // Three correct passwords supplied, none verified.
+    expect(await passwordProofs(user.userId)).toHaveLength(before.length);
+    expect(await methodsOf(user.userId)).toEqual([]);
+  });
+
+  test('a set id is not reused after the credential row is deleted and remade', async () => {
+    // The counter this replaced restarted. `/two-factor/disable` deletes the
+    // credential row and KEEPS the caller's session, so the next generation
+    // inserts a fresh row — and a per-row sequence hands its first set the same
+    // name as the first set of the row before it. An older tab's
+    // acknowledgement then matched, enabled codes the user never saw, and
+    // revoked every other session doing it.
+    const user = await seedUser();
+    const cookie = await signInCookie(user, false);
+
+    const generate = async () => {
+      const generated = await call(
+        'POST',
+        '/api/auth/two-factor/generate-backup-codes',
+        { password: user.password },
+        cookie
+      );
+      expect(generated.status).toBe(HTTP_STATUS.OK);
+      const body = (await generated.json()) as { data?: { setId?: string } };
+      return body.data?.setId;
+    };
+
+    const savedSetId = await generate();
+    expect(savedSetId).toBeString();
+
+    const disabled = await call(
+      'POST',
+      '/api/auth/two-factor/disable',
+      { password: user.password },
+      cookie
+    );
+    expect(disabled.status).toBe(HTTP_STATUS.OK);
+    expect(
+      await db
+        .select({ id: twoFactorCredentials.id })
+        .from(twoFactorCredentials)
+        .where(eq(twoFactorCredentials.userId, user.userId))
+    ).toEqual([]);
+
+    const remadeSetId = await generate();
+    expect(remadeSetId).not.toBe(savedSetId);
+
+    const stale = await call(
+      'POST',
+      '/api/auth/two-factor/backup-codes/acknowledge',
+      { password: user.password, setId: savedSetId },
+      cookie
+    );
+    expect(stale.status).toBe(HTTP_STATUS.CONFLICT);
+    expect(await methodsOf(user.userId)).toEqual([]);
+
+    const current = await call(
+      'POST',
+      '/api/auth/two-factor/backup-codes/acknowledge',
+      { password: user.password, setId: remadeSetId },
+      cookie
+    );
+    expect(current.status).toBe(HTTP_STATUS.OK);
+    expect(await methodsOf(user.userId)).toEqual(['backup_code']);
+  });
+
+  test('acknowledging a set another tab has already replaced is refused', async () => {
+    // Two tabs. A saves set 1, B regenerates into set 2, A confirms. The
+    // acknowledgement used to land on whatever was current, so the method was
+    // enabled, every other session revoked, and the ten codes the user actually
+    // wrote down all answered 401 — a backup-code-only account stranded by a
+    // success message.
+    const user = await seedUser();
+    const cookie = await signInCookie(user, false);
+
+    const tabA = await call(
+      'POST',
+      '/api/auth/two-factor/generate-backup-codes',
+      { password: user.password },
+      cookie
+    );
+    const savedSetId = ((await tabA.json()) as { data?: { setId?: string } })
+      .data?.setId;
+
+    const tabB = await call(
+      'POST',
+      '/api/auth/two-factor/generate-backup-codes',
+      { password: user.password },
+      cookie
+    );
+    const currentSetId = ((await tabB.json()) as { data?: { setId?: string } })
+      .data?.setId;
+    expect(currentSetId).not.toBe(savedSetId);
+
+    const stale = await call(
+      'POST',
+      '/api/auth/two-factor/backup-codes/acknowledge',
+      { password: user.password, setId: savedSetId },
+      cookie
+    );
+    expect(stale.status).toBe(HTTP_STATUS.CONFLICT);
+    // Nothing was enabled, and no session was revoked over it.
+    expect(await methodsOf(user.userId)).toEqual([]);
+
+    // The set that actually exists still acknowledges.
+    const current = await call(
+      'POST',
+      '/api/auth/two-factor/backup-codes/acknowledge',
+      { password: user.password, setId: currentSetId },
+      cookie
+    );
+    expect(current.status).toBe(HTTP_STATUS.OK);
     expect(await methodsOf(user.userId)).toEqual(['backup_code']);
   });
 });

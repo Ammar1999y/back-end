@@ -287,3 +287,52 @@ describe('the budget an unknown sub-path draws on', () => {
     expect(rateLimitKeys()).toHaveLength(1);
   }, 120_000);
 });
+
+describe('the budget an allowlisted sub-path draws on', () => {
+  /**
+   * `preAuthLimit` is declared PER PATH in `lib/auth/allowed-paths.ts`, with
+   * values an order of magnitude apart. The scope used to be the first two path
+   * segments, so every `/two-factor/*` endpoint counted into one key named
+   * `preauth.auth.two-factor` — twelve endpoints, three different budgets, one
+   * counter. Spending a 60/min read then refused a 20/min credential submission
+   * that had been sent once.
+   */
+  const READ_PATH = '/two-factor/trusted-devices';
+  const WRITE_PATH = '/two-factor/methods/disable';
+
+  function budgetOf(path: string): number {
+    const found = BETTER_AUTH_ENDPOINTS.find(
+      (endpoint) => endpoint.path === path
+    );
+    if (found?.preAuthLimit === undefined)
+      throw new Error(`${path} is not an allowlisted path with a budget`);
+    return found.preAuthLimit;
+  }
+
+  test('exhausting one path does not spend another path’s budget', async () => {
+    const readBudget = budgetOf(READ_PATH);
+    const writeBudget = budgetOf(WRITE_PATH);
+    // The premise: the two budgets differ, so a shared counter is observable.
+    expect(readBudget).toBeGreaterThan(writeBudget);
+
+    for (let i = 0; i < readBudget; i++) {
+      const response = await callAuth(READ_PATH, 'GET');
+      expect(response.status).not.toBe(HTTP_STATUS.TOO_MANY_REQUESTS);
+    }
+    // One over its own budget: the counter exists and is being charged.
+    const overBudget = await callAuth(READ_PATH, 'GET');
+    expect(overBudget.status).toBe(HTTP_STATUS.TOO_MANY_REQUESTS);
+
+    // Untouched, though the read has spent 61 requests on the same surface.
+    // 401 (no session) is the handler having been reached.
+    const otherPath = await callAuth(WRITE_PATH);
+    expect(otherPath.status).not.toBe(HTTP_STATUS.TOO_MANY_REQUESTS);
+
+    // The keys, in the same test: `beforeEach` clears the store, so this
+    // cannot be asserted from a second one.
+    const scopes = rateLimitKeys().map((key) => key.split(':', 1)[0]);
+    expect(scopes).toContain('preauth.auth.two-factor.trusted-devices');
+    expect(scopes).toContain('preauth.auth.two-factor.methods.disable');
+    expect(scopes).not.toContain('preauth.auth.two-factor');
+  }, 120_000);
+});

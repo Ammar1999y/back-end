@@ -183,6 +183,26 @@ export interface RoutePrefixPath {
   preAuthLimit: number;
   /** Whether this Better Auth endpoint requires `x-captcha-response`. */
   captcha: boolean;
+  /**
+   * Which credential this path needs, and therefore what the OpenAPI document
+   * publishes as its `security`.
+   *
+   * REQUIRED, for the same reason `preAuthLimit` is: a path whose credential is
+   * not declared here publishes as anonymous, and a generated client then omits
+   * the cookie for an operation that answers 401 without it.
+   *
+   * - `'session'` — `sessionMiddleware` or equivalent; 401 without a cookie.
+   * - `'optional'` — answers with or without one (`/get-session`, `/sign-out`).
+   * - `'challenge'` — the second step of sign-in; 401 without the two-factor
+   *   challenge cookie, which has its own scheme.
+   * - `'session-or-challenge'` — one endpoint serving both enrolment and the
+   *   second step, and it takes EITHER credential (`/two-factor/otp/*`).
+   * - `'none'` — anonymous, or gated by a credential no scheme describes: an
+   *   OAuth state cookie, a single-use grant. Publishing a cookie scheme for
+   *   those would be a different lie from the one this field removes.
+   */
+  session:
+    'session' | 'optional' | 'challenge' | 'session-or-challenge' | 'none';
 }
 
 /**

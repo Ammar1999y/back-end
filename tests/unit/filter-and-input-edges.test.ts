@@ -7,7 +7,10 @@ import { users } from '@/db/schema';
 import { normalizeArabicDigits, OUT_OF_RANGE, positiveInt } from '@/utils';
 import * as z from 'zod';
 import { filterColumns } from '@/lib/data-table/filter-columns';
-import { parseSearchParams } from '@/lib/data-table/parsers';
+import {
+  isTrigramIndexable,
+  parseSearchParams,
+} from '@/lib/data-table/parsers';
 import { REQUEST_BODIES } from '@/lib/http/openapi';
 
 import { HTTP_STATUS } from '@/utils/api-messages';
@@ -504,5 +507,103 @@ describe('M11 - a wrong TYPE stays a type error', () => {
   test('slugSchema, unreferenced today, is swept with the class', () => {
     expect(slugSchema.safeParse(123).success).toBe(false);
     expect(slugSchema.safeParse('My Slug').success).toBe(true);
+  });
+});
+
+describe('the search floor admits only terms pg_trgm can index', () => {
+  /**
+   * The floor exists so `ILIKE '%term%'` stays on the GIN trigram index. Length
+   * alone does not decide that: pg_trgm extracts trigrams from runs of word
+   * characters, padded only where a boundary is KNOWN, and a `%` is not a
+   * boundary. The cases below were each measured against PostgreSQL + pg_trgm
+   * by reading the bitmap index scan's row count — a term with no usable
+   * trigram makes GIN return every row.
+   */
+  test.each([
+    ['abc', true],
+    ['ABC', true],
+    ['123', true],
+    ['فلم', true],
+    // Two word characters reach a trigram only against an internal boundary.
+    ['a-b', true],
+    ['a b', true],
+    ['ab c', true],
+    ['ab-', true],
+    ['-ab', true],
+    ['ab😀', true],
+    ['😀ab', true],
+    // `Nl`, which PostgreSQL's `alpha` carries and `\p{L}` does not — measured
+    // indexable, so a class that refused it refused a working search.
+    ['ⅣⅣⅣ', true],
+    ['〇〇〇', true],
+    // Nothing pg_trgm keys on.
+    ['!!!', false],
+    ['---', false],
+    ['...', false],
+    ['😀😀😀', false],
+    ['a--', false],
+    ['ab', false],
+    ['a1', false],
+    // `No`, and `Other_Alphabetic` — the harakat and the enclosed letters.
+    // `\p{Alphabetic}` carries the last two, which is why the class does not use
+    // it: each is three code points the server scans the whole table for.
+    ['½½½', false],
+    ['①①①', false],
+    ['ٍٍٍ', false],
+    ['َََ', false],
+    ['ְְְ', false],
+    ['ⓐⓐⓐ', false],
+    // Astral, letters included: a 16-bit `wchar_t` cannot classify any of it, so
+    // the server indexes none of it.
+    ['𝐀𝐀𝐀', false],
+    ['𐐀𐐀𐐀', false],
+  ])('%s is indexable: %s', (term, expected) => {
+    expect(isTrigramIndexable(term)).toBe(expected);
+  });
+
+  test('an anchored operator supplies the edge the pattern would not', () => {
+    // `startsWith` emits `term%`, so the LEFT edge is a known boundary and a
+    // single leading word character already yields `  a`. `endsWith` gives the
+    // right edge instead, where a trailing run needs two characters for `ab `.
+    expect(isTrigramIndexable('a--', 'prefix')).toBe(true);
+    expect(isTrigramIndexable('a--', 'contains')).toBe(false);
+    expect(isTrigramIndexable('ab', 'suffix')).toBe(true);
+    expect(isTrigramIndexable('ab', 'contains')).toBe(false);
+    expect(isTrigramIndexable('a', 'suffix')).toBe(false);
+  });
+
+  test('quick search drops a term with no trigram instead of scanning', () => {
+    const search = (term: string) =>
+      parseDataTableParams(users, {
+        url: `https://example.test/api/dash/users?search=${encodeURIComponent(term)}`,
+        filterableColumns: { name: { type: 'text' } },
+        searchableColumns: ['name'],
+      }).search;
+
+    expect(search('bob')).toBe('bob');
+    expect(search('!!!')).toBe('');
+    expect(search('😀😀😀')).toBe('');
+  });
+
+  test('a filter naming such a term is refused rather than dropped', () => {
+    const filter = (value: string, operator: 'iLike' | 'startsWith') =>
+      filterColumns({
+        table: users,
+        filters: [
+          { filterId: 'f1', id: 'name', value, variant: 'text', operator },
+        ],
+        joinOperator: 'and',
+        specs: { name: { type: 'text' } },
+      });
+
+    expect(() => filter('!!!', 'iLike')).toThrow(
+      expect.objectContaining({ status: HTTP_STATUS.UNPROCESSABLE })
+    );
+    expect(() => filter('😀😀😀', 'iLike')).toThrow(
+      expect.objectContaining({ status: HTTP_STATUS.UNPROCESSABLE })
+    );
+    // Legal today and still legal: the fix must not narrow the operator.
+    expect(() => filter('a-b', 'iLike')).not.toThrow();
+    expect(() => filter('a--', 'startsWith')).not.toThrow();
   });
 });

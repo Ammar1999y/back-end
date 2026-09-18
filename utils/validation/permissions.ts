@@ -16,7 +16,14 @@ import {
   ROLE_NAME_MAX,
   ROLE_NAME_MIN,
 } from './constants';
-import { idSchema, sanitizeStrict, sanitizeStrictSingleLine } from './rules';
+import {
+  idSchema,
+  sanitizeStrict,
+  sanitizeStrictSingleLine,
+  STRICT_SINGLE_LINE_DESCRIPTION,
+  STRICT_TEXT_DESCRIPTION,
+  strictTextMaximum,
+} from './rules';
 
 const ERROR_MESSAGES = {
   roleNameMaxLength: `اسم الدور يجب أن لا يتجاوز ${ROLE_NAME_MAX} حرفاً`,
@@ -157,6 +164,10 @@ export const createPermissionSchema = z.object({
       .string()
       .min(ROLE_NAME_MIN, ERROR_MESSAGES.roleNameRequired)
       .max(ROLE_NAME_MAX, ERROR_MESSAGES.roleNameMaxLength)
+      .meta({
+        maxLength: undefined,
+        description: `${STRICT_SINGLE_LINE_DESCRIPTION} ${strictTextMaximum(ROLE_NAME_MAX)}`,
+      })
   ),
   description: z
     .preprocess(
@@ -164,6 +175,10 @@ export const createPermissionSchema = z.object({
       z
         .string()
         .max(ROLE_DESCRIPTION_MAX, ERROR_MESSAGES.descriptionMaxLength)
+        .meta({
+          maxLength: undefined,
+          description: `${STRICT_TEXT_DESCRIPTION}. ${strictTextMaximum(ROLE_DESCRIPTION_MAX)}`,
+        })
         .optional()
         .nullish()
     )

@@ -80,9 +80,24 @@ test('Google and password both admit a stale enrollment when the global 2FA feat
     child.exited,
   ]);
   expect(status).toBe(0);
-  expect(JSON.parse(error)).toMatchObject({
-    msg: 'twoFactor.disabled no method configured',
-  });
+  // Per LINE: a boot writes whatever warnings its configuration earns, and
+  // parsing the whole stream asserted that this child emits exactly one.
+  const logged = error
+    .split(String.fromCodePoint(10))
+    .map((line) => line.trim())
+    .filter((line) => line.startsWith('{'))
+    .flatMap((line) => {
+      try {
+        return [JSON.parse(line) as Record<string, unknown>];
+      } catch {
+        return [];
+      }
+    });
+  expect(logged).toContainEqual(
+    expect.objectContaining({
+      msg: 'twoFactor.disabled no method configured',
+    })
+  );
   expect(output).toContain(
     'Google and password honor disabled two-factor configuration.'
   );
@@ -608,4 +623,46 @@ test('a passkey removed after challenge resolution keeps the established 2FA opt
   } finally {
     removed.mockRestore();
   }
+});
+
+test('a redirected Google sign-in that needs local 2FA delivers the CHALLENGE, not a 401', async () => {
+  // `GET /oauth/result` asked only for `success === true`, and the callback
+  // stores the two-factor envelope — which carries `twoFactorRedirect` and no
+  // `success`. So the documented redirected flow answered 401 to every account
+  // with a second factor, after consuming both records: unrecoverable, with no
+  // retry. The direct (no `callbackURL`) branch was unaffected, which is why
+  // nothing here saw it.
+  const owner = await seedUser({ emailVerified: false });
+  await db.insert(twoFactorMethods).values({
+    userId: owner.userId,
+    method: 'otp',
+    channel: 'email',
+    isDefault: true,
+  });
+  await db
+    .update(users)
+    .set({ twoFactorEnabled: true, emailVerified: true })
+    .where(eq(users.id, owner.userId));
+
+  const flow = await startGoogle(
+    { sub: 'redirected-two-factor', email: owner.email },
+    { callbackURL: '/finish' }
+  );
+  const redirected = await flow.callback();
+  expect(redirected.status).toBe(302);
+
+  const cookie = mergeCookies(flow.cookie, redirected.headers.getSetCookie());
+  const result = await call('/api/auth/oauth/result', cookie);
+
+  expect(result.status).toBe(200);
+  expect(await result.json()).toMatchObject({
+    twoFactorRedirect: true,
+    twoFactorMethods: ['otp'],
+  });
+
+  // Still single-use: the records were consumed by the read above.
+  await expect(call('/api/auth/oauth/result', cookie)).resolves.toHaveProperty(
+    'status',
+    401
+  );
 });

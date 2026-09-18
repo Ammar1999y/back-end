@@ -784,3 +784,71 @@ describe('what the audit trail claims about a login', () => {
     expect(rows.filter((row) => row.data.loginSuccess === true)).toEqual([]);
   });
 });
+
+/**
+ * `callbackURL`, which the sign-in before-hook does NOT strip.
+ *
+ * The hook returns a body naming only `email`, `password` and `rememberMe`, so
+ * it reads as a replacement. It is not: `runBeforeHooks` merges it with
+ * `defuReplaceArrays`, so every key the hook omits keeps the caller's value —
+ * `callbackURL` included, and Better Auth's email sign-in echoes that into
+ * `Location` and `url`. What makes that safe is the library's global
+ * `originCheckMiddleware` plus this deployment configuring no `trustedOrigins`
+ * beyond `baseURL`. Both halves are asserted here, because both are one edit
+ * away from turning a login page's `?next=` into an open redirect.
+ */
+describe('the callbackURL a sign-in body may carry', () => {
+  function signInWithCallback(
+    user: SeededUser,
+    callbackURL: string
+  ): Promise<Response> {
+    return app.handle(
+      new Request(SIGN_IN_URL, {
+        method: 'POST',
+        headers: baseHeaders({ 'content-type': 'application/json' }),
+        body: JSON.stringify({
+          email: user.email,
+          password: user.password,
+          callbackURL,
+        }),
+      })
+    );
+  }
+
+  const BACKSLASH = String.fromCodePoint(92);
+
+  test.each([
+    ['an absolute foreign origin', 'https://attacker.example/phish'],
+    ['a protocol-relative URL', '//attacker.example/phish'],
+    ['a backslash-prefixed path', `/${BACKSLASH}attacker.example`],
+    ['an encoded backslash', '/%5cattacker.example'],
+    ['userinfo naming the trusted host', 'https://localhost@attacker.example/'],
+    ['a javascript: URL', 'javascript:alert(1)'],
+    [
+      'a header-injection attempt',
+      `/dash${String.fromCodePoint(13, 10)}X-I: 1`,
+    ],
+  ])('%s is refused, and sets no Location', async (_label, callbackURL) => {
+    const user = await seedUser();
+    const response = await signInWithCallback(user, callbackURL);
+
+    expect(response.status).toBe(HTTP_STATUS.FORBIDDEN);
+    expect(response.headers.get('location')).toBeNull();
+    expect((await response.json()) as { code?: string }).toMatchObject({
+      code: 'INVALID_CALLBACK_URL',
+    });
+  });
+
+  test('a same-origin path is honoured — which is what proves the key survives the hook', async () => {
+    // If the hook's body actually replaced the caller's, this would be a plain
+    // 200 with no redirect at all, and every refusal above would be vacuous.
+    const user = await seedUser();
+    const response = await signInWithCallback(user, '/dash');
+
+    expect(response.status).toBe(HTTP_STATUS.OK);
+    expect(response.headers.get('location')).toBe('/dash');
+    expect((await response.json()) as { url?: string }).toMatchObject({
+      url: '/dash',
+    });
+  });
+});

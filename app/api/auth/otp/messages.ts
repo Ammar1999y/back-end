@@ -71,4 +71,17 @@ export const twoFactorMsg = {
     'لا يمكن تغيير وسيلة التواصل لأن ذلك سيُفقد الحساب طريقة التحقق بخطوتين الوحيدة. أعد تعيين التحقق بخطوتين للحساب أولاً',
   twoFactorUnavailable:
     'تعذّر إكمال التحقق بخطوتين: لا توجد طريقة تحقق متاحة على حسابك حالياً. تواصل مع الدعم لاستعادة الوصول',
+  /**
+   * Two different states, and the difference is what the user has to DO about
+   * it. The credential is deleted (nothing was kept, so repeating the ceremony
+   * is the whole fix), or it is saved and not a factor (repeating would leave a
+   * second dead key in the list, so it has to be removed first).
+   */
+  passkeyNotSaved:
+    'لم يُحفظ مفتاح المرور، ولم يتم تفعيل التحقق بخطوتين. أعد تسجيل مفتاح المرور',
+  passkeyNotEnrolled:
+    'تم حفظ مفتاح المرور لكن تعذّر تفعيله كوسيلة تحقق ثانية. احذفه من قائمة مفاتيح المرور ثم سجّله من جديد',
+  /** The acknowledged set is not the set that exists — another tab regenerated. */
+  staleBackupSet:
+    'الرموز الاحتياطية التي تؤكّد حفظها لم تعد هي الحالية. تم توليد مجموعة أحدث؛ اعرضها واحفظها ثم أكّد حفظها',
 } as const;

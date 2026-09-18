@@ -17,10 +17,13 @@
  *   function: `shouldOptimizeImage` excludes SVG, and `validateMagicBytes`
  *   rejects animated WebP at the door.
  */
+import { inflateSync } from 'node:zlib';
+
 import { uploadMsg } from '@/app/api/upload/file/messages';
 
 import { HTTP_STATUS } from '@/utils/api-messages';
 import { CustomError } from '@/utils/error-class';
+import { iccProfileChunk } from '@/utils/images/raster-bytes';
 import {
   MAX_IMAGE_EDGE,
   MAX_IMAGE_PIXELS,
@@ -182,6 +185,15 @@ export type OptimizeImageResult = {
 const MAX_LADDER_RUNGS = 128;
 const MAX_ENCODE_ATTEMPTS = 16;
 
+/**
+ * The ceiling a stored image cannot exceed, whatever the ladder reaches.
+ *
+ * `targetSize` is what the ladder AIMS at; this is what it may not pass. It
+ * sits under `MAX_IMAGE_SIZE`, the ceiling on what may be uploaded, so anything
+ * this pipeline stores can still be fed back through it.
+ */
+const MAX_STORED_IMAGE_BYTES = 800 * 1024;
+
 interface Rung {
   width: number;
   quality: number;
@@ -294,39 +306,60 @@ async function optimizeImageWithinSlot(
       return encodeAttempt(input, rung.width, rung.quality);
     };
 
-    const firstAttempt = await measure(0);
-    let fitting = firstAttempt.size <= targetSize ? firstAttempt : null;
-    let lastMeasured = firstAttempt;
+    let best = await measure(0);
+    let fitting = best.size <= targetSize ? best : null;
+    const remember = (attempt: typeof best) => {
+      if (attempt.size < best.size) best = attempt;
+      return attempt;
+    };
 
-    if (!fitting) {
-      let lo = 1;
-      let hi = ladder.length - 1;
-      while (lo <= hi) {
-        const mid = (lo + hi) >> 1;
-        const attempt = await measure(mid);
-        lastMeasured = attempt;
-        if (attempt.size <= targetSize) {
-          fitting = attempt;
-          hi = mid - 1;
-        } else {
-          lo = mid + 1;
+    if (!fitting && ladder.length > 1) {
+      // The FLOOR before the search, not as part of it. When the target is
+      // unreachable — a dense screenshot, dithered art, sensor noise — every
+      // rung the search would visit is wasted work ending in the same answer,
+      // and this settles it in two encodes instead of six. When the floor does
+      // fit, the search below still returns the EARLIEST fitting rung, so the
+      // chosen quality is unchanged.
+      const floor = remember(await measure(ladder.length - 1));
+      if (floor.size <= targetSize) {
+        fitting = floor;
+        let lo = 1;
+        let hi = ladder.length - 2;
+        while (lo <= hi) {
+          const mid = (lo + hi) >> 1;
+          const attempt = remember(await measure(mid));
+          if (attempt.size <= targetSize) {
+            fitting = attempt;
+            hi = mid - 1;
+          } else {
+            lo = mid + 1;
+          }
         }
       }
     }
 
     if (!fitting) {
+      // The target is a goal, not the contract: ordinary high-detail images — a
+      // dense screenshot cannot reach 200 KiB at 800 px and quality 50 — would
+      // otherwise be refused after every encode had already been paid for. The
+      // floor rung is kept instead, up to a ceiling nothing may exceed.
+      const ceiling = Math.max(targetSize, MAX_STORED_IMAGE_BYTES);
       console.warn(
         JSON.stringify({
           msg: 'image.optimize target unreachable',
-          finalBytes: lastMeasured.size,
+          finalBytes: best.size,
           targetBytes: targetSize,
+          ceilingBytes: ceiling,
+          accepted: best.size <= ceiling,
           iterations,
         })
       );
-      throw new CustomError(
-        uploadMsg.targetUnreachable,
-        HTTP_STATUS.UNPROCESSABLE
-      );
+      if (best.size > ceiling)
+        throw new CustomError(
+          uploadMsg.targetUnreachable,
+          HTTP_STATUS.UNPROCESSABLE
+        );
+      fitting = best;
     }
 
     const chosen = fitting;
@@ -369,10 +402,56 @@ async function acquireEncoder(): Promise<() => void> {
   };
 }
 
+/**
+ * The one piece of input metadata `Bun.Image` carries into its output.
+ *
+ * Above every profile a real file carries — the largest in ordinary circulation
+ * is the v4 sRGB ICC preference profile at 60,960 bytes — and far below the size
+ * that makes a profile interesting to an attacker.
+ */
+export const MAX_ICC_PROFILE_BYTES = 64 * 1024;
+
+/**
+ * Refuse an ICC profile the encoder would copy and this application would then
+ * publish.
+ *
+ * The pipeline prices a request in PIXELS, and a profile is not pixels: a 107 KB
+ * PNG carrying a deflated 100 MB profile produces a 105 MB WebP and 202 MB RSS
+ * per encode, and the ladder below performs up to `MAX_ENCODE_ATTEMPTS` of them.
+ * Under the bound the profile is kept, because dropping it is a visible colour
+ * shift on the wide-gamut PNGs macOS and Windows produce.
+ *
+ * ⚠️ Must run BEFORE the encoder slot is taken, or a bomb holds the queue while
+ * it is priced. `maxOutputLength` is what makes the expansion refuse rather than
+ * allocate.
+ */
+function assertIccProfileBounded(input: Buffer): void {
+  const profile = iccProfileChunk(input);
+  if (profile === null) return;
+
+  const tooLarge = new CustomError(
+    uploadMsg.iccProfileTooLarge(Math.floor(MAX_ICC_PROFILE_BYTES / 1024)),
+    HTTP_STATUS.UNPROCESSABLE
+  );
+
+  if (!profile.deflated) {
+    if (profile.data.byteLength > MAX_ICC_PROFILE_BYTES) throw tooLarge;
+    return;
+  }
+  try {
+    inflateSync(profile.data, { maxOutputLength: MAX_ICC_PROFILE_BYTES });
+  } catch {
+    // Over the bound, or not deflate at all. Either way the decoder is being
+    // handed something this application will not carry.
+    throw tooLarge;
+  }
+}
+
 export async function optimizeImage(
   input: Buffer,
   options: OptimizeImageOptions = {}
 ): Promise<OptimizeImageResult> {
+  assertIccProfileBounded(input);
   const release = await acquireEncoder();
   try {
     return await optimizeImageWithinSlot(input, options);

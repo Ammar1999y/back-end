@@ -42,6 +42,7 @@ import {
   auditLogs,
   files,
   folders,
+  orphanedObjects,
   sessions,
   trustedDevices,
   users,
@@ -49,6 +50,10 @@ import {
   verifications,
   verificationSessions,
 } from '@/db/schema';
+import {
+  ORPHAN_DRAIN_BATCH,
+  TRANSITION_RETRY_BATCH,
+} from '@/lib/media/visibility';
 import { startSchedule } from '@/lib/schedule';
 
 import { resetTables } from '../helpers/database';
@@ -133,6 +138,7 @@ const proofs = {
   pastTtl: '',
   freshWithExpiredCode: '',
   freshWithLiveCode: '',
+  oldRowFreshCode: '',
 };
 
 function healthy(): Pass {
@@ -194,18 +200,39 @@ async function codeCount(sessionId: string): Promise<number> {
   return rows.length;
 }
 
-/** Every key the pass asked the object store to remove, single or batched. */
+/**
+ * Every key the pass asked the object store to remove, single or batched, once
+ * each — a delete addresses its key in every enabled bucket, so the raw ops
+ * carry it once per bucket and `deletedBuckets` is what asserts that half.
+ */
 function deletedObjectKeys(ops: readonly StoreOp[]): string[] {
+  return [
+    ...new Set(
+      ops.flatMap((op) =>
+        op.kind === 'DeleteObjects'
+          ? (op.keys ?? [])
+          : op.kind === 'DeleteObject'
+            ? [op.key ?? '(no key)']
+            : []
+      )
+    ),
+  ].toSorted(byText);
+}
+
+/** The buckets a pass swept, sorted — one batched call each, not one per row. */
+function deletedBuckets(ops: readonly StoreOp[]): string[] {
   return ops
     .flatMap((op) =>
-      op.kind === 'DeleteObjects'
-        ? (op.keys ?? [])
-        : op.kind === 'DeleteObject'
-          ? [op.key ?? '(no key)']
-          : []
+      op.kind === 'DeleteObjects' && op.bucket !== undefined ? [op.bucket] : []
     )
     .toSorted(byText);
 }
+
+/** Both configured buckets, which is what every delete has to address. */
+const BOTH_BUCKETS = [
+  process.env.R2_PUBLIC_BUCKET ?? '',
+  process.env.R2_PRIVATE_BUCKET ?? '',
+].toSorted(byText);
 
 /** One sweep, with the operations it performed isolated from every other pass. */
 async function sweepAndRecord(): Promise<Pass> {
@@ -317,6 +344,10 @@ describe('a pass with a healthy object store', () => {
       .returning({ id: verificationSessions.id });
     proofs.consumed = consumed?.id ?? '';
 
+    // Every activity column backdated together, because that is what a
+    // two-day-old row looks like: the sweep judges the row's LAST activity, not
+    // its birth, so a row whose `verify_attempt_window_start` still defaults to
+    // `now()` is not the row this case is about.
     const [pastTtl] = await db
       .insert(verificationSessions)
       .values({
@@ -325,6 +356,9 @@ describe('a pass with a healthy object store', () => {
         identifier: '966512345678',
         purpose: 'passwordless_login',
         createdAt: sql`now() - interval '2 days'`,
+        lastSentAt: sql`now() - interval '2 days'`,
+        nextAllowedAt: sql`now() - interval '2 days' + interval '30 seconds'`,
+        verifyAttemptWindowStart: sql`now() - interval '2 days'`,
       })
       .returning({ id: verificationSessions.id });
     proofs.pastTtl = pastTtl?.id ?? '';
@@ -353,6 +387,28 @@ describe('a pass with a healthy object store', () => {
       .returning({ id: verificationSessions.id });
     proofs.freshWithLiveCode = freshWithLiveCode?.id ?? '';
 
+    // The case a `created_at` TTL got wrong. A send cycle REUSES its row —
+    // `processOtpSend` upserts on `(user, contact_kind, purpose)` and refreshes
+    // `last_sent_at`, `next_allowed_at` and the code, never `created_at`. So a
+    // user returning after a day and asking for a code had that code deleted by
+    // the next nightly run, on every OTP surface at once.
+    const [oldRowFreshCode] = await db
+      .insert(verificationSessions)
+      .values({
+        userId,
+        channel: 'whatsapp',
+        identifier: '966512345679',
+        purpose: 'change_phone',
+        // `chk_change_purpose_has_target`: a change_* proof names the NEW contact.
+        targetIdentifier: '966512345680',
+        createdAt: sql`now() - interval '3 days'`,
+        verifyAttemptWindowStart: sql`now() - interval '3 days'`,
+        lastSentAt: sql`now()`,
+        nextAllowedAt: sql`now() + interval '30 seconds'`,
+      })
+      .returning({ id: verificationSessions.id });
+    proofs.oldRowFreshCode = oldRowFreshCode?.id ?? '';
+
     await db.insert(verificationCodes).values([
       // GOES BY CASCADE: live, on a row that is going anyway.
       {
@@ -371,6 +427,12 @@ describe('a pass with a healthy object store', () => {
       {
         sessionId: proofs.freshWithLiveCode,
         code: 'o1:sweep:live',
+        expiresAt: sql`now() + interval '10 minutes'`,
+      },
+      // STAYS: a code issued seconds ago onto a row three days old.
+      {
+        sessionId: proofs.oldRowFreshCode,
+        code: 'o1:sweep:resent',
         expiresAt: sql`now() + interval '10 minutes'`,
       },
     ]);
@@ -444,7 +506,19 @@ describe('a pass with a healthy object store', () => {
         hasMore: false,
         degraded: false,
       },
-      transitions: { reverted: 0, finished: 0, failed: 0, degraded: false },
+      transitions: {
+        reverted: 0,
+        finished: 0,
+        failed: 0,
+        hasMore: false,
+        degraded: false,
+      },
+      orphanedObjects: {
+        removed: 0,
+        failed: 0,
+        hasMore: false,
+        degraded: false,
+      },
     });
     // The "stays" partner of the backlog signal asserted under a failing R2
     // below: a completed pass must not ask to be re-run.
@@ -469,6 +543,11 @@ describe('a pass with a healthy object store', () => {
   test('a proof row past its TTL is removed; a fresh unconsumed one stays', async () => {
     expect(await proofExists(proofs.pastTtl)).toBe(false);
     expect(await proofExists(proofs.freshWithExpiredCode)).toBe(true);
+  });
+
+  test('a resend keeps an old row alive, and its brand-new code with it', async () => {
+    expect(await proofExists(proofs.oldRowFreshCode)).toBe(true);
+    expect(await codeCount(proofs.oldRowFreshCode)).toBe(1);
   });
 
   test('an expired code is removed without taking its still-live session', async () => {
@@ -498,12 +577,11 @@ describe('a pass with a healthy object store', () => {
     expect(deletedObjectKeys(healthy().ops)).toEqual(
       [KEY.pastTtl, KEY.orphanDeleting].toSorted(byText)
     );
-    // One batched call per bucket, not one round trip per row.
-    expect(healthy().ops.map((op) => op.kind)).toEqual(['DeleteObjects']);
-    // The row's own `bucket_type`, not a hardcoded bucket: a sweep that always
-    // addressed the private bucket would delete nothing and report success.
-    expect(healthy().ops[0]?.bucket).toBe(process.env.R2_PUBLIC_BUCKET);
-    expect(healthy().ops[0]?.bucket).not.toBe(process.env.R2_PRIVATE_BUCKET);
+    // One batched call per bucket, not one round trip per row — and EVERY
+    // bucket, not the one the row names: a stale visibility transition can have
+    // left a copy in the other one, and the row about to be deleted is the last
+    // thing that records the key at all.
+    expect(deletedBuckets(healthy().ops)).toEqual(BOTH_BUCKETS);
   });
 
   test('audit_logs and users are not swept at any age', async () => {
@@ -589,7 +667,7 @@ describe('a pass whose object-store delete fails', () => {
     expect(deletedObjectKeys(r2Down().ops)).toEqual(
       [KEY.pastTtl, KEY.orphanDeleting].toSorted(byText)
     );
-    expect(r2Down().ops.map((op) => op.kind)).toEqual(['DeleteObjects']);
+    expect(deletedBuckets(r2Down().ops)).toEqual(BOTH_BUCKETS);
   });
 });
 
@@ -654,7 +732,7 @@ describe('a pass where one object fails and its sibling succeeds', () => {
     expect(deletedObjectKeys(partial().ops)).toEqual(
       [KEY.pastTtl, KEY.siblingPastTtl, KEY.orphanDeleting].toSorted(byText)
     );
-    expect(partial().ops.map((op) => op.kind)).toEqual(['DeleteObjects']);
+    expect(deletedBuckets(partial().ops)).toEqual(BOTH_BUCKETS);
   });
 });
 
@@ -839,5 +917,72 @@ describe('unfiled files', () => {
       .from(files)
       .where(eq(files.r2Key, UNFILED.fresh));
     expect(stamps[0]?.unfiledAt).toBeNull();
+  });
+});
+
+/**
+ * A bounded step that filled its batch has not finished, and the job has to say
+ * so. Both object-store steps take a fixed number of rows per pass, and both
+ * used to derive the whole of their contribution to `hasMore` from `failed > 0`:
+ * a clean pass over a full batch reported `status: "ok", hasMore: false` with
+ * the remainder still queued, so the operator saw a completed run and the work
+ * waited for the next scheduled one. An ordinary backlog is not a failure, so it
+ * moves `hasMore` and leaves `degraded` alone — the same split `sweepFiles`
+ * already draws.
+ */
+describe('a bounded pass that leaves work behind', () => {
+  beforeAll(async () => {
+    await resetTables();
+  });
+
+  test('an orphan queue one row deeper than the drain batch reports more to do, not a failure', async () => {
+    await db.insert(orphanedObjects).values(
+      Array.from({ length: ORPHAN_DRAIN_BATCH + 1 }, (_, index) => ({
+        r2Key: `m/2026/09/backlog-${index}.webp`,
+        bucketType: 'private' as const,
+      }))
+    );
+
+    const { swept } = await sweepAndRecord();
+    expect(swept.removed.orphanedObjects).toEqual({
+      removed: ORPHAN_DRAIN_BATCH,
+      failed: 0,
+      hasMore: true,
+      degraded: false,
+    });
+    expect(swept.status).toBe('ok');
+    expect(swept.hasMore).toBe(true);
+    expect(await db.$count(orphanedObjects)).toBe(1);
+  });
+
+  test('a stale-transition backlog one row deeper than its batch reports the same', async () => {
+    await resetTables();
+    const { userId } = await seedUser();
+    await db.insert(files).values(
+      Array.from({ length: TRANSITION_RETRY_BATCH + 1 }, (_, index) => ({
+        ...IMAGE_ROW,
+        r2Key: `m/2026/09/stalled-${index}.webp`,
+        displayName: `stalled-${index}.webp`,
+        status: 'active' as const,
+        uploadedBy: userId,
+        transition: 'cleanup' as const,
+        transitionId: sql`gen_random_uuid()`,
+        updatedAt: sql`now() - interval '11 minutes'`,
+      }))
+    );
+
+    const { swept } = await sweepAndRecord();
+    expect(swept.removed.transitions).toEqual({
+      reverted: 0,
+      finished: TRANSITION_RETRY_BATCH,
+      failed: 0,
+      hasMore: true,
+      degraded: false,
+    });
+    expect(swept.status).toBe('ok');
+    expect(swept.hasMore).toBe(true);
+    expect(await db.$count(files, sql`${files.transition} is not null`)).toBe(
+      1
+    );
   });
 });

@@ -33,6 +33,13 @@ export function hasRasterSignature(
   return Object.hasOwn(RASTER_MAGIC_BYTES, mimeType);
 }
 
+/** Which admitted raster these bytes actually are, from the signature alone. */
+function rasterTypeOf(bytes: Uint8Array): RasterMimeType | null {
+  for (const mimeType of Object.keys(RASTER_MAGIC_BYTES) as RasterMimeType[])
+    if (matchesMagicBytes(bytes, mimeType)) return mimeType;
+  return null;
+}
+
 function matchesAt(
   bytes: Uint8Array,
   offset: number,
@@ -162,34 +169,62 @@ function readU24(bytes: Uint8Array, offset: number): number | null {
   );
 }
 
+/** One container chunk: its type, and where its payload starts and ends. */
+interface RasterChunk {
+  type: string;
+  start: number;
+  length: number;
+}
+
+/**
+ * `RIFF<size>WEBP` then 8-byte-headed chunks, each padded to an even length.
+ *
+ * A zero-length chunk is LEGAL — an empty `XMP ` is the ordinary case — so the
+ * walk advances past its 8-byte header rather than stopping. Stopping there let
+ * a standards-valid animated WebP through the admission check, to be refused by
+ * the decoder with the wrong diagnosis after a full decode.
+ */
+function* webpChunks(bytes: Uint8Array): Generator<RasterChunk> {
+  let offset = 12;
+  while (offset + 8 <= bytes.length) {
+    const length = readU32(bytes, offset + 4, true);
+    if (length === null) return;
+    yield { type: fourCC(bytes, offset), start: offset + 8, length };
+    offset += 8 + length + (length % 2);
+  }
+}
+
+/**
+ * An 8-byte signature, then `<4-byte big-endian length><4-byte type><data><CRC>`.
+ */
+function* pngChunks(bytes: Uint8Array): Generator<RasterChunk> {
+  let offset = 8;
+  while (offset + 8 <= bytes.length) {
+    const length = readU32(bytes, offset, false);
+    if (length === null) return;
+    yield { type: fourCC(bytes, offset + 4), start: offset + 8, length };
+    offset += 12 + length;
+  }
+}
+
 const WEBP_ANIMATION_FLAG = 0x02;
 
 /**
  * The flag lives in bit 1 of the first byte of the `VP8X` chunk, which a simple
  * (non-extended) WebP does not have at all — hence the chunk walk rather than a
- * fixed offset. Structure per the WebP container spec: `RIFF<size>WEBP` then
- * 8-byte-headed chunks, each padded to an even length.
+ * fixed offset.
  *
  * Refusing here also keeps the decode path narrow: `Bun.Image` cannot decode
  * animated WebP at all (`ERR_IMAGE_DECODE_FAILED`), and a rejection with a
  * message beats a 500 four layers down.
  */
 function isAnimatedWebp(bytes: Uint8Array): boolean {
-  let offset = 12; // past `RIFF<size>WEBP`
-  while (offset + 8 <= bytes.length) {
-    const fourcc = fourCC(bytes, offset);
-    const size = readU32(bytes, offset + 4, true);
-    if (size === null) return false;
-    if (fourcc === 'VP8X')
-      return ((bytes[offset + 8] ?? 0) & WEBP_ANIMATION_FLAG) !== 0;
+  for (const chunk of webpChunks(bytes)) {
+    if (chunk.type === 'VP8X')
+      return ((bytes[chunk.start] ?? 0) & WEBP_ANIMATION_FLAG) !== 0;
     // An `ANIM` chunk without a VP8X flag is malformed, but treat it as animated
     // rather than reasoning about which of two contradictory headers wins.
-    if (fourcc === 'ANIM' || fourcc === 'ANMF') return true;
-    // A zero-length chunk is LEGAL — an empty `XMP ` is the ordinary case — so
-    // advance past its 8-byte header. Returning `false` here let a
-    // standards-valid animated WebP through the admission check, to be refused
-    // by the decoder with the wrong diagnosis after a full decode.
-    offset += 8 + size + (size % 2);
+    if (chunk.type === 'ANIM' || chunk.type === 'ANMF') return true;
   }
   return false;
 }
@@ -198,22 +233,60 @@ function isAnimatedWebp(bytes: Uint8Array): boolean {
  * A PNG carrying an `acTL` chunk before the first `IDAT`: the APNG animation
  * control.
  *
- * Structure per the PNG spec: an 8-byte signature, then chunks of
- * `<4-byte big-endian length><4-byte type><data><4-byte CRC>`. Position matters —
- * a decoder ignores `acTL` that appears after `IDAT`, so an `acTL` there does not
- * make the file animated.
+ * Position matters — a decoder ignores `acTL` that appears after `IDAT`, so an
+ * `acTL` there does not make the file animated.
  */
 function isAnimatedPng(bytes: Uint8Array): boolean {
-  let offset = 8; // past the 8-byte signature
-  while (offset + 8 <= bytes.length) {
-    const length = readU32(bytes, offset, false);
-    if (length === null) return false;
-    const type = fourCC(bytes, offset + 4);
-    if (type === 'acTL') return true;
-    if (type === 'IDAT' || type === 'IEND') return false;
-    offset += 12 + length; // length + type + data + CRC
+  for (const chunk of pngChunks(bytes)) {
+    if (chunk.type === 'acTL') return true;
+    if (chunk.type === 'IDAT' || chunk.type === 'IEND') return false;
   }
   return false;
+}
+
+/** An embedded ICC profile, still in whatever encoding its container uses. */
+export interface EmbeddedIccProfile {
+  /** PNG stores the profile zlib-deflated; WebP stores it verbatim. */
+  deflated: boolean;
+  data: Uint8Array;
+}
+
+/**
+ * The ICC profile these bytes carry, unexpanded.
+ *
+ * `Bun.Image` COPIES this profile into its output, so it is attacker-controlled
+ * input to every encode attempt and to the bytes this application publishes —
+ * and it is the WHOLE of the metadata that crosses the re-encode, which `eXIf`,
+ * `zTXt`, `iTXt` and `XMP ` do not. Both halves are asserted in
+ * `tests/unit/upload-validation.test.ts`: the bound in
+ * `lib/r2/optimize-image.ts` is a complete policy only while they hold.
+ *
+ * Deliberately does NOT expand a deflated profile: the bound that decides
+ * whether expanding is safe belongs to the caller that can afford `node:zlib`.
+ */
+export function iccProfileChunk(bytes: Uint8Array): EmbeddedIccProfile | null {
+  const mimeType = rasterTypeOf(bytes);
+  if (mimeType === 'image/webp') {
+    for (const chunk of webpChunks(bytes))
+      if (chunk.type === 'ICCP')
+        return {
+          deflated: false,
+          data: bytes.subarray(chunk.start, chunk.start + chunk.length),
+        };
+    return null;
+  }
+  if (mimeType !== 'image/png') return null;
+
+  for (const chunk of pngChunks(bytes)) {
+    if (chunk.type === 'IDAT' || chunk.type === 'IEND') return null;
+    if (chunk.type !== 'iCCP') continue;
+    const end = chunk.start + chunk.length;
+    // `<profile name (1-79 bytes)>\0<compression method><deflated profile>`.
+    const separator = bytes.indexOf(0, chunk.start);
+    if (separator === -1 || separator + 2 > end) return null;
+    return { deflated: true, data: bytes.subarray(separator + 2, end) };
+  }
+  return null;
 }
 
 /**

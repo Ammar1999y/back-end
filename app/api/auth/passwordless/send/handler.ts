@@ -22,12 +22,12 @@ import {
 } from '@/utils/api-response';
 import { PASSWORDLESS_ENABLED } from '@/utils/config';
 import { CustomError } from '@/utils/error-class';
-import { processOtpSend } from '@/utils/otp';
+import { OTP_BASE_RESEND_DELAY_S, processOtpSend } from '@/utils/otp';
 import { OTP_ENABLED, sendOtpSchema } from '@/utils/validation/otp';
 
 import { ensureMinDelay, otpMsg } from '../../otp/messages';
 
-const GENERIC_SEND_DATA = { nextAllowedIn: 30 };
+const GENERIC_SEND_DATA = { nextAllowedIn: OTP_BASE_RESEND_DELAY_S };
 
 /**
  * Passwordless login step 1: send a sign-in code (purpose=passwordless_login)

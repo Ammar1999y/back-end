@@ -33,6 +33,7 @@ function twoFactorEndpoints(): RoutePrefixPath[] {
       methods: ['POST'],
       preAuthLimit: 20,
       captcha: false,
+      session: 'session',
     },
   ];
 
@@ -43,18 +44,21 @@ function twoFactorEndpoints(): RoutePrefixPath[] {
         methods: ['POST'],
         preAuthLimit: 20,
         captcha: false,
+        session: 'session',
       },
       {
         path: '/two-factor/totp/start',
         methods: ['POST'],
         preAuthLimit: 20,
         captcha: false,
+        session: 'session',
       },
       {
         path: '/two-factor/totp/confirm',
         methods: ['POST'],
         preAuthLimit: 30,
         captcha: false,
+        session: 'session',
       },
       // Reachable with only the challenge cookie: the sign-in half of TOTP, not
       // a management path. Its real budget is the per-challenge attempt counter.
@@ -63,6 +67,7 @@ function twoFactorEndpoints(): RoutePrefixPath[] {
         methods: ['POST'],
         preAuthLimit: 30,
         captcha: false,
+        session: 'challenge',
       }
     );
 
@@ -73,47 +78,54 @@ function twoFactorEndpoints(): RoutePrefixPath[] {
       methods: ['POST'],
       preAuthLimit: 20,
       captcha: false,
+      session: 'session',
     },
     {
       path: '/two-factor/trusted-devices',
       methods: ['GET'],
       preAuthLimit: 60,
       captcha: false,
+      session: 'session',
     },
     {
       path: '/two-factor/trusted-devices/revoke',
       methods: ['POST'],
       preAuthLimit: 30,
       captcha: false,
+      session: 'session',
     },
     {
       path: '/two-factor/methods',
       methods: ['GET'],
       preAuthLimit: 60,
       captcha: false,
+      session: 'session',
     },
     {
       path: '/two-factor/methods/disable',
       methods: ['POST'],
       preAuthLimit: 20,
       captcha: false,
+      session: 'session',
     },
     {
       path: '/two-factor/methods/default',
       methods: ['POST'],
       preAuthLimit: 30,
       captcha: false,
+      session: 'session',
     },
     {
       path: '/two-factor/backup-codes/acknowledge',
       methods: ['POST'],
       preAuthLimit: 20,
       captcha: false,
+      session: 'session',
     }
   );
 
   // Neither is anonymous — enrolment needs a session, sign-in a challenge
-  // cookie — so neither carries a captcha.
+  // cookie — so neither carries a captcha, and both credentials are published.
   if (TWO_FACTOR_OTP_AVAILABLE)
     paths.push(
       {
@@ -122,12 +134,14 @@ function twoFactorEndpoints(): RoutePrefixPath[] {
         // Below the verify budget: every request here can cost a message.
         preAuthLimit: 20,
         captcha: false,
+        session: 'session-or-challenge',
       },
       {
         path: '/two-factor/otp/verify',
         methods: ['POST'],
         preAuthLimit: 30,
         captcha: false,
+        session: 'session-or-challenge',
       }
     );
 
@@ -138,12 +152,14 @@ function twoFactorEndpoints(): RoutePrefixPath[] {
         methods: ['POST'],
         preAuthLimit: 20,
         captcha: false,
+        session: 'session',
       },
       {
         path: '/two-factor/verify-backup-code',
         methods: ['POST'],
         preAuthLimit: 30,
         captcha: false,
+        session: 'challenge',
       }
     );
 
@@ -157,36 +173,42 @@ function twoFactorEndpoints(): RoutePrefixPath[] {
         methods: ['POST'],
         preAuthLimit: 20,
         captcha: false,
+        session: 'session',
       },
       {
         path: '/passkey/generate-register-options',
         methods: ['GET'],
         preAuthLimit: 20,
         captcha: false,
+        session: 'session',
       },
       {
         path: '/passkey/verify-registration',
         methods: ['POST'],
         preAuthLimit: 20,
         captcha: false,
+        session: 'session',
       },
       {
         path: '/passkey/list-user-passkeys',
         methods: ['GET'],
         preAuthLimit: 60,
         captcha: false,
+        session: 'session',
       },
       {
         path: '/passkey/delete-passkey',
         methods: ['POST'],
         preAuthLimit: 30,
         captcha: false,
+        session: 'session',
       },
       {
         path: '/passkey/update-passkey',
         methods: ['POST'],
         preAuthLimit: 30,
         captcha: false,
+        session: 'session',
       },
       // Reachable only with a live 2FA challenge.
       {
@@ -194,12 +216,14 @@ function twoFactorEndpoints(): RoutePrefixPath[] {
         methods: ['POST'],
         preAuthLimit: 30,
         captcha: false,
+        session: 'challenge',
       },
       {
         path: '/two-factor/passkey/verify',
         methods: ['POST'],
         preAuthLimit: 30,
         captcha: false,
+        session: 'challenge',
       }
       // ⚠️ `/passkey/generate-authenticate-options` and
       // `/passkey/verify-authentication` are ABSENT, permanently and with no
@@ -231,12 +255,19 @@ function twoFactorEndpoints(): RoutePrefixPath[] {
  * that hook's `PASSWORD_PROOF_PATHS`, or it rejects every password.
  */
 export const BETTER_AUTH_ENDPOINTS: readonly RoutePrefixPath[] = [
-  { path: '/capabilities', methods: ['GET'], preAuthLimit: 60, captcha: false },
+  {
+    path: '/capabilities',
+    methods: ['GET'],
+    preAuthLimit: 60,
+    captcha: false,
+    session: 'none',
+  },
   {
     path: '/reauth/methods',
     methods: ['GET'],
     preAuthLimit: 60,
     captcha: false,
+    session: 'session',
   },
   ...(isTwoFactorMethodEnabled('passkey')
     ? ([
@@ -245,12 +276,14 @@ export const BETTER_AUTH_ENDPOINTS: readonly RoutePrefixPath[] = [
           methods: ['POST'],
           preAuthLimit: 20,
           captcha: false,
+          session: 'session',
         },
         {
           path: '/reauth/passkey/verify',
           methods: ['POST'],
           preAuthLimit: 20,
           captcha: false,
+          session: 'session',
         },
       ] satisfies RoutePrefixPath[])
     : []),
@@ -261,18 +294,21 @@ export const BETTER_AUTH_ENDPOINTS: readonly RoutePrefixPath[] = [
           methods: ['POST'],
           preAuthLimit: 20,
           captcha: true,
+          session: 'none',
         },
         {
           path: '/oauth/google/callback',
           methods: ['GET'],
           preAuthLimit: 30,
           captcha: false,
+          session: 'none',
         },
         {
           path: '/oauth/result',
           methods: ['GET'],
           preAuthLimit: 60,
           captcha: false,
+          session: 'none',
         },
       ] satisfies RoutePrefixPath[])
     : []),
@@ -289,18 +325,21 @@ export const BETTER_AUTH_ENDPOINTS: readonly RoutePrefixPath[] = [
     methods: ['GET'],
     preAuthLimit: 300,
     captcha: false,
+    session: 'optional',
   },
   {
     path: '/sign-out',
     methods: ['POST'],
     preAuthLimit: 30,
     captcha: false,
+    session: 'optional',
   },
   {
     path: '/sign-in/email',
     methods: ['POST'],
     preAuthLimit: 20,
     captcha: true,
+    session: 'none',
   },
   // Passwordless plugin endpoint — does its own captcha/rate-limit/OTP verify.
   {
@@ -308,6 +347,7 @@ export const BETTER_AUTH_ENDPOINTS: readonly RoutePrefixPath[] = [
     methods: ['POST'],
     preAuthLimit: 60,
     captcha: true,
+    session: 'none',
   },
   ...twoFactorEndpoints(),
 ];

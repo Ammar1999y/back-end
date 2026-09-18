@@ -14,6 +14,7 @@ import { auditLog } from '@/lib/audit';
 import { purgeUrls } from '@/lib/cloudflare/purge';
 import {
   deleteObjectsFromR2,
+  ENABLED_VISIBILITIES,
   getPublicUrl,
   hasPublicUrl,
 } from '@/lib/r2/client';
@@ -112,74 +113,111 @@ interface DoomedRow {
 }
 
 /**
- * Phases B and C for rows already marked `deleting`: objects first, then rows,
- * bucket by bucket. `DeleteObjects` reports a missing key as deleted, so a
- * re-run over a half-finished batch is clean. A row stays `deleting` — and is
- * reported as retained — while its object delete is refused, or while a
- * configured cache purge of its public URL has failed: an object gone from the
- * origin but still served from the edge is not gone.
+ * Phases B and C for rows already marked `deleting`: objects first, then rows.
+ * `DeleteObjects` reports a missing key as deleted, so a re-run over a
+ * half-finished batch is clean. A row stays `deleting` — and is reported as
+ * retained — while any object delete it needs is refused, or while a configured
+ * cache purge of its public URL has failed: an object gone from the origin but
+ * still served from the edge is not gone.
+ *
+ * ⚠️ EVERY enabled bucket, not the one the row names. A visibility transition
+ * that lost its saga to the sweep can leave a copy in the other bucket, and the
+ * row is then the only thing that records the key at all — deleting it on the
+ * strength of its own `bucket_type` leaves that copy with no row, no marker and
+ * no sweep that will ever look at it again (reproduced, ending with a readable
+ * public object for a file the API reported deleted). `ux_files_r2_key` is what
+ * makes this safe to do blind: one key belongs to one row, so the object being
+ * removed from the other bucket cannot be anybody else's.
+ *
+ * ⚠️ And the row's OWN bucket is required to be among them. A deployment may
+ * drop a bucket from its environment while rows still name it; those objects do
+ * not disappear with the variable, and an unaddressed bucket is unavailable, not
+ * clean. Treating it as clean deletes the only record of a key whose object is
+ * still stored — and, for the public half, still readable. Such a row is
+ * retained and reported pending until the bucket is configured again; the other
+ * buckets are still cleaned in the meantime.
+ *
+ * The purge follows the same rule rather than the row's bucket, and for the same
+ * reason `removeObject` in `lib/media/visibility.ts` purges every public delete:
+ * a stale public copy is reachable at a URL derivable from the key, so whether
+ * the edge holds it is not a question this can answer from `bucket_type`. It is
+ * decided on the PUBLIC delete alone: once the origin object is gone, an edge
+ * copy outliving it by a year is not made less readable by another bucket's
+ * outage, and the row is retained for that outage either way.
  */
 async function finishDeleting(
   rows: readonly DoomedRow[]
 ): Promise<{ removed: string[]; retained: string[] }> {
-  const removed: string[] = [];
-  const retained: string[] = [];
-  const byBucket = new Map<BucketType, DoomedRow[]>();
-  for (const row of rows) {
-    const group = byBucket.get(row.bucketType) ?? [];
-    group.push(row);
-    byBucket.set(row.bucketType, group);
-  }
+  if (rows.length === 0) return { removed: [], retained: [] };
+  const keys = rows.map((row) => row.r2Key);
 
-  for (const [bucketType, group] of byBucket) {
-    let deletedKeys: Set<string>;
+  const goneFrom = new Map<BucketType, ReadonlySet<string>>();
+  for (const bucketType of ENABLED_VISIBILITIES) {
     try {
-      const outcome = await deleteObjectsFromR2({
-        keys: group.map((row) => row.r2Key),
-        bucketType,
-      });
-      deletedKeys = new Set(outcome.deleted);
+      const outcome = await deleteObjectsFromR2({ keys, bucketType });
+      goneFrom.set(bucketType, new Set(outcome.deleted));
     } catch {
       // Count only. A key is a row id, but the error text is provider-controlled.
       console.error(
         sanitizeForLog({
           msg: 'media.delete objects failed',
-          count: group.length,
+          bucketType,
+          count: keys.length,
         })
       );
-      for (const row of group) retained.push(row.id);
-      continue;
+      goneFrom.set(bucketType, new Set());
     }
-
-    for (const row of group)
-      if (!deletedKeys.has(row.r2Key)) retained.push(row.id);
-    let done = group.filter((row) => deletedKeys.has(row.r2Key));
-    if (done.length === 0) continue;
-
-    if (bucketType === 'public' && hasPublicUrl()) {
-      const purge = await purgeUrls(done.map((row) => getPublicUrl(row.r2Key)));
-      const unpurged = new Set(purge.failed);
-      const held = done.filter((row) => unpurged.has(getPublicUrl(row.r2Key)));
-      for (const row of held) retained.push(row.id);
-      done = done.filter((row) => !unpurged.has(getPublicUrl(row.r2Key)));
-      if (done.length === 0) continue;
-    }
-
-    const deletedRows = await db
-      .delete(files)
-      .where(
-        and(
-          inArray(
-            files.id,
-            done.map((row) => row.id)
-          ),
-          eq(files.status, 'deleting')
-        )
-      )
-      .returning({ id: files.id });
-    for (const row of deletedRows) removed.push(row.id);
   }
-  return { removed, retained };
+
+  const unpurged = new Set<string>();
+  const publicGone = goneFrom.get('public');
+  if (publicGone && hasPublicUrl()) {
+    const urls = rows
+      .filter((row) => publicGone.has(row.r2Key))
+      .map((row) => getPublicUrl(row.r2Key));
+    const purge = await purgeUrls(urls);
+    for (const url of purge.failed) unpurged.add(url);
+  }
+
+  const cleared = goneFrom.values().toArray();
+  const addressable = (row: DoomedRow) =>
+    ENABLED_VISIBILITIES.has(row.bucketType);
+  const stranded = rows.filter((row) => !addressable(row));
+  if (stranded.length > 0)
+    console.error(
+      sanitizeForLog({
+        msg: 'media.delete row names a bucket this deployment cannot address',
+        buckets: [...new Set(stranded.map((row) => row.bucketType))],
+        count: stranded.length,
+      })
+    );
+
+  const done = rows.filter(
+    (row) =>
+      addressable(row) &&
+      cleared.every((gone) => gone.has(row.r2Key)) &&
+      !(hasPublicUrl() && unpurged.has(getPublicUrl(row.r2Key)))
+  );
+
+  const settled = new Set(done.map((row) => row.id));
+  const retained = rows
+    .filter((row) => !settled.has(row.id))
+    .map((row) => row.id);
+  if (done.length === 0) return { removed: [], retained };
+
+  const deletedRows = await db
+    .delete(files)
+    .where(
+      and(
+        inArray(
+          files.id,
+          done.map((row) => row.id)
+        ),
+        eq(files.status, 'deleting')
+      )
+    )
+    .returning({ id: files.id });
+  return { removed: deletedRows.map((row) => row.id), retained };
 }
 
 /**

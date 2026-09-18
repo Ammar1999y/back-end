@@ -31,7 +31,8 @@ interface FilterColumnSpecBase {
   /**
    * Minimum input length for substring-search operators. Below the trigram
    * length pg_trgm's GIN index can't be used and the predicate degrades to a
-   * full scan — the same floor quick search applies.
+   * full scan — the same floor quick search applies. The length is a proxy;
+   * `isTrigramIndexable` is the property, and applies on top of this.
    */
   minSearchLength?: number;
   /**
@@ -178,7 +179,9 @@ export function describeFilterColumns(
       if (spec.values) parts.push(`one of ${spec.values.join('|')}`);
       const floor = spec.minSearchLength ?? defaultMinSearchLength;
       if (operatorsForSpec(spec).some(isSearchOperator))
-        parts.push(`substring searches need ${floor}+ characters`);
+        parts.push(
+          `substring searches need ${floor}+ characters including letters or digits the trigram index can key on`
+        );
       parts.push(`operators: ${operatorsForSpec(spec).join(', ')}`);
       return `\`${id}\` (${parts.join('; ')})`;
     })

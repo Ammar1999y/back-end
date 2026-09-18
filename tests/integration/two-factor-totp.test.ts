@@ -7,21 +7,35 @@
  * challenge identifier, the `2fa-attempts-<id>` counter. Without it an upstream
  * change to any of them surfaces as users unable to log in, with no failing test.
  */
-import { beforeAll, describe, expect, test } from 'bun:test';
+import {
+  afterAll,
+  afterEach,
+  beforeAll,
+  describe,
+  expect,
+  setSystemTime,
+  test,
+} from 'bun:test';
 import type { SeededUser } from '../helpers/session';
 
 import { eq } from 'drizzle-orm';
 
 import { app } from '@/app';
 import { db } from '@/db';
+import { MAX_POOL_CONNECTIONS } from '@/db/limits';
 import {
   sessions,
   twoFactorCredentials,
   twoFactorMethods,
   users,
 } from '@/db/schema';
-import { symmetricDecrypt } from 'better-auth/crypto';
+import {
+  generateRandomString,
+  symmetricDecrypt,
+  symmetricEncrypt,
+} from 'better-auth/crypto';
 import { auth } from '@/lib/auth';
+import { consumeTotpCode, DELEGATED_TOTP_WINDOW } from '@/lib/auth/totp-replay';
 import { PUBLIC_ORIGIN } from '@/lib/env';
 
 import { HTTP_STATUS } from '@/utils/api-messages';
@@ -72,7 +86,13 @@ function cookieHeader(setCookie: string[]): string {
  * rather than a pass. Worth knowing on the frontend side: any non-browser
  * client calling these endpoints has to send it too.
  */
-function post(url: string, body: unknown, cookie?: string): Promise<Response> {
+function post(
+  url: string,
+  body: unknown,
+  cookie?: string,
+  /** Overridden only where a case must not share the default's per-IP budget. */
+  ip?: string
+): Promise<Response> {
   return app.handle(
     new Request(url, {
       method: 'POST',
@@ -80,6 +100,7 @@ function post(url: string, body: unknown, cookie?: string): Promise<Response> {
         'content-type': 'application/json',
         origin: PUBLIC_ORIGIN,
         ...(cookie && { cookie }),
+        ...(ip && { 'cf-connecting-ip': ip }),
       }),
       body: JSON.stringify(body),
     })
@@ -92,6 +113,29 @@ async function totpCode(secret: string): Promise<string> {
   return code;
 }
 
+const TOTP_PERIOD_MS = 30_000;
+
+/**
+ * `beginAttempt(5)` inside Better Auth's own `verifyTOTP`, deliberately NOT
+ * `TWO_FACTOR_ALLOWED_ATTEMPTS`: the library's verifiers run their own budget,
+ * and this file measures theirs. The two happen to agree today.
+ */
+const PLUGIN_ALLOWED_ATTEMPTS = 5;
+
+/**
+ * A code for a time step nothing in this file has spent yet.
+ *
+ * An accepted code now RESERVES its step (RFC 6238 §5.2), and this whole file
+ * runs inside a second or two — so without moving the clock, the enrolment code
+ * and every sign-in code below are the same string and every case after the
+ * first would be refused as a replay. Each caller gets its own period; the
+ * clock is restored in `afterAll`.
+ */
+async function freshTotpCode(secret: string): Promise<string> {
+  setSystemTime(new Date(Date.now() + TOTP_PERIOD_MS));
+  return totpCode(secret);
+}
+
 /**
  * Signs in and returns the response plus the cookies it set. Deliberately not
  * `helpers/session.signIn`, which throws on anything but a 200 — a challenge is
@@ -100,7 +144,8 @@ async function totpCode(secret: string): Promise<string> {
 async function signInRaw(
   user: SeededUser,
   body: Record<string, unknown> = {},
-  jar = ''
+  jar = '',
+  ip?: string
 ): Promise<{
   status: number;
   body: unknown;
@@ -110,7 +155,8 @@ async function signInRaw(
   const response = await post(
     SIGN_IN_URL,
     { email: user.email, password: user.password, ...body },
-    jar || undefined
+    jar || undefined,
+    ip
   );
   const setCookie = response.headers.getSetCookie();
   return {
@@ -132,6 +178,17 @@ async function newestSessionLifetimeDays(userId: string): Promise<number> {
   )[0];
   if (!newest) throw new Error('no session row');
   return (newest.expiresAt.getTime() - newest.createdAt.getTime()) / 86_400_000;
+}
+
+/** The library's account-level consecutive-failure count for this user. */
+async function failedVerifications(userId: string): Promise<number> {
+  const [row] = await db
+    .select({ failed: twoFactorCredentials.failedVerificationCount })
+    .from(twoFactorCredentials)
+    .where(eq(twoFactorCredentials.userId, userId))
+    .limit(1);
+  if (!row) throw new Error('no two-factor credential row');
+  return row.failed;
 }
 
 async function sessionCount(userId: string): Promise<number> {
@@ -198,6 +255,33 @@ beforeAll(async () => {
     secret,
     cookie: cookieHeader(confirm.headers.getSetCookie()) || first.cookie,
   };
+});
+
+/**
+ * The library's account lockout is per CREDENTIAL and outlives a test: ten
+ * consecutive failed verifications lock the row for fifteen minutes, and every
+ * later case in this file then answers 429 instead of the status it asserts.
+ *
+ * It has to be cleared between cases rather than after the one obvious
+ * offender, because a REPLAY is charged exactly like a wrong code — see
+ * `SPENT_TOTP_CODE` in `lib/auth/two-factor.ts` — so the replay and concurrency
+ * cases spend the same budget as the invalid-code ones. That charging is
+ * asserted directly below; clearing it here is what keeps the assertion local
+ * to the case that makes it.
+ */
+afterEach(async () => {
+  /* eslint-disable-next-line drizzle/enforce-update-with-where -- every
+     credential row in the harness database, deliberately: the cases below enrol
+     users of their own and each one carries its own lock */
+  await db
+    .update(twoFactorCredentials)
+    .set({ failedVerificationCount: 0, lockedUntil: null });
+});
+
+afterAll(() => {
+  // `setSystemTime()` with no argument IS the documented reset; this tier runs
+  // `--no-isolate`, so a clock left forward would follow every later file.
+  setSystemTime();
 });
 
 describe('enrolling TOTP', () => {
@@ -267,7 +351,7 @@ describe('signing in with TOTP enrolled', () => {
 
     const verify = await post(
       'http://localhost/api/auth/two-factor/verify-totp',
-      { code: await totpCode(enrolled().secret) },
+      { code: await freshTotpCode(enrolled().secret) },
       attempt.cookie
     );
 
@@ -278,6 +362,106 @@ describe('signing in with TOTP enrolled', () => {
     expect(cookieHeader(verify.headers.getSetCookie())).toContain(
       'session_token'
     );
+  });
+
+  test('a code that already completed a sign-in cannot complete a second one', async () => {
+    // RFC 6238 §5.2. Nothing reserved the accepted time step, so an OBSERVED
+    // code stayed acceptable for its whole period plus the window either side —
+    // about ninety seconds in which somebody holding the password and a
+    // shoulder-surfed code got their own session after the owner had used it.
+    const code = await freshTotpCode(enrolled().secret);
+
+    const first = await signInRaw(enrolled().user);
+    const firstVerify = await post(
+      'http://localhost/api/auth/two-factor/verify-totp',
+      { code },
+      first.cookie
+    );
+    expect(firstVerify.status).toBe(HTTP_STATUS.OK);
+
+    const second = await signInRaw(enrolled().user);
+    const before = await sessionCount(enrolled().user.userId);
+    const secondVerify = await post(
+      'http://localhost/api/auth/two-factor/verify-totp',
+      { code },
+      second.cookie
+    );
+
+    expect(secondVerify.status).not.toBe(HTTP_STATUS.OK);
+    expect(await sessionCount(enrolled().user.userId)).toBe(before);
+    // And the refusal is the ordinary invalid-code answer: "that one was
+    // already used" would tell the holder their capture was good.
+    expect(cookieHeader(secondVerify.headers.getSetCookie())).not.toContain(
+      'session_token'
+    );
+  });
+
+  test('a replay costs what a wrong code costs, not nothing', async () => {
+    // The status and the message matched before this; the COST did not. A
+    // replay refused ahead of the library spent no attempt of the challenge's
+    // five and no failure of the account's ten, so a holder of a captured code
+    // could repeat it indefinitely past the point at which a guess would have
+    // destroyed the challenge — and that difference is the oracle: it says the
+    // capture was genuine.
+    const code = await freshTotpCode(enrolled().secret);
+    const owner = await signInRaw(enrolled().user);
+    const ownerVerify = await post(
+      'http://localhost/api/auth/two-factor/verify-totp',
+      { code },
+      owner.cookie
+    );
+    expect(ownerVerify.status).toBe(HTTP_STATUS.OK);
+
+    // One challenge, replayed until its budget is gone. The last answer is the
+    // exhausted-challenge refusal, which is what a sixth WRONG code gets.
+    const attacker = await signInRaw(enrolled().user);
+    const statuses: number[] = [];
+    for (let attempt = 0; attempt <= PLUGIN_ALLOWED_ATTEMPTS; attempt++) {
+      const replay = await post(
+        'http://localhost/api/auth/two-factor/verify-totp',
+        { code },
+        attacker.cookie
+      );
+      statuses.push(replay.status);
+    }
+
+    expect(statuses).toEqual([
+      ...Array.from(
+        { length: PLUGIN_ALLOWED_ATTEMPTS },
+        () => HTTP_STATUS.UNAUTHORIZED
+      ),
+      HTTP_STATUS.BAD_REQUEST,
+    ]);
+    // And the account-level budget moved too: the sign-in that completed above
+    // cleared it, so every count here is a replay the library charged for.
+    expect(await failedVerifications(enrolled().user.userId)).toBe(
+      PLUGIN_ALLOWED_ATTEMPTS
+    );
+  });
+
+  test('the step is advanced, so a code from an EARLIER period is refused too', async () => {
+    // The window is ±1 period, so the previous period's code is otherwise still
+    // acceptable — and it is the one an attacker is most likely to hold.
+    const previous = await freshTotpCode(enrolled().secret);
+    // Reserve the current step through a real sign-in.
+    const priming = await signInRaw(enrolled().user);
+    const primed = await post(
+      'http://localhost/api/auth/two-factor/verify-totp',
+      { code: await freshTotpCode(enrolled().secret) },
+      priming.cookie
+    );
+    expect(primed.status).toBe(HTTP_STATUS.OK);
+
+    const attempt = await signInRaw(enrolled().user);
+    const before = await sessionCount(enrolled().user.userId);
+    const verify = await post(
+      'http://localhost/api/auth/two-factor/verify-totp',
+      { code: previous },
+      attempt.cookie
+    );
+
+    expect(verify.status).not.toBe(HTTP_STATUS.OK);
+    expect(await sessionCount(enrolled().user.userId)).toBe(before);
   });
 
   test('a wrong code is refused and does not issue a session', async () => {
@@ -294,12 +478,122 @@ describe('signing in with TOTP enrolled', () => {
     expect(await sessionCount(enrolled().user.userId)).toBe(before);
   });
 
+  test('every concurrent submission of one code answers, and exactly one wins', async () => {
+    // `MAX_POOL_CONNECTIONS` submissions at once, which is the shape that
+    // exposed two different ways of never answering: a statement issued against
+    // the POOL from inside the challenge transaction (every request holding a
+    // connection and waiting for another), and the step reservation taking the
+    // credential row's lock inside that transaction while the library's own
+    // verifier updates the same row through the pool. Neither is a lock
+    // PostgreSQL can break, so the assertion is simply that all of them answer.
+    const code = await freshTotpCode(enrolled().secret);
+    const before = await sessionCount(enrolled().user.userId);
+
+    const attempts = [];
+    for (let index = 0; index < MAX_POOL_CONNECTIONS; index++)
+      attempts.push(await signInRaw(enrolled().user));
+
+    const answers = await Promise.all(
+      attempts.map((attempt) =>
+        post(
+          'http://localhost/api/auth/two-factor/verify-totp',
+          { code },
+          attempt.cookie
+        )
+      )
+    );
+
+    // One code, one session. The rest are the ordinary invalid-code answer.
+    expect(
+      answers.filter((answer) => answer.status === HTTP_STATUS.OK)
+    ).toHaveLength(1);
+    expect(await sessionCount(enrolled().user.userId)).toBe(before + 1);
+  }, 30_000);
+
+  test('every concurrent INVALID submission answers too', async () => {
+    // The half the correct-code case cannot reach. A wrong code is rejected by
+    // the reservation and falls through to the library, so all
+    // `MAX_POOL_CONNECTIONS` requests open the challenge transaction — each
+    // holding a connection, nine of them waiting on the user row lock — and the
+    // one holding the lock then needs a POOL connection for the library's own
+    // credential read. There is none, and none can be returned until it
+    // finishes. Nothing in PostgreSQL breaks that: the wait is in the
+    // application pool.
+    // One address per submission. The per-IP admission budget is a real
+    // control and would answer some of these 429 before they reach a
+    // connection, which is exactly the state this has to get past to measure
+    // what the pool does. A distributed attacker has the same addresses.
+    const addresses = Array.from(
+      { length: MAX_POOL_CONNECTIONS },
+      (_, index) => `203.0.113.${index + 1}`
+    );
+    const attempts = [];
+    for (const address of addresses)
+      attempts.push(await signInRaw(enrolled().user, {}, '', address));
+
+    const answers = await Promise.all(
+      attempts.map((attempt, index) =>
+        post(
+          'http://localhost/api/auth/two-factor/verify-totp',
+          { code: '000000' },
+          attempt.cookie,
+          addresses[index]
+        )
+      )
+    );
+
+    expect(answers.map((answer) => answer.status)).toEqual(
+      Array.from(
+        { length: MAX_POOL_CONNECTIONS },
+        () => HTTP_STATUS.UNAUTHORIZED
+      )
+    );
+  }, 60_000);
+
+  test('the reservation covers the window the library can still be in', async () => {
+    // The two verifiers read the clock at different instants, so the library's
+    // ±1 window sits around a LATER reading than the reservation's. A step
+    // boundary crossed between them puts `current + 2` inside the library's
+    // window and outside a ±1 reservation — an accepted code that spends no
+    // step, and is therefore replayable. `DELEGATED_TOTP_WINDOW` is what makes
+    // that step reachable; this is the property, measured on the reservation
+    // itself rather than on an injected clock.
+    const user = await seedUser();
+    const secret = generateRandomString(32);
+    await db.insert(twoFactorCredentials).values({
+      userId: user.userId,
+      secret: await symmetricEncrypt({ key: BETTER_AUTH_SECRET, data: secret }),
+      backupCodes: await symmetricEncrypt({
+        key: BETTER_AUTH_SECRET,
+        data: '[]',
+      }),
+      verified: true,
+    });
+
+    const now = Date.now();
+    setSystemTime(new Date(now + 2 * TOTP_PERIOD_MS));
+    const twoPeriodsAhead = await totpCode(secret);
+    setSystemTime(new Date(now));
+
+    expect(
+      await consumeTotpCode(user.userId, secret, twoPeriodsAhead, {
+        window: DELEGATED_TOTP_WINDOW,
+      })
+    ).toBe('matched');
+    // And still once only.
+    expect(
+      await consumeTotpCode(user.userId, secret, twoPeriodsAhead, {
+        window: DELEGATED_TOTP_WINDOW,
+      })
+    ).toBe('replayed');
+  });
+
   test('a verification with no challenge cookie is refused', async () => {
     // The shape of the attack the design exists to stop: jumping straight to the
     // second factor without having proven the first.
     const verify = await post(
       'http://localhost/api/auth/two-factor/verify-totp',
-      { code: await totpCode(enrolled().secret) }
+      { code: await freshTotpCode(enrolled().secret) }
     );
     expect(verify.status).not.toBe(HTTP_STATUS.OK);
   });
@@ -314,7 +608,7 @@ describe('signing in with TOTP enrolled', () => {
     expect(short.body).toMatchObject({ twoFactorRedirect: true });
     const shortVerify = await post(
       'http://localhost/api/auth/two-factor/verify-totp',
-      { code: await totpCode(enrolled().secret) },
+      { code: await freshTotpCode(enrolled().secret) },
       short.cookie
     );
     expect(shortVerify.status).toBe(HTTP_STATUS.OK);
@@ -337,7 +631,7 @@ describe('signing in with TOTP enrolled', () => {
     expect(remembered.body).toMatchObject({ twoFactorRedirect: true });
     const rememberedVerify = await post(
       'http://localhost/api/auth/two-factor/verify-totp',
-      { code: await totpCode(enrolled().secret) },
+      { code: await freshTotpCode(enrolled().secret) },
       remembered.cookie
     );
     expect(rememberedVerify.status).toBe(HTTP_STATUS.OK);
@@ -361,9 +655,10 @@ describe('a method the challenge did not offer', () => {
       enrolled().cookie
     );
     expect(generated.status).toBe(HTTP_STATUS.OK);
-    const codes =
-      ((await generated.json()) as { data?: { backupCodes?: string[] } }).data
-        ?.backupCodes ?? [];
+    const generatedSet = (await generated.json()) as {
+      data?: { backupCodes?: string[]; setId?: string };
+    };
+    const codes = generatedSet.data?.backupCodes ?? [];
     expect(codes.length).toBeGreaterThan(1);
 
     const attempt = await signInRaw(enrolled().user);
@@ -382,7 +677,10 @@ describe('a method the challenge did not offer', () => {
     // which is what proves the refusal keyed on the offered set.
     const acknowledged = await post(
       'http://localhost/api/auth/two-factor/backup-codes/acknowledge',
-      { password: enrolled().user.password },
+      {
+        password: enrolled().user.password,
+        setId: generatedSet.data?.setId,
+      },
       enrolled().cookie
     );
     expect(acknowledged.status).toBe(HTTP_STATUS.OK);
@@ -403,4 +701,54 @@ describe('a method the challenge did not offer', () => {
       afterAcknowledge + 1
     );
   });
+});
+
+describe('the backup-code verifier under the same concurrency', () => {
+  test('every concurrent INVALID backup code answers', async () => {
+    // The sibling of the TOTP case, and not covered by it: this verifier has no
+    // step reservation in front of it, and it reads the credential through the
+    // same `ctx.context.adapter` — so it is the second endpoint that could hold
+    // a pooled connection inside the challenge transaction. Self-contained
+    // because it must not depend on which earlier case last acknowledged a set.
+    const generated = await post(
+      'http://localhost/api/auth/two-factor/generate-backup-codes',
+      { password: enrolled().user.password },
+      enrolled().cookie
+    );
+    expect(generated.status).toBe(HTTP_STATUS.OK);
+    const setId = ((await generated.json()) as { data?: { setId?: string } })
+      .data?.setId;
+    const acknowledged = await post(
+      'http://localhost/api/auth/two-factor/backup-codes/acknowledge',
+      { password: enrolled().user.password, setId },
+      enrolled().cookie
+    );
+    expect(acknowledged.status).toBe(HTTP_STATUS.OK);
+
+    const addresses = Array.from(
+      { length: MAX_POOL_CONNECTIONS },
+      (_, index) => `198.51.100.${index + 1}`
+    );
+    const attempts = [];
+    for (const address of addresses)
+      attempts.push(await signInRaw(enrolled().user, {}, '', address));
+
+    const answers = await Promise.all(
+      attempts.map((attempt, index) =>
+        post(
+          'http://localhost/api/auth/two-factor/verify-backup-code',
+          { code: 'zzzzz-zzzzz' },
+          attempt.cookie,
+          addresses[index]
+        )
+      )
+    );
+
+    expect(answers.map((answer) => answer.status)).toEqual(
+      Array.from(
+        { length: MAX_POOL_CONNECTIONS },
+        () => HTTP_STATUS.UNAUTHORIZED
+      )
+    );
+  }, 60_000);
 });

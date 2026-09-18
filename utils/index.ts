@@ -441,6 +441,25 @@ const returnNumber = (value: string | undefined | number | null) => {
 };
 
 /**
+ * Whether `value` holds more than `maximum` Unicode code points.
+ *
+ * The UNIT is the point. Both authorities this codebase bounds strings against
+ * count code points — Zod measures a string `.max()` that way, and PostgreSQL
+ * measures `varchar(n)` in characters (`length('😀😀')` is 2, in 8 bytes) — while
+ * `String#length` counts UTF-16 units. A guard that runs AHEAD of either and
+ * counts units refuses input the authority behind it accepts, and one astral
+ * character is all it takes to tell them apart.
+ *
+ * Dropped rather than spread: these guards run on bodies bounded only by the
+ * request ceiling in `app.ts`, and materialising every code point of a megabyte
+ * to answer a 128-character question is what a guard that exists to bound work
+ * must not do. `drop` walks `maximum + 1` code points at most.
+ */
+export function exceedsCodePoints(value: string, maximum: number): boolean {
+  return !value[Symbol.iterator]().drop(maximum).next().done;
+}
+
+/**
  * Canonical decimal integers only — the same shape
  * `app/api/dash/users/[id]/sessions/pagination.ts` enforces, and for the reason
  * stated there: bare `Number()` accepts a whole family of spellings a query

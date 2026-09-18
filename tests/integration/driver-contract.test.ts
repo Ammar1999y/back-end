@@ -83,7 +83,7 @@ import {
   handleUserForeignKeyViolation,
   handleUserUniqueViolation,
 } from '@/utils/api-response';
-import { OTP_CHANNELS, OTP_PURPOSES } from '@/utils/validation/otp';
+import { OTP_CHANNELS, OTP_PURPOSES } from '@/utils/validation/enums';
 
 import { resetTables } from '../helpers/database';
 import { seedUser, signedInUser } from '../helpers/session';

@@ -25,11 +25,11 @@
  */
 import type { FileSweepCount } from '@/lib/media/lifecycle';
 
-import { inArray, lt, or, sql } from 'drizzle-orm';
+import { inArray, lt, sql } from 'drizzle-orm';
 
 import { sanitizeForLog } from '@/utils';
 import { sweepFiles } from '@/lib/media/lifecycle';
-import { retryTransitions } from '@/lib/media/visibility';
+import { retryTransitions, sweepOrphanedObjects } from '@/lib/media/visibility';
 
 import { db } from './index';
 import {
@@ -108,7 +108,19 @@ interface TransitionSweepCount {
   finished: number;
   /** Object-store deletes that failed; the rows stay marked for the next run. */
   failed: number;
+  /** Stalled sagas the bounded pass never reached — a backlog, not a failure. */
+  hasMore: boolean;
   /** A failed delete, or the step itself threw before it could report. */
+  degraded: boolean;
+}
+
+/** Objects whose `files` row was already gone when their delete was owed. */
+interface OrphanSweepCount {
+  removed: number;
+  /** Still owed after this pass; the rows stay for the next one. */
+  failed: number;
+  /** Demands the bounded pass never reached, or a writer re-recorded under it. */
+  hasMore: boolean;
   degraded: boolean;
 }
 
@@ -160,6 +172,7 @@ export interface DatabaseSweepResult {
     trustedDevices: SweepCount;
     files: FileSweepCount;
     transitions: TransitionSweepCount;
+    orphanedObjects: OrphanSweepCount;
   };
   hasMore: boolean;
 }
@@ -228,24 +241,56 @@ function sweepSessions(): Promise<SweepCount> {
  * (`enforceOtpVerifyQuota`) and per user by the endpoint limiters.
  */
 function sweepVerificationSessions(): Promise<SweepCount> {
+  /**
+   * Abandoned, judged from the row's LAST activity rather than its birth.
+   *
+   * `createdAt` is not an activity clock: `processOtpSend` upserts onto the same
+   * `(user, contactKind, purpose)` row, refreshing `lastSentAt`, the code and
+   * `nextAllowedAt` but never `createdAt`, so a row returning to life after a day
+   * still looks a day old — and its freshly issued code, or its unexpired
+   * `blockedUntil` penalty, goes with it.
+   *
+   * So: the newest of every timestamp a live flow WRITES, plus the existence of
+   * an unexpired code, and only then the TTL. ⚠️ `updatedAt` is deliberately not
+   * among them — the send path reaches this row through `onConflictDoUpdate`,
+   * where Drizzle's `$onUpdate` does not fire. `verifyAttemptDaily` is still
+   * forgiven when the row finally goes, as the note above records.
+   */
+  const abandoned = sql`
+    ${verificationSessions.consumedAt} IS NOT NULL
+    OR (
+      greatest(
+        ${verificationSessions.createdAt},
+        coalesce(${verificationSessions.lastSentAt}, ${verificationSessions.createdAt}),
+        coalesce(${verificationSessions.nextAllowedAt}, ${verificationSessions.createdAt}),
+        coalesce(${verificationSessions.blockedUntil}, ${verificationSessions.createdAt}),
+        ${verificationSessions.verifyAttemptWindowStart}
+      ) < now() - ${VERIFICATION_SESSION_TTL}::interval
+      AND NOT EXISTS (
+        SELECT 1 FROM ${verificationCodes}
+        WHERE ${verificationCodes.sessionId} = ${verificationSessions.id}
+          AND ${verificationCodes.expiresAt} > now()
+      )
+    )
+  `;
+
   return sweepBatched(async () => {
     const doomed = db
       .select({ id: verificationSessions.id })
       .from(verificationSessions)
-      .where(
-        or(
-          sql`${verificationSessions.consumedAt} IS NOT NULL`,
-          lt(
-            verificationSessions.createdAt,
-            sql`now() - ${VERIFICATION_SESSION_TTL}::interval`
-          )
-        )
-      )
+      .where(abandoned)
       .limit(BATCH_SIZE);
 
+    // The predicate is repeated on the DELETE, not only used to pick ids.
+    // Selecting candidates and deleting by id is a check and a write with a gap
+    // between them, and `processOtpSend` fills exactly that gap — it takes an
+    // advisory lock and `FOR UPDATE`, so a row can become active while this
+    // statement waits behind it. Repeating the predicate makes PostgreSQL
+    // re-evaluate it against the row it actually locked, so a row that woke up
+    // is skipped instead of deleted.
     const deleted = await db
       .delete(verificationSessions)
-      .where(inArray(verificationSessions.id, doomed))
+      .where(sql`${verificationSessions.id} IN ${doomed} AND (${abandoned})`)
       .returning({ id: verificationSessions.id });
 
     return deleted.length;
@@ -362,13 +407,24 @@ export async function runDatabaseSweep(
         const outcome = await retryTransitions();
         return { ...outcome, degraded: outcome.failed > 0 };
       },
-      { reverted: 0, finished: 0, failed: 0, degraded: true }
+      { reverted: 0, finished: 0, failed: 0, hasMore: true, degraded: true }
+    ),
+    // After the transition retry, which is what records most of what lands here.
+    orphanedObjects: await guarded(
+      'orphanedObjects',
+      async () => {
+        const outcome = await sweepOrphanedObjects();
+        return { ...outcome, degraded: outcome.failed > 0 };
+      },
+      { removed: 0, failed: 0, hasMore: true, degraded: true }
     ),
   };
 
   return {
     status:
-      removed.files.degraded || removed.transitions.degraded
+      removed.files.degraded ||
+      removed.transitions.degraded ||
+      removed.orphanedObjects.degraded
         ? 'degraded'
         : 'ok',
     durationMs: Date.now() - startedAt,
@@ -384,6 +440,9 @@ export async function runDatabaseSweep(
       removed.verifications.hasMore ||
       removed.trustedDevices.hasMore ||
       removed.files.hasMore ||
-      removed.transitions.degraded,
+      removed.transitions.hasMore ||
+      removed.transitions.degraded ||
+      removed.orphanedObjects.hasMore ||
+      removed.orphanedObjects.degraded,
   };
 }

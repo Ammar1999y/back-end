@@ -13,8 +13,7 @@
 import crypto from 'node:crypto';
 import type { Tx } from '@/db';
 import type { EntityID } from '@/types';
-import type { OtpChannel } from '@/utils/validation/otp';
-import type { TwoFactorMethod } from '@/utils/validation/two-factor';
+import type { OtpChannel, TwoFactorMethod } from '@/utils/validation/enums';
 import type { GenericEndpointContext } from '@better-auth/core';
 
 import { and, eq, isNull, sql } from 'drizzle-orm';
@@ -51,7 +50,8 @@ import { lockEligibleAuthUser } from './user-eligibility';
 
 export type AuthContext = GenericEndpointContext;
 
-const TWO_FACTOR_COOKIE_NAME = 'two_factor';
+/** Exported for the OpenAPI document, which publishes it as this surface's security scheme. */
+export const TWO_FACTOR_COOKIE_NAME = 'two_factor';
 
 const CHALLENGE_ID_BYTES = 20;
 
@@ -244,9 +244,8 @@ async function readEnrollment(
       .select({
         secret: twoFactorCredentials.secret,
         verified: twoFactorCredentials.verified,
-        acknowledgedVersion:
-          twoFactorCredentials.backupCodesAcknowledgedVersion,
-        version: twoFactorCredentials.backupCodesVersion,
+        acknowledgedSetId: twoFactorCredentials.backupCodesAcknowledgedSetId,
+        setId: twoFactorCredentials.backupCodesSetId,
         remaining: twoFactorCredentials.backupCodesRemaining,
       })
       .from(twoFactorCredentials)
@@ -282,10 +281,11 @@ async function readEnrollment(
       // ⚠️ Three conditions, and dropping any one advertises recovery material
       // the user does not have: the acknowledgement must belong to the CURRENT
       // set (regeneration replaces every code), and the set must still hold an
-      // unspent code.
+      // unspent code. Both ids are NULL on a row that has never generated a
+      // set, where equality alone would read as "acknowledged".
       backupCodesReady:
-        credential != null &&
-        credential.acknowledgedVersion === credential.version &&
+        credential?.acknowledgedSetId != null &&
+        credential.acknowledgedSetId === credential.setId &&
         credential.remaining > 0,
       hasPasskey: passkeyRow != null,
       emailVerified: user?.emailVerified === true,

@@ -1,4 +1,4 @@
-import type { OtpChannel } from '@/utils/validation/otp';
+import type { OtpChannel } from '@/utils/validation/enums';
 import type { AnyColumn } from 'drizzle-orm';
 
 import { sql } from 'drizzle-orm';

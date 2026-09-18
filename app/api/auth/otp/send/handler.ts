@@ -23,15 +23,21 @@ import {
 } from '@/utils/api-response';
 import { OTP_AUTO_VERIFY } from '@/utils/config';
 import { CustomError } from '@/utils/error-class';
-import { markContactVerified, processOtpSend } from '@/utils/otp';
+import {
+  markContactVerified,
+  OTP_BASE_RESEND_DELAY_S,
+  processOtpSend,
+} from '@/utils/otp';
 import { OTP_ENABLED, sendOtpSchema } from '@/utils/validation/otp';
 
 import { ensureMinDelay, otpMsg } from '../messages';
 
 // Stripped of per-identifier counters so fake and real paths return the same
 // shape. Exposing attemptsRemaining leaks whether the account exists.
+// The ladder is FLAT on this surface, so the constant is the truth rather
+// than an optimistic guess — see `FLAT_RESEND_PURPOSES` in `utils/otp.ts`.
 const GENERIC_SEND_DATA = {
-  nextAllowedIn: 30,
+  nextAllowedIn: OTP_BASE_RESEND_DELAY_S,
 };
 
 export const POST: Handler = async (ctx) => {

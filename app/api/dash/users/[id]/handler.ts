@@ -1,3 +1,4 @@
+import type { Tx } from '@/db';
 import type { Handler } from '@/lib/http/contract';
 import type { checkUserPermission } from '@/lib/permissions/checker';
 import type { EntityID } from '@/types';
@@ -8,6 +9,7 @@ import { db, withTransaction } from '@/db';
 import { accounts, rolePermissions, roles, sessions, users } from '@/db/schema';
 import { validID } from '@/utils';
 import { auditLog, getAuditMeta } from '@/lib/audit';
+import { requireReauthWindow } from '@/lib/auth/admin-reauth';
 import { checkPasswordCompromise } from '@/lib/auth/check-password';
 import { hashPassword } from '@/lib/auth/password';
 import {
@@ -368,8 +370,22 @@ async function assertTargetEditable(opts: {
     );
 }
 
+/**
+ * The `D12` window, for an actor whose session id came from the permission
+ * read. A `null` id cannot own a window, so it is refused rather than skipped.
+ */
+async function requireAdminReauth(
+  actor: {
+    userId: EntityID;
+    sessionId: EntityID | null;
+  },
+  executor?: Tx
+): Promise<void> {
+  await requireReauthWindow(actor.userId, actor.sessionId ?? '', executor);
+}
+
 async function handleAdminEdit(
-  actor: { userId: EntityID; userEmail: string },
+  actor: { userId: EntityID; sessionId: EntityID | null; userEmail: string },
   actorPermissions: Awaited<
     ReturnType<typeof checkUserPermission>
   >['permissions'],
@@ -398,6 +414,10 @@ async function handleAdminEdit(
 
   const password = validatedDataParsed.data.password;
   if (password) {
+    // Before the HIBP request and the 64 MiB hash, not after: a supplied
+    // password needs no comparison with the stored row to be the `D12` class,
+    // so this is the one sensitive change knowable from the request alone.
+    await requireAdminReauth(actor);
     // A cheap, UNLOCKED pre-flight before the expensive work, and only when
     // there is expensive work to do.
     //
@@ -619,7 +639,6 @@ async function handleAdminEdit(
     }
 
     const emailChanged = lockedUser.email !== validatedData.email;
-    if (emailChanged) await unlinkGoogle(tx, userId, auditMeta);
     // Phone is only persisted when enabled. An omitted key means "keep current"
     // — only an explicit null/'' clears it — so a partial update can't silently
     // wipe the number. Presence comes from the PARSED value (`undefined` only
@@ -632,6 +651,28 @@ async function handleAdminEdit(
       PHONE_ENABLED &&
       phoneProvided &&
       lockedUser.phoneNumber !== newPhoneNumber;
+
+    // `D12` is the CHANGE, not the grant. `users.edit` covers a rename and a
+    // role reassignment alike, and this contract is a total object — a client
+    // renaming somebody restates their current email, role and active flag — so
+    // the window is asked for on the actual mutation, not on the shape of the
+    // requested object. Same reasoning as the permission-matrix gate below.
+    //
+    // Decided from the LOCKED row, never from an earlier read: a window skipped
+    // on a stale comparison is a security decision made against a row somebody
+    // else has since changed. Nothing is written at this point, so an unproven
+    // session costs a rollback and no more.
+    const roleChanged = lockedUser.roleId !== assignedRoleId;
+    if (
+      emailChanged ||
+      phoneChanged ||
+      roleChanged ||
+      customPermsChanged ||
+      lockedUser.isActive !== validatedData.isActive
+    )
+      await requireAdminReauth(actor, tx);
+
+    if (emailChanged) await unlinkGoogle(tx, userId, auditMeta);
 
     // A contact change clears that contact's verified flag, which takes the OTP
     // second factor bound to it out of the offered set. When that was the
@@ -718,7 +759,6 @@ async function handleAdminEdit(
       });
     }
 
-    const roleChanged = lockedUser.roleId !== assignedRoleId;
     // Any credential/identity mutation invalidates existing sessions. Phone is
     // included for the same reason the self-service flow revokes on phone
     // change: it is a passwordless login factor, so a session obtained through
@@ -816,6 +856,7 @@ export const PUT: Handler = async (ctx) => {
   try {
     const {
       session,
+      sessionId,
       userId,
       roleId: actorRoleId,
       scope: editScope,
@@ -824,9 +865,11 @@ export const PUT: Handler = async (ctx) => {
       resource: 'users',
       action: 'edit',
       throwError: false,
-      // `D12`: this action lowers ANOTHER account's security posture, so it is
-      // in the re-authentication class. Either all of them are or none are.
-      reauth: true,
+      // No `reauth` here, unlike the other `D12` routes, and the difference is
+      // this route's `throwError: false`: it serves two operations behind one
+      // permission read, so a window demanded before the branch reaches a user
+      // renaming THEMSELVES and inverts 401 before 403 for a caller with no
+      // grant. `handleAdminEdit` requires it, on the changes that earn it.
     });
 
     await enforceRateLimit({
@@ -844,6 +887,7 @@ export const PUT: Handler = async (ctx) => {
 
     const actor = {
       userId,
+      sessionId,
       userEmail: session.user.email,
       // `edit` forces the database read, so this is the live role id rather
       // than the cookie-cached `session.user.roleId`.

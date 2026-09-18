@@ -52,6 +52,7 @@
  * literal and a pure catalog check, neither of which opens a connection.
  */
 import { SQL } from 'bun';
+import { createHash } from 'node:crypto';
 import { readdir, readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -98,6 +99,165 @@ const client = new SQL(connectionString, { max: 1 });
  */
 const MIGRATION_LOCK_KEY = 8_421_337_104_552_113n;
 
+interface JournalEntry {
+  idx: number;
+  when: number;
+  tag: string;
+}
+
+/**
+ * The journal as the installed migrator reads it, plus the hash it would write.
+ *
+ * Same digest drizzle computes (`migrator.js`): sha256 of the raw file text.
+ */
+async function journalWithHashes(): Promise<
+  Array<JournalEntry & { hash: string }>
+> {
+  const raw: unknown = JSON.parse(
+    await readFile(path.join(DRIZZLE_DIR, 'meta', '_journal.json'), 'utf8')
+  );
+  const entries =
+    typeof raw === 'object' && raw !== null && 'entries' in raw
+      ? (raw as { entries: unknown }).entries
+      : undefined;
+  if (!Array.isArray(entries))
+    throw new Error('meta/_journal.json has no entries');
+
+  return Promise.all(
+    entries.map(async (entry: unknown) => {
+      const { idx, when, tag } = entry as Partial<JournalEntry>;
+      if (
+        typeof idx !== 'number' ||
+        typeof when !== 'number' ||
+        typeof tag !== 'string'
+      )
+        throw new Error(`malformed journal entry: ${JSON.stringify(entry)}`);
+      /* eslint-disable-next-line security/detect-non-literal-fs-filename -- the
+         tag comes from this repository's own journal, under a fixed in-repo
+         directory; the same file the migrator itself reads */
+      const sql = await readFile(path.join(DRIZZLE_DIR, `${tag}.sql`), 'utf8');
+      return {
+        idx,
+        when,
+        tag,
+        hash: createHash('sha256').update(sql).digest('hex'),
+      };
+    })
+  );
+}
+
+interface LedgerRow {
+  hash: string;
+  created_at: string | number | bigint;
+}
+
+/** The ledger, oldest first — the order the migrator wrote it in. */
+async function ledgerRows(): Promise<LedgerRow[] | null> {
+  const [probe] = (await client`
+    select to_regclass('drizzle.__drizzle_migrations') is not null as present
+  `) as Array<{ present: boolean }>;
+  if (!probe?.present) return null;
+  return (await client`
+    select hash, created_at
+    from drizzle.__drizzle_migrations
+    order by created_at asc, id asc
+  `) as LedgerRow[];
+}
+
+/**
+ * Every ledger row against the journal entry of the same index.
+ *
+ * Only the PREFIX: a row with no journal entry behind it is a rollback, and the
+ * caller decides whether journal entries with no row are pending work or a
+ * migrator that did not do its job.
+ */
+function assertLedgerPrefix(
+  journal: Array<JournalEntry & { hash: string }>,
+  rows: LedgerRow[]
+): void {
+  if (rows.length > journal.length)
+    throw new Error(
+      `migration ledger has ${rows.length} row(s) for ${journal.length} journal ` +
+        'entry(ies). The database is ahead of this checkout (a rollback), or ' +
+        'rows were removed by hand.'
+    );
+
+  for (const [index, row] of rows.entries()) {
+    const expected = journal[index];
+    if (!expected) throw new Error(`ledger row ${index} has no journal entry`);
+    if (Number(row.created_at) !== expected.when)
+      throw new Error(
+        `ledger row ${index} was applied for a different migration: ` +
+          `expected ${expected.tag} (${expected.when}), found ${row.created_at}`
+      );
+    if (row.hash !== expected.hash)
+      throw new Error(
+        `${expected.tag}.sql has changed since it was applied. The database ` +
+          'still holds the old statements and no environment will ever replay ' +
+          'the new ones. Generate a new migration instead of editing this one.'
+      );
+  }
+}
+
+/**
+ * What the installed migrator does NOT check, and what makes its `ok` a lie.
+ *
+ * `drizzle-orm/pg-core/dialect.js` selects only the NEWEST ledger row and
+ * applies every journal entry whose `when` is larger. It writes hashes and never
+ * reads them back. Three states therefore migrate "successfully" while the
+ * database and `db/schema.ts` disagree:
+ *
+ * - **A journal that is not strictly increasing.** Two branches generate
+ *   migrations, the later-merged one carries the SMALLER `when`, and on every
+ *   environment already past the larger one it is skipped forever — while a
+ *   fresh install applies both. Checked BEFORE applying, because after the
+ *   larger entry lands the skip is permanent.
+ * - **An applied file edited afterwards.** The ledger keeps the old hash and the
+ *   migrator never compares, so the edit reaches new databases only.
+ * - **A code rollback behind the database.** More ledger rows than journal
+ *   entries: the running code expects a schema that has already moved on.
+ *
+ * Each is a deployment that fails at the first request touching the difference
+ * rather than at the gate, so the gate refuses instead.
+ *
+ * ⚠️ Two of the three are properties of what is ALREADY applied, and a refusal
+ * that has let the pending set commit first is not a refusal — a migration that
+ * drops the columns an edited predecessor was supposed to read from takes the
+ * state with it. So `assertLedgerPrefix` runs before the migrator too, over the
+ * rows that exist then; this pass adds only what needs the run to have happened,
+ * which is that every journal entry now HAS a row.
+ */
+async function verifyLedger(
+  journal: Array<JournalEntry & { hash: string }>
+): Promise<void> {
+  const rows = (await ledgerRows()) ?? [];
+  assertLedgerPrefix(journal, rows);
+  if (rows.length !== journal.length)
+    throw new Error(
+      `migration ledger has ${rows.length} row(s) for ${journal.length} journal ` +
+        'entry(ies) after migrating. The migrator skipped an entry.'
+    );
+}
+
+/** Refused before anything is applied — see `verifyLedger`. */
+function assertJournalOrdered(journal: JournalEntry[]): void {
+  for (const [index, entry] of journal.entries()) {
+    const previous = journal[index - 1];
+    if (previous && entry.when <= previous.when)
+      throw new Error(
+        `journal timestamps are not strictly increasing: ${entry.tag} ` +
+          `(${entry.when}) does not follow ${previous.tag} (${previous.when}). ` +
+          'Any environment already past the later timestamp would skip this ' +
+          'migration permanently. Regenerate it so it sorts last.'
+      );
+    if (entry.idx !== index)
+      throw new Error(
+        `journal entry ${index} declares idx ${entry.idx}; the migrator applies ` +
+          'entries in array order, so the two must agree.'
+      );
+  }
+}
+
 try {
   const [target] = await client`select current_database() as db`;
   console.log(`database: ${(target as { db: string }).db}\n`);
@@ -108,8 +268,23 @@ try {
   await client`select pg_advisory_lock(${MIGRATION_LOCK_KEY})`;
   console.log('acquired');
 
+  const journal = await journalWithHashes();
+
+  process.stdout.write('journal order ... ');
+  assertJournalOrdered(journal);
+  console.log('ok');
+
+  process.stdout.write('applied history ... ');
+  const applied = await ledgerRows();
+  if (applied) assertLedgerPrefix(journal, applied);
+  console.log(applied ? 'ok' : 'none yet');
+
   process.stdout.write('drizzle migrations ... ');
   await migrate(drizzle({ client }), { migrationsFolder: DRIZZLE_DIR });
+  console.log('ok');
+
+  process.stdout.write('ledger parity ... ');
+  await verifyLedger(journal);
   console.log('ok');
 
   const files = await sqlFilesInOrder();
