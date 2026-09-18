@@ -181,7 +181,7 @@ const MSG_CHANNEL_DISABLED = 'طريقة الإرسال غير مسموحة حا
 function channelEnabledRefine(data: { channel: string }, ctx: z.RefinementCtx) {
   if (!isChannelEnabled(data.channel)) {
     ctx.addIssue({
-      code: z.ZodIssueCode.custom,
+      code: 'custom',
       message: MSG_CHANNEL_DISABLED,
     });
   }

@@ -35,8 +35,10 @@ const transportSchema: z.ZodType<AuthenticatorTransportFuture> = z.enum([
   'usb',
 ]);
 
+const transportListSchema = z.array(transportSchema);
+
 function transports(value: string | null) {
-  const parsed = z.array(transportSchema).safeParse(value?.split(','));
+  const parsed = transportListSchema.safeParse(value?.split(','));
   return parsed.success ? parsed.data : undefined;
 }
 

@@ -91,7 +91,7 @@ function validatePhoneByMode(
 ) {
   if (!PHONE_ENABLED && data.phoneNumber) {
     ctx.addIssue({
-      code: z.ZodIssueCode.custom,
+      code: 'custom',
       message: 'رقم الهاتف غير مُفعّل في النظام',
       path: ['phoneNumber'],
     });
@@ -101,7 +101,7 @@ function validatePhoneByMode(
   const absent = data.phoneNumber === undefined;
   if (PHONE_REQUIRED && !data.phoneNumber && !(allowAbsent && absent)) {
     ctx.addIssue({
-      code: z.ZodIssueCode.custom,
+      code: 'custom',
       message: 'رقم الهاتف مطلوب',
       path: ['phoneNumber'],
     });
@@ -135,7 +135,7 @@ function validateCustomRolePermissions(
 
   if (missing && data.roleId === CUSTOM_ROLE_VALUE) {
     ctx.addIssue({
-      code: z.ZodIssueCode.custom,
+      code: 'custom',
       message: MSG_CUSTOM_ROLE_NEEDS_PERMISSIONS,
       path: ['permissions'],
     });
@@ -143,7 +143,7 @@ function validateCustomRolePermissions(
 
   if (data.roleId !== CUSTOM_ROLE_VALUE && data.permissions?.length) {
     ctx.addIssue({
-      code: z.ZodIssueCode.custom,
+      code: 'custom',
       message: 'الصلاحيات مسموح بها فقط عند اختيار دور مخصص',
       path: ['permissions'],
     });

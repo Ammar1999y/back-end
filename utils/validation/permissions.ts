@@ -96,7 +96,7 @@ function normalizeActionsForPage(
     }
     if (granted !== true) continue;
     ctx.addIssue({
-      code: z.ZodIssueCode.custom,
+      code: 'custom',
       path: ['permissions', action],
       message: `الصلاحية "${action}" غير متاحة لصفحة "${name}"`,
     });
@@ -118,7 +118,7 @@ export const pagePermissionSchema = rawPagePermissionSchema
 
     if (hasAllWrite && permissions.view !== true) {
       ctx.addIssue({
-        code: z.ZodIssueCode.custom,
+        code: 'custom',
         path: ['permissions', 'view'],
         message: ERROR_MESSAGES.viewRequiredForWrite,
       });
@@ -131,7 +131,7 @@ export const pagePermissionSchema = rawPagePermissionSchema
       permissions.viewOwn !== true
     ) {
       ctx.addIssue({
-        code: z.ZodIssueCode.custom,
+        code: 'custom',
         path: ['permissions', 'viewOwn'],
         message: ERROR_MESSAGES.viewRequiredForWrite,
       });
@@ -141,7 +141,7 @@ function noDuplicatePageNames(items: { name: string }[], ctx: z.RefinementCtx) {
   const names = items.map((p) => p.name);
   if (new Set(names).size !== names.length) {
     ctx.addIssue({
-      code: z.ZodIssueCode.custom,
+      code: 'custom',
       message: ERROR_MESSAGES.duplicatePageNames,
     });
   }

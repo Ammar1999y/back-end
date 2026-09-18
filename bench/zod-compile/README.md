@@ -1,12 +1,19 @@
-# `z.compile()` — Zod 4.5 AOT compilation against this repo's validation layer
+# `z.compile()` / `.validate()` — Zod AOT compilation against this repo's validation layer
 
 Measures whether the validation layer (`utils/validation/*`, parsed by every
 route handler through `schema.safeParse(body)`) should adopt `z.compile()` or the
-global `import "zod/compile"` shim introduced in Zod 4.5.
+global `import "zod/compile"` shim introduced in Zod 4.5, and — since
+**2026-09-18**, on `zod@4.6.5` — the boolean `.validate()` added in Zod 4.6.
 
-**Recommendation: do not adopt, on `zod@4.5.2`.** Not because it is unsafe or
-unsupported here — it is neither — but because the trade runs the wrong way for
-this particular layer:
+**Recommendation: do not adopt for this layer.** `.validate()` is adopted at one
+callback-free site outside it; see "`.validate()`" below for that and for the
+rule that decides where it pays. The 4.5 case follows, and re-measuring it on
+4.6.5 changed none of it.
+
+## `z.compile()`, as measured on `zod@4.5.2`
+
+Do not adopt — not because it is unsafe or unsupported here, it is neither, but
+because the trade runs the wrong way for this particular layer:
 
 1. **The saving is invisible.** 1.55 µs off a login request that spends **93 ms**
    in `argon2.verify` — **0.0017 %**. Zod is not this application's bottleneck and
@@ -51,6 +58,13 @@ whole of it.
 
 Timings use `Bun.nanoseconds()`, 20 000 warmup iterations, then at least 400 ms of
 measurement per cell. Single process, no database, no network.
+
+The 4.6 run (**2026-09-18**, `bun 1.4.2`, `zod@4.6.5`, same host) reports the
+minimum of 9 rounds × 4000 iterations after 3 warmup rounds, interleaved across
+variants. A first harness timed each variant once in sequence and produced a
+170 µs outlier and a `.validate()` that beat `safeParse` in one row and lost in
+the next; nothing from that shape is recorded here. Absolute nanoseconds are not
+comparable across the two runs — only the ratios within each.
 
 ## What was ruled out as a blocker
 
@@ -216,6 +230,73 @@ Under the global shim this cost is **lazy** — paid on each schema's first pars
 not at boot — so it would not show up as a startup stall against the gates in
 `server.ts`. Under explicit `z.compile()` at module scope it would be eager.
 
+## `.validate()` — Zod 4.6, and the rule that decides where it pays
+
+Re-measured **2026-09-18** on `zod@4.6.5`, `bun 1.4.2`, same host. `.validate()`
+returns a boolean and builds no `ZodError`, so it may stop at the first failure.
+The 4.5 conclusion above reproduced unchanged (2.0–2.4x accept, 0.6–0.9x reject,
+51 schemas compiled in 67 ms for +382 KB), so only the new API is recorded here.
+
+**`.validate()` alone is worth nothing to this layer: 1.00–1.17x.** Measured
+against `safeParse` on `loginSchema`, `createUserSchema`, `selfUpdateUserSchema`,
+`moveFilesSchema`, `idSchema` and `emailSchema` — min of 9 rounds × 4000
+iterations. The advertised 35x assumes the saving is in _aggregating issues_.
+Here it is not: these schemas reject on one field, and their cost is dominated by
+`z.preprocess` sanitizers that run before any check can fail.
+
+The order of magnitude appears only under `z.compile()` **and** only on a schema
+that holds no user callback:
+
+| `z.union([z.ipv4(), z.ipv6()])` | `safeParse().success` | `compiled.validate()` |           |
+| ------------------------------- | --------------------- | --------------------- | --------- |
+| valid IPv4                      | 159 ns                | 77 ns                 | 2.07x     |
+| valid IPv6                      | 1504 ns               | 504 ns                | 2.99x     |
+| invalid                         | 2023 ns               | 70 ns                 | **28.9x** |
+
+**The rule**: `compileFn` tracks a `definite` flag, and hoisting any
+user-supplied callback clears it — `zod/v4/core/compile.js:207`, "a rejection is
+then no longer proof that the interpreter would have rejected rather than
+thrown." With `definite` cleared, a compiled rejection still falls back to the
+full runtime parse, which is the double-work this document measured in 4.5;
+`.validate()` does not avoid it. Counted directly on a
+`z.preprocess(…, z.string().refine(…))`: compiled + invalid runs both callbacks
+**twice**, under `safeParse` and `.validate()` alike.
+
+So `compile + validate` is a large win on a callback-free schema, and no win at
+all on this repo's request schemas — every one of which carries a sanitizing
+`z.preprocess`, a `.refine`, or a `.superRefine`.
+
+**Equivalence**: 51 schemas × 22 payloads, `safeParse().success` vs `.validate()`
+vs `compiled.validate()` — **2244 comparisons, 0 mismatches**, over the same
+adversarial payload set as the 4.5 run.
+
+### What was adopted
+
+`lib/audit.ts` `getClientIp` only — the single site in `app/`, `lib/` and
+`utils/` that discards both the parsed value and the issues, and whose schema
+holds no callback. Both directions improve, so the objection above does not
+apply to it.
+
+`.validate()` cannot reach the request handlers at all, for a reason independent
+of speed: they need `parsed.data` — the lowercased email, the `9665…` phone, the
+NFKC password, the sanitized name — and `parsed.error.issues[0]`, which
+`zodIssueMessage` turns into the Arabic 422. A boolean type guard over the
+**input** type supplies neither.
+
+### The larger finding, which is not about either API
+
+Two schemas were being **rebuilt on every call**, which no amount of compilation
+can help and which the rest of the layer does not do:
+
+| site                                                       | per-call build | hoisted | saving             |
+| ---------------------------------------------------------- | -------------- | ------- | ------------------ |
+| `lib/auth/authentication-time.ts` clock row                | 30 845 ns      | 136 ns  | **−30.7 µs, 226x** |
+| `lib/auth/passkey-assertion.ts` transports, per credential | 3197 ns        | 379 ns  | −2.8 µs, 8.4x      |
+
+Both are hoisted to module scope now. The first is ~45 000x the 682 ns that
+compiling `loginSchema` saves — the schema _layer_ was never the cost; building a
+schema per request was.
+
 ## Inconclusive / not measured
 
 - **`SVGIconSchema` timings are not reportable.** Both intended payloads were
@@ -231,11 +312,10 @@ not at boot — so it would not show up as a startup stall against the gates in
 - **Concurrency and event-loop lag.** `safeParse` is synchronous and
   sub-microsecond; there is no threadpool interaction to measure, unlike
   `bench/password`.
-- **`assertOnly` / `z.validate()`.** Zod 4.5 also adds a boolean-only validation
-  path claimed at up to 16x on invalid data. Not measured, and it is the more
-  interesting lead if this is ever revisited — it targets the rejection path,
-  which is the half that lost here. It would require call-site changes, since
-  every handler consumes `parsed.error.issues`.
+- ~~**`assertOnly` / `z.validate()`.**~~ Measured on `zod@4.6.5` — see
+  "`.validate()`" below. It does target the rejection path, and it does reach the
+  advertised order of magnitude, but only on a schema holding no user callback.
+  This layer's schemas all hold one.
 - **`z.toJSONSchema` in `lib/http/openapi.ts`.** Build-time, not request-time.
 
 ## If this is revisited
@@ -246,8 +326,11 @@ Re-run only if one of these becomes true:
    `IDS_ARRAY_MAX` raised well beyond 50. Compile **that schema only**.
 2. Profiling shows Zod above ~1 % of request time on any route. Nothing measured
    here comes within three orders of magnitude of that.
-3. Zod ships a compiled path that does not re-run the runtime on failure, or
-   `z.validate()` is adopted for routes that discard issue detail.
+3. Zod ships a compiled path that does not re-run the runtime on failure — i.e.
+   one that keeps `definite` set through a user callback.
+4. A new hot site answers a **boolean** from a **callback-free** schema, as
+   `getClientIp` does. That is the whole of `compile + validate`'s domain; both
+   halves of the condition are load-bearing.
 
 Do not adopt the global `import "zod/compile"` to chase item 1 — it applies the
 rejection-path regression to all 47 schemas to speed up one.

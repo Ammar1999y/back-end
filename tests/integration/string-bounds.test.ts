@@ -17,8 +17,12 @@
  * - Zod LOOSER than the column turns a 422 into a `22001` from the driver — a
  *   500 on a valid-looking request.
  *
- * Asserted against a real column rather than a scratch table, so a future
- * migration that narrows one without the constant is caught here too.
+ * The round trip below runs against a real column rather than a scratch table,
+ * so a migration that narrows THAT one without the constant is caught here. It
+ * covers `roles.description` alone: `users.name`, `users.email`,
+ * `roles.role_name`, `folders.name`, `files.display_name` and
+ * `users.phone_number` are asserted at the schema only, so narrowing one of
+ * those columns would still pass. Widen this if a migration touches them.
  */
 import { beforeAll, describe, expect, test } from 'bun:test';
 
@@ -27,6 +31,7 @@ import { roles } from '@/db/schema';
 import * as z from 'zod';
 import { generateUuidV7 } from '@/lib/id';
 
+import { createUserSchema } from '@/utils/validation/auth';
 import {
   EMAIL_MAX,
   NAME_MAX,
@@ -36,8 +41,17 @@ import {
 
 import { resetTables } from '../helpers/database';
 
-/** One astral character, so UTF-16 length and code-point length differ. */
-const ASTRAL = '😀';
+/**
+ * One astral character, so UTF-16 length and code-point length differ.
+ *
+ * A LETTER (`\p{Lo}`), not an emoji. `sanitizeStrict` and
+ * `sanitizeStrictSingleLine` strip `\p{So}`, so an emoji probe is deleted before
+ * any bound sees it: measured through the real `createUserSchema`, a 150
+ * code-point name led by `😀` was stored as 149 and never reached `NAME_MAX`.
+ * The ad-hoc schemas below do not sanitize and so could not show that; the
+ * `through the real schema` case does, and shares this constant.
+ */
+const ASTRAL = '\u{20BB7}';
 
 /**
  * Exactly `codePoints` code points, of which one is astral.
@@ -71,6 +85,37 @@ describe('a string of exactly N code points', () => {
 
     expect(schema.safeParse(astralText(max)).success).toBe(true);
     expect(schema.safeParse(astralText(max + 1)).success).toBe(false);
+  });
+
+  /**
+   * The cases above build their own `z.string().max(n)`, so they assert what ZOD
+   * counts, not what THIS codebase's schemas count — a length-changing step
+   * between the two (every bounded leaf here is wrapped in a sanitizing
+   * `z.preprocess`) is invisible to them. `NAME_MAX` is carried end to end here
+   * so that gap is covered for at least one real bound.
+   */
+  test('NAME_MAX is a code-point bound through the real schema', () => {
+    const base = {
+      email: 'bounds@gmail.com',
+      password: 'Passw0rd!x',
+      isActive: true,
+      roleId: '01931b3c-7f2a-7000-8000-000000000001',
+    };
+
+    const atBound = createUserSchema.safeParse({
+      ...base,
+      name: astralText(NAME_MAX),
+    });
+    expect(atBound.success).toBe(true);
+    // Survives the sanitizer intact, so the bound is what refused the next case.
+    expect([...(atBound.success ? atBound.data.name : '')]).toHaveLength(
+      NAME_MAX
+    );
+
+    expect(
+      createUserSchema.safeParse({ ...base, name: astralText(NAME_MAX + 1) })
+        .success
+    ).toBe(false);
   });
 });
 

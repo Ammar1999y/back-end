@@ -81,19 +81,19 @@ const googleProvider = GOOGLE_CREDENTIALS
 
 function returnURL(input: string | undefined) {
   if (!input) return null;
-  try {
-    const url = new URL(input, PUBLIC_ORIGIN);
-    if (
-      url.origin !== PUBLIC_ORIGIN ||
-      url.username ||
-      url.password ||
-      url.hash
-    )
-      throw authenticationDenied();
-    return url.href;
-  } catch {
+  // `input` is client-supplied, and the catch this replaces was the rejection
+  // path for a malformed one: `https://exa mple.com` threw out of `new URL` at
+  // roughly ten times the cost of being told `null`.
+  const url = URL.parse(input, PUBLIC_ORIGIN);
+  if (
+    !url ||
+    url.origin !== PUBLIC_ORIGIN ||
+    url.username ||
+    url.password ||
+    url.hash
+  )
     throw authenticationDenied();
-  }
+  return url.href;
 }
 
 /**

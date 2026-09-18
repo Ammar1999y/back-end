@@ -45,9 +45,9 @@
     "@aws-sdk/client-s3": "^3",
     "@aws-sdk/s3-request-presigner": "^3",
     "@better-auth/passkey": "1.7.3",
-    "better-auth": "1.7.3",
     "@elysia/cors": "^1.4",
     "argon2": "^0.45",
+    "better-auth": "1.7.3",
     "blurhash": "^2",
     "drizzle-orm": "^0.45",
     "elysia": "^1.4",
@@ -55,7 +55,7 @@
     "jsdom": "^30",
     "nodemailer": "^10",
     "svgo": "^4",
-    "zod": "^4"
+    "zod": "4.6.5"
   },
   "devDependencies": {
     "@eslint/eslintrc": "^3",

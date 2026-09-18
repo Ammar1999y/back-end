@@ -233,7 +233,7 @@ export const twoFactorMethodOptionSchema = z
   .superRefine((value, ctx) => {
     if (value.method === 'otp' && value.contactKind === undefined)
       ctx.addIssue({
-        code: z.ZodIssueCode.custom,
+        code: 'custom',
         path: ['contactKind'],
         message: 'يجب تحديد وسيلة الإرسال (البريد أو الهاتف)',
       });
