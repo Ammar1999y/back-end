@@ -9,6 +9,7 @@ import type {
   PermissionAction,
   SessionMetadata,
 } from '@/lib/permissions/constants';
+import type { StoredPreferences } from '@/utils/validation/preferences';
 import type { AnyPgColumn } from 'drizzle-orm/pg-core';
 
 import { relations, sql } from 'drizzle-orm';
@@ -676,6 +677,29 @@ export const trustedDevices = pgTable(
     // `idx_trusted_devices_user` cannot serve that scan: its leading column is
     // `user_id`.
     index('idx_trusted_devices_expires_at').on(t.expiresAt),
+  ]
+);
+
+/**
+ * Not a key in `sessions.metadata`: that rail is the permission cache that
+ * `refreshRoleSessions` merges into and must stay unreachable with
+ * caller-supplied keys. The cascade never fires — `users` rows are soft-deleted,
+ * never purged — so the user DELETE handler removes this row itself.
+ */
+export const userPreferences = pgTable(
+  'user_preferences',
+  {
+    id: uuid('id').primaryKey().$defaultFn(generateId),
+    userId: uuid('user_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'cascade' }),
+    ui: jsonb('ui').$type<StoredPreferences>().notNull(),
+    ...timestamps,
+  },
+  (t) => [
+    uniqueIndex('ux_user_preferences_user').on(t.userId),
+    // Literal, not a constant: see `chk_credential_issuer`.
+    check('chk_user_preferences_ui_size', sql`pg_column_size(ui) <= 4096`),
   ]
 );
 

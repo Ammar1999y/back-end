@@ -6,7 +6,14 @@ import type { EntityID } from '@/types';
 import { and, desc, eq, gt, isNull, sql } from 'drizzle-orm';
 
 import { db, withTransaction } from '@/db';
-import { accounts, rolePermissions, roles, sessions, users } from '@/db/schema';
+import {
+  accounts,
+  rolePermissions,
+  roles,
+  sessions,
+  userPreferences,
+  users,
+} from '@/db/schema';
 import { validID } from '@/utils';
 import { auditLog, getAuditMeta } from '@/lib/audit';
 import { requireReauthWindow } from '@/lib/auth/admin-reauth';
@@ -1033,6 +1040,11 @@ export const DELETE: Handler = async (ctx) => {
       await revokePendingProofs(tx, userId);
       await unlinkGoogle(tx, userId, auditMeta);
       await tx.delete(accounts).where(eq(accounts.userId, userId));
+      // Explicitly, because the FK cascade never fires: this row is soft-deleted
+      // and never purged, so nothing else would ever remove it.
+      await tx
+        .delete(userPreferences)
+        .where(eq(userPreferences.userId, userId));
       if (lockedUser.role_scope === CUSTOM_ROLE_VALUE) {
         // Capture the matrix before the role disappears. Deleting a user also
         // destroys their custom role, and the user event below records only

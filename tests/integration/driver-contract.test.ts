@@ -59,6 +59,7 @@ import {
   rolePermissions,
   roles,
   sessions,
+  userPreferences,
   users,
 } from '@/db/schema';
 import {
@@ -84,6 +85,7 @@ import {
   handleUserUniqueViolation,
 } from '@/utils/api-response';
 import { OTP_CHANNELS, OTP_PURPOSES } from '@/utils/validation/enums';
+import { DEFAULT_PREFERENCES } from '@/utils/validation/preferences';
 
 import { resetTables } from '../helpers/database';
 import { seedUser, signedInUser } from '../helpers/session';
@@ -426,6 +428,7 @@ describe('every jsonb column write lands as jsonb, asserted at the SQL level', (
       'audit_logs.old_data',
       'role_permissions.permissions',
       'sessions.metadata',
+      'user_preferences.ui',
     ]);
   });
 
@@ -451,6 +454,21 @@ describe('every jsonb column write lands as jsonb, asserted at the SQL level', (
     if (!row) throw new Error('the seeded role holds no permission rows');
 
     const kind = await jsonbTypeof('role_permissions', 'permissions', row.id);
+    expect(kind).toBe('object');
+    expect(kind).not.toBe('string');
+  });
+
+  test('user_preferences.ui — through the column mapper the route writes with', async () => {
+    const [row] = await db
+      .insert(userPreferences)
+      .values({
+        userId: seeded().roleMerge.userId,
+        ui: DEFAULT_PREFERENCES,
+      })
+      .returning({ id: userPreferences.id });
+    if (!row) throw new Error('preferences insert returned no row');
+
+    const kind = await jsonbTypeof('user_preferences', 'ui', row.id);
     expect(kind).toBe('object');
     expect(kind).not.toBe('string');
   });

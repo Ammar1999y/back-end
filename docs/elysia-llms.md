@@ -35,6 +35,7 @@
 
 - [End-to-End Type Safety - ElysiaJS](https://elysiajs.com/eden/overview.md)
 - [Eden Installation - ElysiaJS](https://elysiajs.com/eden/installation.md)
+- [Eden Fetch - ElysiaJS](https://elysiajs.com/eden/fetch.md)
 
 #### Eden Treaty
 

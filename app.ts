@@ -262,13 +262,21 @@ const base = new Elysia({
     startedAt.set(request, performance.now());
     applySecurityHeaders(set.headers);
 
-    // `URL.parse`, not `new URL`: Bun does not validate the `Host` header before
-    // building `request.url`, so `Host: exa mple.com`, `Host: [not-ipv6]` and an
-    // empty `Host` all reach here and made `new URL` throw. That throw is not a
-    // NOT_FOUND, so `onError` below logged `unhandled server error` and answered
-    // 500 — one error line per request, unauthenticated, ahead of CORS, routing
-    // and every rate limit. An unparseable host is unroutable, which is what the
-    // length check already answers.
+    // `URL.parse`, not `new URL`. Bun serves a request whose `Host` it cannot
+    // use rather than refusing it (measured): `exa mple.com`, a tab or an empty
+    // header leaves `request.url` as the bare path, and an authority it can
+    // carry — `[not-ipv6]`, `example.com:99999` — is passed through verbatim.
+    // Both shapes made `new URL` throw, and that throw is not a NOT_FOUND, so
+    // `onError` below logged `unhandled server error` and answered 500 — one
+    // error line per request, unauthenticated, ahead of CORS, routing and every
+    // rate limit. An unparseable host is unroutable, which is what the length
+    // check already answers.
+    //
+    // Every later `new URL(request.url)` — `onError`, the auth prefix route,
+    // `buildRequestMeta` — relies on this return: each runs only after routing,
+    // and routing does not run once an `onRequest` hook has answered. A hook
+    // registered ahead of this one, or a mount outside Elysia, would reach them
+    // unguarded.
     const url = URL.parse(request.url);
     if (!url || url.hostname.length < MIN_ROUTABLE_HOSTNAME_LENGTH)
       return finish(request, notFound());

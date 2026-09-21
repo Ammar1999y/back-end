@@ -1,7 +1,5 @@
 import type { SQL } from 'bun';
 
-import { MAX_ID } from '@/constants';
-
 const ARABIC_INDIC_DIGITS = /[٠-٩۰-۹]/g;
 
 const ARABIC_INDIC_BASE = 0x06_60;
@@ -482,7 +480,10 @@ const CANONICAL_INTEGER = /^(?:0|[1-9]\d*)$/;
 /** Distinguishes "over the cap" from "not a number at all". */
 export const OUT_OF_RANGE = -1;
 
-export const positiveInt = (val: unknown, maxValue = MAX_ID) => {
+export const positiveInt = (
+  val: unknown,
+  maxValue = Number.MAX_SAFE_INTEGER
+) => {
   const raw =
     typeof val === 'number' ? String(val) : typeof val === 'string' ? val : '';
   if (!CANONICAL_INTEGER.test(raw)) return 0;

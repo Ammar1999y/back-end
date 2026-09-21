@@ -1,10 +1,12 @@
 /**
  * A malformed `Host` header is a 404, not a 500.
  *
- * Bun does not validate `Host` before it builds `request.url`, so `Host: exa
- * mple.com`, `Host: [not-ipv6]` and an empty `Host` all arrive at `app.ts`'s
- * `onRequest` — where `new URL(request.url)` threw. That throw is not a
- * NOT_FOUND, so it fell to the generic branch of `onError`, which answered 500
+ * Bun serves a request whose `Host` it cannot use rather than refusing it
+ * (measured): `exa mple.com`, a tab or an empty header leaves `request.url` as
+ * the bare path, and an authority it can carry — `[not-ipv6]`,
+ * `example.com:99999` — is passed through verbatim. Both shapes arrive at
+ * `app.ts`'s `onRequest` — where `new URL(request.url)` threw. That throw is not
+ * a NOT_FOUND, so it fell to the generic branch of `onError`, which answered 500
  * and wrote one `unhandled server error` line per request: an unauthenticated
  * write into the channel operators watch, ahead of CORS, routing and every rate
  * limit. `URL.parse` returns `null` instead, and an unparseable host is
@@ -66,6 +68,7 @@ describe('a Host header the URL parser rejects', () => {
     ['a malformed bracket literal', '[not-ipv6]'],
     ['an empty value', ''],
     ['a tab in the authority', 'exa\tmple.com'],
+    ['a port outside the range', 'example.com:99999'],
   ])('%s answers 404, not 500', async (_label, hostHeader) => {
     expect(await statusForHost(hostHeader)).toBe(HTTP_STATUS.NOT_FOUND);
   });

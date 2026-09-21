@@ -79,11 +79,11 @@ export async function requirePermission(
  * Throws 401 when no authenticated user is present.
  * Use this when you need the session but don't need a permission check.
  *
- * The session ROW is verified, not just the cookie. Every caller of this helper
- * is a mutation — change-password and both contact-change flows — and the cookie
- * cache stays valid for minutes after the row is deleted, so a session revoked by
- * credential rotation could still finish a contact change it had started. See
- * `assertLiveSession`.
+ * The session ROW is verified, not just the cookie: the cookie cache stays valid
+ * for minutes after the row is deleted, so a session revoked by credential
+ * rotation could otherwise finish a mutation it had started. See
+ * `assertLiveSession`. The preferences `GET` pays that query too rather than
+ * growing a second, cache-only helper.
  */
 export async function requireSession(ctx: HandlerInput) {
   const session = await auth.api.getSession({ headers: ctx.headers });

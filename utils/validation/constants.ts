@@ -77,5 +77,11 @@ export const ROLE_NAME_MAX = 100;
 export const ROLE_DESCRIPTION_MAX = 150;
 export const PERMISSIONS_ARRAY_MAX = Object.keys(DASHBOARD_PAGES).length;
 
+// Preferences
+export const PRESET_NAME_MAX = 50;
+// Mirror `FONT_SCALE_CONFIG` in the frontend's theme-customizer config.
+export const FONT_SCALE_MIN = 0.875;
+export const FONT_SCALE_MAX = 1.125;
+
 // Common schemas
 export const IDS_ARRAY_MAX = 50;

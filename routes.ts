@@ -58,6 +58,7 @@ import * as meChangeEmailVerify from '@/app/api/dash/users/me/change-email/verif
 import * as meChangePassword from '@/app/api/dash/users/me/change-password/handler';
 import * as meChangePhone from '@/app/api/dash/users/me/change-phone/handler';
 import * as meChangePhoneVerify from '@/app/api/dash/users/me/change-phone/verify/handler';
+import * as mePreferences from '@/app/api/dash/users/me/preferences/handler';
 import * as devSignUp from '@/app/api/dev/sign-up/handler';
 import * as healthStorage from '@/app/api/health/storage/handler';
 import * as uploadFile from '@/app/api/upload/file/handler';
@@ -393,6 +394,28 @@ export const ROUTES: readonly RouteDefinition[] = [
     preAuth: 'ip-limit',
     auth: 'session',
     captcha: true,
+    handlerRateLimit: true,
+    body: 'json',
+    response: 'envelope',
+  },
+  {
+    method: 'GET',
+    path: '/api/dash/users/me/preferences',
+    handler: mePreferences.GET,
+    preAuth: 'ip-limit',
+    auth: 'session',
+    captcha: false,
+    handlerRateLimit: true,
+    body: 'none',
+    response: 'envelope',
+  },
+  {
+    method: 'PUT',
+    path: '/api/dash/users/me/preferences',
+    handler: mePreferences.PUT,
+    preAuth: 'ip-limit',
+    auth: 'session',
+    captcha: false,
     handlerRateLimit: true,
     body: 'json',
     response: 'envelope',

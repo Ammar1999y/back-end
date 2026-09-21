@@ -57,11 +57,14 @@ import {
 } from '@/utils/validation/auth';
 import {
   FOLDER_NAME_MAX,
+  FONT_SCALE_MAX,
+  FONT_SCALE_MIN,
   MAX_DOCUMENT_SIZE_MB,
   MAX_IMAGE_EDGE,
   MAX_IMAGE_PIXELS,
   MAX_IMAGE_SIZE,
   MEDIA_DISPLAY_NAME_MAX,
+  PRESET_NAME_MAX,
 } from '@/utils/validation/constants';
 import {
   createFolderSchema,
@@ -83,6 +86,12 @@ import {
   adminUpdatePermissionBodySchema,
   createPermissionSchema,
 } from '@/utils/validation/permissions';
+import {
+  COLOR_MODES,
+  preferencesSchema,
+  PRESET_NAME_PATTERN,
+  THEME_LAYOUTS,
+} from '@/utils/validation/preferences';
 import {
   ownedRowSchema,
   twoFactorBackupAcknowledgeBodySchema,
@@ -167,6 +176,7 @@ export const REQUEST_BODIES: Record<string, z.ZodType | readonly z.ZodType[]> =
     'POST /api/dash/users/me/change-password': changePasswordSchema,
     'POST /api/dash/users/me/change-phone': changePhoneSchema,
     'POST /api/dash/users/me/change-phone/verify': changePhoneVerifySchema,
+    'PUT /api/dash/users/me/preferences': preferencesSchema,
     'DELETE /api/dash/users/:id/sessions': deleteSessionsSchema,
     'DELETE /api/dash/media/files': deleteFilesSchema,
     'PUT /api/dash/media/files': moveFilesSchema,
@@ -388,6 +398,18 @@ const OPERATION_DOCS: Record<
   },
   'POST /api/dash/users/me/change-phone/verify': {
     summary: 'Verify and commit a phone-number change',
+    tag: 'Account',
+  },
+  'GET /api/dash/users/me/preferences': {
+    summary: 'Read the current dashboard appearance',
+    description:
+      'Answers the stored document, or the defaults with `updatedAt: null` when nothing has been saved — never 404, because the client needs a total document to reconcile its local copy against either way. `updatedAt` is the server-side write time, for a last-write-wins reconcile against a local copy.',
+    tag: 'Account',
+  },
+  'PUT /api/dash/users/me/preferences': {
+    summary: 'Replace the dashboard appearance',
+    description:
+      'Replaces the whole document; a partial body is rejected. Answers the stored document and its new `updatedAt`. Rate limited per user, so a client bound to a slider must debounce.',
     tag: 'Account',
   },
   'GET /api/dash/users': {
@@ -1168,6 +1190,50 @@ const CONTACT_CHANGE_SCHEMA: JsonSchema = {
   ],
 };
 
+/** Mirrors `preferencesSchema` key for key; a field added there is added here. */
+const PREFERENCES_DOCUMENT_SCHEMA: JsonSchema = {
+  type: 'object',
+  properties: {
+    preset: {
+      type: 'string',
+      maxLength: PRESET_NAME_MAX,
+      pattern: PRESET_NAME_PATTERN,
+      description:
+        'A theme preset the client resolves. It falls back to its built-in theme for one it does not know, so this server does not hold the list.',
+    },
+    colorMode: { type: 'string', enum: [...COLOR_MODES] },
+    themeLayout: { type: 'string', enum: [...THEME_LAYOUTS] },
+    fontScale: {
+      type: 'number',
+      minimum: FONT_SCALE_MIN,
+      maximum: FONT_SCALE_MAX,
+    },
+    containerStretch: { type: 'boolean' },
+  },
+  required: [
+    'preset',
+    'colorMode',
+    'themeLayout',
+    'fontScale',
+    'containerStretch',
+  ],
+  additionalProperties: false,
+};
+
+const PREFERENCES_SCHEMA: JsonSchema = {
+  type: 'object',
+  properties: {
+    preferences: PREFERENCES_DOCUMENT_SCHEMA,
+    updatedAt: {
+      anyOf: [DATE_TIME_SCHEMA, NULL_SCHEMA],
+      description:
+        'Server-side write time. Null only when nothing has ever been saved, so a stored choice of the defaults is distinguishable from no choice.',
+    },
+  },
+  required: ['preferences', 'updatedAt'],
+  additionalProperties: false,
+};
+
 /**
  * The two ends of a reset. An account with a second factor never gets `reset:
  * true` from `/reset` — it gets a grant, and the password is written by
@@ -1612,6 +1678,8 @@ const SUCCESS_DATA_SCHEMAS: Record<string, JsonSchema> = {
   'POST /api/dash/users/me/change-password': NULL_SCHEMA,
   'POST /api/dash/users/me/change-phone': CONTACT_CHANGE_SCHEMA,
   'POST /api/dash/users/me/change-phone/verify': VERIFIED_SCHEMA,
+  'GET /api/dash/users/me/preferences': PREFERENCES_SCHEMA,
+  'PUT /api/dash/users/me/preferences': PREFERENCES_SCHEMA,
   'GET /api/dash/users': {
     type: 'array',
     items: {
